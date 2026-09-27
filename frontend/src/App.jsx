@@ -41,7 +41,7 @@ import {
   verifyBootstrapCredential,
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
-import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
+import { ALL_SHOPS_STATUS, allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { resolveShopViewPresentation, shopPickerVisible, shopPickerNoticeVisible } from "./local/shopView";
 import {
   AUTO_UPDATE_DEFAULTS,
@@ -97,6 +97,10 @@ import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./loc
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
+import { resolveShellStatus } from "./local/shellStatus";
+import { plainServerMessage } from "./local/plainServerMessage";
+import { describeReport } from "./local/reportDescriptions";
+import { labelFor, toneFor } from "./local/displayLabels";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
@@ -888,6 +892,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     // from silently reporting the opposite.
     cloudReachable,
     localServiceStarting: localStarting,
+    devicePending: devicePending && cloudReachable,
     banner,
     detail: `${syncSummary}. API mode: ${apiModeLabel}.`,
   };
@@ -1113,7 +1118,7 @@ const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "report
 const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses", "all-shops"]);
 
 const getErrorMessage = (error, fallback) =>
-  error.response?.data?.message || fallback;
+  plainServerMessage(error.response?.data?.message) || fallback;
 
 /**
  * Why a product save failed, never a bare "Error Adding Product": the server's own words when it
@@ -2045,7 +2050,7 @@ class ModuleErrorBoundary extends React.Component {
               </div>
               <button className="remove-button" onClick={this.props.onClose}><Icon name="close" /></button>
             </div>
-            <div className="cart-empty">
+            <div className="error-banner" role="alert">
               {this.state.error?.message || "Unexpected error while rendering this module."}
             </div>
           </section>
@@ -9088,6 +9093,19 @@ function App() {
     heldOffline: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
     localServiceReady: backendHealth?.online === true,
   });
+  // One status, said once: the pill always, the panel only when somebody has to act.
+  // local/shellStatus.js explains why the three older summaries were retired.
+  const shellStatus = resolveShellStatus({
+    connection: connectionSentence,
+    startupError,
+    serviceStarting: connectionStatus.localServiceStarting,
+    serviceDown: backendHealth?.online === false,
+    cloudMode: isCloudMode(),
+    pendingCount: connectionStatus.pending,
+    failedCount: connectionStatus.failed,
+    conflictCount: connectionStatus.conflicts,
+    devicePending: connectionStatus.devicePending,
+  });
 
   return (
     <main className="erp-shell">
@@ -9226,7 +9244,6 @@ function App() {
             </div>
             <BrandLogo compact />
             <div>
-              <span className="eyebrow">Retail Operations Workspace</span>
               <h1>{activeLabel}</h1>
             </div>
           </div>
@@ -9256,7 +9273,7 @@ function App() {
                 <span className="status-dot" />
                 {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
-              <div className="offline-pill">{connectionStatus.syncSummary}</div>
+              <div className="offline-pill" data-tone={shellStatus.pill.tone} title={shellStatus.pill.title || undefined}>{shellStatus.pill.label}</div>
               {/* Whenever the microphone is on, in either mode, for anybody: it is never on without
                   this on screen. With the drawer closed it also carries what was heard and why it
                   is not listening, since nothing else on screen would. */}
@@ -9374,20 +9391,23 @@ function App() {
             online={Boolean(backendHealth.online) && !offlineMode}
             schedule={autoUpdateSchedule}
           />
-          {(startupNotice || startupError || syncMessage) && (
-            <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
-              {startupError && <p>{startupError}</p>}
-              {!startupError && <p>{connectionStatus.banner}</p>}
-              {!startupError && <small>{connectionStatus.detail}</small>}
-              {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
+          {/* Only when somebody has to act. The all-clear lives in the top-bar pill, and being
+              offline is the banner's to say; this panel no longer repeats either of them. */}
+          {shellStatus.notice && (
+            <div
+              className={`startup-status-panel ${shellStatus.notice.tone === "error" ? "startup-status-error" : ""}`}
+              role={shellStatus.notice.tone === "error" ? "alert" : "status"}
+            >
+              <p>{shellStatus.notice.message}</p>
+              {shellStatus.notice.offerRestart && isTauriRuntime() && (
                 <button className="table-action" onClick={async () => {
                   await ensureLocalBackendService({ restart: true, reason: "shell-restart-service" });
                   await performConnectivityCheck("shell-restart-service", { force: true, skipServiceStart: true });
                 }}>
-                  Restart Service
+                  Restart FroozERP
                 </button>
               )}
-              {localBackendService?.message && <small>{localBackendService.message}</small>}
+              {shellStatus.notice.offerRestart && localBackendService?.message && <small>{localBackendService.message}</small>}
             </div>
           )}
           {activeView === "dashboard" && !hasModuleAccess("dashboard") && (
@@ -9409,8 +9429,6 @@ function App() {
               )}
               <section className="welcome-banner">
                 <div>
-                  <BrandLogo />
-                  <span className="eyebrow">Retail Intelligence</span>
                   <h2>Good to see you, {getUserGreetingName(user)}.</h2>
                   <p>Monitor today's performance and keep your inventory moving.</p>
                 </div>
@@ -9871,7 +9889,7 @@ function App() {
           {activeView === "purchase" && (
             <section className="settings-layout">
               {purchases.some((purchase) => purchase.operation_id) && (
-                <ModuleCard eyebrow="Offline Replay" title="Queued Purchase Arrivals" subtitle="Local purchase intent remains visible until the cloud acknowledges it.">
+                <ModuleCard eyebrow="Saved while offline" title="Purchases waiting to send" subtitle="Purchases entered on this computer stay listed here until the cloud has them.">
                   <DataTable headers={["Reference", "Purchase Date", "Bill State", "Sync State", "Detail"]}>
                     {Array.from(new Map(
                       purchases
@@ -9882,8 +9900,8 @@ function App() {
                         <td className="primary-cell">{purchase.provisional_reference || purchase.offline_purchase_ref}</td>
                         <td>{purchase.purchase_date}</td>
                         <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : purchase.purchase_type === "CASH" ? "Paid Purchase" : "Credit Purchase"}</td>
-                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Syncing" : purchase.sync_status === "completed" ? "Cloud Confirmed" : purchase.sync_status === "failed" ? "Failed - Retry Available" : purchase.sync_status === "conflict" ? "Conflict - Review Required" : "Pending Cloud Acknowledgement"}</span></td>
-                        <td>{purchase.last_error || (purchase.sync_status === "completed" ? "Canonical purchase and lot IDs reconciled" : "Stored safely in local SQLite")}</td>
+                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Sending" : purchase.sync_status === "completed" ? "Sent to cloud" : purchase.sync_status === "failed" ? "Not sent - can be retried" : purchase.sync_status === "conflict" ? "Clashes with cloud - needs checking" : "Waiting to send"}</span></td>
+                        <td>{purchase.last_error || (purchase.sync_status === "completed" ? "Sent, and matched to the cloud copy" : "Saved safely on this computer")}</td>
                       </tr>
                     ))}
                   </DataTable>
@@ -9921,7 +9939,7 @@ function App() {
                       <tr key={purchase.id}>
                         <td><span className="batch-id">#{purchase.id}</span></td>
                         <td className="primary-cell">{purchase.product_name}<small className="cell-note">{purchase.batch_no || "-"}</small></td>
-                        <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit || ""}</td>
+                        <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit ? labelFor("unit", purchase.unit) : ""}</td>
                         <td>{currency.format(Number(purchase.purchase_rate || purchase.expected_purchase_rate || 0))}</td>
                         <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : "Completed Bill"}</span></td>
                         <td>{currency.format(Number(purchase.net_payable || purchase.total_amount || 0))}</td>
@@ -10018,8 +10036,8 @@ function App() {
                         <td className="primary-cell">{item.product_name}</td>
                         <td>{item.lot_name || "-"}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
                         <td>{item.quantity}</td>
-                        <td>{item.unit}</td>
-                        <td><span className="origin-rate">{item.origin_type}</span></td>
+                        <td>{labelFor("unit", item.unit)}</td>
+                        <td><span className="origin-rate">{labelFor("origin", item.origin_type)}</span></td>
                         <td>{currency.format(Number(item.purchase_rate || item.expected_purchase_rate || 0))}</td>
                         <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : "-"}</td>
                         <td>{item.remarks || "-"}</td>
@@ -10467,7 +10485,7 @@ function App() {
               </div>
               <button className="remove-button" onClick={() => setSaleEditError("")}><Icon name="close" /></button>
             </div>
-            <div className="cart-empty">{saleEditError}</div>
+            <div className="error-banner" role="alert">{saleEditError}</div>
           </section>
         </div>
       )}
@@ -13451,7 +13469,7 @@ function WhatsAppSendModal({
               {results.map((row, index) => (
                 <tr key={`${row.phoneNumber}-${index}`}>
                   <td>{row.phoneNumber}</td>
-                  <td><span className={row.status === "sent" ? "stock-ok" : "stock-low"}>{row.status}</span></td>
+                  <td><span className={row.status === "sent" ? "stock-ok" : "stock-low"}>{labelFor("messageStatus", row.status)}</span></td>
                   <td>{row.errorMessage || "Done"}</td>
                 </tr>
               ))}
@@ -13986,7 +14004,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Pending Purchase Bills" title="Supplier-Wise Pending Bills" subtitle="Operational queue for stock received before supplier bill completion.">
+      <ModuleCard eyebrow="Supplier bills" title="Waiting for a bill, by supplier" subtitle="Stock that has arrived but whose supplier bill is not complete yet.">
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Pending Suppliers" value={supplierSummaries.length} featured />
           <SummaryMetric label="Pending Bills" value={pendingRows.length} />
@@ -14138,7 +14156,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Operations" title="Pending Bills" subtitle="Complete supplier pending bills and settle customer credit invoices.">
+      <ModuleCard eyebrow="Waiting to be settled" title="Supplier bills and customer credit" subtitle="Finish supplier bills for stock that arrived without one, and collect what customers owe on credit.">
         <label className="icon-input table-search-input">
           <Icon name="search" />
           <input
@@ -14148,8 +14166,8 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
           />
         </label>
         <div className="settings-tabs">
-          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Pending Purchase Bills</button>
-          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer Pending Bills</button>
+          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Supplier bills</button>
+          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer credit</button>
         </div>
       </ModuleCard>
 
@@ -14203,7 +14221,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
                     <td>{currency.format(Number(invoice.received_amount || 0))}</td>
                     <td className="balance-cell">{currency.format(Number(invoice.balance_amount || 0))}</td>
                     <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : "-"}</td>
-                    <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{invoice.credit_status}</span></td>
+                    <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{labelFor("credit_status", invoice.credit_status)}</span></td>
                     <td>
                       <div className="button-row table-actions-row">
                         <button className="primary-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)}>Receive Payment</button>
@@ -14369,8 +14387,8 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
                 <td>{Number(lot.remaining_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                 <td>{currency.format(Number(lot.temporary_sale_rate || 0) > 0 ? Number(lot.temporary_sale_rate) : Number(lot.selling_rate || 0))}</td>
                 <td>{currency.format(Number(lot.effective_cost_per_unit || lot.purchase_rate || 0))}</td>
-                <td>{existing ? `${existing.discount_type} ${currency.format(Number(existing.discount_value || 0))}` : "-"}</td>
-                <td><span className={lot.batch_status === "ACTIVE" || !lot.batch_status ? "stock-ok" : "stock-low"}>{lot.batch_status || "ACTIVE"}</span></td>
+                <td>{existing ? `${labelFor("discountType", existing.discount_type)} ${currency.format(Number(existing.discount_value || 0))}` : "-"}</td>
+                <td><span className={statusClass("batchStatus", lot.batch_status || "ACTIVE")}>{labelFor("batchStatus", lot.batch_status || "ACTIVE")}</span></td>
               </tr>
             );
           })}
@@ -14385,7 +14403,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
             <tr key={discount.id}>
               <td className="primary-cell">{discount.product_name}</td>
               <td>{discount.lot_name || discount.batch_no || "-"}{discount.lot_size ? ` / ${discount.lot_size}` : ""}</td>
-              <td>{discount.discount_type}</td>
+              <td>{labelFor("discountType", discount.discount_type)}</td>
               <td>{discount.discount_type === "PERCENTAGE" ? `${Number(discount.discount_value || 0)}%` : currency.format(Number(discount.discount_value || 0))}</td>
               <td>{formatDisplayDate(discount.start_date)}</td>
               <td>{discount.end_date ? formatDisplayDate(discount.end_date) : "Open"}</td>
@@ -14399,6 +14417,21 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
     </section>
   );
 }
+
+/**
+ * The badge class for a status, from its tone in `local/displayLabels.js`. The four classes are the
+ * shared badge set: success, attention, danger, and a neutral tag for everything else.
+ */
+const STATUS_TONE_CLASS = Object.freeze({ success: "stock-ok", warning: "origin-rate", danger: "stock-low", info: "tag", neutral: "tag" });
+const statusClass = (family, value) => STATUS_TONE_CLASS[toneFor(family, value)] || "tag";
+
+const REPORT_RANGE_LABELS = Object.freeze({
+  today: "today",
+  yesterday: "yesterday",
+  week: "this week",
+  month: "this month",
+  custom: "custom dates",
+});
 
 function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, appliedParams = null, suppliers = [], user }) {
   // Reopening Report Center shows the range it was last loaded with, not "Today" over a year's data.
@@ -14589,17 +14622,17 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   const orderReportsState = (() => {
     const loadState = ordersState.loadState || "idle";
     if (loadState === "error") {
-      return { ready: false, notice: ordersState.loadError || "Orders could not be read on this device.", reports: null };
+      return { ready: false, failed: true, notice: ordersState.loadError || "Orders could not be read on this device.", reports: null };
     }
     if (loadState === "idle" || loadState === "loading") {
-      return { ready: false, notice: "Reading this device's orders…", reports: null };
+      return { ready: false, failed: false, notice: "Reading this device's orders…", reports: null };
     }
     const reports = buildOrderReports(ordersState.orders, {
       range: "custom",
       date_from: appliedQuery.date_from,
       date_to: appliedQuery.date_to,
     });
-    return { ready: reports.ok, notice: describeOrderReportError(reports), reports };
+    return { ready: reports.ok, failed: !reports.ok, notice: describeOrderReportError(reports), reports };
   })();
   /**
    * Rows for one order report, or an empty list while the orders are unread.
@@ -15251,7 +15284,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       headers: ["Product", "Quantity", "Value", "Orders", "Customers", "Cancelled Qty", "Last Ordered"],
       render: (row) => (
         <tr key={row.productKey}>
-          <td className="primary-cell">{row.productName}{row.unit ? <small className="cell-note">{row.unit}</small> : null}</td>
+          <td className="primary-cell">{row.productName}{row.unit ? <small className="cell-note">{labelFor("unit", row.unit)}</small> : null}</td>
           <td>{number(row.quantity)}</td>
           <td>{money(row.value)}</td>
           <td>{number(row.orders)}</td>
@@ -15302,12 +15335,12 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         <tr key={row.id}>
           <td className="primary-cell">
             {row.orderNo}
-            <small className="cell-note">{row.source}</small>
+            <small className="cell-note">{labelFor("orderSource", row.source)}</small>
           </td>
           <td>{row.orderedOnLabel}</td>
           <td>{row.customerName}{row.customerMobile ? <small className="cell-note">{row.customerMobile}</small> : null}</td>
           <td>
-            {row.status}
+            {labelFor("orderStatus", row.status)}
             {/* Carried from the board rather than recomputed, so a warning a person has already
                 seen on the Orders screen reads identically here. */}
             {row.warning ? <small className="cell-note">{row.warning}</small> : null}
@@ -15331,7 +15364,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.salesProductReport),
       summary: (rows) => [["Revenue", money(totalOf(rows, "revenue")), true], ["Quantity Sold", number(totalOf(rows, "quantity_sold"))], ["Profit", money(totalOf(rows, "profit"))]],
       headers: ["Product", "Lot", "Quantity", "Rate", "Revenue", "Cost", "Profit"],
-      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || "-"}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || "-"}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
     },
     salesByCustomer: {
       title: "Sales by Customer",
@@ -15408,7 +15441,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                 {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
                 {salesHasBillDiscount && <td className="amount-cell">{Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
                 <td className="amount-cell">{money(row.net_total)}</td>
-                <td className="status-cell">{row.payment_mode || "-"}</td>
+                <td className="status-cell">{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="status-cell">{row.status_label}</td>
               </tr>
               {expanded && (
@@ -15420,7 +15453,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                           <td className="primary-cell">{item.item_name}</td>
                           <td>{item.lot_name || "No Lot Number"}</td>
                           <td>{number(item.quantity)}</td>
-                          <td>{item.unit || "-"}</td>
+                          <td>{labelFor("unit", item.unit)}</td>
                           <td>{money(item.rate)}</td>
                           <td>{money(item.gross_total)}</td>
                           {salesHasItemDiscount && <td>{Number(item.item_discount_total || 0) ? money(item.item_discount_total) : "-"}</td>}
@@ -15445,13 +15478,13 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
             <td className="primary-cell">{row.item_name}</td>
             <td>{row.lot_name || "No Lot Number"}</td>
             <td>{number(row.quantity)}</td>
-            <td>{row.unit || "-"}</td>
+            <td>{labelFor("unit", row.unit)}</td>
             <td>{money(row.rate)}</td>
             {salesFilters.viewMode !== "CUSTOMER" && <td className="amount-cell">{money(row.gross_total)}</td>}
             {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
             {salesHasBillDiscount && <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
             <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : money(row.net_total)}</td>
-            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : (row.payment_mode || "-")}</td>
+            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : labelFor("paymentMode", row.payment_mode)}</td>
             <td>{row.row_type === "CUSTOMER_ITEM" ? (row.invoice_first_line ? row.status_label : "-") : (row.created_by_name || row.sold_by || "-")}</td>
           </tr>
         );
@@ -15476,14 +15509,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.provisionalProfitSalesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_amount")), true], ["Provisional Profit", money(totalOf(rows, "profit"))], ["Invoices", rows.length]],
       headers: ["Invoice", "Date", "Customer", "Payment", "Products", "Amount", "Cost", "Provisional Profit"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{row.payment_mode}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
     },
     discountReport: {
       title: "Discount Report",
       rows: filterRows(data.discountReport),
       summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Gross Amount", money(totalOf(rows, "gross_amount"))], ["Net Amount", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
       headers: ["Date", "Product", "Lot", "Discount Type", "Discount Value", "Qty Sold", "Gross Amount", "Discount Amount", "Net Amount", "Profit Impact"],
-      render: (row, index) => <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || row.payment_mode}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{row.discount_type || "Bill / Manual"}</td><td>{row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>,
+      render: (row, index) => <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{row.discount_type ? labelFor("discountType", row.discount_type) : "Bill / Manual"}</td><td>{row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>,
     },
     purchasesByDate: {
       title: "Purchases by Date",
@@ -15497,7 +15530,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.purchaseProductReport),
       summary: (rows) => [["Net Purchases", money(totalOf(rows, "net_purchase")), true], ["Quantity", number(totalOf(rows, "quantity_purchased"))], ["Mandi Tax", money(totalOf(rows, "mandi_tax"))]],
       headers: ["Product", "Quantity", "Net Purchase", "Mandi Tax", "Rebate"],
-      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity_purchased)}</td><td>{money(row.net_purchase)}</td><td>{money(row.mandi_tax)}</td><td>{money(row.rebate)}</td></tr>,
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity_purchased)}</td><td>{money(row.net_purchase)}</td><td>{money(row.mandi_tax)}</td><td>{money(row.rebate)}</td></tr>,
     },
     purchasesBySupplier: {
       title: "Purchases by Supplier",
@@ -15549,56 +15582,56 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.pendingPurchaseBillsReport),
       summary: (rows) => [["Pending Bills", rows.length, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
       headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Remarks"],
-      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td><td>{row.remarks || "-"}</td></tr>,
     },
     stockWithoutBill: {
       title: "Stock Received Without Bill",
       rows: filterRows(data.stockWithoutBillReport),
       summary: (rows) => [["Batches", rows.length, true], ["Received Qty", number(totalOf(rows, "purchase_qty"))], ["Remaining Qty", number(totalOf(rows, "remaining_qty"))]],
       headers: ["Arrival Date", "Batch", "Supplier", "Product", "Received", "Remaining", "Temp Sale Rate", "Expected Rate"],
-      render: (row) => <tr key={row.id}><td>{row.arrival_date}</td><td><span className="batch-id">{row.batch_no}</span></td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.arrival_date}</td><td><span className="batch-id">{row.batch_no}</span></td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td></tr>,
     },
     customerLedger: {
       title: "Customer Ledger",
       rows: customerLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     supplierLedger: {
       title: "Supplier Ledger",
       rows: supplierLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
       rows: accountStatementRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {row.account_type}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {labelFor("accountType", row.account_type)}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     paymentReport: {
       title: "Payment Report",
       rows: filterRows(data.paymentReport),
       summary: (rows) => [["Payments", money(totalOf(rows, "payment_amount")), true], ["Rebates", money(totalOf(rows, "rebate_amount"))], ["Entries", rows.length]],
       headers: ["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"],
-      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{row.payment_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{row.payment_mode}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{labelFor("transactionType", row.payment_type)}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
     },
     paymentModeSummary: {
       title: "Payment Mode Summary",
       rows: filterRows(data.paymentModeSummary),
       summary: (rows) => [["Total Amount", money(totalOf(rows, "total_amount")), true], ["Transactions", number(totalOf(rows, "transaction_count"))], ["Modes", new Set(rows.map((row) => row.payment_mode)).size]],
       headers: ["Date", "Source", "Payment Mode", "Transactions", "Total Amount"],
-      render: (row, index) => <tr key={`${row.transaction_date}-${row.source}-${row.payment_mode}-${index}`}><td>{formatDisplayDate(row.transaction_date)}</td><td>{row.source}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.transaction_count}</td><td className="primary-cell">{money(row.total_amount)}</td></tr>,
+      render: (row, index) => <tr key={`${row.transaction_date}-${row.source}-${row.payment_mode}-${index}`}><td>{formatDisplayDate(row.transaction_date)}</td><td>{labelFor("transactionType", row.source)}</td><td><span className="tag">{labelFor("paymentMode", row.payment_mode)}</span></td><td>{row.transaction_count}</td><td className="primary-cell">{money(row.total_amount)}</td></tr>,
     },
     receivableReport: {
       title: "Receivable Report",
       rows: filterRows(data.customerOutstandingReport),
       summary: (rows) => [["Receivable", money(totalOf(rows, "outstanding_balance")), true], ["Sales", money(totalOf(rows, "total_sales"))], ["Paid", money(totalOf(rows, "total_paid"))]],
       headers: ["Customer", "Type", "Sales", "Paid", "Outstanding"],
-      render: (row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_type}</td><td>{money(row.total_sales)}</td><td>{money(row.total_paid)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
+      render: (row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td>{labelFor("customerType", row.customer_type)}</td><td>{money(row.total_sales)}</td><td>{money(row.total_paid)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
     },
     payableReport: {
       title: "Payable Report",
@@ -15612,7 +15645,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.returnHistoryReport),
       summary: (rows) => [["Return Value", money(totalOf(rows, "total_return_amount")), true], ["Returns", rows.length]],
       headers: ["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"],
-      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || "-"}</td><td>{row.customer_name}</td><td>{row.refund_type}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || "-"}</td></tr>,
+      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || "-"}</td><td>{row.customer_name}</td><td>{labelFor("refundType", row.refund_type)}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || "-"}</td></tr>,
     },
     returnValue: {
       title: "Return Value Report",
@@ -15633,35 +15666,35 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.wasteReport),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Entries", number(totalOf(rows, "entry_count"))]],
       headers: ["Date", "Type", "Entries", "Quantity", "Cost"],
-      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{labelFor("wasteType", row.waste_type)}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     monthlyWaste: {
       title: "Monthly Waste",
       rows: filterRows(data.wasteReport),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Entries", number(totalOf(rows, "entry_count"))]],
       headers: ["Date", "Type", "Entries", "Quantity", "Cost"],
-      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{labelFor("wasteType", row.waste_type)}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     productWiseWaste: {
       title: "Product Wise Waste",
       rows: wasteProductRows,
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Products", rows.length]],
       headers: ["Product", "Quantity", "Cost"],
-      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     mostWastedProducts: {
       title: "Most Wasted Products",
       rows: wasteProductRows.slice(0, 10),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Products", rows.length]],
       headers: ["Product", "Quantity", "Cost"],
-      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     wasteCost: {
       title: "Waste Cost Report",
       rows: filterRows(data.wasteReport),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))]],
       headers: ["Date", "Type", "Quantity", "Cost"],
-      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{labelFor("wasteType", row.waste_type)}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     stockInventory: {
       title: "Stock Inventory",
@@ -15675,28 +15708,28 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: stockRows,
       summary: (rows) => [["Stock Value", money(totalOf(rows, "stock_value")), true], ["Products", rows.length], ["Low Stock", lowStockRows.length]],
       headers: ["Product", "Category", "Stock", "Minimum", "Unit", "Value"],
-      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td>{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td>{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{labelFor("unit", row.unit)}</td><td>{money(row.stock_value)}</td></tr>,
     },
     lowStock: {
       title: "Low Stock",
       rows: lowStockRows,
       summary: (rows) => [["Low Stock Items", rows.length, true], ["Stock Value", money(totalOf(rows, "stock_value"))]],
       headers: ["Product", "Category", "Stock", "Minimum", "Unit", "Value"],
-      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td className="stock-low">{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td className="stock-low">{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{labelFor("unit", row.unit)}</td><td>{money(row.stock_value)}</td></tr>,
     },
     stockMovement: {
       title: "Stock Movement",
       rows: filterRows(data.stockMovementReport),
       summary: (rows) => [["Quantity", number(totalOf(rows, "quantity")), true], ["Movements", number(totalOf(rows, "movement_count"))]],
       headers: ["Date", "Product", "Type", "Quantity", "Count", "Remarks"],
-      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.transaction_type}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{labelFor("transactionType", row.transaction_type)}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || "-"}</td></tr>,
     },
     stockValuation: {
       title: "Stock Valuation",
       rows: stockRows,
       summary: (rows) => [["Stock Value", money(totalOf(rows, "stock_value")), true], ["Products", rows.length]],
       headers: ["Product", "Stock", "Unit", "Value"],
-      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{number(row.current_stock)}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{number(row.current_stock)}</td><td>{labelFor("unit", row.unit)}</td><td>{money(row.stock_value)}</td></tr>,
     },
     lotWiseStock: {
       title: "Lot Wise Stock",
@@ -15707,7 +15740,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         const status = String(row.batch_status || "ACTIVE").toUpperCase();
         const balance = Number(row.remaining_qty ?? row.balance_qty ?? 0);
         const statusLabel = status === "CANCELLED" ? "Cancelled" : status === "INACTIVE" ? "Inactive" : balance <= 0 ? "Sold Out" : "Active";
-        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{row.stock_source || "PURCHASE"}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
+        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{labelFor("stockSource", row.stock_source || "PURCHASE")}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
       },
     },
     profitLoss: {
@@ -15775,17 +15808,17 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.expenseReport),
       summary: (rows) => [["Total Expenses", money(totalOf(rows.filter((row) => row.status !== "CANCELLED"), "amount")), true], ["Cash", money(totalOf(rows.filter((row) => row.payment_mode === "CASH" && row.status !== "CANCELLED"), "amount"))], ["UPI", money(totalOf(rows.filter((row) => row.payment_mode === "UPI" && row.status !== "CANCELLED"), "amount"))], ["Cancelled", money(totalOf(rows.filter((row) => row.status === "CANCELLED"), "amount"))]],
       headers: ["Date", "Category", "Paid To", "Payment Mode", "Amount", "Reference", "Remarks", "Status"],
-      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{row.payment_mode}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{row.status || "ACTIVE"}</span></td></tr>,
+      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{labelFor("recordStatus", row.status || "ACTIVE")}</span></td></tr>,
     },
   };
   const categories = [
-    { id: "orders", title: "Order Reports", icon: "parcel", description: "Customer orders taken by phone, WhatsApp and the counter: what was ordered, by whom, and what is still open. Read from this device, so these answer with no internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
-    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Unified sales history with item narration, discounts, payments and bill status.", reports: ["salesHistory", "discountReport"] },
-    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Unified purchase history with item narration, bill status, payments and amendment actions.", reports: ["purchaseHistory"] },
+    { id: "orders", title: "Order Reports", icon: "parcel", description: "Orders taken by phone, WhatsApp and at the counter: what was ordered, by whom, and what is still open. Works without internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
+    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Every bill with its items, discounts, payments and status.", reports: ["salesHistory", "discountReport"] },
+    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Every purchase with its items, bill status, payments and changes.", reports: ["purchaseHistory"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
-    { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
-    { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
-    { id: "inventory", title: "Inventory Reports", icon: "layers", description: "Single stock inventory workspace for stock, lots, valuation, adjustments and audit.", reports: ["stockInventory"] },
+    { id: "returns", title: "Sale Returns", icon: "history", description: "What came back, what it was worth, and why.", reports: ["returnHistory", "returnValue", "returnReason"] },
+    { id: "waste", title: "Waste Management", icon: "alert", description: "Waste by day, month and product, and what it cost.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
+    { id: "inventory", title: "Inventory Reports", icon: "layers", description: "Stock on hand, lots, value, corrections and their history.", reports: ["stockInventory"] },
     { id: "financial", title: "Financial Reports", icon: "wallet", description: "Profit and loss, balance sheet, cash book and expense reports.", reports: ["profitLoss", "balanceSheet", "cashBook", "expenseReport"] },
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);
@@ -15888,7 +15921,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   const renderFilters = () => selectedReport === "stockInventory" ? (
     <div className="ledger-toolbar">
       <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh Inventory"}</button>
-      {refreshError && <div className="field-error" role="alert">{refreshError}</div>}
+      {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   ) : (
     <div className={selectedReport === "purchaseHistory" ? "ledger-toolbar purchase-history-toolbar" : "ledger-toolbar"}>
@@ -16118,7 +16151,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
           <Field label="Payment Mode">
             <select value={salesFilters.paymentMode} onChange={(event) => setSalesFilters({ ...salesFilters, paymentMode: event.target.value })}>
               <option value="">All modes</option>
-              {[...salesFilterOptions.paymentModes].sort().map((mode) => <option key={mode} value={mode}>{mode}</option>)}
+              {[...salesFilterOptions.paymentModes].sort().map((mode) => <option key={mode} value={mode}>{labelFor("paymentMode", mode)}</option>)}
             </select>
           </Field>
           <Field label="Status">
@@ -16176,7 +16209,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         </>
       )}
       <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh"}</button>
-      {refreshError && <div className="field-error" role="alert">{refreshError}</div>}
+      {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   );
   const balanceDetailColumnValue = (row, column) => {
@@ -16292,14 +16325,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
               <tr key={`${row.source_type}-${row.source_id}-${index}`}>
                 <td>{formatDisplayDate(row.date)}<small className="cell-note">{row.entry_time ? new Date(row.entry_time).toLocaleTimeString("en-IN") : ""}</small></td>
                 <td className="primary-cell">{row.reference_no || "-"}</td>
-                <td>{row.source_type || "-"}</td>
+                <td>{labelFor("transactionType", row.source_type)}</td>
                 <td>{row.party_name || row.account_name || "-"}</td>
-                <td>{row.payment_mode || "-"}</td>
+                <td>{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="amount-cell">{money(Number(row.receipt_cash || 0) || Number(row.payment_cash || 0))}</td>
                 <td className="amount-cell">{money(Number(row.receipt_bank || 0) || Number(row.payment_bank || 0))}</td>
                 <td className="purchase-items-cell">{row.narration || "-"}</td>
                 <td>{row.created_by_name || "-"}</td>
-                <td>{row.source_type || "-"}</td>
+                <td>{labelFor("transactionType", row.source_type)}</td>
               </tr>
             ))}
           </DataTable>
@@ -16516,15 +16549,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     return (
       <>
         <section className="settings-layout">
-          <ModuleCard eyebrow="Report View" title={currentReport.title} subtitle="Single report workspace with filters, summary, print and export controls.">
+          <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={describeReport(selectedReport) || "Set the filters, then print or export."}>
             <div className="button-row">
-              <button className="secondary-button" onClick={() => setSelectedReport("")}>Back to {currentCategory?.title || "Report List"}</button>
-              <button className="secondary-button" onClick={() => { setSelectedReport(""); setSelectedCategory(""); }}>Back to Report Center</button>
+              <button className="secondary-button" onClick={() => setSelectedReport("")}>Back to {currentCategory?.title || "Reports"}</button>
               {selectedReport === "purchaseHistory" && <button className="primary-button" onClick={onOpenBlankPurchaseAmendment}>Add/Edit Purchase</button>}
             </div>
             {renderFilters()}
           </ModuleCard>
-          <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={selectedReport === "stockInventory" ? "Inventory results use the filters shown below." : `${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
+          <ModuleCard eyebrow="Results" title={selectedReport === "stockInventory" ? "Stock on hand" : ["profitLoss", "balanceSheet", "cashBook"].includes(selectedReport) ? "Statement" : `${rows.length} row${rows.length === 1 ? "" : "s"}`} subtitle={selectedReport === "stockInventory" ? "Uses the filters shown below." : "Matching the filters above."}>
             <PrintableReport
               beforePdfExport={handleReportPrintOption}
               beforePrint={handleReportPrintOption}
@@ -16560,7 +16592,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
                   </DataTable>
                   {rows.length === 0 && (
-                    <div className="cart-empty">
+                    <div
+                      className={isOrderReport && orderReportsState.failed ? "error-banner" : "cart-empty"}
+                      role={isOrderReport && orderReportsState.failed ? "alert" : undefined}
+                    >
                       {/* An order report with no rows has two very different causes, and saying
                           "no records found" for both would report a failed read as a quiet day. */}
                       {isOrderReport && !orderReportsState.ready
@@ -16581,7 +16616,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   if (currentCategory) {
     return (
       <section className="settings-layout">
-        <ModuleCard eyebrow="Report Category" title={currentCategory.title} subtitle={currentCategory.description}>
+        <ModuleCard eyebrow="Reports" title={currentCategory.title} subtitle={currentCategory.description}>
           <div className="button-row">
             <button className="secondary-button" onClick={() => setSelectedCategory("")}>Back to Report Center</button>
           </div>
@@ -16594,7 +16629,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
               <button className="report-menu-card" key={reportId} onClick={() => { setSearch(""); setSelectedReport(reportId); }}>
                 <Icon name={currentCategory.icon} size={22} />
                 <strong>{report.title}</strong>
-                <span>Open report workspace</span>
+                <span>{describeReport(reportId)}</span>
               </button>
             );
           })}
@@ -16604,20 +16639,22 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   }
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Report Center" title="Business Report Center" subtitle="Choose a report category first. Each report opens in its own focused workspace.">
-        <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Categories" value={categories.length} featured />
-          <SummaryMetric label="Available Reports" value={Object.keys(reports).length} />
-          <SummaryMetric label="Current Range" value={range === "custom" ? "Custom" : range} />
-        </div>
-      </ModuleCard>
+      {/* The range every report opens with. Named here because it is an effective filter: an
+          unnamed "today" once made a month of sales look missing. */}
+      <section className="content-card">
+        <p className="form-note">
+          Reports open for <strong>{REPORT_RANGE_LABELS[appliedQuery.range] || "the chosen dates"}</strong>
+          {` (${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}). `}
+          Change the dates inside any report.
+        </p>
+      </section>
       <section className="report-center-grid">
         {categories.map((category) => (
           <button className="report-category-card" key={category.id} onClick={() => setSelectedCategory(category.id)}>
             <span className="report-category-icon"><Icon name={category.icon} size={24} /></span>
             <strong>{category.title}</strong>
             <span>{category.description}</span>
-            <em>{category.reports.length} reports</em>
+            <em>{category.reports.length} {category.reports.length === 1 ? "report" : "reports"}</em>
           </button>
         ))}
       </section>
@@ -16939,7 +16976,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
     const status = lotStatus(lot);
     return (
       <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
-        <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.unit}</small></td>
+        <td className="primary-cell">{lot.product_name}<small className="cell-note">{labelFor("unit", lot.unit)}</small></td>
         <td>{lot.category || "Fruit"}</td>
         <td>{lot.supplier_name || "-"}</td>
         <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}</td>
@@ -16993,7 +17030,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
       {inventoryUnavailable && <div className="error-banner" role="alert" data-report-note="">{inventoryPresentation.message}</div>}
       {stockDateRangeError && <div className="error-banner" role="alert">{stockDateRangeError}</div>}
       {auditUnavailableMessage && <div className="cart-empty" role="status" data-report-note="">{auditUnavailableMessage}</div>}
-      {auditError && <div className="error-banner" data-report-note="">{auditError}</div>}
+      {auditError && <div className="error-banner" role="alert" data-report-note="">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
           <Field label="Product Search / Selector">
@@ -17247,7 +17284,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
                     <td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td>
                     <td className="primary-cell">{row.product_name}</td>
                     <td>{row.lot_name || row.lot_id || "-"}</td>
-                    <td><span className="tag">{row.action}</span></td>
+                    <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                     <td>{auditChangeSummary(row)}</td>
                     <td>{row.reason || "-"}</td>
                     <td>{row.edited_by_name || "-"}</td>
@@ -17346,7 +17383,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
             const value = (Number(item.net_amount || 0) / Number(item.sold_quantity || 1)) * quantity;
             return (
               <tr key={item.sale_item_id}>
-                <td className="primary-cell">{item.product_name}<small className="cell-note">{item.unit}</small></td>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{labelFor("unit", item.unit)}</small></td>
                 <td>{Number(item.sold_quantity || 0).toLocaleString("en-IN")}</td>
                 <td>{Number(item.returned_quantity || 0).toLocaleString("en-IN")}</td>
                 <td>{Number(item.returnable_quantity || 0).toLocaleString("en-IN")}</td>
@@ -17360,7 +17397,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Selected Items" value={selectedItems.length} />
           <SummaryMetric label="Return Value" value={currency.format(totalReturnValue)} featured />
-          <SummaryMetric label="Refund Mode" value={refundType.replaceAll("_", " ")} />
+          <SummaryMetric label="Refund Mode" value={labelFor("refundType", refundType)} />
         </div>
         <button className="primary-button" onClick={saveReturn}>Save Return / Refund</button>
       </ModuleCard>
@@ -17372,7 +17409,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
               <td>{toDateKey(entry.return_date)}</td>
               <td>{entry.invoice_no}</td>
               <td className="primary-cell">{entry.customer_name || "Walk-in"}</td>
-              <td><span className="tag">{entry.refund_type}</span></td>
+              <td><span className="tag">{labelFor("refundType", entry.refund_type)}</span></td>
               <td>{currency.format(Number(entry.total_return_amount || 0))}</td>
               <td>{entry.return_reason}</td>
               <td>{(entry.items || []).map((item) => `${item.product_name} x ${item.return_quantity}`).join(", ")}</td>
@@ -17392,8 +17429,13 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
     waste_date: toDateKey(new Date()),
     remarks: "",
   });
+  // Keyed and read with the canonical id on both sides. It used to be `Number()` on both, which
+  // folds "004" into 4 and turns a non-numeric id into NaN, so a product could show another's stock
+  // or none at all.
   const stockByProduct = inventory.reduce((stock, item) => {
-    stock.set(Number(item.product_id), (stock.get(Number(item.product_id)) || 0) + Number(item.remaining_qty || 0));
+    const key = canonicalInventoryId(item.product_id);
+    if (key === "") return stock;
+    stock.set(key, (stock.get(key) || 0) + Number(item.remaining_qty || 0));
     return stock;
   }, new Map());
   const mostWasted = [...entries].reduce((map, entry) => {
@@ -17423,12 +17465,12 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
   };
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Waste Management" title="Waste Entry" subtitle="Record Daagi, sampling, personal use and other fruit waste with automatic FIFO stock reduction.">
+      <ModuleCard eyebrow="Record waste" title="Fruit taken off the shelf" subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
         <div className="form-grid supplier-form-grid">
           <Field label="Product">
             <select value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
               <option value="">Select product</option>
-              {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} - Stock {stockByProduct.get(Number(product.id)) || 0}</option>)}
+              {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} - Stock {(stockByProduct.get(canonicalInventoryId(product.id)) || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</option>)}
             </select>
           </Field>
           <Field label="Quantity"><input min="0" step="0.001" type="number" value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: event.target.value })} /></Field>
@@ -17445,7 +17487,7 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
         </div>
         <button className="primary-button" onClick={saveWaste}>Save Waste Entry</button>
       </ModuleCard>
-      <ModuleCard eyebrow="Business Intelligence" title="Most Wasted Products" subtitle="Highlights products causing the highest waste quantity.">
+      <ModuleCard eyebrow="Top five" title="Most wasted products" subtitle="The products lost most, by quantity.">
         <div className="top-product-list">
           {mostWastedProducts.length ? mostWastedProducts.map((item) => (
             <article className="top-product-row" key={item.product_name}>
@@ -17455,13 +17497,13 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
           )) : <div className="empty-inline">No waste entries yet.</div>}
         </div>
       </ModuleCard>
-      <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Waste quantity and FIFO cost are stored for daily and monthly reporting.">
+      <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Each entry's quantity and what that fruit cost to buy. The waste reports are built from these.">
         <DataTable headers={["Date", "Product", "Type", "Quantity", "Cost", "Remarks"]}>
           {entries.map((entry) => (
             <tr key={entry.id}>
               <td>{toDateKey(entry.waste_date)}</td>
-              <td className="primary-cell">{entry.product_name}<small className="cell-note">{entry.unit}</small></td>
-              <td><span className="tag">{entry.waste_type}</span></td>
+              <td className="primary-cell">{entry.product_name}<small className="cell-note">{labelFor("unit", entry.unit)}</small></td>
+              <td><span className="tag">{labelFor("wasteType", entry.waste_type)}</span></td>
               <td>{Number(entry.quantity || 0).toLocaleString("en-IN")}</td>
               <td>{currency.format(Number(entry.cost_amount || 0))}</td>
               <td>{entry.remarks || "-"}</td>
@@ -17645,7 +17687,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
     <section className="content-card">
       <div className="card-heading">
         <div>
-          <h2>Stock Distribution</h2>
+          <h2>Consignments between shops</h2>
           <p className="muted-note">
             Fruit moving between the warehouse and the shops. Stock leaves the sender when it is
             dispatched and joins the receiver when it is received.
@@ -17666,7 +17708,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       </div>
 
       {board.message && (
-        <div className="startup-status-panel startup-status-error">
+        <div className="startup-status-panel startup-status-error" role="alert">
           <p><strong>{board.status === DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN ? "This counter has no shop set" : "Consignments unavailable"}</strong></p>
           <p>{board.message}</p>
         </div>
@@ -17756,11 +17798,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       )}
 
       {board.status === DISTRIBUTION_BOARD_STATUS.READY && (
-        <table className="data-table">
-          <thead>
-            <tr><th>Number</th><th>From</th><th>To</th><th>Status</th><th>What you can do</th></tr>
-          </thead>
-          <tbody>
+        <DataTable headers={["Number", "From", "To", "Status", "What you can do"]}>
             {board.transfers.map((entry) => {
               // The board's entries are the *described* form; the crates need the raw lines. Looked
               // up by the same canonical id `describeTransfer` derived, never by `Number()`.
@@ -17859,10 +17897,9 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
               );
             })}
             {board.transfers.length === 0 && (
-              <tr><td colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
+              <tr><td className="empty-cell" colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
             )}
-          </tbody>
-        </table>
+        </DataTable>
       )}
     </section>
   );
@@ -17925,7 +17962,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
 
   if (state.loadState === "loading") {
     return (
-      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+      <ModuleCard eyebrow="Open orders" title="Loading orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <p className="form-note">Reading orders from this device...</p>
       </ModuleCard>
     );
@@ -17936,7 +17973,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     // orders from this device..." that was reading nothing. A stuck spinner is a lie about what
     // the app is doing; this says what happened and offers the way out.
     return (
-      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+      <ModuleCard eyebrow="Open orders" title="Orders not loaded yet" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <div className="cart-empty">Orders have not been loaded yet.</div>
         <p><button className="table-action" type="button" onClick={onReload}>Load orders</button></p>
       </ModuleCard>
@@ -17946,8 +17983,8 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     // A distinct error state, never an empty board. "No orders" and "orders could not be read" look
     // identical to a reader and mean opposite things.
     return (
-      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
-        <div className="cart-empty">{state.loadError}</div>
+      <ModuleCard eyebrow="Open orders" title="Orders could not be loaded" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+        <div className="error-banner" role="alert">{state.loadError}</div>
         <p><button className="table-action" type="button" onClick={onReload}>Try again</button></p>
       </ModuleCard>
     );
@@ -17995,7 +18032,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                 <tr key={order.id}>
                   <td className="primary-cell">
                     {order.orderNo}
-                    <small className="cell-note">{order.source.toLowerCase()}</small>
+                    <small className="cell-note">{labelFor("orderSource", order.source)}</small>
                   </td>
                   <td>
                     {order.customerName}
@@ -18039,16 +18076,16 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       )}
 
       <ModuleCard
-        eyebrow="Customer Orders"
-        title="Orders"
-        subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Stored on this device — no internet needed."
+        eyebrow="At a glance"
+        title="Open orders"
+        subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Kept on this computer, so it works without internet."
       >
         <p><button className="table-action" type="button" onClick={onReload}>Refresh</button></p>
 
         {board.needsAttention.length > 0 && (
           // Above the board, not a badge on a card. A lapsed order looks exactly like a healthy one
           // and the difference is that its fruit may already have been sold to somebody else.
-          <div className="cart-empty" role="alert">
+          <div className="warning-note" role="alert">
             <strong>{board.needsAttention.length} order{board.needsAttention.length === 1 ? "" : "s"} need checking.</strong>{" "}
             {board.needsAttention.map((order) => `${order.orderNo || "Order"} (${order.customerName})`).join(", ")}
             {" — "}the stock held for these went back on the shelf after six hours. Check it is still in the shop before packing.
@@ -18064,7 +18101,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       </ModuleCard>
 
       <ModuleCard eyebrow="New" title="Take an order" subtitle="Rings the phone? Write it here. Stock is set aside the moment you save.">
-        {draftError && <div className="cart-empty" role="alert">{draftError}</div>}
+        {draftError && <div className="error-banner" role="alert">{draftError}</div>}
         {products.length === 0 && (
           // An empty dropdown with no explanation reads as a broken screen. This says which of the
           // two it is: nothing to sell yet, or a list that did not arrive.
@@ -18150,17 +18187,17 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                 <span>{money(order.value)}</span>
               </div>
               <p className="form-note">
-                {order.customerMobile || "No number"} · {order.source}
+                {order.customerMobile || "No number"} · {labelFor("orderSource", order.source)}
                 {order.deliveryAddress ? ` · ${order.deliveryAddress}` : ""}
                 {order.invoiceNo ? ` · billed ${order.invoiceNo}` : ""}
               </p>
 
-              {order.warning && <div className="cart-empty" role="alert">{order.warning}</div>}
+              {order.warning && <div className="warning-note" role="alert">{order.warning}</div>}
 
               {/* Money before goods. Shown on the card and enforced in validateOrderAction, so the
                   answer cannot be skipped by a path that did not draw this control. */}
               {order.paymentWarning && (
-                <div className="cart-empty" role="alert">{order.paymentWarning}</div>
+                <div className="warning-note" role="alert">{order.paymentWarning}</div>
               )}
               <div className="purchase-summary-grid supplier-payment-preview">
                 <Field label="Has this been paid?">
@@ -18254,13 +18291,13 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       ))}
 
       {board.finished.length > 0 && (
-        <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Kept on purpose — 'did that go out yesterday?' has to stay answerable.">
+        <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Delivered, returned and cancelled orders, so you can check what went out.">
           <DataTable headers={["Order", "Customer", "Status", "Carrier", "Value"]}>
             {board.finished.map((order) => (
               <tr key={order.id}>
                 <td>{order.orderNo}</td>
                 <td>{order.customerName}</td>
-                <td>{order.status}</td>
+                <td>{labelFor("orderStatus", order.status)}</td>
                 <td>{order.carrier || "-"}</td>
                 <td>{money(order.value)}</td>
               </tr>
@@ -18286,7 +18323,7 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
   return (
     <ModuleCard
       eyebrow="Owner View"
-      title="All Shops"
+      title="Company position"
       subtitle={asAt ? `Company position as at ${asAt}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
     >
       <p className="form-row">
@@ -18305,9 +18342,17 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
         )}
       </p>
 
-      {presentation.message && <p className="form-note">{presentation.message}</p>}
+      {/* A failed or partial load is an error or a warning, never help text: "Some shops are
+          missing" in the same calm style as a tip reads as a tip. Loading and empty stay neutral. */}
+      {presentation.message && (
+        presentation.status === ALL_SHOPS_STATUS.ERROR
+          ? <p className="error-banner" role="alert">{presentation.message}</p>
+          : presentation.status === ALL_SHOPS_STATUS.PARTIAL || presentation.status === ALL_SHOPS_STATUS.OFFLINE
+            ? <p className="warning-note" role="alert">{presentation.message}</p>
+            : <p className="form-note">{presentation.message}</p>
+      )}
       {presentation.warnings.map((warning) => (
-        <p className="form-note" key={warning} role="alert"><strong>Check this:</strong> {warning}</p>
+        <p className="warning-note" key={warning} role="alert"><strong>Check this:</strong> {warning}</p>
       ))}
 
       {showFigures && (
@@ -18437,11 +18482,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Operating Costs" title="Expenses" subtitle="Record and manage daily operating expenses.">
-        <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Active Expense Total" value={currency.format(totalActiveExpenses)} featured />
-          <SummaryMetric label="Expense Entries" value={expenses.length} />
-        </div>
+      <ModuleCard eyebrow={editingId ? "Editing" : "New expense"} title={editingId ? "Edit expense" : "Record an expense"} subtitle="Rent, wages, transport and the other costs of running the shop.">
         <div className="form-grid supplier-form-grid">
           <Field label="Expense Date"><input type="date" value={draft.expense_date} onChange={(event) => setDraft({ ...draft, expense_date: event.target.value })} /></Field>
           <Field label="Category">
@@ -18459,7 +18500,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
           </Field>
           <Field label="Reference Number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
           <Field label="Paid To / Vendor Name"><input value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
-          <label className="check-field"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
+          <label className="check-field pm-check"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
           <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
         <div className="button-row">
@@ -18495,6 +18536,12 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
           <Field label="To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
           <button className="secondary-button" onClick={onReload}>Refresh</button>
         </div>
+        {/* Both tiles count the rows the table below shows, so the summary and the list cannot
+            disagree about which expenses are in view. */}
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <SummaryMetric label="Total (excluding cancelled)" value={currency.format(totalActiveExpenses)} featured />
+          <SummaryMetric label="Entries shown" value={filteredExpenses.length} />
+        </div>
         <DataTable headers={["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""]}>
           {filteredExpenses.map((expense) => {
             const status = expense.status || (expense.active !== false ? "ACTIVE" : "CANCELLED");
@@ -18503,9 +18550,9 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
               <td>{expense.expense_date}</td>
               <td className="primary-cell">{expense.category}</td>
               <td>{expense.paid_to || expense.vendor_name || "-"}</td>
-              <td><span className="tag">{expense.payment_mode}</span></td>
+              <td><span className="tag">{labelFor("paymentMode", expense.payment_mode)}</span></td>
               <td>{currency.format(Number(expense.amount || 0))}</td>
-              <td><span className={status === "ACTIVE" ? "stock-ok" : "stock-low"}>{status}</span></td>
+              <td><span className={statusClass("recordStatus", status)}>{labelFor("recordStatus", status)}</span></td>
               <td>{expense.reference_number || "-"}</td>
               <td>{expense.remarks || expense.cancellation_reason || "-"}</td>
               <td>
@@ -18816,13 +18863,6 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
 
   return (
     <section className="settings-layout">
-      <section className="settings-banner">
-        <div>
-          <span className="eyebrow">Unified Accounts</span>
-          <h2>Accounts</h2>
-          <p>Customers, suppliers, vendors, staff and other account ledgers in one workspace.</p>
-        </div>
-      </section>
       <div className="account-tabs">
         {accountTabs.map(([value, label]) => (
           <button className={tab === value ? "account-tab account-tab-active" : "account-tab"} key={value} onClick={() => setTab(value)}>{label}</button>
@@ -18831,29 +18871,42 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
 
       {tab === "master" && (
         <>
-          <ModuleCard eyebrow="Account Master" title="Create / Edit Account" subtitle="Use account type to control purchase, POS, ledger and payment behavior.">
-            <div className="form-grid supplier-form-grid">
-              <Field label="Account Type">
-                <select value={draft.account_type} onChange={(event) => setDraft({ ...draft, account_type: event.target.value })}>
-                  {accountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                </select>
-              </Field>
-              <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
-              <Field label="Firm Name"><input value={draft.firm_name} onChange={(event) => setDraft({ ...draft, firm_name: event.target.value })} /></Field>
-              <Field label="Mobile"><input value={draft.mobile_number} onChange={(event) => setDraft({ ...draft, mobile_number: event.target.value.replace(/\D/g, "") })} /></Field>
-              <Field label="WhatsApp Number"><input placeholder="Blank uses mobile number" value={draft.whatsapp_number} onChange={(event) => setDraft({ ...draft, whatsapp_number: event.target.value.replace(/[^\d+]/g, "") })} /></Field>
-              <label className="check-field"><input checked={draft.whatsapp_opt_in !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, whatsapp_opt_in: event.target.checked })} /><span>WhatsApp Opt-in</span></label>
-              <Field label="Alternate Number"><input value={draft.alternate_number} onChange={(event) => setDraft({ ...draft, alternate_number: event.target.value.replace(/\D/g, "") })} /></Field>
-              <Field label="City"><input value={draft.city} onChange={(event) => setDraft({ ...draft, city: event.target.value })} /></Field>
-              <Field label="GST Number"><input value={draft.gst_number} onChange={(event) => setDraft({ ...draft, gst_number: event.target.value })} /></Field>
-              <Field label="Bank Name"><input value={draft.bank_name} onChange={(event) => setDraft({ ...draft, bank_name: event.target.value })} /></Field>
-              <Field label="Account Number"><input value={draft.account_number} onChange={(event) => setDraft({ ...draft, account_number: event.target.value })} /></Field>
-              <Field label="IFSC"><input value={draft.ifsc_code} onChange={(event) => setDraft({ ...draft, ifsc_code: event.target.value })} /></Field>
-              <Field label="UPI ID"><input value={draft.upi_id} onChange={(event) => setDraft({ ...draft, upi_id: event.target.value })} /></Field>
-              <Field label="Opening Balance"><input min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
-              <label className="check-field"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
-              <Field label="Address"><textarea value={draft.address} onChange={(event) => setDraft({ ...draft, address: event.target.value })} /></Field>
-              <Field label="Notes"><textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+          <ModuleCard eyebrow="Account details" title={editingKey ? "Edit account" : "Add an account"} subtitle="The account type decides where it shows up: purchases, POS bills, ledgers and payments.">
+            <div className="pm-form-section">
+              <h3>Account</h3>
+              <div className="form-grid supplier-form-grid">
+                <Field label="Account Type">
+                  <select value={draft.account_type} onChange={(event) => setDraft({ ...draft, account_type: event.target.value })}>
+                    {accountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                  </select>
+                </Field>
+                <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
+                <Field label="Firm Name"><input value={draft.firm_name} onChange={(event) => setDraft({ ...draft, firm_name: event.target.value })} /></Field>
+                <Field label="GST Number"><input value={draft.gst_number} onChange={(event) => setDraft({ ...draft, gst_number: event.target.value })} /></Field>
+                <Field label="Opening Balance"><input min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
+                <Field label="Notes"><textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+              </div>
+              <label className="check-field pm-check"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
+            </div>
+            <div className="pm-form-section">
+              <h3>Contact</h3>
+              <div className="form-grid supplier-form-grid">
+                <Field label="Mobile"><input value={draft.mobile_number} onChange={(event) => setDraft({ ...draft, mobile_number: event.target.value.replace(/\D/g, "") })} /></Field>
+                <Field label="WhatsApp Number"><input placeholder="Blank uses mobile number" value={draft.whatsapp_number} onChange={(event) => setDraft({ ...draft, whatsapp_number: event.target.value.replace(/[^\d+]/g, "") })} /></Field>
+                <Field label="Alternate Number"><input value={draft.alternate_number} onChange={(event) => setDraft({ ...draft, alternate_number: event.target.value.replace(/\D/g, "") })} /></Field>
+                <Field label="City"><input value={draft.city} onChange={(event) => setDraft({ ...draft, city: event.target.value })} /></Field>
+                <Field label="Address"><textarea value={draft.address} onChange={(event) => setDraft({ ...draft, address: event.target.value })} /></Field>
+              </div>
+              <label className="check-field pm-check"><input checked={draft.whatsapp_opt_in !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, whatsapp_opt_in: event.target.checked })} /><span>Send WhatsApp messages to this account</span></label>
+            </div>
+            <div className="pm-form-section">
+              <h3>Bank details</h3>
+              <div className="form-grid supplier-form-grid">
+                <Field label="Bank Name"><input value={draft.bank_name} onChange={(event) => setDraft({ ...draft, bank_name: event.target.value })} /></Field>
+                <Field label="Account Number"><input value={draft.account_number} onChange={(event) => setDraft({ ...draft, account_number: event.target.value })} /></Field>
+                <Field label="IFSC"><input value={draft.ifsc_code} onChange={(event) => setDraft({ ...draft, ifsc_code: event.target.value })} /></Field>
+                <Field label="UPI ID"><input value={draft.upi_id} onChange={(event) => setDraft({ ...draft, upi_id: event.target.value })} /></Field>
+              </div>
             </div>
             <div className="button-row">
               <button className="primary-button" onClick={saveAccount}>{editingKey ? "Update Account" : "Add Account"}</button>
@@ -18872,7 +18925,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
                     {account.account_name}
                     <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address || "-"}</small>
                   </td>
-                  <td><span className="tag">{account.account_type}</span></td>
+                  <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
                   <td>{account.mobile_number || "-"}</td>
                   <td>{currency.format(Number(account.opening_balance || 0))}</td>
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
@@ -18897,7 +18950,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <Field label="Account">
               <select value={ledgerAccountKey} onChange={(event) => loadLedger(event.target.value)}>
                 <option value="">Select account</option>
-                {ledgerAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {account.account_type}</option>)}
+                {ledgerAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {labelFor("accountType", account.account_type)}</option>)}
               </select>
             </Field>
             <button className="secondary-button" onClick={() => loadLedger(ledgerAccountKey)}>Refresh Ledger</button>
@@ -18926,9 +18979,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
                 <tr key={`${row.date}-${row.transaction_type}-${index}`}>
                   <td>{row.date}</td>
                   <td>{row.invoice_no || "-"}</td>
-                  <td><span className="tag">{row.transaction_type}</span></td>
+                  <td><span className="tag">{labelFor("transactionType", row.transaction_type)}</span></td>
                   <td>{row.sale_amount ? currency.format(Number(row.sale_amount || 0)) : "-"}</td>
-                  <td>{row.payment_mode || "-"}</td>
+                  <td>{labelFor("paymentMode", row.payment_mode)}</td>
                   <td>{currency.format(Number(row.debit || 0))}</td>
                   <td>{currency.format(Number(row.credit || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
@@ -18988,7 +19041,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <Field label="Account">
               <select value={payment.account_key} onChange={(event) => refreshPaymentsForSelection(event.target.value)}>
                 <option value="">Select account</option>
-                {paymentAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {account.account_type}</option>)}
+                {paymentAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {labelFor("accountType", account.account_type)}</option>)}
               </select>
             </Field>
             <Field label="Payment Date"><input type="date" value={payment.payment_date} onChange={(event) => setPayment({ ...payment, payment_date: event.target.value })} /></Field>
@@ -19021,10 +19074,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
               <tr key={row.payment_key}>
                 <td>{toDateKey(row.payment_date)}</td>
                 <td className="primary-cell">{row.account_name}</td>
-                <td><span className="tag">{row.payment_source}</span></td>
+                <td><span className="tag">{labelFor("payment_source", row.payment_source)}</span></td>
                 <td>{currency.format(Number(row.payment_amount || 0))}</td>
                 <td>{Number(row.rebate_amount || 0) ? currency.format(Number(row.rebate_amount || 0)) : "-"}</td>
-                <td><span className="tag">{row.payment_mode}</span></td>
+                <td><span className="tag">{labelFor("paymentMode", row.payment_mode)}</span></td>
                 <td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td>
                 <td>{row.reference_number || "-"}</td>
                 <td>{row.cancellation_reason || row.edit_reason || row.remarks || "-"}</td>
@@ -19052,7 +19105,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             {[...(accountOutstanding.customerOutstanding || []), ...(accountOutstanding.supplierOutstanding || [])].map((account) => (
               <tr key={account.account_key}>
                 <td className="primary-cell">{account.account_name}</td>
-                <td><span className="tag">{account.account_type}</span></td>
+                <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
                 <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                 <td>{currency.format(Number(account.payable_balance || 0))}</td>
                 <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
@@ -19252,15 +19305,10 @@ function SettingsModule({
     "settings/system-info": <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />,
   };
 
-  const banner = (
-    <section className="settings-banner">
-      <div>
-        <span className="eyebrow">System Controls</span>
-        <h2>Settings</h2>
-        <p>{canManage ? "Owner/Admin controls are active." : "Read-only access. Owner/Admin approval is required for changes."}</p>
-      </div>
-      <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
-    </section>
+  // The page title already says Settings. What is worth a line of its own is whether this person
+  // can change anything here -- and only when they cannot, because that is the surprise.
+  const banner = canManage ? null : (
+    <p className="warning-note" role="status">You can look at these settings but not change them. Ask the Owner or an Administrator to make changes.</p>
   );
 
   const openGroup = SETTINGS_GROUPS.find((group) => group.id === settingsGroup) || null;
@@ -19292,7 +19340,8 @@ function SettingsModule({
   return (
     <section className="settings-layout">
       {banner}
-      <ModuleCard eyebrow="Settings" title="Choose what to change" subtitle="Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.">
+      <section className="content-card">
+        <p className="form-note">Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.</p>
         <section className="report-center-grid">
           {SETTINGS_GROUPS.map((group) => {
             const count = sectionsInGroup(group.id).length;
@@ -19306,7 +19355,7 @@ function SettingsModule({
             );
           })}
         </section>
-      </ModuleCard>
+      </section>
     </section>
   );
 }
@@ -19439,7 +19488,7 @@ function PosSettingsSection({ canManage, onReload, posSettings, user }) {
     }
   };
   return (
-    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="Hardware integration foundation for USB, serial, Bluetooth and manual fallback billing.">
+    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="Connect a scale by USB, serial or Bluetooth. Weights can always be typed in by hand.">
       <div className="form-grid supplier-form-grid">
         <label className="check-field"><input checked={draft.enable_weighing_scale === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_weighing_scale", event.target.checked)} /><span>Enable weighing scale mode</span></label>
         <Field label="Connection Type">
@@ -19814,7 +19863,7 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
         <Field label="POS Lot Selection Mode">
           <select disabled={!canManage} value={draft.pos_lot_selection_mode || "ASK_MULTIPLE"} onChange={(event) => setDraft({ ...draft, pos_lot_selection_mode: event.target.value })}>
             <option value="ASK_MULTIPLE">Ask When Multiple Lots Exist</option>
-            <option value="AUTO_FIFO">Auto FIFO</option>
+            <option value="AUTO_FIFO">Use the oldest lot first</option>
             <option value="MANUAL">Manual Lot Selection</option>
           </select>
         </Field>
@@ -19920,7 +19969,7 @@ function MandiRuleRow({ canManage, onReload, rule, user }) {
   };
   return (
     <tr>
-      <td className="primary-cell">{rule.origin_type}</td>
+      <td className="primary-cell">{labelFor("origin", rule.origin_type)}</td>
       <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={taxPercent} onChange={(event) => setTaxPercent(event.target.value)} /></td>
       <td><label className="check-field"><input checked={active} disabled={!canManage} type="checkbox" onChange={(event) => setActive(event.target.checked)} /><span>{active ? "Active" : "Inactive"}</span></label></td>
       <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
@@ -21525,13 +21574,13 @@ function SyncSettingsSection({
                 nobody had ever typed anything into it. The address is now part of the build, and
                 shown a few rows down as a fact rather than offered as a question. */}
             <Field label="Branch"><input disabled value={branchLabel} /></Field>
-            <Field label="Local SQLite Device ID"><input disabled value={localDeviceId} /></Field>
-            <Field label="Canonical Cloud Device ID"><input disabled value={canonicalCloudDeviceId} /></Field>
-            <Field label="Legacy Settings Device ID"><input disabled value={draft.device_id || "Not set"} /></Field>
+            <Field label="This Computer's ID"><input disabled value={localDeviceId} /></Field>
+            <Field label="ID in the Cloud"><input disabled value={canonicalCloudDeviceId} /></Field>
+            <Field label="Older Device ID (from Settings)"><input disabled value={draft.device_id || "Not set"} /></Field>
             <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
-            <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
+            <Field label="Local Database File"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
             <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
-            <Field label="SQLite Integrity"><input disabled value={localDbAudit?.integrity || "Not checked"} /></Field>
+            <Field label="Local Database Check"><input disabled value={localDbAudit?.integrity || "Not checked"} /></Field>
             <Field label="Local Product Count"><input disabled value={localDbAudit?.products ?? "Not checked"} /></Field>
             <Field label="Local Inventory Lot Count"><input disabled value={localDbAudit?.inventory_lots ?? "Not checked"} /></Field>
             <Field label="Sellable Local Lot Count"><input disabled value={localDbAudit?.sellable_lots ?? "Not checked"} /></Field>
@@ -21573,7 +21622,7 @@ function SyncSettingsSection({
             <Field label="Cloud Device Detail"><input disabled value={cloudDeviceDetail} /></Field>
             <Field label="Device Local Time"><input disabled value={timeDiagnostics?.deviceLocalTime || formatKolkataDateTime(new Date())} /></Field>
             <Field label="Device UTC Time"><input disabled value={timeDiagnostics?.deviceUtcTime || new Date().toISOString()} /></Field>
-            <Field label="Railway Server UTC Time"><input disabled value={timeDiagnostics?.railwayServerUtcTime || "Unavailable"} /></Field>
+            <Field label="Cloud Server Time (UTC)"><input disabled value={timeDiagnostics?.railwayServerUtcTime || "Unavailable"} /></Field>
             <Field label="Detected Timezone"><input disabled value={timeDiagnostics?.detectedTimezone || "Unknown"} /></Field>
             <Field label="Clock Offset (seconds)"><input disabled value={timeDiagnostics?.clockOffsetSeconds ?? "Unavailable"} /></Field>
             <Field label="Last Server-Time Check"><input disabled value={timeDiagnostics?.lastSuccessfulServerTimeCheck ? formatKolkataDateTime(timeDiagnostics.lastSuccessfulServerTimeCheck) : "Not checked"} /></Field>
@@ -21930,7 +21979,7 @@ function OperationalScopeManagement({
         {stepMessage("computers")}
         <h3 className="scope-subheading">Approved</h3>
         <DataTable headers={["Computer", "Branch", "Counter", "Used for", "Status"]}>
-          {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.intended_usage}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td></tr>)}
+          {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{labelFor("deviceUsage", assignment.intended_usage)}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td></tr>)}
         </DataTable>
         {activeCounters.length === 0 && <p className="form-note">Add a counter in Step 2 before approving a computer.</p>}
       </ModuleCard>
@@ -22012,9 +22061,9 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
         {devices.map((device) => (
           <tr key={device.device_id}>
             <td className="primary-cell">{device.device_name}<small className="cell-note">{device.device_id}</small></td>
-            <td>{device.device_type || "Browser"}</td>
+            <td>{labelFor("deviceType", device.device_type || "Browser")}</td>
             <td>{device.branch_name || "Main Branch"}<small className="cell-note">{device.counter_name || "No counter assigned"}</small></td>
-            <td><span className={device.status === "APPROVED" ? "stock-ok" : device.status === "PENDING" ? "origin-rate" : "stock-low"}>{device.status}</span></td>
+            <td><span className={statusClass("deviceStatus", device.status)}>{labelFor("deviceStatus", device.status)}</span></td>
             <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
             <td>{device.last_sync_at ? new Date(device.last_sync_at).toLocaleString("en-IN") : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
             <td>
@@ -22054,7 +22103,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
             <td>{code.branch_name || "Any"}</td>
             <td>{code.counter_name || "Any"}</td>
             <td>{code.expires_at ? new Date(code.expires_at).toLocaleString("en-IN") : "-"}</td>
-            <td><span className={code.status === "ACTIVE" ? "stock-ok" : "stock-low"}>{code.status}</span></td>
+            <td><span className={statusClass("activationCodeStatus", code.status)}>{labelFor("activationCodeStatus", code.status)}</span></td>
             <td>{code.used_by_device_id || "-"}</td>
             <td><button className="remove-button" disabled={!canManage || code.status !== "ACTIVE"} onClick={() => revokeCode(code)}>Revoke</button></td>
           </tr>
@@ -22118,7 +22167,7 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
         <button className="primary-button" disabled={!canManage || !counterDraft.counter_name.trim()} onClick={addCounter}>Add Counter</button>
       </div>
       <DataTable headers={["Counter", "Branch", "Type", "Status"]}>
-        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || "-"}</td><td>{counter.counter_type}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || "-"}</td><td>{labelFor("counterType", counter.counter_type)}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
       </DataTable>
     </ModuleCard>
   );
@@ -22198,11 +22247,11 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
         {backupLogs.map((log) => (
           <tr key={log.id}>
             <td className="primary-cell">{log.backup_file_name || "-"}<small className="cell-note">{log.backup_path || "-"}</small></td>
-            <td>{log.backup_type}</td>
+            <td>{labelFor("backupType", log.backup_type)}</td>
             <td>{Number(log.backup_size || 0).toLocaleString("en-IN")} bytes</td>
             <td>{log.started_at ? new Date(log.started_at).toLocaleString("en-IN") : "-"}</td>
             <td>{log.completed_at ? new Date(log.completed_at).toLocaleString("en-IN") : "-"}</td>
-            <td><span className={log.status === "SUCCESS" ? "stock-ok" : log.status === "FAILED" ? "stock-low" : "origin-rate"}>{log.status}</span></td>
+            <td><span className={statusClass("backupStatus", log.status)}>{labelFor("backupStatus", log.status)}</span></td>
             <td>{log.error_message || "-"}</td>
           </tr>
         ))}
@@ -22228,10 +22277,10 @@ function SystemInfoSection({ systemInfo }) {
         </div>
       </section>
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric featured label="Backend" value={systemInfo.backendStatus || "Unknown"} />
+        <SummaryMetric featured label="Server" value={systemInfo.backendStatus || "Unknown"} />
         <SummaryMetric label="Database" value={systemInfo.databaseStatus || "Unknown"} />
         <SummaryMetric label="Server IP" value={systemInfo.serverIp || "-"} />
-        <SummaryMetric label="Device Status" value={device.status || "Not registered"} />
+        <SummaryMetric label="Device Status" value={device.status ? labelFor("deviceStatus", device.status) : "Not registered"} />
       </div>
       <DataTable headers={["Item", "Value"]}>
         <tr><td>Software Version</td><td>{systemInfo.softwareVersion || APP_VERSION}</td></tr>
@@ -22241,7 +22290,7 @@ function SystemInfoSection({ systemInfo }) {
         <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || "-"}</td></tr>
         <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>
         <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
-        <tr><td>Current Device Type</td><td>{device.device_type || "Browser"}</td></tr>
+        <tr><td>Current Device Type</td><td>{labelFor("deviceType", device.device_type || "Browser")}</td></tr>
         <tr><td>Current Branch</td><td>{branch.branch_name || "Main Branch"}</td></tr>
         <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "Not assigned"}</td></tr>
         <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
@@ -22256,7 +22305,7 @@ function SystemInfoSection({ systemInfo }) {
           <li>For counter tablets, assign the device as Retail Counter Tablet from Authorized Devices.</li>
           <li>Use Chrome menu → Add to Home screen to install the FroozERP shortcut.</li>
         </ol>
-        <p>Android devices use the same backend and database. No separate phone/tablet database is created.</p>
+        <p>Phones and tablets opened this way use the same server and the same data as this computer. No separate phone or tablet database is created.</p>
       </section>
     </ModuleCard>
   );
@@ -22387,7 +22436,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
                 <td className="primary-cell">{rate.product_name}<small className="cell-note">{rate.category}</small></td>
                 <td>{rate.lot_name || (rate.inventory_batch_id ? `Lot #${rate.inventory_batch_id}` : "Product default")}</td>
                 <td>{rate.lot_size || "-"}</td>
-                <td><span className="tag">{rate.origin_type}</span></td>
+                <td><span className="tag">{labelFor("origin", rate.origin_type)}</span></td>
                 <td>{currency.format(Number(rate.selling_rate))}</td>
                 <td className="profit-cell">{currency.format(Number(rate.suggested_selling_rate))}</td>
                 <td><input className="table-input" min="0" step="0.01" type="number" value={draftRates[rate.id] || ""} onChange={(event) => setDraftRates({ ...draftRates, [rate.id]: event.target.value })} /></td>
@@ -22925,10 +22974,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const mandiTaxNeedsConfiguration = mandiTaxRelevantForCustomer && salesMandiCustomerScope !== "NONE" && paymentSettings.enable_sales_mandi_tax === true && Number(paymentSettings.sales_mandi_tax_percent || 0) <= 0;
   const mandiTaxDisabled = mandiTaxRelevantForCustomer && (salesMandiCustomerScope === "NONE" || paymentSettings.enable_sales_mandi_tax !== true);
 
-  const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
+  const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Oldest lot first";
   const getCompactLotName = (lot) => {
     const raw = String(lot?.lot_name || lot?.batch_no || "").trim();
-    if (!raw) return "Auto FIFO";
+    if (!raw) return "Oldest lot first";
     const parts = raw.split("-");
     if (parts.length >= 3 && /^\d{8,}$/.test(parts[1])) {
       return `${parts[0]}-${parts[parts.length - 1]}`;
@@ -23616,9 +23665,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         <section className="content-card pos-search-card">
           <div className="card-heading">
             <div>
-              <span className="eyebrow">Retail Counter</span>
-              <h2>POS Billing</h2>
-              <p>Search products or scan a barcode to build the invoice.</p>
+              <span className="eyebrow">New bill</span>
+              <h2>Add items</h2>
+              <p>Search for a product or scan its barcode.</p>
             </div>
             <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout</span>
           </div>
@@ -23723,7 +23772,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               </div>
             )}
             {searchResults.length === 0 && (posSearching || !shelf.usable) && (
-              <div className="cart-empty">
+              <div className={shelf.usable ? "cart-empty" : "warning-note"} role={shelf.usable ? undefined : "alert"}>
                 {shelf.usable
                   ? "No matching products or lots found."
                   // Not "nothing found". The search worked; the shop is the unknown.
@@ -23759,7 +23808,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                           <small className="cell-note">{reservedNote(reservedIndex, item.product_id, item.unit)}</small>
                         )}
                       </td>
-                      <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Auto FIFO"}</span></td>
+                      <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
                       <td>
                         <input
                           className="table-input"
@@ -24058,11 +24107,11 @@ function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
           <DataTable headers={["Payment Mode", "Amount"]}>
             {payments.length > 0 ? payments.map((payment, index) => (
               <tr key={`${payment.mode || payment.payment_mode}-${index}`}>
-                <td>{payment.mode || payment.payment_mode}</td>
+                <td>{labelFor("paymentMode", payment.mode || payment.payment_mode)}</td>
                 <td>{currency.format(Number(payment.amount || 0))}</td>
               </tr>
             )) : (
-              <tr><td>{sale.payment_mode || "-"}</td><td>{currency.format(Number(sale.total_amount || sale.net_total || 0))}</td></tr>
+              <tr><td>{labelFor("paymentMode", sale.payment_mode)}</td><td>{currency.format(Number(sale.total_amount || sale.net_total || 0))}</td></tr>
             )}
           </DataTable>
           <DataTable headers={["Item", "Lot / Size", "Qty", "Rate", "Amount"]}>
@@ -24526,7 +24575,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
                 </td>
                 <td>
                   <select className="settings-table-input" value={item.inventory_batch_id || ""} onChange={(event) => changeItemLot(index, event.target.value)}>
-                    <option value="">FIFO / Auto</option>
+                    <option value="">Oldest lot first</option>
                     {activeLotsForProduct(item.product_id).map((lot) => (
                       <option key={lot.id} value={lot.id}>
                         {(lot.lot_name || lot.batch_no || `Lot #${lot.id}`)}{lot.lot_size ? ` / ${lot.lot_size}` : ""} - Avl {Number(lot.remaining_qty ?? lot.balance_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}
@@ -24636,7 +24685,7 @@ function ChangeHistoryModal({ history, onClose }) {
           <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Readable Changes"]}>
             {history.rows.map((row) => (
               <tr key={row.id}>
-                <td><span className="tag">{row.action}</span></td>
+                <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                 <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
                 <td>{row.edited_by_name || "-"}</td>
                 <td>{row.reason}</td>
@@ -24691,7 +24740,7 @@ function PaymentAuditModal({ audit, onClose }) {
           <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Readable Changes"]}>
             {audit.rows.map((row) => (
               <tr key={row.id}>
-                <td><span className="tag">{row.action}</span></td>
+                <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                 <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
                 <td>{row.edited_by_name || "-"}</td>
                 <td>{row.reason}</td>
@@ -24766,7 +24815,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
           </header>
           <section className="invoice-customer">
             <div><small>Party Name</small><strong>{payment.account_name || "-"}</strong><span>{payment.account_type || payment.payment_source || "-"}</span></div>
-            <div><small>Payment Mode</small><strong>{payment.payment_mode || "-"}</strong><span>{payment.reference_number || "No reference"}</span></div>
+            <div><small>Payment Mode</small><strong>{labelFor("paymentMode", payment.payment_mode)}</strong><span>{payment.reference_number || "No reference"}</span></div>
           </section>
           <section className="receipt-summary">
             <TotalLine label="Outstanding Before" value={Number(payment.outstanding_before || 0)} />
@@ -25237,7 +25286,7 @@ function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCust
 
       <section className="chart-grid">
         <LineChart color="#f59e0b" data={data.salesTrend} subtitle="Revenue" title="Daily Sales Trend" valueKey="sales" />
-        <LineChart color="#22c55e" data={data.profitTrend} subtitle="FIFO Landed Cost" title="Daily Profit Trend" valueKey="grossProfit" />
+        <LineChart color="#22c55e" data={data.profitTrend} subtitle="At purchase cost" title="Daily Profit Trend" valueKey="grossProfit" />
         <BarChart color="#fb7185" data={data.expenseTrend} subtitle="Operating Cost" title="Daily Expense Trend" valueKey="expenses" />
         <LineChart color="#a78bfa" data={data.netProfitTrend} subtitle="Profit After Expenses" title="Net Profit Trend" valueKey="netProfit" />
         <DualLineChart

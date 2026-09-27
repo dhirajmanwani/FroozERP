@@ -23,8 +23,10 @@ test("new offline purchases use a durable protocol-v3 purchase intent", () => {
   assert.match(appSource, /queueLocalPurchase\(\{/);
   assert.match(appSource, /readConnectivityMode\(\) === CONNECTIVITY_MODES\.LOCAL_ONLY/);
   assert.match(appSource, /purchaseSaveInFlightRef\.current/);
-  assert.match(appSource, /Pending Cloud Acknowledgement/);
-  assert.match(appSource, /Cloud Confirmed/);
+  // Reworded from "Pending Cloud Acknowledgement" / "Cloud Confirmed" to plain words; the queued and
+  // confirmed states must still each have their own label.
+  assert.match(appSource, /: "Waiting to send"\}/);
+  assert.match(appSource, /purchase\.sync_status === "completed" \? "Sent to cloud"/);
   assert.match(databaseSource, /purchase_queue_local/);
   assert.match(repositorySource, /purchases:\s*\{[\s\S]*queue:/);
   assert.match(migrationSource, /CREATE TABLE IF NOT EXISTS local_purchase_intents/);

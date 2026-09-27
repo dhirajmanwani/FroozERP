@@ -440,6 +440,25 @@ input[type="number"] {
   font-weight: 700;
 }
 
+/* The pill's tone follows what it says: all well is calm, offline is a notice, a problem is red. */
+.offline-pill[data-tone="calm"] {
+  border-color: var(--success-line);
+  background: var(--success-soft);
+  color: var(--success-ink);
+}
+
+.offline-pill[data-tone="problem"] {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+  color: var(--danger-ink);
+}
+
+/* On a desktop the sidebar already carries the logo; the top bar's copy only returns on narrow
+   screens, where the sidebar is off-canvas (see the 820px query). */
+.topbar .brand-lockup-compact {
+  display: none;
+}
+
 .kiosk-exit-button {
   white-space: nowrap;
 }
