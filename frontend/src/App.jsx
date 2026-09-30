@@ -10530,6 +10530,8 @@ function App() {
                 unavailableReason={resolveSaleRateAvailability({
                   localOnly: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
                   offline: offlineMode,
+                  // Only the desktop forwards these routes to a cloud; a browser talks to the server itself.
+                  noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
                 })}
               />
               {/* Right after the rates are set is when the website's copy of them is

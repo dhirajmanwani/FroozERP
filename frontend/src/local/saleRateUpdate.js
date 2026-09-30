@@ -247,9 +247,14 @@ export const describeSaveResult = (response, sentCount) => {
  * Local Only chosen or no connection there is nothing to load and nowhere to save, and an empty
  * table would look like "no products".
  */
-export const resolveSaleRateAvailability = ({ localOnly = false, offline = false } = {}) => {
+export const resolveSaleRateAvailability = ({ localOnly = false, offline = false, noCloud = false } = {}) => {
   if (localOnly) {
     return "This computer is in Local Only mode. Sale rates are kept on the server, so they cannot be loaded or changed here until Local Only is turned off. POS keeps selling at the rates it already has.";
+  }
+  // A desktop with no cloud address at all (a test copy, or a fresh install before setup): every
+  // request would be refused by the gateway, so say why instead of showing that refusal as an error.
+  if (noCloud) {
+    return "This computer is not connected to a cloud server. Sale rates are kept on the server, so they cannot be loaded or changed here. POS keeps selling at the rates it already has.";
   }
   if (offline) {
     return "This computer is offline. Sale rates are kept on the server, so they cannot be loaded or changed until the connection is back. POS keeps selling at the rates it already has.";

@@ -233,6 +233,8 @@ test("the success message counts what the server changed, not what was sent", ()
 test("Local Only and offline explain themselves instead of showing an empty table", () => {
   assert.match(resolveSaleRateAvailability({ localOnly: true }), /Local Only/);
   assert.match(resolveSaleRateAvailability({ offline: true }), /offline/);
+  assert.match(resolveSaleRateAvailability({ noCloud: true }), /not connected to a cloud server/);
+  assert.match(resolveSaleRateAvailability({ localOnly: true, noCloud: true }), /Local Only/);
   assert.equal(resolveSaleRateAvailability({}), null);
 });
 
