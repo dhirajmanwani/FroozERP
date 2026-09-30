@@ -17,7 +17,12 @@ test("every main navigation module has a render path and refresh path", () => {
     // does that so its data is loaded however it is reached.
     const dispatched = new RegExp(`view === \\"${view}\\"|\\[.*\\"${view}\\".*\\]\\.includes\\(view\\)`).test(appSource);
     const selfLoading = new RegExp(`activeView === \\"${view}\\"[^\\n]*\\n[\\s\\S]{0,400}?onLoad=\\{load\\w+\\}`).test(appSource);
-    assert.ok(dispatched || selfLoading, `${view} has no refresh path`);
+    // Or the screen's own component loads on mount (Discounts: `loadDiscounts()` in its effect).
+    const component = appSource.match(new RegExp(`activeView === \\"${view}\\"[^\\n]*\\n\\s*<([A-Z]\\w+)`))?.[1];
+    const componentStart = component ? appSource.indexOf(`function ${component}(`) : -1;
+    const componentBody = componentStart >= 0 ? appSource.slice(componentStart, appSource.indexOf("\nfunction ", componentStart + 10)) : "";
+    const loadsOnMount = /useEffect\(\(\) => \{\n\s*if \(unavailableReason\) return;\n\s*load\w+\(\);/.test(componentBody);
+    assert.ok(dispatched || selfLoading || loadsOnMount, `${view} has no refresh path`);
   }
 });
 

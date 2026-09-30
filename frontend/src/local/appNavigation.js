@@ -126,7 +126,7 @@ const modules = [
     label: "Discounts",
     icon: "wallet",
     shortcut: null,
-    keywords: ["offer", "slab", "concession", "bill discount"],
+    keywords: ["offer", "lot discount", "special price", "price off", "concession"],
     sections: [],
   },
   {
@@ -238,7 +238,7 @@ const modules = [
       { group: "business", id: "settings/other-charges", label: "Other Charges", eyebrow: "Charge Settings", keywords: ["crate", "labour", "delivery", "freight", "charge", "charges", "slab", "per km", "per kg", "extra"] },
       { group: "business", id: "settings/supplier-rebate", label: "Payment-Speed Rebate Slabs", eyebrow: "Supplier Rebate Settings", keywords: ["rebate", "early payment", "discount days", "slab"] },
       { group: "business", id: "settings/sale-rate-suggestions", label: "Sale Rate Suggestions", eyebrow: "Sale Rate Settings", keywords: ["margin", "rounding", "suggested rate"] },
-      { group: "business", id: "settings/bill-discount-slabs", label: "Bill-Level Discount Slabs", eyebrow: "Overall Sale Discount Settings", keywords: ["automatic discount", "bill total", "payment mode"] },
+      { group: "business", id: "settings/bill-discount-slabs", label: "Discount on bill total", eyebrow: "Bill discounts", keywords: ["slab", "bill discount", "bill-level discount slabs", "automatic discount", "bill total", "payment mode"] },
       { group: "people", id: "settings/permission-matrix", label: "Permission Matrix", eyebrow: "Role Management", keywords: ["roles", "access", "permissions", "cashier", "admin"] },
       { group: "people", id: "settings/users", label: "Owner User Administration", eyebrow: "User Management", keywords: ["staff", "add user", "reset password", "deactivate"] },
       { group: "system", id: "settings/updates", label: "FroozERP Windows Updates", eyebrow: "Software Updates", keywords: ["update", "version", "installer", "upgrade"] },
