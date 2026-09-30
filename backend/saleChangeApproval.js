@@ -27,12 +27,24 @@
  * - **Moved.** A different bill, action, cashier, company or device refuses it.
  * - **Kept forever.** It expires after seven days, so a forgotten one cannot be found later.
  * - **Trusted from the client.** The desktop only carries the id; every property is re-read here.
+ *
+ * ## The same machinery for a discount over 5% (30 Sep 2026)
+ *
+ * A cashier's own item discount above 5% of a line (`discounts.manualDiscountLine`) needs the same
+ * Owner/Admin password. It is the same request with `action: "discount"`, and `sale_ref` is the new
+ * bill's client operation id (`operation_id`, which the browser also sends as `idempotency_key`)
+ * because the bill does not exist yet. The browser checkout refuses without it
+ * (`DISCOUNT_APPROVAL_REQUIRED`); a desktop bill that syncs without it is kept -- the customer
+ * already has it -- and leaves a `sale_audit_trail` row saying so.
  */
 
 /** The roles that may approve, and that need no approval themselves. */
 const APPROVER_ROLES = new Set(["Owner", "Admin"]);
 
-const APPROVAL_ACTIONS = Object.freeze(["cancel", "edit"]);
+const APPROVAL_ACTIONS = Object.freeze(["cancel", "edit", "discount"]);
+
+/** The reason stored for a discount approval when the counter sent none. */
+const DEFAULT_DISCOUNT_REASON = "Item discount over 5%";
 
 const APPROVAL_STATUS = Object.freeze({
   ISSUED: "ISSUED",
@@ -72,6 +84,7 @@ const CODES = Object.freeze({
   ATTEMPTS_LOCKED: "APPROVAL_ATTEMPTS_LOCKED",
   PASSWORD_RESET_REQUIRED: "PASSWORD_RESET_REQUIRED",
   APPROVAL_REQUIRED: "SALE_CHANGE_APPROVAL_REQUIRED",
+  DISCOUNT_APPROVAL_REQUIRED: "DISCOUNT_APPROVAL_REQUIRED",
 });
 
 /**
@@ -133,7 +146,9 @@ const invalid = (message) => ({ ok: false, code: CODES.REQUEST_INVALID, message 
 const normalizeApprovalRequest = (body) => {
   const source = body && typeof body === "object" ? body : {};
   const action = text(source.action).toLowerCase();
-  if (!APPROVAL_ACTIONS.includes(action)) return invalid("Say whether the bill is being cancelled or edited.");
+  if (!APPROVAL_ACTIONS.includes(action)) {
+    return invalid("Say whether the bill is being cancelled or edited, or a discount approved.");
+  }
   const saleRef = idText(source.sale_ref);
   if (!saleRef) return invalid("Say which bill needs approval.");
   if (saleRef.length > SALE_REF_MAX_LENGTH) return invalid("The bill reference is too long.");
@@ -143,7 +158,8 @@ const normalizeApprovalRequest = (body) => {
   const approverPassword = typeof source.approver_password === "string" ? source.approver_password : "";
   if (!approverPassword) return invalid("Enter the Owner or Admin password.");
   if (approverPassword.length > PASSWORD_MAX_LENGTH) return invalid("That password is too long.");
-  const reason = text(source.reason);
+  // A discount is approved at the counter with the cart on screen; the counter need not type why.
+  const reason = text(source.reason) || (action === "discount" ? DEFAULT_DISCOUNT_REASON : "");
   if (!reason) return invalid("A reason is required.");
   if (reason.length > REASON_MAX_LENGTH) return invalid("The reason is too long.");
   return { ok: true, value: { action, saleRef, approverUsername, approverPassword, reason } };
@@ -218,6 +234,33 @@ const checkApprovalBinding = (row, { action, saleRefs, requesterId, companyId, d
 /** The refusal for a change that arrived with no approval at all. */
 const missingApproval = () => refuse(BINDING_DETAILS.MISSING, APPROVAL_NEEDED_MESSAGE);
 
+const DISCOUNT_APPROVAL_MESSAGE = "A discount over 5% needs an Owner or Admin to approve it.";
+
+/**
+ * Does this stored approval cover a discount over 5% on this new bill? The same bindings as a bill
+ * change -- action, bill, requester, company, device, expiry, single use, approver still an active
+ * Owner or Admin -- answered with the discount's own code and message. `detail` says which binding
+ * failed. `saleRefs` are the new bill's client references (its operation id first).
+ *
+ * @returns {{ok: true} | {ok: false, code: "DISCOUNT_APPROVAL_REQUIRED", detail: string, message: string}}
+ */
+const checkDiscountApprovalBinding = (row, { saleRefs, requesterId, companyId, deviceId, nowMs } = {}) => {
+  const result = checkApprovalBinding(row, { action: "discount", saleRefs, requesterId, companyId, deviceId, nowMs });
+  if (result.ok) return result;
+  return { ok: false, code: CODES.DISCOUNT_APPROVAL_REQUIRED, detail: result.detail, message: DISCOUNT_APPROVAL_MESSAGE };
+};
+
+/** The refusal for a discount over 5% that arrived with no approval at all. */
+const missingDiscountApproval = () => ({
+  ok: false,
+  code: CODES.DISCOUNT_APPROVAL_REQUIRED,
+  detail: BINDING_DETAILS.MISSING,
+  message: DISCOUNT_APPROVAL_MESSAGE,
+});
+
+/** Every client reference a new bill can be approved under, as opaque strings, blanks dropped. */
+const newSaleRefsOf = (...refs) => [...new Set(refs.map(idText).filter(Boolean))];
+
 /** Failures inside the window, from a list of failure times. */
 const recentFailureCount = (failureTimes, nowMs) => {
   if (!Array.isArray(failureTimes) || !Number.isFinite(nowMs)) return 0;
@@ -256,6 +299,8 @@ module.exports = {
   APPROVER_ROLES,
   BINDING_DETAILS,
   CODES,
+  DEFAULT_DISCOUNT_REASON,
+  DISCOUNT_APPROVAL_MESSAGE,
   FAILURE_LIMIT,
   FAILURE_WINDOW_MINUTES,
   FAILURE_WINDOW_MS,
@@ -266,8 +311,11 @@ module.exports = {
   approvalRequired,
   canApprove,
   checkApprovalBinding,
+  checkDiscountApprovalBinding,
   expiresAtFrom,
   missingApproval,
+  missingDiscountApproval,
+  newSaleRefsOf,
   normalizeApprovalId,
   normalizeApprovalRequest,
   recentFailureCount,

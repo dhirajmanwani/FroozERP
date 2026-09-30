@@ -6039,6 +6039,121 @@ const authorizeSaleChange = async (client, { actor, action, approvalId, sale, co
   return { ok: true, approverId: row.approver_id };
 };
 
+/**
+ * The signed-in user as the 5% discount rule needs them: role and role permissions, re-read from
+ * the database. Null for an unknown or inactive user, who is never exempt.
+ */
+const getManualDiscountActor = async (userId, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return null;
+  const result = await client.query(
+    `
+    SELECT u.id, u.full_name, r.role_name, COALESCE(rps.permissions, '{}'::jsonb) AS permissions
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    LEFT JOIN role_permission_settings rps ON rps.role_name = r.role_name
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  return result.rows[0] || null;
+};
+
+/** A new bill's lines, as the 5% rule reads them (`discounts.assessManualDiscounts`). */
+const manualDiscountLinesOf = (invoiceItems) => (invoiceItems || []).map((item) => ({
+  productId: item.productId,
+  inventoryBatchId: item.inventoryBatchId,
+  quantity: item.quantity,
+  rate: item.sellingRate,
+  discountAmount: item.discountAmount,
+  lotDiscount: item.lotDiscountOfRecord || null,
+}));
+
+/**
+ * The owner's rule for a cashier's own item discount, shared by browser checkout
+ * (`createSaleHandler`) and desktop sync (`processPosSaleFoundationOperation`).
+ *
+ * Nothing is asked unless a line's own discount is over 5% (`assessment.needsApproval`). An Owner,
+ * an Admin, or a holder of `manual_pos_rate_override` -- re-read from the database, never from the
+ * token -- needs nothing. Anyone else needs an ISSUED `discount` approval bound to one of this new
+ * bill's client references, themselves, this company and this device. It is locked FOR UPDATE
+ * here and consumed by `recordManualDiscountDecision` once the bill has an id, in the same
+ * transaction, so a rolled-back bill leaves it usable and two bills cannot both spend it.
+ *
+ * Returns `{ ok: true, needed, exempt, approvalId, approverId }` or
+ * `{ ok: false, code: "DISCOUNT_APPROVAL_REQUIRED", detail, message, approvalId }`.
+ */
+const authorizeManualDiscount = async (client, { assessment, actorId, approvalId, saleRefs, companyId, deviceId }) => {
+  if (!assessment?.needsApproval) return { ok: true, needed: false, exempt: false, approvalId: null, approverId: null };
+  const actor = await getManualDiscountActor(actorId, client);
+  if (discountRules.manualDiscountExempt(actor)) {
+    return { ok: true, needed: true, exempt: true, approvalId: null, approverId: null };
+  }
+  const id = saleChangeApproval.normalizeApprovalId(approvalId);
+  if (!id) return { ...saleChangeApproval.missingDiscountApproval(), approvalId: null };
+  const result = await client.query(
+    `SELECT a.*, r.role_name AS approver_role, u.active AS approver_active
+     FROM sale_change_approvals a
+     LEFT JOIN users u ON u.id = a.approver_id
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE a.id = $1
+     FOR UPDATE OF a`,
+    [id]
+  );
+  const row = result.rows[0];
+  const binding = saleChangeApproval.checkDiscountApprovalBinding(row, {
+    saleRefs,
+    requesterId: actorId,
+    companyId,
+    deviceId,
+    nowMs: Date.now(),
+  });
+  if (!binding.ok) return { ...binding, approvalId: id };
+  return { ok: true, needed: true, exempt: false, approvalId: id, approverId: row.approver_id };
+};
+
+const MANUAL_DISCOUNT_UNAPPROVED_REASON = "Discount over 5% without approval";
+
+/**
+ * After the bill is written: spend the approval and name the approver on the bill's audit trail
+ * (`DISCOUNT_APPROVED`, `approved_by`), or -- on the sync path only, where the bill is already in
+ * the customer's hands and is never refused for this -- leave `DISCOUNT_UNAPPROVED` with the
+ * binding that failed. Existing columns only. Nothing is written when no line was over 5% or the
+ * cashier was exempt.
+ */
+const recordManualDiscountDecision = async (client, { saleId, decision, assessment, actorId }) => {
+  if (!assessment?.needsApproval || !decision || decision.exempt) return;
+  const trace = discountRules.manualDiscountTrace(assessment);
+  if (decision.ok && decision.approvalId) {
+    await client.query(
+      `UPDATE sale_change_approvals
+       SET status = 'CONSUMED', consumed_at = CURRENT_TIMESTAMP, consumed_sale_id = $2
+       WHERE id = $1 AND status = 'ISSUED'`,
+      [decision.approvalId, saleId]
+    );
+    await client.query(
+      `
+      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+      VALUES ($1, 'DISCOUNT_APPROVED', 'item_discount', NULL, $2::jsonb, $3, $4, $5)
+      `,
+      [saleId, JSON.stringify({ ...trace, approval_id: decision.approvalId }), "Discount over 5% approved", actorId || null, decision.approverId]
+    );
+    return;
+  }
+  await client.query(
+    `
+    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+    VALUES ($1, 'DISCOUNT_UNAPPROVED', 'item_discount', NULL, $2::jsonb, $3, $4, NULL)
+    `,
+    [
+      saleId,
+      JSON.stringify({ ...trace, approval_id: decision.approvalId || null, detail: decision.detail || null }),
+      MANUAL_DISCOUNT_UNAPPROVED_REASON,
+      actorId || null,
+    ]
+  );
+};
+
 /** The browser path's refusal: roll back and answer 403 with the binding's code and reason. */
 const rejectSaleChange = async (client, res, approval) => {
   await client.query("ROLLBACK");
@@ -10912,6 +11027,43 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     return rejectOperation(operation, "VALIDATION_ERROR", salePayload.error.message || "POS sale validation failed");
   }
 
+  // The owner's 5% rule, on a bill the customer already has: it is NEVER refused for this. A valid
+  // approval is spent and its approver recorded; a missing or invalid one leaves a
+  // DISCOUNT_UNAPPROVED row on the bill's audit trail. The lot's own discount is not the
+  // cashier's: a ₹ or % lot discount the lot really has (or had -- one stopped since billing
+  // still was the lot's) is set aside before the 5% is measured.
+  const claimedLotIds = salePayload.invoiceItems
+    .filter((item) => ["PERCENTAGE", "FIXED_AMOUNT"].includes(item.lotDiscountType) && item.lotDiscountId && item.inventoryBatchId)
+    .map((item) => item.inventoryBatchId);
+  const lotDiscountsOfRecord = claimedLotIds.length > 0
+    ? await loadLotDiscountsForLots(client, claimedLotIds, context.branchId)
+    : [];
+  const manualDiscountAssessment = discountRules.assessManualDiscounts(manualDiscountLinesOf(
+    salePayload.invoiceItems.map((item) => ({
+      ...item,
+      lotDiscountOfRecord: discountRules.lotDiscountOfRecord({
+        claim: { id: item.lotDiscountId, type: item.lotDiscountType, value: item.lotDiscountValue },
+        discounts: lotDiscountsOfRecord,
+        lotId: item.inventoryBatchId,
+        productId: item.productId,
+      }),
+    }))
+  ));
+  const manualDiscountDecision = await authorizeManualDiscount(client, {
+    assessment: manualDiscountAssessment,
+    actorId: context.user.id,
+    approvalId: cleanText(payload.discount_approval_id),
+    saleRefs: saleChangeApproval.newSaleRefsOf(
+      operation.operation_id,
+      operation.idempotency_key,
+      payload.operation_id,
+      invoiceGlobalId,
+      offlineInvoiceRef
+    ),
+    companyId: context.companyId,
+    deviceId: context.deviceId,
+  });
+
   const transactionDate = toBusinessDateKey(payload.bill_date || payload.bill_datetime || new Date());
   const requestedBillDateTime = cleanText(payload.bill_datetime) || `${transactionDate}T00:00`;
   const saleResult = await client.query(
@@ -10978,6 +11130,12 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   const invoiceNo = `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`;
   await client.query("UPDATE sales SET invoice_no = $1 WHERE id = $2", [invoiceNo, sale.id]);
   await insertSaleCharges(client, sale.id, salePayload.chargeLines);
+  await recordManualDiscountDecision(client, {
+    saleId: sale.id,
+    decision: manualDiscountDecision,
+    assessment: manualDiscountAssessment,
+    actorId: context.user.id,
+  });
 
   for (const item of salePayload.invoiceItems) {
     const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
@@ -23050,6 +23208,9 @@ const createSaleHandler = async (req, res) => {
         sellingRate,
         defaultSellingRate,
         manualRateOverride,
+        // The lot discount this line was verified against above: the part of its discount that is
+        // the lot's, not the cashier's, for the 5% rule below.
+        lotDiscountOfRecord: verifiedLotDiscount,
         inventoryBatchId: requestedItem.inventoryBatchId || allocations[0]?.inventoryBatchId || null,
         lotName: allocations[0]?.lotName || null,
         lotSize: allocations[0]?.lotSize || null,
@@ -23068,6 +23229,21 @@ const createSaleHandler = async (req, res) => {
     itemDiscountAmount = roundCurrency(itemDiscountAmount);
     totalCost = roundCurrency(totalCost);
     const subtotalAfterItemDiscounts = roundCurrency(grossAmount - itemDiscountAmount);
+
+    // The owner's rule: a cashier's own discount above 5% of a line needs an Owner or Admin's
+    // password first. The approval is bound to this bill's operation id (the idempotency key the
+    // POS sends with every bill), so it cannot be carried to another bill. Refused here, before
+    // anything is committed; the cart stays on the counter.
+    const manualDiscountAssessment = discountRules.assessManualDiscounts(manualDiscountLinesOf(invoiceItems));
+    const manualDiscountDecision = await authorizeManualDiscount(client, {
+      assessment: manualDiscountAssessment,
+      actorId: parsedCreatedBy,
+      approvalId: req.body.discount_approval_id,
+      saleRefs: saleChangeApproval.newSaleRefsOf(v3OperationKey(req)),
+      companyId: context?.company_id ?? req.auth.companyId,
+      deviceId: context?.device_id ?? req.auth.deviceId,
+    });
+    if (!manualDiscountDecision.ok) return rejectSaleChange(client, res, manualDiscountDecision);
 
     const requestedPaymentsInput = Array.isArray(payments) && payments.length > 0 ? payments : null;
     const allowedPaymentModes = new Set(["CASH", "UPI", "CARD", "BANK_TRANSFER", "CREDIT"]);
@@ -23219,6 +23395,12 @@ const createSaleHandler = async (req, res) => {
       [invoiceNo, sale.id]
     );
     await insertSaleCharges(client, sale.id, resolvedCharges.lines);
+    await recordManualDiscountDecision(client, {
+      saleId: sale.id,
+      decision: manualDiscountDecision,
+      assessment: manualDiscountAssessment,
+      actorId: parsedCreatedBy,
+    });
 
     for (const item of invoiceItems) {
       const invoiceDiscountShare = subtotalAfterItemDiscounts === 0
@@ -24622,6 +24804,9 @@ app.post("/api/v3/sales/:id/cancel", rateLimitSyncRequest, v3WriteAdapter(cancel
  *
  * - The requester is `req.auth.userId` and nothing else, and must already hold the cancel or edit
  *   permission: approval adds a second person, it does not grant the right.
+ * - `action: "discount"` approves a cashier's item discount over 5% on a bill being made. Its
+ *   `sale_ref` is that bill's operation id; the requester need only be an active user who is not
+ *   already exempt from the 5% rule. Credentials, attempt limits and audit are the same.
  * - The approver is looked up by username and must be an active Owner or Admin of the same company.
  * - A wrong attempt is recorded as a FAILED row against the **requester**; five inside fifteen
  *   minutes refuses further attempts. The approver's own login lockout is never touched, so a
@@ -24659,19 +24844,32 @@ const createSaleChangeApprovalHandler = async (req, res) => {
     return res.status(400).json({ code: parsed.code, message: parsed.message });
   }
 
-  const requester = await getSalePermissionUser(requesterId, request.action);
+  // A discount over 5% is approved for a bill being made, so the requester needs no bill-change
+  // permission -- only to be an active user. Anyone the 5% rule already exempts (Owner, Admin,
+  // holder of manual_pos_rate_override) is told they need no approval.
+  const discountRequest = request.action === "discount";
+  const requester = discountRequest
+    ? await getManualDiscountActor(requesterId)
+    : await getSalePermissionUser(requesterId, request.action);
   if (!requester) {
     await audit(CODES.REQUESTER_NOT_ALLOWED, { stage: "requester_permission" });
     return res.status(403).json({
       code: CODES.REQUESTER_NOT_ALLOWED,
-      message: request.action === "cancel"
-        ? "You do not have permission to cancel completed sales."
-        : "You do not have permission to edit completed sales.",
+      message: discountRequest
+        ? "Your account is not active."
+        : request.action === "cancel"
+          ? "You do not have permission to cancel completed sales."
+          : "You do not have permission to edit completed sales.",
     });
   }
-  if (!saleChangeApproval.approvalRequired(requester.role_name)) {
+  if (discountRequest ? discountRules.manualDiscountExempt(requester) : !saleChangeApproval.approvalRequired(requester.role_name)) {
     await audit(CODES.NOT_NEEDED, { stage: "requester_role" });
-    return res.status(400).json({ code: CODES.NOT_NEEDED, message: "Owners and Admins do not need approval to change a bill." });
+    return res.status(400).json({
+      code: CODES.NOT_NEEDED,
+      message: discountRequest
+        ? "You can give this discount without approval."
+        : "Owners and Admins do not need approval to change a bill.",
+    });
   }
 
   const client = await pool.connect();

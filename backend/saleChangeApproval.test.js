@@ -383,3 +383,126 @@ test("the change-events report is branch-scoped and Owner/Admin only", () => {
   assert.match(route, /\[req\.auth\.branchId,/);
   assert.match(route, /approved_by_name/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// The same machinery for a cashier's discount over 5% (30 Sep 2026)
+// ---------------------------------------------------------------------------------------------
+
+const {
+  DEFAULT_DISCOUNT_REASON,
+  DISCOUNT_APPROVAL_MESSAGE,
+  checkDiscountApprovalBinding,
+  missingDiscountApproval,
+  newSaleRefsOf,
+} = approval;
+
+const discountRow = (overrides = {}) => issuedRow({ action: "discount", sale_ref: "bill-op-1", ...overrides });
+const discountBinding = (overrides = {}) => ({
+  saleRefs: ["bill-op-1"],
+  requesterId: 12,
+  companyId: 1,
+  deviceId: "FZDEV-COUNTER-1",
+  nowMs: NOW,
+  ...overrides,
+});
+
+test("a discount request needs no typed reason; a cancel or edit still does", () => {
+  const parsed = normalizeApprovalRequest(validBody({ action: "discount", sale_ref: "bill-op-1", reason: "" }));
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.value.action, "discount");
+  assert.equal(parsed.value.reason, DEFAULT_DISCOUNT_REASON);
+  assert.equal(normalizeApprovalRequest(validBody({ action: "discount", reason: "Regular customer" })).value.reason, "Regular customer");
+  for (const action of ["cancel", "edit"]) {
+    assert.equal(normalizeApprovalRequest(validBody({ action, reason: "" })).ok, false, `${action} still needs a reason`);
+  }
+  assert.equal(normalizeApprovalRequest(validBody({ action: "discount", approver_password: "" })).ok, false, "the password is still required");
+});
+
+test("a discount approval covers exactly the new bill it was issued for", () => {
+  assert.deepEqual(checkDiscountApprovalBinding(discountRow(), discountBinding()), { ok: true });
+  assert.equal(checkDiscountApprovalBinding(discountRow({ sale_ref: "OFF-1" }), discountBinding({ saleRefs: ["op-9", "invoice-9", "OFF-1"] })).ok, true);
+});
+
+test("a discount approval that does not hold answers DISCOUNT_APPROVAL_REQUIRED with the failed binding", () => {
+  const cases = [
+    [null, {}, BINDING_DETAILS.NOT_FOUND],
+    [discountRow({ status: APPROVAL_STATUS.CONSUMED }), {}, BINDING_DETAILS.ALREADY_USED],
+    [discountRow({ expires_at: new Date(NOW - 1) }), {}, BINDING_DETAILS.EXPIRED],
+    [discountRow({ action: "edit" }), {}, BINDING_DETAILS.WRONG_ACTION],
+    [discountRow({ action: "cancel" }), {}, BINDING_DETAILS.WRONG_ACTION],
+    [discountRow(), { saleRefs: ["another-bill"] }, BINDING_DETAILS.WRONG_SALE],
+    [discountRow(), { requesterId: 13 }, BINDING_DETAILS.WRONG_REQUESTER],
+    [discountRow(), { companyId: 2 }, BINDING_DETAILS.WRONG_COMPANY],
+    [discountRow(), { deviceId: "FZDEV-OTHER" }, BINDING_DETAILS.WRONG_DEVICE],
+    [discountRow({ approver_active: false }), {}, BINDING_DETAILS.APPROVER_NO_LONGER_ALLOWED],
+  ];
+  for (const [row, override, detail] of cases) {
+    const result = checkDiscountApprovalBinding(row, discountBinding(override));
+    assert.equal(result.ok, false, detail);
+    assert.equal(result.code, "DISCOUNT_APPROVAL_REQUIRED");
+    assert.equal(result.detail, detail);
+    assert.equal(result.message, "A discount over 5% needs an Owner or Admin to approve it.");
+  }
+  assert.deepEqual(missingDiscountApproval(), {
+    ok: false, code: "DISCOUNT_APPROVAL_REQUIRED", detail: BINDING_DETAILS.MISSING, message: DISCOUNT_APPROVAL_MESSAGE,
+  });
+});
+
+test("a discount approval cannot cancel or edit a bill", () => {
+  const result = checkApprovalBinding(discountRow({ sale_ref: "44" }), binding({ action: "edit" }));
+  assert.equal(result.detail, BINDING_DETAILS.WRONG_ACTION);
+});
+
+test("a new bill's references are opaque strings, blanks and repeats dropped", () => {
+  assert.deepEqual(newSaleRefsOf("op-1", "op-1", "", undefined, null, " invoice-1 ", 44), ["op-1", "invoice-1", "44"]);
+  assert.deepEqual(newSaleRefsOf(), []);
+});
+
+test("browser checkout checks the discount approval before the bill is written, against its operation id", () => {
+  const body = handlerBody("const createSaleHandler");
+  assert.match(body, /discountRules\.assessManualDiscounts\(manualDiscountLinesOf\(invoiceItems\)\)/);
+  assert.match(body, /await authorizeManualDiscount\(client, \{[\s\S]*?actorId: parsedCreatedBy,[\s\S]*?approvalId: req\.body\.discount_approval_id,[\s\S]*?saleRefs: saleChangeApproval\.newSaleRefsOf\(v3OperationKey\(req\)\),/);
+  assert.match(body, /if \(!manualDiscountDecision\.ok\) return rejectSaleChange\(client, res, manualDiscountDecision\);/);
+  assert.ok(body.indexOf("authorizeManualDiscount(") < body.indexOf("INSERT INTO sales"), "refused before the bill is written");
+  assert.ok(body.indexOf("recordManualDiscountDecision(") > body.indexOf("INSERT INTO sales"), "spent once the bill has an id");
+  assert.match(body, /lotDiscountOfRecord: verifiedLotDiscount/, "the lot part is the verified lot discount");
+  const parsed = body.slice(body.indexOf("const parsedCreatedBy"), body.indexOf("const parsedCreatedBy") + 60);
+  assert.match(parsed, /req\.auth\.userId/, "the cashier is the verified session");
+});
+
+test("desktop sync never rejects a bill for the discount rule, and records the decision on the bill", () => {
+  const body = handlerBody("const processPosSaleFoundationOperation");
+  const start = body.indexOf("authorizeManualDiscount(");
+  assert.ok(start > 0);
+  const after = body.slice(start);
+  assert.doesNotMatch(after.slice(0, after.indexOf("INSERT INTO sales")), /rejectOperation|conflict\(/, "nothing between the check and the insert refuses the bill");
+  assert.match(body, /approvalId: cleanText\(payload\.discount_approval_id\)/);
+  assert.match(body, /actorId: context\.user\.id/);
+  assert.match(body, /deviceId: context\.deviceId/);
+  assert.match(body, /newSaleRefsOf\(\s*operation\.operation_id,\s*operation\.idempotency_key,\s*payload\.operation_id,\s*invoiceGlobalId,\s*offlineInvoiceRef\s*\)/);
+  assert.ok(body.indexOf("recordManualDiscountDecision(") > body.indexOf("INSERT INTO sales"));
+});
+
+test("the discount helpers lock and spend the approval like a bill change, and trace without new columns", () => {
+  const authorize = handlerBody("const authorizeManualDiscount");
+  assert.match(authorize, /getManualDiscountActor\(actorId, client\)/);
+  assert.match(authorize, /discountRules\.manualDiscountExempt\(actor\)/);
+  assert.match(authorize, /FOR UPDATE OF a/);
+  assert.match(authorize, /checkDiscountApprovalBinding\(/);
+  const record = handlerBody("const recordManualDiscountDecision");
+  assert.match(record, /SET status = 'CONSUMED'[\s\S]*WHERE id = \$1 AND status = 'ISSUED'/);
+  assert.match(record, /INSERT INTO sale_audit_trail \(sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by\)/);
+  assert.match(record, /'DISCOUNT_APPROVED'/);
+  assert.match(record, /'DISCOUNT_UNAPPROVED'/);
+  assert.match(CODE, /const MANUAL_DISCOUNT_UNAPPROVED_REASON = "Discount over 5% without approval";/);
+  // Reports that list bill changes read EDIT and CANCEL only; a discount row is not a bill change.
+  assert.doesNotMatch(CODE, /sat\.action IN \([^)]*DISCOUNT/);
+});
+
+test("the approval route takes a discount requester from the session and asks the 5% rule who is exempt", () => {
+  const route = handlerBody("const createSaleChangeApprovalHandler");
+  assert.match(route, /getManualDiscountActor\(requesterId\)/);
+  assert.match(route, /discountRules\.manualDiscountExempt\(requester\)/);
+  const actor = handlerBody("const getManualDiscountActor");
+  assert.match(actor, /WHERE u\.id = \$1 AND u\.active = TRUE/);
+});

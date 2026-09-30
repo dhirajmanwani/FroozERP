@@ -39,6 +39,20 @@ import {
   slabSnapshot,
   validateLotDiscountDraft,
   validateSlabDraft,
+  DISCOUNT_APPROVAL_ACTION,
+  DISCOUNT_APPROVAL_MODE,
+  DISCOUNT_APPROVAL_NOTE,
+  DISCOUNT_APPROVAL_OFFLINE_MESSAGE,
+  DISCOUNT_APPROVAL_REQUIRED_CODE,
+  MANUAL_DISCOUNT_FREE_PERCENT,
+  cartDiscountApproval,
+  describeDiscountApprovalError,
+  describeDiscountApprovalReason,
+  discountApprovalExempt,
+  lineLotDiscountPart,
+  lineManualDiscount,
+  readDiscountApprovalRequired,
+  resolveDiscountApprovalRoute,
 } from "./discounts.js";
 
 const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
@@ -537,6 +551,276 @@ test("a lot discount the screen accepts is one the server accepts, and the other
         const theirs = backend.validateLotDiscountInput({ type, value, currentRate, startDate: TODAY });
         assert.equal(mine.errors.length === 0, !theirs.error, `${type} ${value} at ${currentRate}: ${mine.errors[0] || ""} / ${theirs.error || ""}`);
       }
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Manual item discount over 5% needs Owner/Admin approval
+// ---------------------------------------------------------------------------------------------
+
+const line = (overrides = {}) => ({
+  line_id: "line-1",
+  product_name: "Apple",
+  quantity: 2,
+  selling_rate: 100,
+  discount_amount: 0,
+  lot_discount_id: null,
+  lot_discount_type: null,
+  lot_discount_value: 0,
+  ...overrides,
+});
+
+test("up to 5% off a line needs nobody; a paisa over the limit and its rounding tolerance does", () => {
+  assert.equal(MANUAL_DISCOUNT_FREE_PERCENT, 5);
+  assert.equal(DISCOUNT_APPROVAL_NOTE, "Up to 5% without approval");
+  // 2 x ₹100 = ₹200; 5% is ₹10; the rule allows ₹10.01 (tolerance) and asks at ₹10.02.
+  assert.equal(lineManualDiscount(line({ discount_amount: 10 })).needsApproval, false);
+  assert.equal(lineManualDiscount(line({ discount_amount: 10.01 })).needsApproval, false);
+  assert.equal(lineManualDiscount(line({ discount_amount: 10.02 })).needsApproval, true);
+  assert.equal(lineManualDiscount(line({ discount_amount: 0 })).needsApproval, false);
+  // A ₹1,000 line: 5% is ₹50; ₹50.01 is inside the paisa of tolerance, ₹50.02 is not.
+  const thousand = { quantity: 10, selling_rate: 100 };
+  assert.equal(lineManualDiscount(line({ ...thousand, discount_amount: 50 })).needsApproval, false);
+  assert.equal(lineManualDiscount(line({ ...thousand, discount_amount: 50.01 })).needsApproval, false);
+  assert.equal(lineManualDiscount(line({ ...thousand, discount_amount: 50.02 })).needsApproval, true);
+  assert.equal(lineManualDiscount(line({ ...thousand, discount_amount: 60 })).needsApproval, true);
+  const over = lineManualDiscount(line({ discount_amount: 25 }));
+  assert.deepEqual(over, { lotPart: 0, base: 200, manualPart: 25, freeLimit: 10, percent: 12.5, needsApproval: true, unreadable: false });
+  // A blank discount is no discount. An unreadable one is not waved through.
+  assert.equal(lineManualDiscount(line({ discount_amount: "" })).needsApproval, false);
+  assert.equal(lineManualDiscount(line({ discount_amount: null })).needsApproval, false);
+  assert.equal(lineManualDiscount(line({ discount_amount: "abc" })).needsApproval, true);
+  // A quantity still being typed ("") with money off it is asked about; with none, it is not.
+  assert.equal(lineManualDiscount(line({ quantity: "", discount_amount: 1 })).needsApproval, true);
+  assert.equal(lineManualDiscount(line({ quantity: "", discount_amount: 0 })).needsApproval, false);
+  // Typed as text (the input's value) it is the same number.
+  assert.equal(lineManualDiscount(line({ discount_amount: "10.02", quantity: "2", selling_rate: "100" })).needsApproval, true);
+});
+
+test("a lot discount is not the cashier's: only what is typed on top of it counts, against the line after it", () => {
+  // 10% lot discount on ₹100 x 2: lot part ₹20, base ₹180, free ₹9.
+  const lot = { lot_discount_id: "004", lot_discount_type: "PERCENTAGE", lot_discount_value: 10 };
+  assert.equal(lineLotDiscountPart(line(lot)), 20);
+  assert.equal(lineManualDiscount(line({ ...lot, discount_amount: 20 })).needsApproval, false, "the lot discount alone");
+  assert.equal(lineManualDiscount(line({ ...lot, discount_amount: 29 })).needsApproval, false, "₹9 on top is 5% of ₹180");
+  const extra = lineManualDiscount(line({ ...lot, discount_amount: 29.02 }));
+  assert.equal(extra.needsApproval, true);
+  assert.equal(extra.base, 180);
+  assert.equal(extra.manualPart, 9.02);
+  // Typing less than the lot discount is not a negative manual discount.
+  assert.equal(lineManualDiscount(line({ ...lot, discount_amount: 5 })).manualPart, 0);
+  // ₹ off per unit: ₹15 x 2 = ₹30; never more than the rate per unit.
+  assert.equal(lineLotDiscountPart(line({ lot_discount_id: "7", lot_discount_type: "FIXED_AMOUNT", lot_discount_value: 15 })), 30);
+  assert.equal(lineLotDiscountPart(line({ lot_discount_id: "7", lot_discount_type: "FIXED_AMOUNT", lot_discount_value: 150 })), 200);
+  // SPECIAL_RATE: the price is the special price, so the lot part is 0 and base is qty x that price.
+  const special = { lot_discount_id: "9", lot_discount_type: "SPECIAL_RATE", lot_discount_value: 80, selling_rate: 80 };
+  assert.equal(lineLotDiscountPart(line(special)), 0);
+  assert.equal(lineManualDiscount(line({ ...special, discount_amount: 8 })).needsApproval, false);
+  assert.equal(lineManualDiscount(line({ ...special, discount_amount: 8.02 })).needsApproval, true);
+  // No claim, no lot part, whatever value is lying on the line.
+  assert.equal(lineLotDiscountPart(line({ lot_discount_value: 10 })), 0);
+});
+
+test("a line with nothing to measure against still asks for any real money off, and says no percentage", () => {
+  const free = lineManualDiscount(line({ selling_rate: 0, discount_amount: 5 }));
+  assert.equal(free.needsApproval, true);
+  assert.equal(free.percent, null, "a percentage of nothing is not 0%");
+  assert.equal(lineManualDiscount(line({ selling_rate: 0, discount_amount: 0 })).needsApproval, false);
+});
+
+test("the bill needs approval when any line does; Owner, Admin and rate-override holders are never asked", () => {
+  const cart = [line({ line_id: "a", discount_amount: 5 }), line({ line_id: "b", product_name: "Mango", discount_amount: 30 })];
+  const result = cartDiscountApproval(cart);
+  assert.equal(result.needed, true);
+  assert.deepEqual(result.lines, [{ lineId: "b", productName: "Mango", discount: 30, base: 200, percent: 15 }]);
+  assert.deepEqual(cartDiscountApproval([line({ discount_amount: 5 })]), { needed: false, lines: [] });
+  assert.deepEqual(cartDiscountApproval(cart, { exempt: true }), { needed: false, lines: [] });
+  assert.deepEqual(cartDiscountApproval(null), { needed: false, lines: [] });
+
+  assert.equal(discountApprovalExempt({ role: "Owner" }), true);
+  assert.equal(discountApprovalExempt({ role: " Admin " }), true);
+  assert.equal(discountApprovalExempt({ role: "admin" }), false, "matched exactly, as the server does");
+  assert.equal(discountApprovalExempt({ role: "Cashier", canManualRateOverride: true }), true);
+  assert.equal(discountApprovalExempt({ role: "Cashier" }), false);
+  assert.equal(discountApprovalExempt({ role: "Manager", canManualRateOverride: "yes" }), false, "only an exact true exempts");
+  assert.equal(discountApprovalExempt({}), false, "no role is asked, not waved through");
+});
+
+test("the approval reason names each line over the limit and fits the server's 500 characters", () => {
+  const { lines } = cartDiscountApproval([line({ discount_amount: 25 })]);
+  assert.equal(describeDiscountApprovalReason(lines), "Item discount over 5%: Apple 12.5% (₹25 of ₹200)");
+  const many = Array.from({ length: 40 }, (_, index) => line({ line_id: String(index), product_name: `Product number ${index}`, discount_amount: 50 }));
+  const reason = describeDiscountApprovalReason(cartDiscountApproval(many).lines);
+  assert.ok(reason.length <= 500);
+  assert.equal(DISCOUNT_APPROVAL_ACTION, "discount", "sale_change_approvals.action is VARCHAR(20)");
+});
+
+test("approval goes to the cloud only when online, not Local Only, and the gate says yes -- otherwise refused before billing", () => {
+  assert.deepEqual(resolveDiscountApprovalRoute({ needsApproval: false, offlineMode: true, localOnly: true }), { mode: DISCOUNT_APPROVAL_MODE.NONE });
+  assert.deepEqual(resolveDiscountApprovalRoute({ needsApproval: true, cloudGateAllowed: true }), { mode: DISCOUNT_APPROVAL_MODE.CLOUD });
+  for (const state of [
+    { needsApproval: true, offlineMode: true, cloudGateAllowed: true },
+    { needsApproval: true, localOnly: true, cloudGateAllowed: true },
+    { needsApproval: true, cloudGateAllowed: false },
+    { needsApproval: true },
+    { needsApproval: undefined, cloudGateAllowed: true, offlineMode: true },
+  ]) {
+    assert.deepEqual(resolveDiscountApprovalRoute(state), { mode: DISCOUNT_APPROVAL_MODE.REFUSED, message: DISCOUNT_APPROVAL_OFFLINE_MESSAGE }, JSON.stringify(state));
+  }
+  assert.equal(DISCOUNT_APPROVAL_OFFLINE_MESSAGE, "A discount over 5% needs an Owner or Admin's approval, which needs internet. Give up to 5%, or wait for the connection.");
+});
+
+test("a 403 DISCOUNT_APPROVAL_REQUIRED is read as 'open the approval dialog'; nothing else is", () => {
+  assert.deepEqual(readDiscountApprovalRequired(403, { code: DISCOUNT_APPROVAL_REQUIRED_CODE, message: "Needs approval." }), { message: "Needs approval." });
+  assert.deepEqual(readDiscountApprovalRequired("403", { code: "discount_approval_required" }), { message: "A discount over 5% needs an Owner or Admin to approve it." });
+  assert.equal(readDiscountApprovalRequired(403, { message: "You do not have permission to change sale rate" }), null);
+  assert.equal(readDiscountApprovalRequired(409, { code: DISCOUNT_APPROVAL_REQUIRED_CODE }), null);
+});
+
+test("a failed approval shows the server's sentence for a wrong password, and always says the cart is kept", () => {
+  const wrong = { isAxiosError: true, response: { status: 401, data: { code: "APPROVER_CREDENTIALS_INVALID", message: "That Owner or Admin username or password is not right." } } };
+  assert.equal(describeDiscountApprovalError(wrong), "That Owner or Admin username or password is not right. The bill is not saved yet; the cart is still here.");
+  const silent = { isAxiosError: true, response: { status: 401, data: { code: "APPROVER_CREDENTIALS_INVALID" } } };
+  assert.match(describeDiscountApprovalError(silent), /^The Owner or Admin username or password is wrong\. /);
+  const unreachable = { isAxiosError: true, request: {} };
+  assert.match(describeDiscountApprovalError(unreachable), /could not be reached\. The bill is not saved yet; the cart is still here\.$/);
+  const technical = { isAxiosError: true, response: { status: 500, data: { code: "XX000", message: "relation \"sale_change_approvals\" does not exist" } } };
+  assert.equal(describeDiscountApprovalError(technical), "The approval could not be completed. The bill is not saved yet; the cart is still here.");
+  assert.equal(describeDiscountApprovalError(null), "The approval could not be completed. The bill is not saved yet; the cart is still here.");
+});
+
+// How POS wires the 5% rule. The decisions are tested above; this pins the order App.jsx asks
+// them in, because that order is what keeps LOCAL_ONLY at zero cloud calls and the cart intact.
+const appSlice = (startMarker, endMarker) => {
+  const start = app.indexOf(startMarker);
+  assert.notEqual(start, -1, `missing ${startMarker}`);
+  const end = app.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(end, -1, `missing ${endMarker} after ${startMarker}`);
+  return app.slice(start, end);
+};
+const comesBefore = (source, first, second) => {
+  const a = source.indexOf(first);
+  const b = source.indexOf(second);
+  assert.notEqual(a, -1, `missing ${first}`);
+  assert.notEqual(b, -1, `missing ${second}`);
+  assert.ok(a < b, `${first} must come before ${second}`);
+};
+
+test("POS discount approval: offline and Local Only are refused before the cloud gate is asked", () => {
+  const route = appSlice("const resolvePosDiscountApprovalRoute = ", "const requestSaleChangeApproval = ");
+  comesBefore(route, "isSaleChangeLocalOnly(connectivityMode)", "guardCloudCall(\"discount-approval\"");
+  assert.match(route, /!needsApproval \|\| offlineMode \|\| localOnly\s*\?\s*false/);
+  assert.match(route, /hasCloudSession\(user\) !== false/);
+  assert.match(route, /resolveDiscountApprovalRoute\(\{/);
+});
+
+test("POS checkout asks for approval before billing, sends the approval with the bill's own reference, and keeps the cart", () => {
+  const checkoutBody = appSlice("const checkout = async (printAfterSave = false, confirmations = {}) => {", "const handleSearchKeys = ");
+  // Decided before anything is saved, locally or on the server.
+  comesBefore(checkoutBody, "discountApprovalCheck.needed", "setSaving(true)");
+  comesBefore(checkoutBody, "resolvePosDiscountApprovalRoute(", "completeLocalPosSale(localSale)");
+  comesBefore(checkoutBody, "openDiscountApproval(", "axios.post(`${API_URL}/api/v3/sales`");
+  // The approval id and the reference it was issued for travel with both kinds of bill.
+  assert.match(checkoutBody, /buildLocalSalePayload\(\{ payments, selectedBillDate, dateOverrideReason, operationId: saleRef, discountApprovalId \}\)/);
+  assert.match(checkoutBody, /discount_approval_id: discountApprovalId \} : \{\}\),\n\s*\}, saleRef\);/);
+  // A 403 DISCOUNT_APPROVAL_REQUIRED opens the dialog instead of an alert.
+  assert.match(checkoutBody, /readDiscountApprovalRequired\(error\.response\?\.status, responseData\)/);
+  // Refusals and the dialog never empty the cart: setCart([]) only after a bill is saved.
+  const refusal = appSlice("if (!discountApprovalId && confirmations.discount_approval_not_needed !== true && discountApprovalCheck.needed) {", "setSaving(true)");
+  assert.doesNotMatch(refusal, /setCart\(/);
+  // An approval is never held while the cart can change: the dialog keeps only the bill's
+  // reference, drops any earlier approval when it reopens, and checkout is resumed straight away.
+  const open = appSlice("const openDiscountApproval = ", "const closeDiscountApproval = ");
+  assert.match(open, /discount_approval_id: _usedApproval, discount_approval_not_needed: _notNeeded, sale_ref: _usedRef/);
+  assert.doesNotMatch(app, /useState\([^)]*discount_approval_id/);
+  const confirmBody = appSlice("const confirmDiscountApproval = async () => {", "const checkout = async (");
+  comesBefore(confirmBody, "setDiscountApproval(null);", "await checkout(draft.printAfterSave");
+  const payload = appSlice("const buildLocalSalePayload = ", "const openDiscountApproval = ");
+  assert.match(payload, /operation_id: operationId \|\| newSyncId\("op"\)/);
+  assert.match(payload, /discount_approval_id: discountApprovalId/);
+});
+
+test("the approval dialog asks the server only on the CLOUD route and forgets the password every time", () => {
+  const confirm = appSlice("const confirmDiscountApproval = async () => {", "const checkout = async (");
+  comesBefore(confirm, "resolvePosDiscountApprovalRoute(", "requestSaleChangeApproval(");
+  comesBefore(confirm, "if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD)", "requestSaleChangeApproval(");
+  assert.match(confirm, /action: DISCOUNT_APPROVAL_ACTION/);
+  assert.match(confirm, /saleRef: draft\.saleRef/);
+  assert.match(confirm, /approverPassword: "", error, saving: false/);
+  assert.match(confirm, /describeDiscountApprovalError\(error\)/);
+  comesBefore(confirm, "requestSaleChangeApproval(", "discount_approval_id: approvalId");
+  // The same username/password fields as a cashier's cancel or edit, not a second copy.
+  const modal = appSlice("function DiscountApprovalModal(", "\nfunction ");
+  assert.match(modal, /<SaleChangeApprovalFields/);
+  assert.doesNotMatch(modal, /type="password"/);
+});
+
+test("POS shows the 5% note only to someone who can be asked, and exempts Owner, Admin and rate-override holders", () => {
+  assert.match(app, /const discountExempt = discountApprovalExempt\(\{ role: user\?\.role, canManualRateOverride \}\);/);
+  assert.match(app, /!discountExempt && <small className="cell-note pos-discount-limit-note">\{DISCOUNT_APPROVAL_NOTE\}<\/small>/);
+  assert.match(app, /connectivityMode=\{connectivityMode\}\n\s*offlineMode=\{offlineMode\}/);
+});
+
+test("the till and the server agree on every line of the 5% rule", { skip: backend?.manualDiscountLine ? false : "backend/discounts.js has no manualDiscountLine" }, () => {
+  const lots = [
+    null,
+    { id: "004", discount_type: "PERCENTAGE", discount_value: 10 },
+    { id: "7", discount_type: "FIXED_AMOUNT", discount_value: 15 },
+    { id: "7", discount_type: "FIXED_AMOUNT", discount_value: 150 },
+    { id: "9", discount_type: "SPECIAL_RATE", discount_value: 80 },
+  ];
+  let compared = 0;
+  for (const lot of lots) {
+    for (const quantity of [2, 0.75, "1.125", "", 0]) {
+      for (const rate of [100, 80, 33.33, 0, ""]) {
+        for (const discount of [0, "", 5, 9, 9.01, 9.02, 10, 10.01, 10.02, 25, 29.02, 200, "abc"]) {
+          const mine = lineManualDiscount({
+            quantity,
+            selling_rate: rate,
+            discount_amount: discount,
+            lot_discount_id: lot?.id ?? null,
+            lot_discount_type: lot?.discount_type ?? null,
+            lot_discount_value: lot?.discount_value ?? 0,
+          });
+          const theirs = backend.manualDiscountLine({ quantity, rate, discountAmount: discount, lotDiscount: lot });
+          const label = JSON.stringify({ lot: lot?.discount_type || null, quantity, rate, discount });
+          assert.equal(mine.needsApproval, theirs.needsApproval, label);
+          assert.equal(mine.unreadable, theirs.unreadable, label);
+          if (!mine.unreadable) {
+            assert.equal(mine.lotPart, theirs.lotPart, label);
+            assert.equal(mine.manualPart, theirs.manualPart, label);
+            assert.equal(mine.base, theirs.base, label);
+            assert.equal(mine.freeLimit, theirs.freeLimit, label);
+          }
+          compared += 1;
+        }
+      }
+    }
+  }
+  assert.ok(compared > 1000);
+  assert.equal(backend.MANUAL_DISCOUNT_FREE_PERCENT, MANUAL_DISCOUNT_FREE_PERCENT);
+  if ("MANUAL_DISCOUNT_TOLERANCE" in backend) assert.equal(backend.MANUAL_DISCOUNT_TOLERANCE, 0.01);
+  // The whole bill: needs approval when any line does, on both sides.
+  if (typeof backend.assessManualDiscounts === "function") {
+    const cartLines = [
+      { quantity: 10, selling_rate: 100, discount_amount: 50 },
+      { quantity: 10, selling_rate: 100, discount_amount: 50.02, product_name: "Mango" },
+    ];
+    const theirs = backend.assessManualDiscounts(cartLines.map((entry) => ({ quantity: entry.quantity, rate: entry.selling_rate, discountAmount: entry.discount_amount })));
+    assert.equal(cartDiscountApproval(cartLines).needed, theirs.needsApproval);
+    assert.equal(cartDiscountApproval(cartLines.slice(0, 1)).needed, backend.assessManualDiscounts([{ quantity: 10, rate: 100, discountAmount: 50 }]).needsApproval);
+  }
+});
+
+test("the till and the server agree on who is never asked", { skip: backend?.manualDiscountExempt ? false : "backend/discounts.js has no manualDiscountExempt" }, () => {
+  for (const role of ["Owner", "Admin", " Owner ", "owner", "Cashier", "Manager", "", null]) {
+    for (const override of [true, false]) {
+      assert.equal(
+        discountApprovalExempt({ role, canManualRateOverride: override }),
+        backend.manualDiscountExempt({ role_name: role, permissions: { manual_pos_rate_override: override } }),
+        JSON.stringify({ role, override }),
+      );
     }
   }
 });

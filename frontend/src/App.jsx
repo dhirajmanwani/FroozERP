@@ -101,7 +101,7 @@ import { resolveShellStatus } from "./local/shellStatus";
 import { plainServerMessage } from "./local/plainServerMessage";
 import { describeReport } from "./local/reportDescriptions";
 import { labelFor, toneFor } from "./local/displayLabels";
-import { BILL_DISCOUNT_PAYMENT_MODES, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, currentLotDiscount, describeBillDiscountPreview, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, readDiscountConflict, reconcileCartLotDiscounts, resolveDiscountAvailability, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
+import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, cartDiscountApproval, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, describeDiscountApprovalReason, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, resolveDiscountApprovalRoute, resolveDiscountAvailability, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
 import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, describeSaveResult, filterSaleRateRows, marginOnCost, parseTargetMargin, rateTone, resolveSaleRateAvailability, suggestedDrafts } from "./local/saleRateUpdate";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
@@ -666,6 +666,19 @@ const resolveSaleChangeRoute = ({ user, offlineMode = false, connectivityMode } 
     ? false
     : guardCloudCall("sale-change-approval", API_URL).allowed === true && hasCloudSession(user) !== false;
   return resolveSaleChangeApprovalRoute({ needsApproval, offlineMode: Boolean(offlineMode), localOnly, cloudGateAllowed });
+};
+/**
+ * Which way a POS bill's discount approval goes (local/discounts.js decides): the same Local Only,
+ * offline and cloud-gate checks as a cancel or edit, in the same order, so a refused route makes no
+ * request and bills nothing. `needsApproval` comes from `cartDiscountApproval`, which already
+ * waves Owner, Admin and rate-override holders through.
+ */
+const resolvePosDiscountApprovalRoute = ({ needsApproval, user, offlineMode = false, connectivityMode } = {}) => {
+  const localOnly = isSaleChangeLocalOnly(connectivityMode);
+  const cloudGateAllowed = !needsApproval || offlineMode || localOnly
+    ? false
+    : guardCloudCall("discount-approval", API_URL).allowed === true && hasCloudSession(user) !== false;
+  return resolveDiscountApprovalRoute({ needsApproval: needsApproval === true, offlineMode: Boolean(offlineMode), localOnly, cloudGateAllowed });
 };
 /**
  * Ask the server to check the Owner or Admin's password for one cancel or edit. Returns the
@@ -10515,6 +10528,8 @@ function App() {
               onConfigureMandiTax={() => setActiveView("settings")}
               canManualRateOverride={hasRolePermission("manual_pos_rate_override")}
               canPosDateOverride={hasRolePermission("pos_date_override")}
+              connectivityMode={connectivityMode}
+              offlineMode={offlineMode}
               user={user}
             />
           )}
@@ -23465,7 +23480,7 @@ const newCartLineId = () => {
   return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
-function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -23504,6 +23519,16 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const [discountNotice, setDiscountNotice] = useState("");
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
+  /**
+   * An Owner or Admin approving more than 5% off an item (local/discounts.js), or null. Holds the
+   * bill's own reference (`saleRef`, sent as the sale's idempotency key / sync operation id), the
+   * lines over the limit, and how checkout was going when it stopped to ask. The cart itself is
+   * never copied here and never cleared by it.
+   */
+  const [discountApproval, setDiscountApproval] = useState(null);
+  // Owner, Admin and anyone who may already set any rate are never asked.
+  const discountExempt = discountApprovalExempt({ role: user?.role, canManualRateOverride });
+  const discountApprovalCheck = useMemo(() => cartDiscountApproval(cart, { exempt: discountExempt }), [cart, discountExempt]);
   /**
    * Tell the shell whether this counter is mid-bill.
    *
@@ -24065,15 +24090,19 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     return `${prefix}-${id}`;
   };
 
-  const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason }) => {
+  const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason, operationId = "", discountApprovalId = "" }) => {
     const invoiceGlobalId = newSyncId("invoice");
     const offlineInvoiceRef = `OFF-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
     const savedCustomer = customer.account_id
       ? customer
       : { ...customer, name: "Walk-in Customer", mobile: customer.mobile || "", system_account: true };
     return {
-      operation_id: newSyncId("op"),
+      // The bill's reference: an Owner/Admin discount approval was issued against exactly this id,
+      // and the cloud reads it back off the queued sync operation.
+      operation_id: operationId || newSyncId("op"),
       invoice_global_id: invoiceGlobalId,
+      // Passed through untouched to the outbox payload (local_db.rs keeps the sale as sent).
+      ...(discountApprovalId ? { discount_approval_id: discountApprovalId } : {}),
       offline_invoice_ref: offlineInvoiceRef,
       branch_id: String(user.branch_id || 1),
       device_id: deviceInfo.device_id || newSyncId("device"),
@@ -24150,8 +24179,81 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     };
   };
 
+  /**
+   * Stop checkout to ask for an Owner or Admin's approval. A fresh bill reference every time: an
+   * approval is single-use and bound to the reference it was issued for.
+   */
+  const openDiscountApproval = ({ lines, printAfterSave, confirmations, notice = "" }) => {
+    const { discount_approval_id: _usedApproval, discount_approval_not_needed: _notNeeded, sale_ref: _usedRef, retry: _retry, ...carried } = confirmations || {};
+    setDiscountApproval({
+      saleRef: newSyncId("op"),
+      lines: Array.isArray(lines) ? lines : [],
+      printAfterSave,
+      confirmations: carried,
+      notice,
+      approverUsername: "",
+      approverPassword: "",
+      error: "",
+      saving: false,
+    });
+  };
+
+  const closeDiscountApproval = () => {
+    // The cart stays exactly as it is; only the question is dropped (and the password with it).
+    setDiscountApproval((current) => (current?.saving ? current : null));
+  };
+
+  const confirmDiscountApproval = async () => {
+    const draft = discountApproval;
+    if (!draft || draft.saving) return;
+    // Every way out of here forgets the approver's password, whatever happened.
+    const stop = (error) => setDiscountApproval((current) => (current ? { ...current, approverPassword: "", error, saving: false } : current));
+    // Asked again, not trusted from when the dialog opened: the connection may have gone since.
+    // A refused route makes no request.
+    const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
+    if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
+      stop(route.message);
+      return;
+    }
+    if (!String(draft.approverUsername || "").trim() || !draft.approverPassword) {
+      stop("Owner or Admin username and password are needed.");
+      return;
+    }
+    setDiscountApproval((current) => (current ? { ...current, error: "", saving: true } : current));
+    let approvalId;
+    try {
+      approvalId = await requestSaleChangeApproval(user, {
+        action: DISCOUNT_APPROVAL_ACTION,
+        saleRef: draft.saleRef,
+        // The cart as it is now, in case it changed behind the dialog; the lines it opened with otherwise.
+        reason: describeDiscountApprovalReason(discountApprovalCheck.lines.length ? discountApprovalCheck.lines : draft.lines),
+        approverUsername: draft.approverUsername,
+        approverPassword: draft.approverPassword,
+      });
+    } catch (error) {
+      // The server says this person needs no approval (its role list is newer than this counter's):
+      // bill it as it is. The server still checks the rule on the bill itself.
+      if (approvalErrorCode(error) === "APPROVAL_NOT_NEEDED") {
+        setDiscountApproval(null);
+        await checkout(draft.printAfterSave, { ...draft.confirmations, sale_ref: draft.saleRef, discount_approval_not_needed: true, retry: true });
+        return;
+      }
+      stop(describeDiscountApprovalError(error));
+      return;
+    }
+    setDiscountApproval(null);
+    await checkout(draft.printAfterSave, {
+      ...draft.confirmations,
+      sale_ref: draft.saleRef,
+      discount_approval_id: approvalId,
+      retry: true,
+    });
+  };
+
   const checkout = async (printAfterSave = false, confirmations = {}) => {
     if (saving && !confirmations.retry) return;
+    // The approval dialog is open (F4 pressed behind it): it finishes checkout itself.
+    if (discountApproval && !confirmations.discount_approval_id && !confirmations.discount_approval_not_needed) return;
     if (cart.length === 0) {
       alert("Add at least one product before checkout.");
       return;
@@ -24234,6 +24336,31 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return;
     }
 
+    // What this pass has already asked, so a checkout resumed after an approval asks none of it again.
+    const carriedConfirmations = {
+      ...confirmations,
+      ...dateConfirmations,
+      ...(dateOverrideReason ? { date_override_reason: dateOverrideReason } : {}),
+      below_cost_confirmed: belowCostConfirmed,
+      zero_rate_confirmed: zeroRateConfirmed,
+    };
+    // More than 5% off an item needs an Owner or Admin (local/discounts.js; the server keeps the
+    // same rule). Decided before anything is billed or sent. Offline, Local Only or no cloud:
+    // refused here with no request. Online: the approval dialog, and checkout resumes from it.
+    const discountApprovalId = String(confirmations.discount_approval_id || "").trim();
+    if (!discountApprovalId && confirmations.discount_approval_not_needed !== true && discountApprovalCheck.needed) {
+      const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
+      if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
+        setDiscountNotice(route.message);
+        return;
+      }
+      openDiscountApproval({ lines: discountApprovalCheck.lines, printAfterSave, confirmations: carriedConfirmations });
+      return;
+    }
+    // The bill's own reference: the approval (if any) was issued for it, and it is the sale's
+    // idempotency key (browser) or sync operation id (desktop).
+    const saleRef = String(confirmations.sale_ref || "").trim() || newSyncId("op");
+
     setSaving(true);
     try {
       if (isTauriRuntime()) {
@@ -24241,7 +24368,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           alert("Desktop local-first POS requires a selected stock lot for every item.");
           return;
         }
-        const localSale = buildLocalSalePayload({ payments, selectedBillDate, dateOverrideReason });
+        const localSale = buildLocalSalePayload({ payments, selectedBillDate, dateOverrideReason, operationId: saleRef, discountApprovalId });
         const result = await completeLocalPosSale(localSale);
         const invoice = {
           id: localSale.invoice_global_id,
@@ -24348,7 +24475,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         future_date_confirmed: confirmations.future_date_confirmed || dateConfirmations.future_date_confirmed || false,
         below_cost_confirmed: belowCostConfirmed,
         zero_rate_confirmed: zeroRateConfirmed,
-      });
+        ...(discountApprovalId ? { discount_approval_id: discountApprovalId } : {}),
+      }, saleRef);
       const response = await axios.post(`${API_URL}/api/v3/sales`, saleWrite.body, saleWrite.config);
       setCart([]);
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
@@ -24378,6 +24506,23 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       if (discountConflict) {
         setDiscountNotice(discountConflict.message);
         await Promise.resolve(onDiscountsStale?.()).catch(() => null);
+        return;
+      }
+      // The server wants an Owner or Admin's approval for the discount (none sent, or the one sent
+      // was used, expired or for another bill). Nothing was saved; ask for one, cart untouched.
+      const approvalRequired = readDiscountApprovalRequired(error.response?.status, responseData);
+      if (approvalRequired) {
+        const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
+        if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
+          setDiscountNotice(route.message);
+          return;
+        }
+        openDiscountApproval({
+          lines: cartDiscountApproval(cart, { exempt: false }).lines,
+          printAfterSave,
+          confirmations: carriedConfirmations,
+          notice: approvalRequired.message,
+        });
         return;
       }
       if (error.response?.status === 409) {
@@ -24642,7 +24787,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           ) : (
             <div className="table-wrap cart-table">
               <table>
-                <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount</th>}<th>Total</th><th /></tr></thead>
+                <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount{!discountExempt && <small className="cell-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}</small>}</th>}<th>Total</th><th /></tr></thead>
                 <tbody>
                   {cart.map((item) => (
                     <tr key={item.line_id}>
@@ -24669,7 +24814,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                         />
                       </td>
                       <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.line_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.line_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
-                      {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} /></td>}
+                      {printSettings.show_item_discount_column_pos !== false && (
+                        <td>
+                          <input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} />
+                          {discountApprovalCheck.lines.some((entry) => entry.lineId === item.line_id) && (
+                            <small className="cell-note stock-low pos-discount-over-note">Over 5%: needs Owner/Admin approval</small>
+                          )}
+                        </td>
+                      )}
                       <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
                       <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
                     </tr>
@@ -24922,7 +25074,64 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           </section>
         </div>
       )}
+      {discountApproval && (
+        <DiscountApprovalModal
+          draft={discountApproval}
+          onChange={(patch) => setDiscountApproval((current) => (current ? { ...current, ...patch } : current))}
+          onClose={closeDiscountApproval}
+          onConfirm={confirmDiscountApproval}
+        />
+      )}
     </section>
+  );
+}
+
+/**
+ * An Owner or Admin approves more than 5% off an item, on the counter, before the bill is saved.
+ * The same username and password fields as a cashier's cancel or edit. Closing it keeps the cart;
+ * a refused password says so in the server's words and keeps the dialog open.
+ */
+function DiscountApprovalModal({ draft, onChange, onClose, onConfirm }) {
+  const lines = Array.isArray(draft?.lines) ? draft.lines : [];
+  const missingCredentials = !String(draft?.approverUsername || "").trim() || !draft?.approverPassword;
+  return (
+    <div className="modal-backdrop">
+      <section aria-label="Discount approval" aria-modal="true" className="invoice-modal discount-approval-modal" role="dialog">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Discount approval</span>
+            <strong>A discount over 5% needs an Owner or Admin</strong>
+          </div>
+          <button aria-label="Close discount approval" className="remove-button" disabled={draft.saving} type="button" onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <form
+          className="sale-edit-body"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onConfirm();
+          }}
+        >
+          {draft.notice && <div className="warning-note">{draft.notice}</div>}
+          {lines.length > 0 && (
+            <ul className="discount-approval-lines">
+              {lines.map((line, index) => <li key={`${line.lineId ?? "line"}-${index}`}>{describeDiscountApprovalLine(line)}</li>)}
+            </ul>
+          )}
+          <SaleChangeApprovalFields
+            disabled={draft.saving}
+            form={draft}
+            onChange={onChange}
+            route={{ mode: SALE_CHANGE_APPROVAL_MODE.CLOUD }}
+          />
+          {draft.error && <div className="error-banner" role="alert">{draft.error}</div>}
+          <p className="form-note">The bill is saved only after approval. Close this to change the discount; the cart stays as it is.</p>
+          <div className="button-row">
+            <button className="primary-button" disabled={draft.saving || missingCredentials} type="submit">{draft.saving ? "Checking..." : "Approve and save bill"}</button>
+            <button className="secondary-button" disabled={draft.saving} type="button" onClick={onClose}>Change discount</button>
+          </div>
+        </form>
+      </section>
+    </div>
   );
 }
 

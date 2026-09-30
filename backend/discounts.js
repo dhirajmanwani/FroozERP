@@ -500,6 +500,128 @@ const verifyLotDiscountClaim = ({ claim, discounts, lotId, productId, day, prior
   return null;
 };
 
+/**
+ * The lot discount a recorded bill line names, if the lot really has (or had) one of that shape:
+ * the same id, type and value, on that lot and product, whatever its status today. Used only to
+ * tell a desktop bill's lot discount apart from a cashier's own discount when the bill syncs --
+ * a discount stopped between billing and sync was still the lot's discount when the customer got
+ * it. Unlike `verifyLotDiscountClaim` it grants nothing (no rate, no permission); it only decides
+ * how much of the line's discount is not the cashier's. Returns the row, or null.
+ */
+const lotDiscountOfRecord = ({ claim, discounts, lotId, productId }) => {
+  if (!claim || canonicalId(claim.id) === "" || !lotId) return null;
+  const type = String(claim.type || "").trim().toUpperCase();
+  const value = finiteOrNull(claim.value);
+  if (!LOT_DISCOUNT_TYPES.includes(type) || value === null) return null;
+  for (const row of Array.isArray(discounts) ? discounts : []) {
+    if (!row || !idsEqual(row.id, claim.id) || !idsEqual(row.inventory_batch_id, lotId)) continue;
+    if (productId !== undefined && productId !== null && !idsEqual(row.product_id, productId)) continue;
+    if (String(row.discount_type ?? "").toUpperCase() !== type) continue;
+    if (finiteOrNull(row.discount_value) === null || roundMoney(row.discount_value) !== roundMoney(value)) continue;
+    return row;
+  }
+  return null;
+};
+
+// ---------------------------------------------------------------------------------------------
+// A cashier's own item discount (owner's rule, 30 Sep 2026)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Up to this share of a line, a cashier may take off on their own. Above it, an Owner or Admin
+ * types their password on the counter first (`POST /api/v3/sale-change-approvals`, action
+ * "discount"). The same rule, to the paisa, is in `frontend/src/local/discounts.js`.
+ */
+const MANUAL_DISCOUNT_FREE_PERCENT = 5;
+/** Headroom on the free limit, in rupees: a paisa of rounding is not a discount. */
+const MANUAL_DISCOUNT_TOLERANCE = 0.01;
+/** Whoever holds this may already set any rate, so a discount needs no approval from them. */
+const MANUAL_DISCOUNT_EXEMPT_PERMISSION = "manual_pos_rate_override";
+const MANUAL_DISCOUNT_EXEMPT_ROLES = Object.freeze(["Owner", "Admin"]);
+
+/**
+ * How much of a line's discount the lot gave. SPECIAL_RATE gives nothing here -- its discount is
+ * the price itself, already in `rate`. PERCENTAGE and FIXED_AMOUNT give what they give at this
+ * rate and quantity (`expectedLotDiscount`). No lot discount, or one that cannot be priced, is 0.
+ */
+const lotDiscountPart = (lotDiscount, rate, quantity) => {
+  if (!lotDiscount) return 0;
+  if (String(lotDiscount.discount_type || "").trim().toUpperCase() === "SPECIAL_RATE") return 0;
+  const expected = expectedLotDiscount(lotDiscount, rate, quantity);
+  return expected ? expected.lineDiscount : 0;
+};
+
+/**
+ * One line against the 5% rule.
+ *
+ *   lotPart    = the line's lot discount (0 for none and for SPECIAL_RATE)
+ *   manualPart = max(0, round2(discount_amount - lotPart))           -- the cashier's own
+ *   base       = round2(round2(qty x rate) - lotPart)                 -- rate is the special price
+ *                                                                        on a SPECIAL_RATE line
+ *   freeLimit  = round2(base x 5 / 100)
+ *   needsApproval when manualPart > round2(freeLimit + 0.01)
+ *
+ * A line whose quantity or rate cannot be read is not waved through as "no discount": if it carries
+ * any discount at all it needs approval (`unreadable: true`).
+ */
+const manualDiscountLine = ({ quantity, rate, discountAmount, lotDiscount = null } = {}) => {
+  const qty = finiteOrNull(quantity);
+  const price = finiteOrNull(rate);
+  const discount = isBlank(discountAmount) ? 0 : finiteOrNull(discountAmount);
+  if (qty === null || price === null || discount === null) {
+    return { lotPart: 0, manualPart: discount ?? 0, base: null, freeLimit: 0, needsApproval: discount === null || discount > 0, unreadable: true };
+  }
+  const lotPart = lotDiscountPart(lotDiscount, price, qty);
+  const manualPart = Math.max(0, roundMoney(discount - lotPart));
+  const base = roundMoney(roundMoney(qty * price) - lotPart);
+  const freeLimit = Math.max(0, roundMoney((base * MANUAL_DISCOUNT_FREE_PERCENT) / 100));
+  const needsApproval = manualPart > roundMoney(freeLimit + MANUAL_DISCOUNT_TOLERANCE);
+  return { lotPart, manualPart, base, freeLimit, needsApproval, unreadable: false };
+};
+
+/**
+ * Every line of a bill against the 5% rule. The bill needs approval when any line does; a small
+ * discount on one line never lends headroom to another.
+ */
+const assessManualDiscounts = (lines) => {
+  const assessed = (Array.isArray(lines) ? lines : []).map((line) => ({ ...line, ...manualDiscountLine(line) }));
+  return {
+    needsApproval: assessed.some((line) => line.needsApproval),
+    lines: assessed,
+    manualDiscountTotal: roundMoney(assessed.reduce((sum, line) => sum + line.manualPart, 0)),
+  };
+};
+
+/**
+ * Who never needs approval for a discount: an Owner or Admin, or anyone whose role holds
+ * `manual_pos_rate_override` (they can already set any rate). `actor` is a database row
+ * (`role_name`, `permissions`), never a token claim. No actor is not exempt.
+ */
+const manualDiscountExempt = (actor) => {
+  if (!actor) return false;
+  const role = typeof actor.role_name === "string" ? actor.role_name.trim() : "";
+  if (MANUAL_DISCOUNT_EXEMPT_ROLES.includes(role)) return true;
+  const permissions = actor.permissions && typeof actor.permissions === "object" ? actor.permissions : {};
+  return permissions[MANUAL_DISCOUNT_EXEMPT_PERMISSION] === true;
+};
+
+/** The lines that broke the rule, as stored with the bill's audit row. Money at 2 dp. */
+const manualDiscountTrace = (assessment) => ({
+  free_percent: MANUAL_DISCOUNT_FREE_PERCENT,
+  manual_discount_total: assessment?.manualDiscountTotal ?? null,
+  lines: (assessment?.lines || []).filter((line) => line.needsApproval).map((line) => ({
+    product_id: line.productId ?? null,
+    inventory_batch_id: line.inventoryBatchId ?? null,
+    quantity: finiteOrNull(line.quantity),
+    rate: finiteOrNull(line.rate),
+    discount_amount: finiteOrNull(line.discountAmount),
+    lot_part: line.lotPart,
+    manual_part: line.manualPart,
+    free_limit: line.freeLimit,
+    unreadable: line.unreadable === true,
+  })),
+});
+
 const discountChangedRefusal = (productName) => ({
   status: 409,
   code: "DISCOUNT_CHANGED",
@@ -612,9 +734,19 @@ module.exports = {
   DISCOUNT_REPORT_SQL,
   LOT_DISCOUNT_STATUSES,
   LOT_DISCOUNT_TYPES,
+  MANUAL_DISCOUNT_EXEMPT_PERMISSION,
+  MANUAL_DISCOUNT_EXEMPT_ROLES,
+  MANUAL_DISCOUNT_FREE_PERCENT,
+  MANUAL_DISCOUNT_TOLERANCE,
   SLAB_PAYMENT_MODES,
   SLAB_TYPES,
   activeLotDiscount,
+  assessManualDiscounts,
+  lotDiscountOfRecord,
+  lotDiscountPart,
+  manualDiscountExempt,
+  manualDiscountLine,
+  manualDiscountTrace,
   billSlabAmount,
   boundBillDiscount,
   canonicalId,

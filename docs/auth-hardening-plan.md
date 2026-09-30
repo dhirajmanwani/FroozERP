@@ -1928,7 +1928,8 @@ place since A-3 where the server checks a password for someone who is **not** th
 so it is recorded here next to `/login`.
 
 - **`POST /api/v3/sale-change-approvals`** (through `v3WriteAdapter`). Body
-  `{action: "cancel"|"edit", sale_ref, approver_username, approver_password, reason}`.
+  `{action: "cancel"|"edit"|"discount", sale_ref, approver_username, approver_password, reason}`
+  (`"discount"` since 2026-09-30, below).
   The requester is `req.auth.userId` and nothing else, and must already hold the cancel or edit
   permission (`getSalePermissionUser`) — approval adds a second person, it does not grant the right.
   The approver is looked up by username (case-insensitive, as `/login` does) and must be an active
@@ -1983,3 +1984,64 @@ The rules are pure functions in `backend/saleChangeApproval.js`, tested in
 - **Sync binds the approval to the requester and the device.** An offline change pushed later under
   a different user's session, or from a different device, is refused. That is deliberate, and means
   a counter where cashiers swap sessions before the outbox drains will see those changes rejected.
+
+### Discount over 5% (2026-09-30)
+
+The owner's rule: a cashier may take up to 5% off an item on their own; above that an Owner or
+Admin types their password on the counter. It reuses the machinery above rather than adding a
+second password path. No schema change: `sale_change_approvals.action` is VARCHAR(20) and the
+trace uses `sale_audit_trail`'s existing columns.
+
+- **The rule** (`discounts.manualDiscountLine`, mirrored in `frontend/src/local/discounts.js`).
+  Per line, the lot's own discount is set aside (`lotPart`: what a ₹-off or %-off lot discount gives
+  at that rate and quantity; 0 for none and for SPECIAL_RATE, whose discount is the price itself).
+  `manualPart = max(0, round2(discount_amount - lotPart))`, `base = round2(round2(qty x rate) -
+  lotPart)` at the special price on a SPECIAL_RATE line, and the line needs approval when
+  `manualPart > round2(round2(base x 5 / 100) + 0.01)`. The bill needs approval if any line does;
+  lines do not lend each other headroom. A line whose numbers cannot be read and that carries any
+  discount needs approval -- it is never read as "no discount".
+- **Who is exempt**: Owner, Admin, or a role holding `manual_pos_rate_override` (who can already set
+  any rate). Always re-read from `users` / `role_permission_settings`, never the token's role claim.
+  Such a user asking for a discount approval gets 400 `APPROVAL_NOT_NEEDED`; an unknown or
+  inactive requester 403 `REQUESTER_NOT_ALLOWED`. The requester needs no bill-change permission --
+  the bill does not exist yet.
+- **The approval** is `POST /api/v3/sale-change-approvals` with `action: "discount"`, same
+  credential check, per-requester failure limits, audit rows and 7-day single use. `reason` is
+  optional for a discount (stored as "Item discount over 5%"). `sale_ref` is the new bill's
+  **operation id**: `operation_id` on the browser bill (the browser also sends it as
+  `idempotency_key` and `x-idempotency-key`, and `v3WriteAdapter` makes all three one value) and
+  `operation_id` in the desktop's queued sale payload, which the Rust outbox also uses as the sync
+  operation's id. The sync path also accepts the bill's `invoice_global_id` or
+  `offline_invoice_ref`. The POS must fix that id *before* asking, and send the bill under it.
+- **Browser checkout** (`createSaleHandler`) runs `authorizeManualDiscount` after every line is
+  priced and verified and before the bill is written. Needed and missing or not binding: ROLLBACK
+  and 403 `{code: "DISCOUNT_APPROVAL_REQUIRED", detail, message: "A discount over 5% needs an
+  Owner or Admin to approve it."}`, `detail` being the same binding codes as above
+  (`APPROVAL_MISSING`, `APPROVAL_WRONG_SALE`, `APPROVAL_WRONG_DEVICE`, ...). Valid: the approval
+  is locked `FOR UPDATE`, then consumed with `consumed_sale_id` once the bill has an id, and a
+  `sale_audit_trail` row `DISCOUNT_APPROVED` names the cashier (`edited_by`) and the approver
+  (`approved_by`), with the lines that needed it in `new_value`.
+- **Desktop sync** (`processPosSaleFoundationOperation`) **never refuses the bill for this** -- the
+  customer already has it. A valid `discount_approval_id` in the payload is consumed and recorded
+  as above. Missing or not binding: the bill is accepted and a `DISCOUNT_UNAPPROVED` audit row is
+  left, reason "Discount over 5% without approval", `approved_by` NULL, with the failed binding in
+  `new_value.detail`. A ₹/% lot discount on a synced line counts as the lot's when the lot has, or
+  had, a discount of that id, type and value (`lotDiscountOfRecord`) -- one stopped between billing
+  and sync still was the lot's. A lot discount the lot never had is the cashier's.
+- The bill-change reports read `EDIT`/`CANCEL` rows only, so the new rows do not appear as bill
+  changes there; `GET /sales/:id/audit` lists them.
+
+Tested in `discounts.test.js` (the rule, browser checkout, sync and the approval route, driven) and
+`saleChangeApproval.test.js` (bindings and wiring).
+
+Still open:
+
+- **The approval covers the bill, not an amount.** Once approved, the cashier could raise the
+  discount before completing the bill and the approval would still cover it. The approver is
+  standing at the counter with the cart on screen, and the `DISCOUNT_APPROVED` row keeps what was
+  actually given, so it is visible after the fact -- but binding the approved amount would need a
+  column, and this change adds none.
+- **Offline counters.** An approval needs the cloud. The POS refuses a >5% discount before billing
+  when it cannot reach it; a bill that still arrives without one is kept and traced, not refused.
+- A manual *bill-level* discount is out of scope: the POS has no field for it, and changing one on
+  an existing bill already needs sale-edit approval.

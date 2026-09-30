@@ -643,3 +643,205 @@ export const describeStartResult = (created, lotCount) => {
   const replacedText = replaced ? ` It replaced ${replaced === 1 ? "the discount" : `${replaced} discounts`} already on ${replaced === 1 ? "that lot" : "those lots"}.` : "";
   return `Discount started on ${lots}.${replacedText} Counters pick it up on their next sync.`;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Manual item discount: up to 5% without approval
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The owner's rule (30 Sep 2026): a cashier may give up to 5% off an item on their own; more than
+ * that needs an Owner or Admin to type their password at the counter. `backend/discounts.js`
+ * keeps the same rule, so the till never bills something the server refuses, and the other way
+ * round.
+ *
+ * Per line:
+ *   - lotPart: what the line's lot discount takes off (0 when it has none; 0 for SPECIAL_RATE,
+ *     because there the price itself is the special price),
+ *   - manualPart = max(0, round2(discount_amount - lotPart)),
+ *   - base = round2(qty x rate) - lotPart,
+ *   - the line needs approval when manualPart > round2(base x 5 / 100) + 0.01.
+ * A bill needs approval when any line does. Owner, Admin and anyone who may already set any rate
+ * (`manual_pos_rate_override`) never need it.
+ */
+export const MANUAL_DISCOUNT_FREE_PERCENT = 5;
+const MANUAL_DISCOUNT_TOLERANCE = 0.01;
+
+/** The approval action `POST /api/v3/sale-change-approvals` takes for a discount. */
+export const DISCOUNT_APPROVAL_ACTION = "discount";
+/** The server's 403 code when a bill's discount needs an approval it does not have. */
+export const DISCOUNT_APPROVAL_REQUIRED_CODE = "DISCOUNT_APPROVAL_REQUIRED";
+/** The note beside the item discount, for someone who is not exempt. */
+export const DISCOUNT_APPROVAL_NOTE = `Up to ${MANUAL_DISCOUNT_FREE_PERCENT}% without approval`;
+/** Said when approval is needed and cannot happen here (offline, Local Only, no cloud). */
+export const DISCOUNT_APPROVAL_OFFLINE_MESSAGE = "A discount over 5% needs an Owner or Admin's approval, which needs internet. Give up to 5%, or wait for the connection.";
+/** Said by the server (and here, when it gives no sentence) when the approval is missing. */
+export const DISCOUNT_APPROVAL_REQUIRED_MESSAGE = "A discount over 5% needs an Owner or Admin to approve it.";
+
+const EXEMPT_ROLES = Object.freeze(["Owner", "Admin"]);
+/**
+ * Never asked: Owner, Admin, or someone holding `manual_pos_rate_override`. Anything else is asked.
+ * The role is matched exactly (spaces trimmed), as the server's `manualDiscountExempt` does, so the
+ * till never waves through a bill the server would refuse.
+ */
+export const discountApprovalExempt = ({ role, canManualRateOverride = false } = {}) => (
+  EXEMPT_ROLES.includes(text(role)) || canManualRateOverride === true
+);
+
+/**
+ * What a cart line's lot discount takes off the line, 2 dp -- the backend's `expectedLotDiscount`
+ * on the line's rate. 0 when the line claims no lot discount, for SPECIAL_RATE, and when the rate,
+ * value or quantity is not usable.
+ */
+export const lineLotDiscountPart = (line) => {
+  const claimed = canonicalInventoryId(line?.lot_discount_id) !== "" || text(line?.lot_discount_type) !== "";
+  if (!claimed) return 0;
+  const type = text(line?.lot_discount_type).toUpperCase();
+  const rate = finiteOrNull(line?.selling_rate);
+  const value = finiteOrNull(line?.lot_discount_value);
+  const quantity = finiteOrNull(line?.quantity);
+  if (rate === null || rate <= 0 || value === null || value <= 0 || quantity === null || quantity <= 0) return 0;
+  let perUnit = 0;
+  if (type === "PERCENTAGE") perUnit = roundMoney((rate * value) / 100);
+  else if (type === "FIXED_AMOUNT") perUnit = roundMoney(Math.min(value, rate));
+  return roundMoney(perUnit * quantity);
+};
+
+/**
+ * One line against the 5% rule -- `manualDiscountLine` in backend/discounts.js, to the paisa.
+ * `percent` is the typed discount as a share of the line after its lot discount, or null when that
+ * is not above 0 (a percentage of nothing is not 0%).
+ *
+ * A blank discount is no discount. A line whose quantity, rate or discount cannot be read is not
+ * waved through: with any discount on it at all, it needs approval (`unreadable: true`).
+ */
+export const lineManualDiscount = (line) => {
+  const quantity = finiteOrNull(line?.quantity);
+  const rate = finiteOrNull(line?.selling_rate);
+  const discount = text(line?.discount_amount) === "" ? 0 : finiteOrNull(line?.discount_amount);
+  if (quantity === null || rate === null || discount === null) {
+    return {
+      lotPart: 0,
+      base: null,
+      manualPart: discount ?? 0,
+      freeLimit: 0,
+      percent: null,
+      needsApproval: discount === null || discount > 0,
+      unreadable: true,
+    };
+  }
+  const lotPart = lineLotDiscountPart(line);
+  const base = roundMoney(roundMoney(quantity * rate) - lotPart);
+  const manualPart = Math.max(0, roundMoney(discount - lotPart));
+  const freeLimit = Math.max(0, roundMoney((base * MANUAL_DISCOUNT_FREE_PERCENT) / 100));
+  return {
+    lotPart,
+    base,
+    manualPart,
+    freeLimit,
+    percent: base > 0 ? roundMoney((manualPart / base) * 100) : null,
+    needsApproval: manualPart > roundMoney(freeLimit + MANUAL_DISCOUNT_TOLERANCE),
+    unreadable: false,
+  };
+};
+
+/**
+ * Does this cart need an Owner or Admin's approval before it is billed? `lines` are the lines over
+ * the limit, in cart order, for the dialog and the stored reason. An exempt user is never asked.
+ */
+export const cartDiscountApproval = (cart, { exempt = false } = {}) => {
+  if (exempt === true) return { needed: false, lines: [] };
+  const lines = [];
+  for (const item of Array.isArray(cart) ? cart : []) {
+    const check = lineManualDiscount(item);
+    if (!check.needsApproval) continue;
+    lines.push({
+      lineId: item?.line_id ?? null,
+      productName: text(item?.product_name) || MISSING,
+      discount: check.manualPart,
+      base: check.base,
+      percent: check.percent,
+    });
+  }
+  return { needed: lines.length > 0, lines };
+};
+
+/** "Apple 12.5% (₹50 of ₹400)", or "Apple ₹50 off" when the line has no value to measure against. */
+export const describeDiscountApprovalLine = (line) => (line?.percent === null || line?.percent === undefined
+  ? `${text(line?.productName) || MISSING} ${formatRupees(line?.discount)} off`
+  : `${text(line?.productName) || MISSING} ${formatPercent(line.percent)} (${formatRupees(line.discount)} of ${formatRupees(line.base)})`);
+
+const REASON_LIMIT = 500;
+/** The reason the approval is stored with (the server takes at most 500 characters). */
+export const describeDiscountApprovalReason = (lines) => {
+  const parts = (Array.isArray(lines) ? lines : []).map(describeDiscountApprovalLine);
+  const reason = `Item discount over ${MANUAL_DISCOUNT_FREE_PERCENT}%: ${parts.join("; ") || MISSING}`;
+  return reason.length > REASON_LIMIT ? `${reason.slice(0, REASON_LIMIT - 1)}…` : reason;
+};
+
+export const DISCOUNT_APPROVAL_MODE = Object.freeze({ NONE: "NONE", CLOUD: "CLOUD", REFUSED: "REFUSED" });
+
+/**
+ * Which way a discount approval goes, decided before anything is billed or sent.
+ *
+ * `needsApproval` must be exactly `false` to skip, and `cloudGateAllowed` exactly `true` to reach
+ * the cloud. Offline or Local Only refuses whatever the gate says, so Local Only never makes the
+ * approval call. REFUSED means: do not bill, do not call, show `message`.
+ */
+export const resolveDiscountApprovalRoute = ({ needsApproval, offlineMode, localOnly, cloudGateAllowed } = {}) => {
+  if (needsApproval === false) return { mode: DISCOUNT_APPROVAL_MODE.NONE };
+  if (offlineMode || localOnly || cloudGateAllowed !== true) {
+    return { mode: DISCOUNT_APPROVAL_MODE.REFUSED, message: DISCOUNT_APPROVAL_OFFLINE_MESSAGE };
+  }
+  return { mode: DISCOUNT_APPROVAL_MODE.CLOUD };
+};
+
+/** A checkout refusal because the discount needs approval, or null for any other answer. */
+export const readDiscountApprovalRequired = (status, data) => {
+  if (Number(status) !== 403) return null;
+  if (text(data?.code).toUpperCase() !== DISCOUNT_APPROVAL_REQUIRED_CODE) return null;
+  return { message: text(data?.message) || DISCOUNT_APPROVAL_REQUIRED_MESSAGE };
+};
+
+const CART_KEPT = "The bill is not saved yet; the cart is still here.";
+
+/**
+ * Approval answers whose own sentence is shown. These are plain sentences the approval route
+ * writes for the counter (a wrong password says so in the server's words); anything else gets a
+ * fixed line, so a stray technical message never reaches the counter screen.
+ */
+const DISCOUNT_APPROVAL_SERVER_CODES = Object.freeze([
+  "APPROVER_CREDENTIALS_INVALID",
+  "APPROVER_NOT_ALLOWED",
+  "REQUESTER_NOT_ALLOWED",
+  "APPROVAL_ATTEMPTS_LOCKED",
+  "PASSWORD_RESET_REQUIRED",
+  "APPROVAL_REQUEST_INVALID",
+  "APPROVAL_NOT_NEEDED",
+  DISCOUNT_APPROVAL_REQUIRED_CODE,
+]);
+
+const DISCOUNT_APPROVAL_FALLBACKS = Object.freeze({
+  APPROVER_CREDENTIALS_INVALID: "The Owner or Admin username or password is wrong.",
+  APPROVER_NOT_ALLOWED: "That person cannot approve this. Only an active Owner or Admin can.",
+  REQUESTER_NOT_ALLOWED: "You are not allowed to ask for this approval.",
+  APPROVAL_ATTEMPTS_LOCKED: "Too many wrong approval attempts. Wait 15 minutes and try again.",
+  PASSWORD_RESET_REQUIRED: "The approver's password has to be reset before they can approve.",
+  [DISCOUNT_APPROVAL_REQUIRED_CODE]: DISCOUNT_APPROVAL_REQUIRED_MESSAGE,
+});
+
+/**
+ * One line for a failed discount approval, always ending with "the cart is still here". Known
+ * approval codes show the server's own sentence (its fallback when it sent none); a request that
+ * never reached the server says so; anything else is a generic line.
+ */
+export const describeDiscountApprovalError = (error) => {
+  const data = error && typeof error === "object" ? (error.response?.data || error.data || null) : null;
+  const code = text(data?.code || (error && typeof error === "object" ? error.code : "")).toUpperCase();
+  if (code && DISCOUNT_APPROVAL_SERVER_CODES.includes(code)) {
+    const sentence = text(data?.message) || DISCOUNT_APPROVAL_FALLBACKS[code] || "The approval was refused.";
+    return `${sentence} ${CART_KEPT}`;
+  }
+  const axiosLike = error && typeof error === "object" && ("isAxiosError" in error || "request" in error);
+  if (axiosLike && !error.response) return `The approval could not be checked because the server could not be reached. ${CART_KEPT}`;
+  return `The approval could not be completed. ${CART_KEPT}`;
+};
