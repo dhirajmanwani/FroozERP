@@ -6831,8 +6831,11 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                     change.payload.get("category").or_else(|| change.payload.get("category_name")).and_then(|v| v.as_str()),
                     change.payload.get("unit").and_then(|v| v.as_str()),
                     change.payload.get("barcode").and_then(|v| v.as_str()),
-                    change.payload.get("selling_rate").or_else(|| change.payload.get("sale_rate")).and_then(|v| v.as_f64()),
-                    change.payload.get("minimum_stock").and_then(|v| v.as_f64()),
+                    // node-postgres sends NUMERIC columns as text ("120.00"). `as_f64` reads text as
+                    // nothing, so every product change published as a raw row wrote a NULL rate
+                    // over the counter's real one. `json_number` reads both shapes.
+                    change.payload.get("selling_rate").or_else(|| change.payload.get("sale_rate")).and_then(json_number),
+                    change.payload.get("minimum_stock").and_then(json_number),
                     if change.payload.get("active").and_then(|v| v.as_bool()).unwrap_or(true) { 1 } else { 0 },
                     change.payload.get("remarks").and_then(|v| v.as_str()),
                     change.updated_at,
@@ -8281,6 +8284,55 @@ mod tests {
         assert_eq!(after["entity_version"], 5);
         drop(conn);
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_product_change_reads_a_rate_sent_as_numeric_text() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-pull-product-numeric-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize pull product database");
+        let change = PulledChange {
+            change_id: serde_json::Value::Null,
+            branch_id: Some(1),
+            entity_type: "product".to_string(),
+            entity_id: "product-numeric-1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-09-30T08:00:00.000Z".to_string()),
+            // Exactly as a raw Postgres row reaches the change log: NUMERIC as text.
+            payload: serde_json::json!({
+                "branch_id": 1,
+                "product_name": "Alphonso",
+                "unit": "KG",
+                "selling_rate": "120.00",
+                "minimum_stock": "5.000",
+                "active": true
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&change),
+            "cursor-numeric-1",
+            None,
+            Some("2026-09-30T08:00:01.000Z".to_string()),
+        )
+        .expect("apply pulled product");
+        let conn = Connection::open(&path).expect("open after product pull");
+        let (rate, minimum): (Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT sale_rate, minimum_stock FROM local_products WHERE id = 'product-numeric-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read pulled product");
+        assert_eq!(rate, Some(120.0), "a text rate must not become NULL");
+        assert_eq!(minimum, Some(5.0));
+        drop(conn);
         let _ = fs::remove_file(&path);
     }
 

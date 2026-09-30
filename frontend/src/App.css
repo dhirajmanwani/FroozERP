@@ -8949,3 +8949,30 @@ tbody tr:has(> .empty-cell):hover {
     page-break-inside: avoid;
   }
 }
+
+/* Sale Rate Update: search, category, origin and the target margin on one row, above one table. */
+.sale-rate-toolbar {
+  grid-template-columns: minmax(220px, 2fr) repeat(3, minmax(140px, 1fr));
+}
+
+/* Six columns that fit beside the menu at 1440px, so New rate is never scrolled out of sight:
+   the product cell and the headers wrap, the numbers do not. */
+.sale-rate-table th,
+.sale-rate-table td.primary-cell {
+  white-space: normal;
+}
+
+.sale-rate-table td.primary-cell {
+  min-width: 200px;
+}
+
+.sale-rate-table .table-input {
+  width: 96px;
+  text-align: right;
+}
+
+@media (max-width: 820px) {
+  .sale-rate-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

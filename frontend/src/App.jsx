@@ -101,6 +101,7 @@ import { resolveShellStatus } from "./local/shellStatus";
 import { plainServerMessage } from "./local/plainServerMessage";
 import { describeReport } from "./local/reportDescriptions";
 import { labelFor, toneFor } from "./local/displayLabels";
+import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, describeSaveResult, filterSaleRateRows, marginOnCost, parseTargetMargin, rateTone, resolveSaleRateAvailability, suggestedDrafts } from "./local/saleRateUpdate";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
@@ -2389,6 +2390,9 @@ function App() {
   const [saleRates, setSaleRates] = useState([]);
   const [saleRateHistory, setSaleRateHistory] = useState([]);
   const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
+  // Whether the rate list on screen is real. An empty list and a list that failed to load are
+  // different facts; the Sale Rate Update screen says which one it is holding.
+  const [saleRatesLoad, setSaleRatesLoad] = useState({ status: "idle", message: "", historyMessage: "" });
   const [suppliers, setSuppliers] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [purchases, setPurchases] = useState([]);
@@ -4485,7 +4489,7 @@ function App() {
     setProductDuplicateWarning(bundle.productDuplicateWarning || "");
     setSaleRates(bundle.saleRates || []);
     setSaleRateHistory(bundle.saleRateHistory || []);
-    setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
+    setSaleDesiredMargin(String(parseTargetMargin(nextSaleRateSettings.desired_margin_percent, 25)));
   };
 
   const applyReferenceSnapshot = async (snapshot, { offline = false, localOnly = false, nextView = null } = {}) => {
@@ -5507,7 +5511,7 @@ function App() {
     });
     setDiscountRules((data.discountRules || []).filter((rule) => rule.active !== false));
     setChargeTypes(readChargeTypes(data));
-    setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
+    setSaleDesiredMargin(String(parseTargetMargin(nextSaleRateSettings.desired_margin_percent, 25)));
   };
 
   const loadDiscountRules = async () => {
@@ -6402,13 +6406,27 @@ function App() {
     }
   };
 
+  // Never throws: a failure is held in `saleRatesLoad` and shown on the screen itself, not only in
+  // the global sync line, so a failed load cannot pass for "no products". The history is separate
+  // so that a history hiccup does not stop the morning rate update.
   const loadSaleRates = async (desiredMargin = saleDesiredMargin) => {
-    const [ratesResponse, historyResponse] = await Promise.all([
+    setSaleRatesLoad((current) => ({ ...current, status: "loading", message: "" }));
+    const [ratesResult, historyResult] = await Promise.allSettled([
       axios.get(`${API_URL}/sale-rates`, { params: { user_id: user.id, desired_margin: desiredMargin } }),
       axios.get(`${API_URL}/sale-rate-history`, { params: { user_id: user.id } }),
     ]);
-    setSaleRates(ratesResponse.data);
-    setSaleRateHistory(historyResponse.data);
+    const historyMessage = historyResult.status === "fulfilled"
+      ? ""
+      : `Recent changes could not be loaded (${getErrorMessage(historyResult.reason, "no answer from the server")}).`;
+    if (historyResult.status === "fulfilled") setSaleRateHistory(Array.isArray(historyResult.value.data) ? historyResult.value.data : []);
+    if (ratesResult.status !== "fulfilled" || !Array.isArray(ratesResult.value.data)) {
+      const reason = ratesResult.status === "fulfilled" ? "the server sent something that is not a rate list" : getErrorMessage(ratesResult.reason, "no answer from the server");
+      setSaleRatesLoad({ status: "failed", message: `Sale rates could not be loaded (${reason}). Nothing on this screen is current.`, historyMessage });
+      return false;
+    }
+    setSaleRates(ratesResult.value.data);
+    setSaleRatesLoad({ status: "ready", message: "", historyMessage });
+    return true;
   };
 
   const loadSupplierData = async (search = "") => {
@@ -8840,7 +8858,8 @@ function App() {
       // Branches & Counters shows the device list the licences are issued against and the screen
       // lock, both of which come from the settings bundle.
       if (view === "settings" || view === "branches") await loadSettingsData();
-      if (view === "sale-rates") await loadSaleRates();
+      // Sale Rate Update loads itself when it opens (and when it is reached by Back/Forward, which
+      // does not come through here), so it is not loaded twice.
     } catch (error) {
       console.warn(`Unable to refresh ${view}`, error);
       setSyncMessage(getErrorMessage(error, `${navigationItems.find(([itemView]) => itemView === view)?.[1] || "Module"} data could not be refreshed.`));
@@ -10487,12 +10506,31 @@ function App() {
             <>
               <SaleRateManager
                 history={saleRateHistory}
-                onReload={async () => { await Promise.all([loadProducts(), loadSaleRates()]); }}
-                onRefresh={loadSaleRates}
+                loadState={saleRatesLoad}
+                onLoad={loadSaleRates}
+                onSaved={async () => {
+                  // POS prices a lot from `inventory`, not from this list, so it is refreshed too:
+                  // in a browser from the server, on the desktop by pulling the change into SQLite
+                  // (which Local Only refuses inside runSyncNow). Not awaited -- the list below is
+                  // what the owner is looking at.
+                  if (isTauriRuntime()) {
+                    runSyncNow({ force: true }).catch(() => null);
+                  } else {
+                    axios.get(`${API_URL}/inventory`)
+                      .then((response) => setInventory((current) => preserveVerifiedLocalCollection(response.data, current)))
+                      .catch(() => null);
+                  }
+                  loadProducts().catch(() => null);
+                  return loadSaleRates();
+                }}
                 rates={saleRates}
                 desiredMargin={saleDesiredMargin}
+                saleRateSettings={settingsData.saleRateSettings}
                 setDesiredMargin={setSaleDesiredMargin}
-                user={user}
+                unavailableReason={resolveSaleRateAvailability({
+                  localOnly: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
+                  offline: offlineMode,
+                })}
               />
               {/* Right after the rates are set is when the website's copy of them is
                   wrong, so the export lives here rather than somewhere it has to be
@@ -20092,9 +20130,10 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
     }
   };
   return (
-    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="Default margin and rounding controls used by owner-approved rate updates.">
+    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="How Sale Rate Update suggests a rate from each lot's cost. A suggestion is only filled in when you choose it.">
+      <p className="form-note">The margin is on cost: a ₹100 cost at 25% suggests ₹125. Sale Rate Update starts at this margin; changing it on that screen does not change this setting.</p>
       <div className="form-grid settings-add-grid">
-        <Field label="Desired Margin %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent || ""} onChange={(event) => setDraft({ ...draft, desired_margin_percent: event.target.value })} /></Field>
+        <Field label="Target margin on cost %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent ?? ""} onChange={(event) => setDraft({ ...draft, desired_margin_percent: event.target.value })} /></Field>
         <Field label="Rounding Rule">
           <select disabled={!canManage} value={draft.rounding_rule || "NEAREST_RUPEE"} onChange={(event) => setDraft({ ...draft, rounding_rule: event.target.value })}>
             {roundingRules.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -20107,7 +20146,7 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
             <option value="MANUAL">Manual Lot Selection</option>
           </select>
         </Field>
-        <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, suggestion_enabled: event.target.checked })} /><span>Suggestions Active</span></label>
+        <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, suggestion_enabled: event.target.checked })} /><span>Show suggested rates</span></label>
         <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Sale Rate Settings</button>
@@ -22551,177 +22590,288 @@ function SystemInfoSection({ systemInfo }) {
   );
 }
 
-function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, setDesiredMargin, user }) {
+function SaleRateManager({ desiredMargin, history, loadState = {}, onLoad, onSaved, rates, saleRateSettings = {}, setDesiredMargin, unavailableReason = null }) {
   const [search, setSearch] = useState("");
   const [origin, setOrigin] = useState("");
   const [category, setCategory] = useState("");
-  const [draftRates, setDraftRates] = useState({});
-  const [selectedSuggested, setSelectedSuggested] = useState({});
-  const [confirmUpdates, setConfirmUpdates] = useState(null);
-  const categories = [...new Set(rates.map((rate) => rate.category).filter(Boolean))];
-  const filteredRates = rates.filter((rate) =>
-    rate.product_name.toLowerCase().includes(search.toLowerCase()) &&
-    (!origin || rate.origin_type === origin) &&
-    (!category || rate.category === category)
-  );
+  // Row key -> what is typed in that row's box. Only boxes with something in them are here.
+  const [drafts, setDrafts] = useState({});
+  const [confirmChanges, setConfirmChanges] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saveNotice, setSaveNotice] = useState(null);
 
-  const buildRateUpdates = () => Object.entries(draftRates)
-    .map(([rowId, value]) => {
-      const rate = rates.find((item) => String(item.id) === String(rowId));
-      return rate ? {
-        product_id: Number(rate.product_id || rate.id),
-        inventory_batch_id: rate.inventory_batch_id || null,
-        product_name: rate.product_name,
-        lot_name: rate.lot_name,
-        lot_size: rate.lot_size,
-        old_rate: Number(rate.selling_rate || 0),
-        new_selling_rate: Number(value),
-      } : null;
-    })
-    .filter(Boolean);
+  // Loaded here rather than by the menu, so the list is fetched however the screen was reached
+  // (menu, shortcut, command palette or Back/Forward). Never in Local Only or offline.
+  useEffect(() => {
+    if (unavailableReason || typeof onLoad !== "function") return;
+    onLoad();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unavailableReason]);
 
-  const requestSaveRates = () => {
-    const updates = buildRateUpdates();
-    if (updates.length === 0) {
-      alert("Select at least one product rate to update.");
-      return;
-    }
-    const invalid = updates.find((update) => !Number.isFinite(update.new_selling_rate) || update.new_selling_rate <= 0);
-    if (invalid) {
-      alert("New Rate must be greater than 0 for every selected product.");
-      return;
-    }
-    setConfirmUpdates(updates);
-  };
+  const targetMargin = parseTargetMargin(desiredMargin, saleRateSettings.desired_margin_percent);
+  const suggestionsEnabled = saleRateSettings.suggestion_enabled !== false;
+  const rows = useMemo(() => buildSaleRateRows(rates, {
+    targetMargin,
+    roundingRule: saleRateSettings.rounding_rule,
+    suggestionsEnabled,
+  }), [rates, targetMargin, saleRateSettings.rounding_rule, suggestionsEnabled]);
+  const categories = [...new Set(rows.map((row) => row.category).filter(Boolean))].sort();
+  const visibleRows = filterSaleRateRows(rows, { search, category, origin });
+  const { changes, invalid, hiddenCount } = collectSaleRateChanges(rows, drafts, visibleRows);
+  const invalidKeys = new Set(invalid);
+  const status = loadState.status || "idle";
+  const failed = status === "failed";
+  const firstLoad = (status === "idle" || status === "loading") && rows.length === 0;
 
-  const saveRates = async () => {
-    const updates = confirmUpdates || buildRateUpdates();
-    const invalid = updates.find((update) => !Number.isFinite(update.new_selling_rate) || update.new_selling_rate <= 0);
-    if (updates.length === 0 || invalid) {
-      alert("Select valid rates before saving.");
-      return;
-    }
-    const payloadUpdates = updates.map((update) => ({
-      product_id: update.product_id,
-      inventory_batch_id: update.inventory_batch_id || null,
-      new_selling_rate: update.new_selling_rate,
-    }));
-    try {
-      await axios.post(`${API_URL}/sale-rates/bulk`, { updates: payloadUpdates, changed_by: user.id });
-      setDraftRates({});
-      setSelectedSuggested({});
-      setConfirmUpdates(null);
-      await onReload();
-      alert(`${updates.length} selling rate${updates.length === 1 ? "" : "s"} updated successfully.`);
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update selling rates"));
-    }
-  };
-
-  const toggleSuggestedRate = (rate, checked) => {
-    setSelectedSuggested((current) => ({ ...current, [rate.id]: checked }));
-    setDraftRates((current) => {
+  const setDraft = (key, value) => {
+    setSaveNotice(null);
+    setDrafts((current) => {
       const next = { ...current };
-      if (checked) next[rate.id] = Number(rate.suggested_selling_rate || 0);
-      else delete next[rate.id];
+      if (String(value ?? "").trim() === "") delete next[key];
+      else next[key] = value;
       return next;
     });
   };
 
-  const selectVisibleSuggestedRates = () => {
-    const selected = {};
-    const drafts = {};
-    for (const rate of filteredRates) {
-      selected[rate.id] = true;
-      drafts[rate.id] = Number(rate.suggested_selling_rate || 0);
-    }
-    setSelectedSuggested((current) => ({ ...current, ...selected }));
-    setDraftRates((current) => ({ ...current, ...drafts }));
+  const fillSuggested = () => {
+    setSaveNotice(null);
+    setDrafts((current) => ({ ...current, ...suggestedDrafts(visibleRows) }));
   };
 
-  const allVisibleSelected = filteredRates.length > 0 && filteredRates.every((rate) => Boolean(selectedSuggested[rate.id]));
-  const toggleAllVisible = (checked) => {
-    if (checked) {
-      selectVisibleSuggestedRates();
+  const requestSave = () => {
+    setSaveError("");
+    if (invalid.length) {
+      setSaveError(`${invalid.length} new rate${invalid.length === 1 ? " is" : "s are"} not a price above zero. Correct or clear ${invalid.length === 1 ? "it" : "them"} first.`);
       return;
     }
-    const visibleIds = new Set(filteredRates.map((rate) => String(rate.id)));
-    setSelectedSuggested((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !visibleIds.has(String(id)))));
-    setDraftRates((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !visibleIds.has(String(id)))));
+    if (changes.length) setConfirmChanges(changes);
+  };
+
+  const save = async () => {
+    const pending = confirmChanges || [];
+    if (!pending.length || saving) return;
+    setSaving(true);
+    setSaveError("");
+    let response;
+    try {
+      // No identity in the body: the server records who changed the rate from the signed session.
+      response = await axios.post(`${API_URL}/sale-rates/bulk`, { updates: buildBulkRatePayload(pending) });
+    } catch (error) {
+      // Nothing was saved (the server applies all or none), so the typed rates stay for a retry.
+      setSaveError(getErrorMessage(error, "The rates could not be saved. Nothing was changed."));
+      setSaving(false);
+      setConfirmChanges(null);
+      return;
+    }
+    // Saved. Anything that goes wrong from here is about refreshing the screen, never "not saved".
+    setDrafts({});
+    setConfirmChanges(null);
+    setSaving(false);
+    const saved = describeSaveResult(response?.data, pending.length);
+    const reloaded = await Promise.resolve(onSaved?.()).catch(() => false);
+    setSaveNotice(reloaded === false
+      ? { tone: "warning", text: `${saved} The list could not be refreshed, so it may still show the old rates. Open this screen again to check.` }
+      : { tone: "success", text: `${saved} Each counter's POS picks them up at its next sync, usually within a minute.` });
+  };
+
+  const rateCell = (rate, cost, suggestedRate) => {
+    if (rate === null) return MISSING_VALUE;
+    const margin = marginOnCost(rate, cost);
+    const tone = rateTone({ rate, cost, suggestedRate, targetMargin });
+    return margin === null
+      ? <span title="No purchase cost to compare with">{MISSING_VALUE}</span>
+      : <span className={STATUS_TONE_CLASS[tone] || "tag"}>{`${margin.toFixed(1)}%`}</span>;
   };
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Owner Controls" title="Daily Sale Rate Update" subtitle="Review landed costs, suggested rates, and approve daily selling-rate changes. Suggestions never auto-apply.">
-        <div className="rate-toolbar">
-          <input placeholder="Search products" value={search} onChange={(event) => setSearch(event.target.value)} />
-          <select value={origin} onChange={(event) => setOrigin(event.target.value)}><option value="">All Origins</option><option value="LOCAL">Local</option><option value="IMPORTED">Imported</option></select>
-          <select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">All Categories</option>{categories.map((item) => <option key={item}>{item}</option>)}</select>
-          <input min="0" placeholder="Desired margin %" step="0.1" type="number" value={desiredMargin} onChange={(event) => setDesiredMargin(event.target.value)} />
-          <button className="secondary-button" onClick={() => onRefresh(desiredMargin)}>Refresh Suggestions</button>
-          <button className="secondary-button" onClick={selectVisibleSuggestedRates}>Select Visible Suggestions</button>
-          <button className="primary-button" onClick={requestSaveRates}>Save Rates</button>
-        </div>
-        <DataTable headers={[
-          <label className="table-check-label"><input checked={allVisibleSelected} type="checkbox" onChange={(event) => toggleAllVisible(event.target.checked)} /> Select All Suggested Rates</label>,
-          "Product", "Lot", "Size", "Origin", "Current Lot Sale Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Pending Bill Stock", "Margin %", "Updated", "Updated By",
-        ]}>
-          {filteredRates.map((rate) => {
-            const sellingRate = Number(draftRates[rate.id] || rate.selling_rate);
-            const cost = Number(rate.latest_effective_cost || 0);
-            const margin = sellingRate > 0 ? ((sellingRate - cost) / sellingRate) * 100 : 0;
-            return (
-              <tr key={rate.id}>
-                <td><input checked={Boolean(selectedSuggested[rate.id])} type="checkbox" onChange={(event) => toggleSuggestedRate(rate, event.target.checked)} /></td>
-                <td className="primary-cell">{rate.product_name}<small className="cell-note">{rate.category}</small></td>
-                <td>{rate.lot_name || (rate.inventory_batch_id ? `Lot #${rate.inventory_batch_id}` : "Product default")}</td>
-                <td>{rate.lot_size || "-"}</td>
-                <td><span className="tag">{labelFor("origin", rate.origin_type)}</span></td>
-                <td>{currency.format(Number(rate.selling_rate))}</td>
-                <td className="profit-cell">{currency.format(Number(rate.suggested_selling_rate))}</td>
-                <td><input className="table-input" min="0" step="0.01" type="number" value={draftRates[rate.id] || ""} onChange={(event) => setDraftRates({ ...draftRates, [rate.id]: event.target.value })} /></td>
-                <td>{currency.format(cost)}</td>
-                <td>{rate.current_stock}</td>
-                <td>{Number(rate.pending_bill_stock || 0) > 0 ? <span className="stock-low">{rate.pending_bill_stock} - provisional profit</span> : "-"}</td>
-                <td><span className={margin < 15 ? "stock-low" : "stock-ok"}>{margin.toFixed(1)}%</span></td>
-                <td>{rate.selling_rate_updated_at ? new Date(rate.selling_rate_updated_at).toLocaleDateString("en-IN") : "-"}</td>
-                <td>{rate.updated_by_name || "-"}</td>
+      <ModuleCard
+        eyebrow="Owner and Admin"
+        title="Today's selling rates"
+        subtitle="Type a new rate for anything you are re-pricing, then save once. Rows with nothing typed keep their rate."
+      >
+        {unavailableReason ? (
+          <div className="warning-note" role="status">{unavailableReason}</div>
+        ) : (
+          <>
+            <div className="pm-toolbar sale-rate-toolbar">
+              <label className="pm-toolbar-search">
+                <span>Search</span>
+                <span className="icon-input">
+                  <Icon name="search" />
+                  <input placeholder="Product or lot" type="search" value={search} onChange={(event) => setSearch(event.target.value)} />
+                </span>
+              </label>
+              <Field label="Category">
+                <select value={category} onChange={(event) => setCategory(event.target.value)}>
+                  <option value="">All categories</option>
+                  {categories.map((item) => <option key={item} value={item}>{item}</option>)}
+                </select>
+              </Field>
+              <Field label="Origin">
+                <select value={origin} onChange={(event) => setOrigin(event.target.value)}>
+                  <option value="">Local and imported</option>
+                  <option value="LOCAL">{labelFor("origin", "LOCAL")}</option>
+                  <option value="IMPORTED">{labelFor("origin", "IMPORTED")}</option>
+                </select>
+              </Field>
+              {suggestionsEnabled && (
+                <Field label="Target margin on cost %">
+                  <input min="0" step="0.1" type="number" value={desiredMargin} onChange={(event) => setDesiredMargin(event.target.value)} />
+                </Field>
+              )}
+            </div>
+            <div className="pm-list-meta">
+              <span>
+                {failed ? "" : `Showing ${visibleRows.length} of ${rows.length}`}
+                {changes.length > 0 && ` · ${changes.length} new rate${changes.length === 1 ? "" : "s"} to save`}
+                {hiddenCount > 0 && ` (${hiddenCount} not shown by the filter)`}
+              </span>
+              <div className="pm-toolbar-actions">
+                {Object.keys(drafts).length > 0 && (
+                  <button className="secondary-button" type="button" onClick={() => { setDrafts({}); setSaveError(""); }}>Clear typed rates</button>
+                )}
+                {suggestionsEnabled && (
+                  <button className="secondary-button" disabled={failed || visibleRows.every((row) => row.suggestedRate === null)} type="button" onClick={fillSuggested}>Use suggested rates</button>
+                )}
+                <button className="primary-button" disabled={saving || failed || changes.length === 0} type="button" onClick={requestSave}>
+                  {changes.length > 0 ? `Save ${changes.length} rate${changes.length === 1 ? "" : "s"}` : "Save rates"}
+                </button>
+              </div>
+            </div>
+            {failed && (
+              <div className="error-banner" role="alert">
+                {loadState.message}{" "}
+                <button className="secondary-button compact-button" type="button" onClick={() => onLoad?.()}>Try again</button>
+              </div>
+            )}
+            {saveError && <div className="error-banner" role="alert">{saveError}</div>}
+            {saveNotice && <p className={saveNotice.tone === "success" ? "form-note" : "warning-note"} role="status">{saveNotice.text}</p>}
+            {!failed && (
+              <DataTable
+                className="pm-table sale-rate-table"
+                headers={[
+                  "Product",
+                  <span className="pm-num-head" key="cost">Cost</span>,
+                  <span className="pm-num-head" key="current">Current rate</span>,
+                  <span className="pm-num-head" key="margin" title="(rate − cost) ÷ cost">Margin on cost</span>,
+                  ...(suggestionsEnabled ? [<span className="pm-num-head" key="suggested">{`Suggested (${targetMargin}%)`}</span>] : []),
+                  <span className="pm-num-head" key="new">New rate</span>,
+                ]}
+              >
+                {firstLoad && <tr><td className="empty-cell" colSpan={suggestionsEnabled ? 6 : 5}>Loading today's rates…</td></tr>}
+                {!firstLoad && rows.length === 0 && <tr><td className="empty-cell" colSpan={suggestionsEnabled ? 6 : 5}>No active products yet. Add products in Product Master.</td></tr>}
+                {!firstLoad && rows.length > 0 && visibleRows.length === 0 && <tr><td className="empty-cell" colSpan={suggestionsEnabled ? 6 : 5}>Nothing matches the search or filters.</td></tr>}
+                {visibleRows.map((row) => {
+                  const draft = drafts[row.key] ?? "";
+                  const invalidDraft = invalidKeys.has(row.key);
+                  const change = changes.find((item) => item.key === row.key);
+                  const stockNote = row.isLot && row.stock !== null
+                    ? `${formatOptionalQuantity(row.stock)}${row.unit ? ` ${row.unit.toLowerCase()}` : ""} in stock`
+                    : "";
+                  return (
+                    <tr key={row.key}>
+                      <td className="primary-cell">
+                        {row.productName}
+                        <small className="cell-note">{[row.lotLabel, stockNote, row.origin ? labelFor("origin", row.origin) : ""].filter(Boolean).join(" · ")}</small>
+                      </td>
+                      <td className="pm-num">
+                        {formatOptionalMoney(row.cost, currency)}
+                        {row.costIsEstimate && <small className="cell-note">Bill pending · estimate</small>}
+                      </td>
+                      <td className="pm-num">{formatOptionalMoney(row.currentRate, currency)}</td>
+                      <td className="pm-num">
+                        {rateCell(change ? change.newRate : row.currentRate, row.cost, row.suggestedRate)}
+                        {change && <small className="cell-note">at new rate</small>}
+                      </td>
+                      {suggestionsEnabled && (
+                        <td className="pm-num">
+                          {row.suggestedRate === null
+                            ? <span title="No purchase cost to work from">{MISSING_VALUE}</span>
+                            : (
+                              <button
+                                className="table-action"
+                                title="Put this in New rate"
+                                type="button"
+                                onClick={() => setDraft(row.key, String(row.suggestedRate))}
+                              >
+                                {currency.format(row.suggestedRate)}
+                              </button>
+                            )}
+                        </td>
+                      )}
+                      <td className="pm-num">
+                        <input
+                          aria-invalid={invalidDraft || undefined}
+                          aria-label={`New rate for ${row.productName} ${row.lotLabel}`}
+                          className="table-input"
+                          min="0"
+                          step="0.01"
+                          type="number"
+                          value={draft}
+                          onChange={(event) => setDraft(row.key, event.target.value)}
+                        />
+                        {invalidDraft && <small className="cell-note stock-low">Enter a price above 0</small>}
+                        {change?.belowCost && <small className="cell-note stock-low">Below cost</small>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </DataTable>
+            )}
+          </>
+        )}
+      </ModuleCard>
+      {!unavailableReason && (
+        <ModuleCard eyebrow="History" title="Recent rate changes" subtitle="The last 100 changes, newest first, from every screen that sets a sale rate.">
+          {loadState.historyMessage && <div className="error-banner" role="alert">{loadState.historyMessage}</div>}
+          <DataTable className="pm-table" headers={["When", "Product", <span className="pm-num-head" key="old">Old rate</span>, <span className="pm-num-head" key="new">New rate</span>, "Changed by", "Note"]}>
+            {history.length === 0 && !loadState.historyMessage && <tr><td className="empty-cell" colSpan={6}>No rate changes yet.</td></tr>}
+            {history.map((item) => (
+              <tr key={item.id}>
+                <td>{item.changed_at ? new Date(item.changed_at).toLocaleString("en-IN") : MISSING_VALUE}</td>
+                <td className="primary-cell">{item.product_name || MISSING_VALUE}</td>
+                <td className="pm-num">{formatOptionalMoney(item.old_selling_rate, currency)}</td>
+                <td className="pm-num">{formatOptionalMoney(item.new_selling_rate, currency)}</td>
+                <td>{item.changed_by_name || MISSING_VALUE}</td>
+                <td>{item.reason || MISSING_VALUE}</td>
               </tr>
-            );
-          })}
-        </DataTable>
-      </ModuleCard>
-      <ModuleCard eyebrow="Audit Trail" title="Sale Rate History" subtitle="Every approved selling-rate change is stored for reporting and accountability.">
-        <DataTable headers={["Changed At", "Product", "Old Rate", "New Rate", "Changed By", "Reason"]}>
-          {history.map((item) => <tr key={item.id}><td>{new Date(item.changed_at).toLocaleString("en-IN")}</td><td className="primary-cell">{item.product_name}</td><td>{currency.format(Number(item.old_selling_rate))}</td><td className="profit-cell">{currency.format(Number(item.new_selling_rate))}</td><td>{item.changed_by_name}</td><td>{item.reason || "-"}</td></tr>)}
-        </DataTable>
-      </ModuleCard>
-      {confirmUpdates && (
+            ))}
+          </DataTable>
+        </ModuleCard>
+      )}
+      {confirmChanges && (
         <div className="modal-backdrop">
-          <section className="invoice-modal change-history-modal">
+          <section aria-labelledby="sale-rate-confirm-title" aria-modal="true" className="invoice-modal change-history-modal" role="dialog">
             <div className="invoice-toolbar">
               <div>
-                <span className="eyebrow">Confirm Sale Rate Update</span>
-                <strong>Are you sure you want to update selected sale rates?</strong>
+                <span className="eyebrow">Check before saving</span>
+                <strong id="sale-rate-confirm-title">{`Save ${confirmChanges.length} new rate${confirmChanges.length === 1 ? "" : "s"}?`}</strong>
               </div>
-              <button aria-label="Close confirmation" className="remove-button" onClick={() => setConfirmUpdates(null)}><Icon name="close" /></button>
+              <button aria-label="Close" className="remove-button" disabled={saving} onClick={() => setConfirmChanges(null)}><Icon name="close" /></button>
             </div>
             <div className="sale-edit-body">
-              <div className="purchase-summary-grid supplier-payment-preview">
-                <SummaryMetric label="Selected Products" value={confirmUpdates.length} featured />
-              </div>
-              <DataTable headers={["Product", "Old Rate", "New Rate"]}>
-                {confirmUpdates.map((update) => (
-                  <tr key={update.product_id}>
-                    <td className="primary-cell">{update.product_name}<small className="cell-note">{[update.lot_name, update.lot_size].filter(Boolean).join(" / ") || "Product default"}</small></td>
-                    <td>{currency.format(update.old_rate)}</td>
-                    <td className="profit-cell">{currency.format(update.new_selling_rate)}</td>
+              <p className="form-note">POS sells at these rates from the next bill on every counter.</p>
+              {confirmChanges.some((change) => change.belowCost) && (
+                <div className="warning-note">
+                  {confirmChanges.filter((change) => change.belowCost).length === 1
+                    ? "One of these is below its purchase cost."
+                    : `${confirmChanges.filter((change) => change.belowCost).length} of these are below their purchase cost.`}
+                </div>
+              )}
+              <DataTable className="pm-table" headers={["Product", <span className="pm-num-head" key="old">Now</span>, <span className="pm-num-head" key="new">New</span>]}>
+                {confirmChanges.map((change) => (
+                  <tr key={change.key}>
+                    <td className="primary-cell">{change.productName}<small className="cell-note">{change.lotLabel}</small></td>
+                    <td className="pm-num">{formatOptionalMoney(change.oldRate, currency)}</td>
+                    <td className={change.belowCost ? "pm-num stock-low" : "pm-num"}>{currency.format(change.newRate)}</td>
                   </tr>
                 ))}
               </DataTable>
               <div className="button-row">
-                <button className="primary-button" onClick={saveRates}>Confirm Save Rates</button>
-                <button className="secondary-button" onClick={() => setConfirmUpdates(null)}>Cancel</button>
+                <button className="primary-button" disabled={saving} onClick={save}>{saving ? "Saving…" : "Save"}</button>
+                <button className="secondary-button" disabled={saving} onClick={() => setConfirmChanges(null)}>Go back</button>
               </div>
             </div>
           </section>

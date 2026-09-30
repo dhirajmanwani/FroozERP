@@ -73,6 +73,15 @@ const { normaliseLicenceRequest } = require("./activationLicenceRequest");
 const { validateProductPhoto } = require("./productPhoto");
 const saleChangeApproval = require("./saleChangeApproval");
 const {
+  effectiveLotRate,
+  normalizeRateUpdate,
+  productRateSyncPayload,
+  resolveDesiredMargin,
+  resolveRoundingRule,
+  sameRate,
+  suggestSellingRate,
+} = require("./saleRateUpdate");
+const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
   lockReferenceBootstrapBoundary,
@@ -1233,21 +1242,6 @@ const upgradeStoredPassword = async (userId, password, verification) => {
     await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [upgraded, userId]);
   } catch (error) {
     console.error("password rehash skipped", error?.message || error);
-  }
-};
-const applySaleRateRounding = (value, rule) => {
-  const amount = Number(value || 0);
-  if (!Number.isFinite(amount)) return 0;
-  switch (rule) {
-    case "ROUND_UP_5":
-      return Math.ceil(amount / 5) * 5;
-    case "ROUND_UP_10":
-      return Math.ceil(amount / 10) * 10;
-    case "NO_ROUND":
-      return roundCurrency(amount);
-    case "NEAREST_RUPEE":
-    default:
-      return Math.round(amount);
   }
 };
 const toDateKey = (value) =>
@@ -16685,10 +16679,8 @@ app.get("/sale-rates", async (req, res) => {
     }
     const settingsResult = await pool.query("SELECT * FROM sale_rate_settings WHERE id = 1");
     const saleRateSettings = settingsResult.rows[0] || {};
-    const desiredMargin = parseNonNegativeNumber(req.query.desired_margin) ?? Number(saleRateSettings.desired_margin_percent || 25);
-    const roundingRule = ROUNDING_RULES.has(saleRateSettings.rounding_rule)
-      ? saleRateSettings.rounding_rule
-      : "NEAREST_RUPEE";
+    const desiredMargin = resolveDesiredMargin(req.query.desired_margin, saleRateSettings.desired_margin_percent);
+    const roundingRule = resolveRoundingRule(saleRateSettings.rounding_rule);
     const result = await pool.query(
       `
       SELECT
@@ -16707,24 +16699,19 @@ app.get("/sale-rates", async (req, res) => {
         COALESCE(ib.remaining_qty, stock.current_stock, 0) AS current_stock,
         CASE WHEN COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING' THEN COALESCE(ib.remaining_qty, 0) ELSE 0 END AS pending_bill_stock,
         COALESCE(ib.temporary_sale_rate, 0) AS temporary_sale_rate,
-        COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) AS latest_effective_cost,
-        CASE
-          WHEN COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) > 0
-            THEN COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) * (1 + $1 / 100.0)
-          ELSE COALESCE(NULLIF(ib.temporary_sale_rate, 0), p.selling_rate)
-        END AS suggested_selling_rate
+        COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) AS latest_effective_cost
       FROM products p
       LEFT JOIN users u ON u.id = p.selling_rate_updated_by
       LEFT JOIN inventory_batches ib ON ib.product_id = p.id
         AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
         AND ib.remaining_qty > 0
-        AND ib.branch_id = $2
+        AND ib.branch_id = $1
       LEFT JOIN LATERAL (
         SELECT ib.effective_cost_per_unit
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-          AND ib.branch_id = $2
+          AND ib.branch_id = $1
         ORDER BY ib.purchase_date DESC, ib.created_at DESC, ib.id DESC
         LIMIT 1
       ) latest ON TRUE
@@ -16736,16 +16723,17 @@ app.get("/sale-rates", async (req, res) => {
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-          AND ib.branch_id = $2
+          AND ib.branch_id = $1
       ) stock ON TRUE
       WHERE p.active = TRUE
       ORDER BY p.product_name, ib.purchase_date, ib.created_at, ib.id
       `,
-      [desiredMargin, req.auth.branchId]
+      [req.auth.branchId]
     );
+    // No purchase cost means no suggestion (null), not the current rate handed back as one.
     return res.json(result.rows.map((row) => ({
       ...row,
-      suggested_selling_rate: applySaleRateRounding(row.suggested_selling_rate, roundingRule),
+      suggested_selling_rate: suggestSellingRate(row.latest_effective_cost, desiredMargin, roundingRule),
     })));
   } catch (error) {
     console.error(error);
@@ -16753,6 +16741,18 @@ app.get("/sale-rates", async (req, res) => {
   }
 });
 
+/**
+ * The owner's daily rate update, all or nothing.
+ *
+ * A lot row writes that lot's `temporary_sale_rate`; the `inventory_batches` publish trigger (cloud
+ * migration 011) turns that into an `inventory_lot` change every counter pulls. A product row writes
+ * `products.selling_rate`, which has no trigger: it reaches a counter only through a
+ * `logSyncChange` row, exactly as a Product Master edit does. Without one (as it was until
+ * 27 Sep 2026) a desktop counter's SQLite kept the old product rate until a full re-bootstrap.
+ *
+ * A lot must be in the caller's branch -- the list this saves from is `ib.branch_id = branchId`,
+ * and a hand-made request must not re-price another branch's fruit.
+ */
 app.post("/sale-rates/bulk", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -16764,32 +16764,34 @@ app.post("/sale-rates/bulk", async (req, res) => {
     await client.query("BEGIN");
     const saved = [];
     for (const update of updates) {
-      const productId = parsePositiveInteger(update.product_id);
-      const inventoryBatchId = parsePositiveInteger(update.inventory_batch_id);
-      const newRate = parsePositiveNumber(update.new_selling_rate);
-      if (!productId || !newRate) {
+      // Ids parsed as the server's integers; the rate rounded to 2 dp before it is compared,
+      // stored or written to history, so 12.345 is 12.35 everywhere.
+      const entry = normalizeRateUpdate(update);
+      if (entry.error) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: "Enter valid selling rates" });
+        return res.status(400).json({ message: entry.error });
       }
+      const { productId, inventoryBatchId, newRate, reason } = entry;
       if (inventoryBatchId) {
         const batchResult = await client.query(
-          "SELECT ib.*, p.product_name, p.selling_rate AS product_selling_rate FROM inventory_batches ib JOIN products p ON p.id = ib.product_id WHERE ib.id = $1 AND ib.product_id = $2 AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' FOR UPDATE",
-          [inventoryBatchId, productId]
+          "SELECT ib.*, p.product_name, p.selling_rate AS product_selling_rate FROM inventory_batches ib JOIN products p ON p.id = ib.product_id WHERE ib.id = $1 AND ib.product_id = $2 AND ib.branch_id = $3 AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' FOR UPDATE OF ib",
+          [inventoryBatchId, productId, req.auth.branchId]
         );
         if (batchResult.rows.length === 0) {
           await client.query("ROLLBACK");
-          return res.status(404).json({ message: "Inventory lot not found" });
+          return res.status(404).json({ message: "Inventory lot not found in this branch" });
         }
         const batch = batchResult.rows[0];
-        const oldRate = Number(batch.temporary_sale_rate || batch.product_selling_rate || 0);
-        if (oldRate === newRate) continue;
+        // What POS charges today: the lot's own rate, else the product rate (the list's rule).
+        const oldRate = effectiveLotRate(batch.temporary_sale_rate, batch.product_selling_rate);
+        if (sameRate(oldRate, newRate)) continue;
         const updatedBatch = await client.query(
-          "UPDATE inventory_batches SET temporary_sale_rate = $1 WHERE id = $2 RETURNING *",
-          [newRate, inventoryBatchId]
+          "UPDATE inventory_batches SET temporary_sale_rate = $1 WHERE id = $2 AND branch_id = $3 RETURNING *",
+          [newRate, inventoryBatchId, req.auth.branchId]
         );
         await client.query(
           "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
-          [productId, oldRate, newRate, manager.id, update.reason?.trim() || `Lot rate update ${batch.lot_name || batch.batch_no}`]
+          [productId, oldRate, newRate, manager.id, reason || `Lot rate update ${batch.lot_name || batch.batch_no}`]
         );
         saved.push({ ...updatedBatch.rows[0], product_name: batch.product_name });
         continue;
@@ -16799,12 +16801,13 @@ app.post("/sale-rates/bulk", async (req, res) => {
         await client.query("ROLLBACK");
         return res.status(404).json({ message: "Product not found" });
       }
-      const oldRate = Number(currentResult.rows[0].selling_rate);
-      if (oldRate === newRate) continue;
+      const oldRate = Number(currentResult.rows[0].selling_rate || 0);
+      if (sameRate(oldRate, newRate)) continue;
       const productResult = await client.query(
         `
         UPDATE products
-        SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2
+        SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2,
+            entity_version = entity_version + 1
         WHERE id = $3
         RETURNING *
         `,
@@ -16815,8 +16818,18 @@ app.post("/sale-rates/bulk", async (req, res) => {
         INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason)
         VALUES ($1, $2, $3, $4, $5)
         `,
-        [productId, oldRate, newRate, manager.id, update.reason?.trim() || "Daily sale rate update"]
+        [productId, oldRate, newRate, manager.id, reason || "Daily sale rate update"]
       );
+      // Published to the owner's branch, as a Product Master rate edit is, so that branch's
+      // desktop counters pick the new product rate up at their next pull.
+      await logSyncChange(client, {
+        branchId: req.auth.branchId || 1,
+        entityType: "sale_rate",
+        entityId: productResult.rows[0].global_id,
+        operationType: "UPSERT",
+        version: productResult.rows[0].entity_version || 1,
+        payload: productRateSyncPayload(productResult.rows[0]),
+      });
       saved.push(productResult.rows[0]);
     }
     await client.query("COMMIT");

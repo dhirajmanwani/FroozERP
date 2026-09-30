@@ -12,7 +12,12 @@ test("every main navigation module has a render path and refresh path", () => {
   for (const view of navigationViews) {
     assert.match(appSource, new RegExp(`\\[\\"${view}\\",\\s*\\"`), `${view} is missing from navigation`);
     assert.match(appSource, new RegExp(`activeView === \\"${view}\\"`), `${view} has no render path`);
-    assert.match(appSource, new RegExp(`view === \\"${view}\\"|\\[.*\\"${view}\\".*\\]\\.includes\\(view\\)`), `${view} has no refresh path`);
+    // A refresh path is either the menu handler's dispatch or a screen that loads itself when it
+    // mounts (`onLoad={...}` on its render path), which also covers Back/Forward -- Sale Rate Update
+    // does that so its data is loaded however it is reached.
+    const dispatched = new RegExp(`view === \\"${view}\\"|\\[.*\\"${view}\\".*\\]\\.includes\\(view\\)`).test(appSource);
+    const selfLoading = new RegExp(`activeView === \\"${view}\\"[^\\n]*\\n[\\s\\S]{0,400}?onLoad=\\{load\\w+\\}`).test(appSource);
+    assert.ok(dispatched || selfLoading, `${view} has no refresh path`);
   }
 });
 
