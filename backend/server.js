@@ -63,6 +63,13 @@ const {
 const { callerKey, registerAttempt, throttleMessage } = require("./publicRouteThrottle");
 const { resolveBackupLocation } = require("./backupLocation");
 const {
+  assertHostedDeploymentConfiguration,
+  defaultCloudDeploymentId,
+  resolveTrustProxy,
+} = require("./hostedDeploymentGuard");
+const { createCorsPolicy } = require("./cloudCorsPolicy");
+const { createCloudFreezeMiddleware, healthStatus, readCloudFreeze } = require("./cloudFreeze");
+const {
   issueLicence,
   ActivationLicenceError,
   dayToIso,
@@ -153,24 +160,16 @@ const serverTimePayload = () => {
     server_timezone: "UTC",
   };
 };
-const legacyProductionRailwayOrigins = new Set(["https://froozerp-production.up.railway.app"]);
-const productionRailwayOrigin = "https://froozerp-production-27bb.up.railway.app";
+// The production cloud's address as this layer knows it, and the retired addresses a saved
+// configuration may still carry. Host-neutral names: the values are the deployment's, not the
+// platform's. `frontend/src/local/cloudOrigins.js` lists every layer that carries a copy; moving the
+// cloud changes all of them together, and puts the old address into every legacy set.
+const legacyProductionCloudOrigins = new Set(["https://froozerp-production.up.railway.app"]);
+const defaultProductionCloudOrigin = "https://froozerp-production-27bb.up.railway.app";
 const canonicalizeCloudApiUrl = (value) => {
   const normalized = String(value || "").trim().replace(/\/$/, "");
-  return legacyProductionRailwayOrigins.has(normalized) ? productionRailwayOrigin : normalized;
+  return legacyProductionCloudOrigins.has(normalized) ? defaultProductionCloudOrigin : normalized;
 };
-const defaultCorsOrigins = [
-  productionRailwayOrigin,
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "http://localhost:5000",
-  "http://127.0.0.1:5000",
-];
-const configuredCorsOrigins = String(process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter((origin) => origin && origin !== "*");
-const allowedCorsOrigins = [...new Set([...defaultCorsOrigins, ...configuredCorsOrigins])];
 const apiContractVersion = "1";
 const frostApiVersion = "1";
 const supportedFrostCapabilities = [
@@ -201,7 +200,7 @@ const deploymentType = cloudServerRuntime ? "cloud" : "local";
 /**
  * A-6 Gate 2.4 — trust exactly one proxy hop when hosted, and none otherwise.
  *
- * Railway terminates TLS and forwards, so without this every request appears to come from the
+ * The hosting platform (Railway, Render) terminates TLS and forwards, so without this every request appears to come from the
  * platform's own address: `req.ip` is the proxy, `X-Forwarded-For` is ignored, and every rate
  * limit, lockout and audit row records the wrong origin. The failure is not that controls stop
  * working — it is that they all key on one shared value, so one attacker looks like every user and
@@ -214,11 +213,32 @@ const deploymentType = cloudServerRuntime ? "cloud" : "local";
  * Off entirely when not hosted: on the desktop the only client is loopback, and trusting a
  * forwarded header there would let anything on the machine claim to be somewhere else.
  */
-app.set("trust proxy", deploymentType === "cloud" ? 1 : false);
+// The hop count is configurable (FROOZERP_TRUST_PROXY_HOPS, default 1) because a platform whose edge
+// adds more than one proxy needs it; see backend/hostedDeploymentGuard.js `resolveTrustProxy`.
+const trustProxy = resolveTrustProxy({ env: process.env, cloud: deploymentType === "cloud" });
+if (trustProxy.warning) console.warn(`[proxy] ${trustProxy.warning}`);
+app.set("trust proxy", trustProxy.value);
 
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
+
+// Fail closed on a hosted process whose own variables say it is not hosted -- cloud-server without
+// APP_MODE=CLOUD_PRODUCTION (the startup bootstrap would rewrite live data), or desktop-local on a
+// hosting platform (it would serve an empty ephemeral SQLite file and report healthy). The rules,
+// and what they deliberately leave alone, are in backend/hostedDeploymentGuard.js. Judged against
+// the connection the storage adapter will actually open, not a variable left in a shell.
+try {
+  assertHostedDeploymentConfiguration({
+    env: process.env,
+    runtimeMode,
+    hostedCloudDeployment,
+    databaseUrl: storageAdapter.connectionString || "",
+  });
+} catch (error) {
+  console.error(`\n${error.message}\n`);
+  throw error;
+}
 
 // Where backups go, and whether writing them there means anything. See backend/backupLocation.js:
 // the old `path.join(__dirname, "..", "backups")` is right on a desktop install and resolves to
@@ -231,13 +251,53 @@ if (backupLocation.warning) {
   // success that means nothing would be worse, so it says so in the same place.
   console.warn(`[backup] ${backupLocation.warning}`);
 }
+/**
+ * In-process backups are skipped where they cannot survive (`backupLocation.durable === false`: a
+ * hosted deployment with no BACKUP_DIR). Each one reads every table into memory and writes it to a
+ * filesystem the next deploy deletes. On a small instance that is an out-of-memory risk, and on a
+ * platform that sends SIGTERM at every deploy and idle spin-down, the shutdown backup also turns
+ * each restart into a full read of the database -- for a file nobody can ever fetch. The real
+ * backups of a hosted database are the provider's own and `node scripts/cloud/backup-cloud.mjs`.
+ */
+const inProcessBackupsEnabled = backupLocation.durable;
+const IN_PROCESS_BACKUP_REFUSAL =
+  "This server has no durable backup location, so it does not write in-process backups: the file "
+  + "would be deleted at the next deploy. Back up the cloud database with "
+  + "`node scripts/cloud/backup-cloud.mjs` (see docs/production/CLOUD_BACKUP.md), or set BACKUP_DIR "
+  + "to a mounted volume.";
+if (!inProcessBackupsEnabled) {
+  console.warn("[backup] Scheduled and shutdown backups are OFF on this deployment (no durable BACKUP_DIR). Use scripts/cloud/backup-cloud.mjs.");
+}
 const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || "").trim() || null;
 const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
 const configuredBranchId = String(process.env.BRANCH_ID || "").trim() || null;
 const configuredDeviceId = String(process.env.DEVICE_ID || "").trim() || null;
 const configuredDeviceName = String(process.env.DEVICE_NAME || "").trim() || null;
-const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || (hostedCloudDeployment ? "railway-production" : "")).trim() || null;
-const publicCloudApiUrl = canonicalizeCloudApiUrl(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || (hostedCloudDeployment ? productionRailwayOrigin : "")) || null;
+const cloudDeploymentId = String(
+  process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || defaultCloudDeploymentId({ env: process.env, hostedCloudDeployment })
+).trim() || null;
+// RENDER_EXTERNAL_URL is set by Render itself to the service's public https URL, so a Render
+// deployment that forgot CLOUD_API_URL still names itself rather than the built-in default.
+const publicCloudApiUrl = canonicalizeCloudApiUrl(
+  process.env.CLOUD_API_URL
+  || process.env.FROOZERP_PUBLIC_API_URL
+  || process.env.RENDER_EXTERNAL_URL
+  || (hostedCloudDeployment ? defaultProductionCloudOrigin : "")
+) || null;
+// Exact origins only -- see backend/cloudCorsPolicy.js for why there is no platform wildcard.
+const corsPolicy = createCorsPolicy({
+  productionOrigin: defaultProductionCloudOrigin,
+  legacyOrigins: [...legacyProductionCloudOrigins],
+  publicCloudApiUrl,
+  configured: process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGINS || "",
+});
+const allowedCorsOrigins = corsPolicy.allowedOrigins;
+// The cut-over freeze (backend/cloudFreeze.js). Read once at startup; changing it is a redeploy.
+const cloudFreeze = readCloudFreeze(process.env);
+if (cloudFreeze.warning) console.warn(`[freeze] ${cloudFreeze.warning}`);
+if (cloudFreeze.frozen) {
+  console.warn("[freeze] FROOZERP_CLOUD_FROZEN=true: every route except GET /api/health, /health, /api/time and /api/version answers 503 CLOUD_UNAVAILABLE.");
+}
 const readOptionalBoolean = (value, defaultValue) => {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return defaultValue;
@@ -318,7 +378,7 @@ const cloudConfigurationChecks = (identity = {}) => ({
   startup_schema_bootstrap_disabled: !runStartupSchemaBootstrap,
   startup_reference_seed_disabled: true,
 });
-const canonicalCloudApiUrl = isRealHostedCloudUrl(publicCloudApiUrl) ? publicCloudApiUrl : productionRailwayOrigin;
+const canonicalCloudApiUrl = isRealHostedCloudUrl(publicCloudApiUrl) ? publicCloudApiUrl : defaultProductionCloudOrigin;
 const cloudPolicyDirectory = path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
 const cloudPolicyPath = path.join(cloudPolicyDirectory, "cloud-network-policy.json");
 const defaultCloudPolicy = Object.freeze({
@@ -510,54 +570,11 @@ const buildCloudHealthPayload = async ({ userId = null, deviceId = "", branchId 
     return { ...base, railwayHttpStatus: safe.httpStatus, errorCode: safe.errorCode, safeErrorMessage: safe.safeErrorMessage };
   }
 };
-const allowedTauriCorsOrigins = new Set([
-  "tauri://localhost",
-  "http://tauri.localhost",
-  "https://tauri.localhost",
-]);
-
-const normalizeCorsHost = (value) => {
-  const hostValue = String(value || "").split(",")[0].trim().toLowerCase();
-  if (!hostValue) return "";
-  try {
-    return new URL(hostValue).host.toLowerCase();
-  } catch {
-    return hostValue.replace(/^\[|\]$/g, "");
-  }
-};
-
-const normalizeCorsHostname = (value) =>
-  String(value || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
-
-const isPrivateNetworkHost = (hostname) => {
-  const hostValue = normalizeCorsHostname(hostname);
-  if (!hostValue) return false;
-  if (hostValue === "localhost" || hostValue === "127.0.0.1" || hostValue === "::1") return true;
-  if (/^10\./.test(hostValue) || /^192\.168\./.test(hostValue)) return true;
-  const private172 = hostValue.match(/^172\.(\d{1,3})\./);
-  return Boolean(private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31);
-};
-
-const isSameOriginHost = (parsedOrigin, req) => {
-  const originHost = normalizeCorsHost(parsedOrigin.host);
-  const requestHosts = [
-    normalizeCorsHost(req.headers.host),
-    normalizeCorsHost(req.headers["x-forwarded-host"]),
-  ].filter(Boolean);
-  return requestHosts.includes(originHost);
-};
-
-const isAllowedDynamicCorsOrigin = (origin, req) => {
-  if (!origin) return true;
-  if (allowedCorsOrigins.includes(origin)) return true;
-  if (allowedTauriCorsOrigins.has(origin)) return true;
-  const parsed = new URL(origin);
-  const hostname = normalizeCorsHostname(parsed.hostname);
-  if (isSameOriginHost(parsed, req)) return true;
-  if (parsed.protocol === "https:" && hostname.endsWith(".up.railway.app")) return true;
-  if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isPrivateNetworkHost(hostname)) return true;
-  return false;
-};
+// Tauri shells, same-origin, private-network hosts and the exact list above. No platform wildcard.
+const isAllowedDynamicCorsOrigin = (origin, req) => corsPolicy.isAllowedOrigin(origin, {
+  host: req.headers.host,
+  forwardedHost: req.headers["x-forwarded-host"],
+});
 
 app.use((req, res, next) => cors({
   credentials: true,
@@ -583,6 +600,10 @@ app.use((req, res, next) => cors({
     return callback(new Error("Origin not allowed by FroozERP CORS"));
   },
 })(req, res, next));
+
+// Mounted straight after CORS, so a frozen cloud refuses before authentication, the protocol gate
+// or any handler can run -- and a browser still gets CORS headers on the refusal it can read.
+app.use(createCloudFreezeMiddleware({ frozen: cloudFreeze.frozen }));
 
 app.use((req, res, next) => {
   if (
@@ -12392,7 +12413,10 @@ const healthHandler = async (req, res) => {
     const cloudChecks = cloudConfigurationChecks(cloudIdentity);
     const cloudReady = Object.values(cloudChecks).every(Boolean);
     return res.json({
-      status: "ok",
+      // "frozen" during a cut-over (backend/cloudFreeze.js): still 200 so the platform keeps the
+      // deployment, but not "ok", so no client treats this cloud as reachable.
+      status: healthStatus(cloudFreeze.frozen),
+      ...(cloudFreeze.frozen ? { cloud_frozen: true } : {}),
       app: "FroozERP",
       api_version: apiContractVersion,
       ...serverTimePayload(),
@@ -12427,14 +12451,15 @@ app.get("/health", healthHandler);
 
 app.get("/api/time", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  return res.json({ status: "ok", app: "FroozERP", ...serverTimePayload() });
+  return res.json({ status: healthStatus(cloudFreeze.frozen), app: "FroozERP", ...serverTimePayload() });
 });
 
 app.get("/api/version", async (req, res) => {
   const cloudIdentity = await resolveCloudDeploymentIdentity();
   const cloudReady = Object.values(cloudConfigurationChecks(cloudIdentity)).every(Boolean);
   res.json({
-    status: "ok",
+    status: healthStatus(cloudFreeze.frozen),
+    ...(cloudFreeze.frozen ? { cloud_frozen: true } : {}),
     app: "FroozERP",
     api_version: apiContractVersion,
     version: appVersion,
@@ -14469,6 +14494,9 @@ app.post("/settings/backup-now", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can run backups" });
+    if (!inProcessBackupsEnabled) {
+      return res.status(409).json({ code: "BACKUP_LOCATION_NOT_DURABLE", message: IN_PROCESS_BACKUP_REFUSAL });
+    }
     const backup = await createDatabaseBackup({ backupType: req.body.backup_type || "Manual", createdBy: manager.id });
     return res.json(backup);
   } catch (error) {
@@ -14481,6 +14509,9 @@ app.post("/settings/safe-shutdown", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can safely close software" });
+    if (!inProcessBackupsEnabled) {
+      return res.status(409).json({ code: "BACKUP_LOCATION_NOT_DURABLE", message: IN_PROCESS_BACKUP_REFUSAL });
+    }
     const backup = await createDatabaseBackup({ backupType: "Shutdown", createdBy: manager.id });
     return res.json({
       ...backup,
@@ -15014,7 +15045,7 @@ app.post("/login", async (req, res) => {
       authentication_source: canonicalAliasUsed
         ? "cloud_canonical_alias"
         : cloudServerRuntime ? "cloud_postgresql" : "cloud_api_proxy",
-      canonical_cloud_api_url: productionRailwayOrigin,
+      canonical_cloud_api_url: canonicalCloudApiUrl,
       force_password_change: user.force_password_change === true,
       session_revocation_version: user.session_revocation_version || 0,
       device_session_token: deviceSessionToken,
@@ -25340,7 +25371,7 @@ app.use((error, req, res, next) => {
 prepareDatabaseForStartup()
   .then(async () => {
     let lastScheduledBackupDate = "";
-    if (!desktopLocalRuntime) {
+    if (!desktopLocalRuntime && inProcessBackupsEnabled) {
       setInterval(async () => {
         try {
           const settingsResult = await pool.query("SELECT * FROM backup_settings WHERE id = 1");
@@ -25361,7 +25392,7 @@ prepareDatabaseForStartup()
 
     const runShutdownBackup = async (signal) => {
       try {
-        if (!desktopLocalRuntime) {
+        if (!desktopLocalRuntime && inProcessBackupsEnabled) {
           const settingsResult = await pool.query("SELECT backup_on_shutdown FROM backup_settings WHERE id = 1");
           if (settingsResult.rows[0]?.backup_on_shutdown !== false) {
             await createDatabaseBackup({ backupType: "Shutdown" });

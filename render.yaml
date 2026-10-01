@@ -1,0 +1,83 @@
+# Render Blueprint for the FroozERP cloud backend (+ the hosted web UI it serves).
+#
+# Phase 1 of the Render + Neon move: this file creates nothing until someone applies it in the Render
+# dashboard. railway.json and backend/railway.json stay as they are until the cut-over is done.
+# Runbook: docs/production/RENDER_NEON_CUTOVER.md. Pinned by backend/renderBlueprint.test.js.
+#
+# Secrets are declared with `sync: false` and NO value: Render asks for each one when the Blueprint
+# is applied, and a value never lives in this repository. Copy them from Railway exactly -- above all
+# DEVICE_SESSION_SECRET, or every counter's session stops verifying.
+#
+# Never add here: FROOZERP_DESKTOP_SERVICE, FROOZERP_SQLITE_PATH, NODE_ENV=test,
+# FROOZERP_ALLOW_LOOPBACK_*, FROOZERP_ALLOW_SCHEMA_DRIFT, RECOVERY_DEV_OTP_ENABLED, BACKUP_DIR (the
+# free instance has no persistent disk), PORT (Render sets it). The server refuses to start if the
+# runtime variables below disagree with each other (backend/hostedDeploymentGuard.js).
+services:
+  - type: web
+    name: froozerp-cloud
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    # Deploy on purpose only. Merging to main must not move the shop's cloud on its own.
+    autoDeploy: false
+    # --include=dev: NODE_ENV=production is visible at build time and would otherwise drop vite.
+    buildCommand: >-
+      npm --prefix backend ci --omit=dev &&
+      npm --prefix frontend ci --include=dev &&
+      npm --prefix frontend run build &&
+      rm -rf backend/public && mkdir -p backend/public &&
+      cp -R frontend/dist/. backend/public/
+    startCommand: npm --prefix backend start
+    # Deploy gate: answers only after the database is verified, and touches the database each time.
+    # /api/time is DB-free if Neon compute hours become the constraint (see the runbook).
+    healthCheckPath: /api/health
+    envVars:
+      # --- Runtime identity (plain values; these three must agree or the server refuses to start) ---
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: APP_MODE
+        value: CLOUD_PRODUCTION
+      - key: FROOZERP_DEPLOYMENT_TYPE
+        value: cloud
+      - key: FROOZERP_RUNTIME_MODE
+        value: cloud-server
+      # Belt and braces: ignored when hosted; an unhosted cloud-server is refused by the guard anyway.
+      - key: RUN_STARTUP_SCHEMA_BOOTSTRAP
+        value: "false"
+      - key: FROOZERP_CLOUD_DEPLOYMENT_ID
+        value: render-production
+      # Neon free: one instance, a small compute. 5 connections is plenty and stays far below the
+      # endpoint's limit. The code default (10) applies wherever this is not set.
+      - key: PG_POOL_MAX
+        value: "5"
+
+      # --- Set in the dashboard when applying the Blueprint (never commit a value) ---
+      # https://<service>.onrender.com. RENDER_EXTERNAL_URL is the fallback if left empty.
+      - key: CLOUD_API_URL
+        sync: false
+      # Neon DIRECT (non-pooler) endpoint, ?sslmode=verify-full. Restore the dump BEFORE setting this:
+      # an empty database is bootstrapped on first boot and the restore then half-fails.
+      - key: DATABASE_URL
+        sync: false
+      # Identical to Railway's, or every issued session token fails verification.
+      - key: DEVICE_SESSION_SECRET
+        sync: false
+      - key: RECOVERY_OTP_HASH_SECRET
+        sync: false
+      # Only needed to ISSUE activation licences; issued ones verify on-device regardless.
+      - key: FROOZERP_ACTIVATION_SIGNING_KEY
+        sync: false
+      - key: EMAIL_PROVIDER
+        sync: false
+      - key: EMAIL_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      # Copy Railway's value exactly (off / enforce ...).
+      - key: FROOZERP_OPERATIONAL_SCOPE_MODE
+        sync: false
+      # Also copy, if Railway has them: COMPANY_ID, BRANCH_ID, FROOZERP_COMPANY_NAME, SMS_*,
+      # FROOZERP_ACTIVATION_KEY_ID, ALLOWED_ORIGINS. Never OPENAI_API_KEY: it must stay unset.

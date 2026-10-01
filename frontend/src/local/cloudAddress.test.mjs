@@ -32,10 +32,21 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUST = fs.readFileSync(path.join(HERE, "..", "..", "..", "src-tauri", "src", "lib.rs"), "utf8");
 const APP = fs.readFileSync(path.join(HERE, "..", "App.jsx"), "utf8");
+const SYNC = fs.readFileSync(path.join(HERE, "syncService.js"), "utf8");
+const ORIGINS = fs.readFileSync(path.join(HERE, "cloudOrigins.js"), "utf8");
 const GATEWAY = fs.readFileSync(path.join(HERE, "..", "..", "..", "backend", "desktopGateway.js"), "utf8");
+const SERVER = fs.readFileSync(path.join(HERE, "..", "..", "..", "backend", "server.js"), "utf8");
+const MOBILE_GATEWAY = fs.readFileSync(path.join(HERE, "..", "..", "..", "src-tauri", "src", "mobile_gateway.rs"), "utf8");
 
 const rustString = (name) => RUST.match(new RegExp(`const ${name}: &str = "([^"]+)"`))?.[1];
 const jsString = (source, name) => source.match(new RegExp(`const ${name} = "([^"]+)"`))?.[1];
+const quoted = (text) => [...String(text ?? "").matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+// Read a legacy list as a sorted set of its string literals. `undefined` when the declaration is
+// missing, so a rename fails here by name instead of comparing two empty lists as equal.
+const listLiterals = (source, pattern) => {
+  const body = source.match(pattern)?.[1];
+  return body === undefined ? undefined : [...new Set(quoted(body))].sort();
+};
 
 const cloudFn = RUST.slice(RUST.indexOf("fn cloud_api_url"), RUST.indexOf("fn local_backend_url"));
 
@@ -53,10 +64,64 @@ test("the shell hands the gateway a cloud address at all", () => {
 test("both sides name the same cloud, character for character", () => {
   // Drift here does not error. It splits one shop's bills across two databases.
   const rust = rustString("PRODUCTION_CLOUD_API_URL");
-  const frontend = jsString(APP, "DEFAULT_PRODUCTION_CLOUD_API_URL");
+  const frontend = jsString(ORIGINS, "PRODUCTION_CLOUD_API_URL");
   assert.ok(rust, "Rust must name the production cloud");
-  assert.ok(frontend, "the frontend must name the production cloud");
+  assert.ok(frontend, "the frontend must name the production cloud, in local/cloudOrigins.js");
   assert.equal(rust, frontend);
+});
+
+test("the shell, the frontend, the desktop gateway and the server all name the same production cloud", () => {
+  // The cloud is about to move. Moving it is one literal per layer, and a layer left behind does not
+  // fail -- it keeps talking to the old service. So every literal is pinned to the others here.
+  const rust = rustString("PRODUCTION_CLOUD_API_URL");
+  const frontend = jsString(ORIGINS, "PRODUCTION_CLOUD_API_URL");
+  const gateway = jsString(GATEWAY, "DEFAULT_CLOUD_API_URL");
+  // Renamed from productionRailwayOrigin in the host-agnostic backend change; either name counts.
+  const server = SERVER.match(/const (?:productionRailwayOrigin|defaultProductionCloudOrigin) = "([^"]+)"/)?.[1];
+  assert.ok(gateway, "backend/desktopGateway.js must name the production cloud as DEFAULT_CLOUD_API_URL");
+  assert.ok(server, "backend/server.js must name its default production origin");
+  assert.equal(frontend, rust, "cloudOrigins.js and lib.rs disagree");
+  assert.equal(gateway, rust, "desktopGateway.js and lib.rs disagree");
+  assert.equal(server, rust, "server.js and lib.rs disagree");
+});
+
+test("the frontend names the production cloud once, in cloudOrigins.js", () => {
+  // App.jsx and syncService.js each used to carry their own copy of the URL, the legacy list and the
+  // hosted-origin test. Two copies drift; one import cannot.
+  for (const [name, source] of [["App.jsx", APP], ["syncService.js", SYNC]]) {
+    assert.match(
+      source,
+      /import \{[^}]*\bcanonicalizeCloudApiUrl\b[^}]*\bisHostedCloudOrigin\b[^}]*\} from "\.\/(?:local\/)?cloudOrigins\.js";/,
+      `${name} must take the cloud's address and origin test from cloudOrigins.js`,
+    );
+    assert.doesNotMatch(source, /froozerp-production|\.up\.railway\.app|\.onrender\.com/, `${name} must not re-declare a cloud address`);
+    assert.doesNotMatch(source, /const (?:LEGACY_PRODUCTION_CLOUD_API_URLS|DEFAULT_PRODUCTION_CLOUD_API_URL|canonicalizeCloudApiUrl|isRailwayProductionHost|isHostedCloudOrigin) =/);
+  }
+});
+
+test("every layer retires the same old addresses", () => {
+  // A saved URL that one layer rewrites and another does not is the split-brain this file exists to
+  // prevent, reached through the migration path instead of the default. Each list is compared as a
+  // set: order carries no meaning, and the Rust array length must match what it holds.
+  const frontend = listLiterals(ORIGINS, /export const LEGACY_PRODUCTION_CLOUD_API_URLS = Object\.freeze\(\[([^\]]*)\]\)/);
+  const gateway = listLiterals(GATEWAY, /const LEGACY_CLOUD_API_URLS = new Set\(\[([^\]]*)\]\)/);
+  const server = listLiterals(SERVER, /const (?:legacyProductionRailwayOrigins|legacyProductionCloudOrigins) = new Set\(\[([^\]]*)\]\)/);
+  const mobileDeclaration = MOBILE_GATEWAY.match(/const LEGACY_CLOUD_API_URLS: \[&str; (\d+)\] = \[([^\]]*)\]/);
+  const mobile = mobileDeclaration ? [...new Set(quoted(mobileDeclaration[2]))].sort() : undefined;
+
+  assert.ok(frontend, "cloudOrigins.js must declare LEGACY_PRODUCTION_CLOUD_API_URLS");
+  assert.ok(gateway, "desktopGateway.js must declare LEGACY_CLOUD_API_URLS");
+  assert.ok(server, "server.js must declare its legacy production origins");
+  assert.ok(mobile, "mobile_gateway.rs must declare LEGACY_CLOUD_API_URLS");
+  assert.ok(frontend.length > 0, "the legacy list cannot be empty while a retired address is still saved on counters");
+  assert.equal(Number(mobileDeclaration[1]), quoted(mobileDeclaration[2]).length, "the Rust array length must match its contents");
+
+  assert.deepEqual(gateway, frontend, "desktopGateway.js retires a different set");
+  assert.deepEqual(server, frontend, "server.js retires a different set");
+  assert.deepEqual(mobile, frontend, "mobile_gateway.rs retires a different set");
+
+  const production = rustString("PRODUCTION_CLOUD_API_URL");
+  assert.equal(frontend.includes(production), false, "the current cloud cannot also be a retired one");
 });
 
 test("the address is a real hosted URL, not a placeholder or a local one", () => {

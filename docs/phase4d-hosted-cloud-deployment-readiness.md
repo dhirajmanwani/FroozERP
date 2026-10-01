@@ -25,6 +25,7 @@ NODE_ENV=production
 APP_VERSION=1.0.30
 APP_MODE=CLOUD_PRODUCTION
 FROOZERP_DEPLOYMENT_TYPE=cloud
+FROOZERP_RUNTIME_MODE=cloud-server
 
 CLOUD_API_URL=https://api.example.com
 DATABASE_URL=postgresql://managed-provider-value
@@ -41,7 +42,9 @@ FROOZERP_CLOUD_DEPLOYMENT_ID=provider-deployment-id
 ALLOWED_ORIGINS=https://owner.example.com,tauri://localhost
 ```
 
-`CLOUD_DATABASE_URL` can replace `DATABASE_URL`. Explicit `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` are supported when the provider does not supply a connection URL. Secrets must remain in the provider secret manager.
+~~`CLOUD_DATABASE_URL` can replace `DATABASE_URL`. Explicit `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` are supported when the provider does not supply a connection URL.~~ **Corrected 2026-10-01:** that was never true of the code. The server connects with **`DATABASE_URL` only** (`backend/storageAdapters.js` `createStorageAdapter`). `CLOUD_DATABASE_URL` is not read. `DB_HOST`, `DB_NAME` and `DB_USER` only feed the `hosted_database_configured` readiness check and the backup label, and `DB_PASSWORD` is only a fallback for the OTP hash secret. None of them opens a connection. Secrets must remain in the provider secret manager.
+
+The three runtime variables must agree. Since 2026-10-01 the server refuses to start (`backend/hostedDeploymentGuard.js`) when the runtime is `cloud-server` without `APP_MODE=CLOUD_PRODUCTION`, or when a hosting platform's own variables are present but the runtime is not `cloud-server`. `ALLOWED_ORIGINS` takes **exact** origins; there is no platform wildcard, and the Tauri shells and same-origin pages are allowed without being listed. The current host-by-host list of variables is in `docs/production/RENDER_NEON_CUTOVER.md`.
 
 Installed app build/runtime:
 

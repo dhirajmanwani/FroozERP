@@ -3,7 +3,7 @@
 One command, run on a machine in the shop, writing to that machine.
 
 ```powershell
-$env:DATABASE_PUBLIC_URL = "<the public connection string from Railway>"
+$env:DATABASE_PUBLIC_URL = "<the public connection string: Railway DATABASE_PUBLIC_URL, or Neon's direct string>"
 node scripts/cloud/backup-cloud.mjs --out "D:\FroozERP-Backups"
 ```
 
@@ -17,7 +17,13 @@ it is not, and the command exits non-zero so a scheduled task can tell.
 The hosted backend has a scheduled backup of its own. It writes inside the container, which the
 platform replaces on every deploy and from which nobody can download anything — and it had been
 failing every night with `EACCES: permission denied, mkdir '/backups'` for as long as it had been
-deployed, saying so only in a log nobody reads. Both halves are fixed (`backend/backupLocation.js`),
+deployed, saying so only in a log nobody reads. Since the Render + Neon preparation (2026-10-01) a
+hosted deployment with no `BACKUP_DIR` does not attempt it at all: scheduled and shutdown backups
+are skipped, and *Backup now* answers `BACKUP_LOCATION_NOT_DURABLE`, naming this command.
+
+For Neon, use the **direct** connection string (not the `-pooler` host) with `sslmode=require` or
+`verify-full`. Neon's own point-in-time history and branches are a second line, not a replacement:
+they live with the same provider as the data. Both halves are fixed (`backend/backupLocation.js`),
 but the second half cannot be fixed by fixing a path:
 
 **A copy that lives on the same service as the original is not a backup.** It is a second way to
@@ -84,7 +90,7 @@ everything else can be corrected later from the data, and this *is* the data.
 # Putting A Backup Back
 
 ```powershell
-$env:DATABASE_PUBLIC_URL = "<the public connection string from Railway>"
+$env:DATABASE_PUBLIC_URL = "<the public connection string: Railway DATABASE_PUBLIC_URL, or Neon's direct string>"
 node scripts/cloud/restore-cloud.mjs --file "D:\FroozERP-Backups\froozerp-cloud-....jsonl.gz"
 ```
 

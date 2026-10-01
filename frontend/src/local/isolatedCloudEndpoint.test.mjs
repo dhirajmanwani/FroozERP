@@ -16,7 +16,7 @@ test("loopback cloud rehearsal requires both Vite development and an explicit fl
 
 test("the isolated endpoint overrides saved production configuration only inside the gate", () => {
   assert.match(source, /cloudApiUrl: ISOLATED_LOOPBACK_CLOUD_API_URL\s*\|\| canonicalizeCloudApiUrl/);
-  assert.match(source, /RAILWAY_PRODUCTION_API_URL \|\|\s*ISOLATED_LOOPBACK_CLOUD_API_URL/);
+  assert.match(source, /HOSTED_CLOUD_ORIGIN_API_URL \|\|\s*ISOLATED_LOOPBACK_CLOUD_API_URL/);
   assert.match(source, /normalizeApiBase\(url\) === ISOLATED_LOOPBACK_CLOUD_API_URL/);
 });
 

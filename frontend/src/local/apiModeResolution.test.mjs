@@ -41,12 +41,29 @@ test("VITE_API_MODE is consulted when no mode is saved on the device", () => {
   );
 });
 
-test("a saved mode outranks build env, and a Railway origin outranks everything", () => {
+test("a saved mode outranks build env, and a hosted cloud origin outranks everything", () => {
   assert.equal(resolveApiMode({ savedMode: "BRANCH_LAN_SERVER", envMode: "HYBRID" }).mode, "BRANCH_LAN_SERVER");
   assert.deepEqual(
-    resolveApiMode({ savedMode: "LOCAL_ONLY", envMode: "LOCAL_ONLY", railwayProductionHost: true }),
-    { mode: "CLOUD_PRODUCTION", source: "railway-production-host", configured: true },
+    resolveApiMode({ savedMode: "LOCAL_ONLY", envMode: "LOCAL_ONLY", hostedCloudOrigin: true }),
+    { mode: "CLOUD_PRODUCTION", source: "hosted-cloud-origin", configured: true },
   );
+});
+
+test("the pre-rename railwayProductionHost flag still reaches the hosted rung for one release", () => {
+  // Renamed when the cloud stopped being Railway-only. A caller still passing the old name must not
+  // silently fall through to the saved/env rungs and lose CLOUD_PRODUCTION.
+  assert.deepEqual(
+    resolveApiMode({ savedMode: "LOCAL_ONLY", envMode: "LOCAL_ONLY", railwayProductionHost: true }),
+    { mode: "CLOUD_PRODUCTION", source: "hosted-cloud-origin", configured: true },
+  );
+  assert.equal(resolveApiMode({ hostedCloudOrigin: false, railwayProductionHost: false, desktopRuntime: true }).mode, "LOCAL_SINGLE_DEVICE");
+});
+
+test("App.jsx feeds the hosted rung from the shared origin test", () => {
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /const HOSTED_CLOUD_ORIGIN = isHostedCloudOrigin\(\);/);
+  assert.match(app, /resolveApiMode\(\{[\s\S]*?hostedCloudOrigin: HOSTED_CLOUD_ORIGIN,[\s\S]*?\}\);/);
+  assert.doesNotMatch(app, /railwayProductionHost|isRailwayProductionHost|RAILWAY_PRODUCTION_/);
 });
 
 test("an unconfigured desktop is LOCAL_SINGLE_DEVICE, and an unconfigured browser is LOCAL_ONLY", () => {

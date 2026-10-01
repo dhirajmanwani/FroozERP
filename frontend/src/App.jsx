@@ -106,6 +106,7 @@ import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, descri
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
+import { PRODUCTION_CLOUD_API_URL, canonicalizeCloudApiUrl, isHostedCloudOrigin } from "./local/cloudOrigins.js";
 import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
 import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
@@ -308,10 +309,6 @@ const getCurrentOrigin = () => {
   if (typeof window === "undefined" || !window.location) return "";
   return normalizeApiBase(window.location.origin || `${window.location.protocol}//${window.location.host}`);
 };
-const isRailwayProductionHost = () => {
-  if (typeof window === "undefined" || !window.location) return false;
-  return String(window.location.hostname || "").toLowerCase().endsWith(".up.railway.app");
-};
 const API_MODES = Object.freeze({
   LOCAL_ONLY: "LOCAL_ONLY",
   CLOUD_ONLY: "CLOUD_ONLY",
@@ -347,10 +344,9 @@ const writeSavedApiConfig = (config) => {
   if (typeof window === "undefined" || !window.localStorage) return;
   window.localStorage.setItem("froozerp.apiConfig", JSON.stringify(config));
 };
-const LEGACY_PRODUCTION_CLOUD_API_URLS = new Set([
-  "https://froozerp-production.up.railway.app",
-]);
-const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+// The production cloud's address, its retired addresses and `canonicalizeCloudApiUrl` live in
+// local/cloudOrigins.js -- once for the whole frontend, pinned against lib.rs and the gateway by
+// local/cloudAddress.test.mjs.
 const ISOLATED_LOOPBACK_CLOUD_API_URL = (() => {
   if (!import.meta.env.DEV || import.meta.env.VITE_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS !== "true") return "";
   const candidate = normalizeApiBase(import.meta.env.VITE_CLOUD_API_URL || "");
@@ -364,10 +360,6 @@ const ISOLATED_LOOPBACK_CLOUD_API_URL = (() => {
     return "";
   }
 })();
-const canonicalizeCloudApiUrl = (value) => {
-  const normalized = normalizeApiBase(value);
-  return LEGACY_PRODUCTION_CLOUD_API_URLS.has(normalized) ? DEFAULT_PRODUCTION_CLOUD_API_URL : normalized;
-};
 const sanitizeSavedApiConfigForRuntime = (config) => {
   // This function persists what it computes, so a default here is not a read-time convenience:
   // it re-poisons localStorage on every module load. Clearing all cloud configuration used to
@@ -379,8 +371,8 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
       || canonicalizeCloudApiUrl(config.cloudApiUrl),
   };
   if (migratedConfig.cloudApiUrl !== savedCloudApiUrl) writeSavedApiConfig(migratedConfig);
-  if (!isRailwayProductionHost()) return migratedConfig;
-  const railwayOrigin = getCurrentOrigin();
+  if (!isHostedCloudOrigin()) return migratedConfig;
+  const hostedCloudOrigin = getCurrentOrigin();
   const savedMode = normalizeApiMode(migratedConfig.mode);
   const localModeSaved = [
     API_MODES.LOCAL_SINGLE_DEVICE,
@@ -396,7 +388,7 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
     const nextConfig = {
       ...config,
       mode: API_MODES.CLOUD_PRODUCTION,
-      cloudApiUrl: railwayOrigin,
+      cloudApiUrl: hostedCloudOrigin,
     };
     writeSavedApiConfig(nextConfig);
     return nextConfig;
@@ -404,11 +396,11 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
   return {
     ...migratedConfig,
     mode: API_MODES.CLOUD_PRODUCTION,
-    cloudApiUrl: railwayOrigin,
+    cloudApiUrl: hostedCloudOrigin,
   };
 };
-const RAILWAY_PRODUCTION_HOST = isRailwayProductionHost();
-const RAILWAY_PRODUCTION_API_URL = RAILWAY_PRODUCTION_HOST ? getCurrentOrigin() : "";
+const HOSTED_CLOUD_ORIGIN = isHostedCloudOrigin();
+const HOSTED_CLOUD_ORIGIN_API_URL = HOSTED_CLOUD_ORIGIN ? getCurrentOrigin() : "";
 const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
   const current = readSavedApiConfig();
   const next = {
@@ -440,7 +432,7 @@ const API_MODE_RESOLUTION = resolveApiMode({
   savedMode: SAVED_API_CONFIG.mode,
   envMode: import.meta.env.VITE_API_MODE,
   globalMode: window.__FROOZERP_API_MODE__,
-  railwayProductionHost: RAILWAY_PRODUCTION_HOST,
+  hostedCloudOrigin: HOSTED_CLOUD_ORIGIN,
   desktopRuntime: isDesktopShell(),
 });
 const API_MODE = normalizeApiMode(API_MODE_RESOLUTION.mode);
@@ -534,10 +526,10 @@ const BRANCH_LAN_API_URL = normalizeApiBase(
  *     an unconfigured profile stays unconfigured on disk.
  */
 const BUILT_IN_DESKTOP_CLOUD_API_URL = isDesktopShell() && !import.meta.env.DEV
-  ? DEFAULT_PRODUCTION_CLOUD_API_URL
+  ? PRODUCTION_CLOUD_API_URL
   : "";
 const CLOUD_API_URL = normalizeApiBase(
-  RAILWAY_PRODUCTION_API_URL ||
+  HOSTED_CLOUD_ORIGIN_API_URL ||
   ISOLATED_LOOPBACK_CLOUD_API_URL ||
   canonicalizeCloudApiUrl(SAVED_API_CONFIG.cloudApiUrl) ||
   import.meta.env.VITE_CLOUD_API_URL ||
@@ -569,7 +561,7 @@ const CONFIGURED_SUB_BRANCH_ID = String(SAVED_API_CONFIG.subBranchId || import.m
 const CONFIGURED_DEVICE_ID = String(SAVED_API_CONFIG.deviceId || import.meta.env.VITE_DEVICE_ID || "").trim();
 const CONFIGURED_DEVICE_NAME = String(SAVED_API_CONFIG.deviceName || import.meta.env.VITE_DEVICE_NAME || "").trim();
 const resolveConfiguredApiUrl = () => {
-  if (RAILWAY_PRODUCTION_API_URL) return RAILWAY_PRODUCTION_API_URL;
+  if (HOSTED_CLOUD_ORIGIN_API_URL) return HOSTED_CLOUD_ORIGIN_API_URL;
   if (API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.HYBRID) return LOCAL_API_URL;
   if (API_MODE === API_MODES.CLOUD_ONLY && CLOUD_API_URL) return CLOUD_API_URL;
   if (API_MODE === API_MODES.BRANCH_LAN_CLIENT && BRANCH_LAN_API_URL) return BRANCH_LAN_API_URL;
@@ -3383,7 +3375,7 @@ function App() {
       const response = await axios.get(localHealthUrl, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
       return { status: response.status, message: response.data?.status === "ok" ? "Local backend healthy" : "Local backend health did not report ok" };
     }));
-    results.push(await check("Railway /api/health", cloudHealthUrl, async () => {
+    results.push(await check("Cloud /api/health", cloudHealthUrl, async () => {
       const response = await axios.get(cloudHealthUrl, {
         timeout: 8000,
         headers: { "Cache-Control": "no-store", "x-user-id": user?.id || "", "x-device-id": latestDevice?.device_id || "" },
@@ -3395,7 +3387,7 @@ function App() {
         message: health.safeErrorMessage || (health.cloudReachable ? "Cloud backend healthy" : `Cloud not ready: ${health.errorCode || "unknown"}`),
       };
     }));
-    results.push(await check("Railway authentication", `${LOCAL_API_URL}/api/auth/me`, async () => ({
+    results.push(await check("Cloud authentication", `${LOCAL_API_URL}/api/auth/me`, async () => ({
       status: user?.id ? 200 : 401,
       message: user?.id ? `Signed in as user ${user.id}` : "No active local session for cloud diagnostics",
     })));
