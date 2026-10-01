@@ -101,9 +101,12 @@ import { resolveShellStatus } from "./local/shellStatus";
 import { plainServerMessage } from "./local/plainServerMessage";
 import { describeReport } from "./local/reportDescriptions";
 import { labelFor, toneFor } from "./local/displayLabels";
+import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, MANUAL_BILL_DISCOUNT_MODE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, billDiscountRuleName, describeBillApprovalLine, describePosDiscountApprovalReason, posDiscountApproval, readBillDiscountTooLarge, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, resolveDiscountApprovalRoute, resolveDiscountAvailability, resolveManualBillDiscount, roundMoney as roundDiscountMoney, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
+import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, describeSaveResult, filterSaleRateRows, marginOnCost, parseTargetMargin, rateTone, resolveSaleRateAvailability, suggestedDrafts } from "./local/saleRateUpdate";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
+import { PRODUCTION_CLOUD_API_URL, canonicalizeCloudApiUrl, isHostedCloudOrigin } from "./local/cloudOrigins.js";
 import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
 import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
@@ -306,10 +309,6 @@ const getCurrentOrigin = () => {
   if (typeof window === "undefined" || !window.location) return "";
   return normalizeApiBase(window.location.origin || `${window.location.protocol}//${window.location.host}`);
 };
-const isRailwayProductionHost = () => {
-  if (typeof window === "undefined" || !window.location) return false;
-  return String(window.location.hostname || "").toLowerCase().endsWith(".up.railway.app");
-};
 const API_MODES = Object.freeze({
   LOCAL_ONLY: "LOCAL_ONLY",
   CLOUD_ONLY: "CLOUD_ONLY",
@@ -345,10 +344,9 @@ const writeSavedApiConfig = (config) => {
   if (typeof window === "undefined" || !window.localStorage) return;
   window.localStorage.setItem("froozerp.apiConfig", JSON.stringify(config));
 };
-const LEGACY_PRODUCTION_CLOUD_API_URLS = new Set([
-  "https://froozerp-production.up.railway.app",
-]);
-const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+// The production cloud's address, its retired addresses and `canonicalizeCloudApiUrl` live in
+// local/cloudOrigins.js -- once for the whole frontend, pinned against lib.rs and the gateway by
+// local/cloudAddress.test.mjs.
 const ISOLATED_LOOPBACK_CLOUD_API_URL = (() => {
   if (!import.meta.env.DEV || import.meta.env.VITE_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS !== "true") return "";
   const candidate = normalizeApiBase(import.meta.env.VITE_CLOUD_API_URL || "");
@@ -362,10 +360,6 @@ const ISOLATED_LOOPBACK_CLOUD_API_URL = (() => {
     return "";
   }
 })();
-const canonicalizeCloudApiUrl = (value) => {
-  const normalized = normalizeApiBase(value);
-  return LEGACY_PRODUCTION_CLOUD_API_URLS.has(normalized) ? DEFAULT_PRODUCTION_CLOUD_API_URL : normalized;
-};
 const sanitizeSavedApiConfigForRuntime = (config) => {
   // This function persists what it computes, so a default here is not a read-time convenience:
   // it re-poisons localStorage on every module load. Clearing all cloud configuration used to
@@ -377,8 +371,8 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
       || canonicalizeCloudApiUrl(config.cloudApiUrl),
   };
   if (migratedConfig.cloudApiUrl !== savedCloudApiUrl) writeSavedApiConfig(migratedConfig);
-  if (!isRailwayProductionHost()) return migratedConfig;
-  const railwayOrigin = getCurrentOrigin();
+  if (!isHostedCloudOrigin()) return migratedConfig;
+  const hostedCloudOrigin = getCurrentOrigin();
   const savedMode = normalizeApiMode(migratedConfig.mode);
   const localModeSaved = [
     API_MODES.LOCAL_SINGLE_DEVICE,
@@ -394,7 +388,7 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
     const nextConfig = {
       ...config,
       mode: API_MODES.CLOUD_PRODUCTION,
-      cloudApiUrl: railwayOrigin,
+      cloudApiUrl: hostedCloudOrigin,
     };
     writeSavedApiConfig(nextConfig);
     return nextConfig;
@@ -402,11 +396,11 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
   return {
     ...migratedConfig,
     mode: API_MODES.CLOUD_PRODUCTION,
-    cloudApiUrl: railwayOrigin,
+    cloudApiUrl: hostedCloudOrigin,
   };
 };
-const RAILWAY_PRODUCTION_HOST = isRailwayProductionHost();
-const RAILWAY_PRODUCTION_API_URL = RAILWAY_PRODUCTION_HOST ? getCurrentOrigin() : "";
+const HOSTED_CLOUD_ORIGIN = isHostedCloudOrigin();
+const HOSTED_CLOUD_ORIGIN_API_URL = HOSTED_CLOUD_ORIGIN ? getCurrentOrigin() : "";
 const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
   const current = readSavedApiConfig();
   const next = {
@@ -438,7 +432,7 @@ const API_MODE_RESOLUTION = resolveApiMode({
   savedMode: SAVED_API_CONFIG.mode,
   envMode: import.meta.env.VITE_API_MODE,
   globalMode: window.__FROOZERP_API_MODE__,
-  railwayProductionHost: RAILWAY_PRODUCTION_HOST,
+  hostedCloudOrigin: HOSTED_CLOUD_ORIGIN,
   desktopRuntime: isDesktopShell(),
 });
 const API_MODE = normalizeApiMode(API_MODE_RESOLUTION.mode);
@@ -532,10 +526,10 @@ const BRANCH_LAN_API_URL = normalizeApiBase(
  *     an unconfigured profile stays unconfigured on disk.
  */
 const BUILT_IN_DESKTOP_CLOUD_API_URL = isDesktopShell() && !import.meta.env.DEV
-  ? DEFAULT_PRODUCTION_CLOUD_API_URL
+  ? PRODUCTION_CLOUD_API_URL
   : "";
 const CLOUD_API_URL = normalizeApiBase(
-  RAILWAY_PRODUCTION_API_URL ||
+  HOSTED_CLOUD_ORIGIN_API_URL ||
   ISOLATED_LOOPBACK_CLOUD_API_URL ||
   canonicalizeCloudApiUrl(SAVED_API_CONFIG.cloudApiUrl) ||
   import.meta.env.VITE_CLOUD_API_URL ||
@@ -567,7 +561,7 @@ const CONFIGURED_SUB_BRANCH_ID = String(SAVED_API_CONFIG.subBranchId || import.m
 const CONFIGURED_DEVICE_ID = String(SAVED_API_CONFIG.deviceId || import.meta.env.VITE_DEVICE_ID || "").trim();
 const CONFIGURED_DEVICE_NAME = String(SAVED_API_CONFIG.deviceName || import.meta.env.VITE_DEVICE_NAME || "").trim();
 const resolveConfiguredApiUrl = () => {
-  if (RAILWAY_PRODUCTION_API_URL) return RAILWAY_PRODUCTION_API_URL;
+  if (HOSTED_CLOUD_ORIGIN_API_URL) return HOSTED_CLOUD_ORIGIN_API_URL;
   if (API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.HYBRID) return LOCAL_API_URL;
   if (API_MODE === API_MODES.CLOUD_ONLY && CLOUD_API_URL) return CLOUD_API_URL;
   if (API_MODE === API_MODES.BRANCH_LAN_CLIENT && BRANCH_LAN_API_URL) return BRANCH_LAN_API_URL;
@@ -664,6 +658,19 @@ const resolveSaleChangeRoute = ({ user, offlineMode = false, connectivityMode } 
     ? false
     : guardCloudCall("sale-change-approval", API_URL).allowed === true && hasCloudSession(user) !== false;
   return resolveSaleChangeApprovalRoute({ needsApproval, offlineMode: Boolean(offlineMode), localOnly, cloudGateAllowed });
+};
+/**
+ * Which way a POS bill's discount approval goes (local/discounts.js decides): the same Local Only,
+ * offline and cloud-gate checks as a cancel or edit, in the same order, so a refused route makes no
+ * request and bills nothing. `needsApproval` comes from `posDiscountApproval`, which already
+ * waves Owner, Admin and rate-override holders through.
+ */
+const resolvePosDiscountApprovalRoute = ({ needsApproval, user, offlineMode = false, connectivityMode } = {}) => {
+  const localOnly = isSaleChangeLocalOnly(connectivityMode);
+  const cloudGateAllowed = !needsApproval || offlineMode || localOnly
+    ? false
+    : guardCloudCall("discount-approval", API_URL).allowed === true && hasCloudSession(user) !== false;
+  return resolveDiscountApprovalRoute({ needsApproval: needsApproval === true, offlineMode: Boolean(offlineMode), localOnly, cloudGateAllowed });
 };
 /**
  * Ask the server to check the Owner or Admin's password for one cancel or edit. Returns the
@@ -1780,11 +1787,6 @@ const ledgerModes = [
   ["SUPPLIER", "Supplier Ledger"],
 ];
 
-const discountTypes = [
-  ["FLAT_AMOUNT", "Flat Amount"],
-  ["PERCENTAGE", "Percentage"],
-];
-
 const dashboardRanges = [
   ["7", "Last 7 Days"],
   ["15", "Last 15 Days"],
@@ -1822,13 +1824,6 @@ const emptyDashboardAnalytics = {
   lowStockItems: [],
   insights: [],
 };
-
-const discountPaymentModes = [
-  ["ALL", "All"],
-  ["CASH", "Cash"],
-  ["UPI", "UPI"],
-  ["CARD", "Card"],
-];
 
 const roundingRules = [
   ["NEAREST_RUPEE", "Nearest rupee"],
@@ -2389,6 +2384,9 @@ function App() {
   const [saleRates, setSaleRates] = useState([]);
   const [saleRateHistory, setSaleRateHistory] = useState([]);
   const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
+  // Whether the rate list on screen is real. An empty list and a list that failed to load are
+  // different facts; the Sale Rate Update screen says which one it is holding.
+  const [saleRatesLoad, setSaleRatesLoad] = useState({ status: "idle", message: "", historyMessage: "" });
   const [suppliers, setSuppliers] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [purchases, setPurchases] = useState([]);
@@ -3377,7 +3375,7 @@ function App() {
       const response = await axios.get(localHealthUrl, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
       return { status: response.status, message: response.data?.status === "ok" ? "Local backend healthy" : "Local backend health did not report ok" };
     }));
-    results.push(await check("Railway /api/health", cloudHealthUrl, async () => {
+    results.push(await check("Cloud /api/health", cloudHealthUrl, async () => {
       const response = await axios.get(cloudHealthUrl, {
         timeout: 8000,
         headers: { "Cache-Control": "no-store", "x-user-id": user?.id || "", "x-device-id": latestDevice?.device_id || "" },
@@ -3389,7 +3387,7 @@ function App() {
         message: health.safeErrorMessage || (health.cloudReachable ? "Cloud backend healthy" : `Cloud not ready: ${health.errorCode || "unknown"}`),
       };
     }));
-    results.push(await check("Railway authentication", `${LOCAL_API_URL}/api/auth/me`, async () => ({
+    results.push(await check("Cloud authentication", `${LOCAL_API_URL}/api/auth/me`, async () => ({
       status: user?.id ? 200 : 401,
       message: user?.id ? `Signed in as user ${user.id}` : "No active local session for cloud diagnostics",
     })));
@@ -3505,6 +3503,10 @@ function App() {
       loadSaleReturns,
       loadWasteEntries,
       loadReports,
+      // An open POS gives the discounts it holds in memory. In a browser they come from the
+      // server here; on the desktop from the reference snapshot fetched just below, so the
+      // desktop makes no extra request for them.
+      ...(isTauriRuntime() ? [] : [loadLotDiscounts, loadDiscountRules]),
     ];
     const results = await Promise.allSettled(refreshes.map((refresh) => refresh()));
     const failures = results.filter((result) => result.status === "rejected");
@@ -3514,6 +3516,24 @@ function App() {
         const snapshot = await fetchOnlineReferenceSnapshot(userRef.current, latestDevice);
         const localStatus = await cacheLocalReferenceSnapshot(snapshot);
         setLocalDbStatus(localStatus);
+        const bundle = snapshot?.settings_bundle;
+        if (bundle && Array.isArray(bundle.lotDiscounts)) setLotDiscounts(bundle.lotDiscounts);
+        if (bundle && Array.isArray(bundle.discountRules)) {
+          setDiscountRules(bundle.discountRules.filter((rule) => rule.active !== false));
+          setSettingsData((current) => ({
+            ...current,
+            discountRules: bundle.discountRules,
+            saleRateSettings: { ...current.saleRateSettings, ...(bundle.saleRateSettings || {}) },
+          }));
+        }
+        // The shop's print and POS display switches ("Show Item Discount Column on POS" and the
+        // rest) from the same snapshot -- no extra request. Without this an open counter kept the
+        // switches it signed in with until someone opened Settings on it, so a switch changed on
+        // another machine never reached its POS, while Settings (which reloads on open) showed it.
+        const businessBundle = bundle?.businessSettings;
+        if (businessBundle && typeof businessBundle === "object" && !Array.isArray(businessBundle) && Object.keys(businessBundle).length > 0) {
+          setSettingsData((current) => ({ ...current, businessSettings: { ...defaultBusinessSettings, ...businessBundle } }));
+        }
       } catch (error) {
         failures.push({ status: "rejected", reason: error });
       }
@@ -4485,7 +4505,7 @@ function App() {
     setProductDuplicateWarning(bundle.productDuplicateWarning || "");
     setSaleRates(bundle.saleRates || []);
     setSaleRateHistory(bundle.saleRateHistory || []);
-    setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
+    setSaleDesiredMargin(String(parseTargetMargin(nextSaleRateSettings.desired_margin_percent, 25)));
   };
 
   const applyReferenceSnapshot = async (snapshot, { offline = false, localOnly = false, nextView = null } = {}) => {
@@ -5507,7 +5527,7 @@ function App() {
     });
     setDiscountRules((data.discountRules || []).filter((rule) => rule.active !== false));
     setChargeTypes(readChargeTypes(data));
-    setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
+    setSaleDesiredMargin(String(parseTargetMargin(nextSaleRateSettings.desired_margin_percent, 25)));
   };
 
   const loadDiscountRules = async () => {
@@ -5518,6 +5538,27 @@ function App() {
   const loadLotDiscounts = async () => {
     const response = await axios.get(`${API_URL}/lot-discounts`);
     setLotDiscounts(response.data);
+  };
+
+  /**
+   * POS's discounts, fresh from the server: lot discounts, bill-total slabs, and whether slabs are
+   * on. Used when checkout is refused because a discount changed under the till. Never in Local
+   * Only -- there the till keeps what it has, and nothing is sent.
+   */
+  const reloadPosDiscounts = async () => {
+    if (isLocalOnlyConnectivitySelected()) return false;
+    const [lots, rules, settings] = await Promise.allSettled([
+      axios.get(`${API_URL}/lot-discounts`),
+      axios.get(`${API_URL}/settings/discount-rules`),
+      axios.get(`${API_URL}/settings`),
+    ]);
+    if (lots.status === "fulfilled" && Array.isArray(lots.value.data)) setLotDiscounts(lots.value.data);
+    if (rules.status === "fulfilled" && Array.isArray(rules.value.data)) setDiscountRules(rules.value.data.filter((rule) => rule.active !== false));
+    const saleRateSettings = settings.status === "fulfilled" ? settings.value.data?.saleRateSettings : null;
+    if (saleRateSettings && typeof saleRateSettings === "object") {
+      setSettingsData((current) => ({ ...current, saleRateSettings: { ...current.saleRateSettings, ...saleRateSettings } }));
+    }
+    return [lots, rules, settings].every((result) => result.status === "fulfilled");
   };
 
   const loadCustomerPendingBills = async () => {
@@ -6402,13 +6443,27 @@ function App() {
     }
   };
 
+  // Never throws: a failure is held in `saleRatesLoad` and shown on the screen itself, not only in
+  // the global sync line, so a failed load cannot pass for "no products". The history is separate
+  // so that a history hiccup does not stop the morning rate update.
   const loadSaleRates = async (desiredMargin = saleDesiredMargin) => {
-    const [ratesResponse, historyResponse] = await Promise.all([
+    setSaleRatesLoad((current) => ({ ...current, status: "loading", message: "" }));
+    const [ratesResult, historyResult] = await Promise.allSettled([
       axios.get(`${API_URL}/sale-rates`, { params: { user_id: user.id, desired_margin: desiredMargin } }),
       axios.get(`${API_URL}/sale-rate-history`, { params: { user_id: user.id } }),
     ]);
-    setSaleRates(ratesResponse.data);
-    setSaleRateHistory(historyResponse.data);
+    const historyMessage = historyResult.status === "fulfilled"
+      ? ""
+      : `Recent changes could not be loaded (${getErrorMessage(historyResult.reason, "no answer from the server")}).`;
+    if (historyResult.status === "fulfilled") setSaleRateHistory(Array.isArray(historyResult.value.data) ? historyResult.value.data : []);
+    if (ratesResult.status !== "fulfilled" || !Array.isArray(ratesResult.value.data)) {
+      const reason = ratesResult.status === "fulfilled" ? "the server sent something that is not a rate list" : getErrorMessage(ratesResult.reason, "no answer from the server");
+      setSaleRatesLoad({ status: "failed", message: `Sale rates could not be loaded (${reason}). Nothing on this screen is current.`, historyMessage });
+      return false;
+    }
+    setSaleRates(ratesResult.value.data);
+    setSaleRatesLoad({ status: "ready", message: "", historyMessage });
+    return true;
   };
 
   const loadSupplierData = async (search = "") => {
@@ -8805,11 +8860,8 @@ function App() {
         await refreshPosInventoryFromSQLite("navigate-auto-pos");
         await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
       }
-      if (view === "discounts") {
-        const inventoryResponse = await axios.get(`${API_URL}/inventory`);
-        setInventory((current) => preserveVerifiedLocalCollection(inventoryResponse.data, current));
-        await Promise.all([loadLotDiscounts(), loadProducts(), loadSupplierData()]);
-      }
+      // Discounts loads itself when it opens (and on Back/Forward, which does not come through
+      // here), shows its own failure, and sends nothing in Local Only or offline.
       if (["purchase", "pending-bills", "accounts"].includes(view)) {
         await loadSupplierData();
       }
@@ -8840,7 +8892,8 @@ function App() {
       // Branches & Counters shows the device list the licences are issued against and the screen
       // lock, both of which come from the settings bundle.
       if (view === "settings" || view === "branches") await loadSettingsData();
-      if (view === "sale-rates") await loadSaleRates();
+      // Sale Rate Update loads itself when it opens (and when it is reached by Back/Forward, which
+      // does not come through here), so it is not loaded twice.
     } catch (error) {
       console.warn(`Unable to refresh ${view}`, error);
       setSyncMessage(getErrorMessage(error, `${navigationItems.find(([itemView]) => itemView === view)?.[1] || "Module"} data could not be refreshed.`));
@@ -9071,6 +9124,13 @@ function App() {
   const notificationSeverity = highestUnreadSeverity(notifications) || NOTIFICATION_SEVERITY.INFO;
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
+  // Discounts live on the server. In Local Only, offline, or on a desktop with no cloud the
+  // Discounts screen and the bill-total settings say so and send nothing.
+  const discountUnavailableReason = resolveDiscountAvailability({
+    localOnly: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
+    offline: offlineMode,
+    noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
+  });
   const userDisplayName = getUserDisplayName(user);
   const userRoleLabel = getUserRoleLabel(user);
   const canEditSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("sale_edit");
@@ -10414,6 +10474,7 @@ function App() {
               deviceInfo={deviceInfo}
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
+              onDiscountsStale={reloadPosDiscounts}
               inventory={posShelf.loaded ? posShelf.inventoryLots : inventory}
               counterScope={counterScope}
               onInvoice={setSelectedInvoice}
@@ -10455,7 +10516,7 @@ function App() {
                   await refreshSyncStatus();
                   return;
                 }
-                await Promise.all([loadDashboardData(), loadLotDiscounts(), loadCustomerPendingBills()]);
+                await Promise.all([loadDashboardData(), loadLotDiscounts(), loadDiscountRules(), loadCustomerPendingBills()]);
               }}
               paymentSettings={settingsData.paymentSettings}
               posSettings={settingsData.posSettings}
@@ -10467,19 +10528,23 @@ function App() {
               onConfigureMandiTax={() => setActiveView("settings")}
               canManualRateOverride={hasRolePermission("manual_pos_rate_override")}
               canPosDateOverride={hasRolePermission("pos_date_override")}
+              connectivityMode={connectivityMode}
+              offlineMode={offlineMode}
               user={user}
             />
           )}
 
           {activeView === "discounts" && (
             <DiscountManagementModule
-              discounts={lotDiscounts}
-              inventory={inventory}
-              onReload={async () => {
-                await Promise.all([loadLotDiscounts(), loadDashboardData()]);
+              canManage={canManageRates}
+              // The list this screen loaded is the one POS gives, so POS takes it as is.
+              onDiscountsLoaded={setLotDiscounts}
+              onSaved={() => {
+                // A desktop's POS also reads discounts from its SQLite snapshot (offline, and after
+                // a restart); a sync refreshes it. Local Only refuses inside runSyncNow. Not awaited.
+                if (isTauriRuntime()) runSyncNow({ force: true }).catch(() => null);
               }}
-              products={products.filter((product) => product.active !== false)}
-              user={user}
+              unavailableReason={discountUnavailableReason}
             />
           )}
 
@@ -10487,12 +10552,33 @@ function App() {
             <>
               <SaleRateManager
                 history={saleRateHistory}
-                onReload={async () => { await Promise.all([loadProducts(), loadSaleRates()]); }}
-                onRefresh={loadSaleRates}
+                loadState={saleRatesLoad}
+                onLoad={loadSaleRates}
+                onSaved={async () => {
+                  // POS prices a lot from `inventory`, not from this list, so it is refreshed too:
+                  // in a browser from the server, on the desktop by pulling the change into SQLite
+                  // (which Local Only refuses inside runSyncNow). Not awaited -- the list below is
+                  // what the owner is looking at.
+                  if (isTauriRuntime()) {
+                    runSyncNow({ force: true }).catch(() => null);
+                  } else {
+                    axios.get(`${API_URL}/inventory`)
+                      .then((response) => setInventory((current) => preserveVerifiedLocalCollection(response.data, current)))
+                      .catch(() => null);
+                  }
+                  loadProducts().catch(() => null);
+                  return loadSaleRates();
+                }}
                 rates={saleRates}
                 desiredMargin={saleDesiredMargin}
+                saleRateSettings={settingsData.saleRateSettings}
                 setDesiredMargin={setSaleDesiredMargin}
-                user={user}
+                unavailableReason={resolveSaleRateAvailability({
+                  localOnly: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
+                  offline: offlineMode,
+                  // Only the desktop forwards these routes to a cloud; a browser talks to the server itself.
+                  noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
+                })}
               />
               {/* Right after the rates are set is when the website's copy of them is
                   wrong, so the export lives here rather than somewhere it has to be
@@ -10530,6 +10616,14 @@ function App() {
                 onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
                 onConnectivityModeChange={changeConnectivityMode}
                 onApproveCloudDevice={approveCloudDevice}
+                discountUnavailableReason={discountUnavailableReason}
+                onDiscountRulesChanged={async () => {
+                  // POS reads slabs from `discountRules` and on/off from the settings bundle; both
+                  // are refreshed, quietly -- the settings card reports its own save.
+                  const results = await Promise.allSettled([loadDiscountRules(), loadSettingsData()]);
+                  if (isTauriRuntime()) runSyncNow({ force: true }).catch(() => null);
+                  return results.every((result) => result.status === "fulfilled");
+                }}
                 // Never rejects, and never lets one failed read fail the other two.
                 //
                 // Twenty settings handlers await this inside the same try as their own write, so a
@@ -14508,146 +14602,378 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
   );
 }
 
-function DiscountManagementModule({ discounts = [], inventory = [], onReload, products = [], user }) {
+/**
+ * Discounts: money off a lot of fruit at the counter.
+ *
+ * Loads itself when it opens (menu, shortcut, palette or Back/Forward), shows a failed load as a
+ * failure rather than as "no discounts", and in Local Only / offline / no cloud says why and sends
+ * nothing. Every rule it applies -- what a discount is worth, when it is running, what is refused --
+ * comes from local/discounts.js, which POS and the server share.
+ */
+function DiscountManagementModule({ canManage = false, onDiscountsLoaded, onSaved, unavailableReason = null }) {
+  const today = toDateKey(new Date());
+  const [load, setLoad] = useState({ status: "idle", message: "" });
+  const [discounts, setDiscounts] = useState([]);
+  const [lots, setLots] = useState([]);
+  const [showEnded, setShowEnded] = useState(false);
   const [productId, setProductId] = useState("");
-  const [selectedLotIds, setSelectedLotIds] = useState([]);
-  const [form, setForm] = useState({
-    discount_type: "FIXED_AMOUNT",
-    discount_value: "",
-    start_date: toDateKey(new Date()),
-    end_date: "",
-    active: true,
-    remarks: "",
-  });
-  const canManage = ["Owner", "Admin"].includes(user.role);
-  const productLots = inventory.filter((lot) =>
-    String(lot.product_id) === String(productId) &&
-    Number(lot.remaining_qty || 0) > 0 &&
-    lot.batch_status !== "CANCELLED"
-  );
-  const activeDiscountForLot = (lotId) => discounts.find((discount) =>
-    Number(discount.inventory_batch_id) === Number(lotId) &&
-    discount.active !== false &&
-    (!discount.end_date || toDateKey(discount.end_date) >= toDateKey(new Date()))
-  );
+  const [selectedLots, setSelectedLots] = useState([]);
+  const [offerType, setOfferType] = useState("FIXED_AMOUNT");
+  const [amount, setAmount] = useState("");
+  const [startLater, setStartLater] = useState(false);
+  const [startDate, setStartDate] = useState(today);
+  const [endDate, setEndDate] = useState("");
+  const [attempted, setAttempted] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [notice, setNotice] = useState(null);
+  const [stopping, setStopping] = useState(null);
+
+  const loadDiscounts = async () => {
+    setLoad((current) => ({ ...current, status: "loading", message: "" }));
+    const [discountResult, lotResult] = await Promise.allSettled([
+      axios.get(`${API_URL}/lot-discounts`),
+      axios.get(`${API_URL}/inventory`),
+    ]);
+    const failure = [discountResult, lotResult].find((result) => result.status !== "fulfilled" || !Array.isArray(result.value.data));
+    if (failure) {
+      const reason = failure.status === "fulfilled" ? "the server sent something that is not a list" : getErrorMessage(failure.reason, "no answer from the server");
+      setLoad({ status: "failed", message: `Discounts could not be loaded (${reason}). Nothing on this screen is current.` });
+      return false;
+    }
+    setDiscounts(discountResult.value.data);
+    setLots(lotResult.value.data);
+    onDiscountsLoaded?.(discountResult.value.data);
+    setLoad({ status: "ready", message: "" });
+    return true;
+  };
+
+  useEffect(() => {
+    if (unavailableReason) return;
+    loadDiscounts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unavailableReason]);
+
+  const failed = load.status === "failed";
+  const firstLoad = (load.status === "idle" || load.status === "loading") && discounts.length === 0 && lots.length === 0;
+  const { rows, hiddenCount } = buildDiscountRows(discounts, lots, { today, showEnded });
+  const products = discountableProducts(lots);
+  const product = products.find((item) => inventoryIdsEqual(item.id, productId)) || null;
+  const productLots = product ? discountableLots(lots, product.id) : [];
+  const unit = unitWord(product?.unit);
+  const choices = lotOfferChoices(product?.unit);
+  const suffix = choices.find((choice) => choice.type === offerType)?.suffix || "₹";
+  const chosenLots = productLots.filter((lot) => selectedLots.some((key) => inventoryIdsEqual(key, lot.id)));
+  const effectiveStart = startLater ? startDate : today;
+  const draft = { type: offerType, value: amount, startDate: effectiveStart, endDate, today, unit: product?.unit };
+  const checks = chosenLots.map((lot) => ({
+    lot,
+    rate: lotCurrentRate(lot),
+    result: validateLotDiscountDraft({ ...draft, currentRate: lotCurrentRate(lot), cost: lotCost(lot) }),
+  }));
+  const refusals = [...new Set([
+    ...(product ? [] : attempted ? ["Choose a fruit."] : []),
+    ...(product && chosenLots.length === 0 && attempted ? ["Tick at least one lot."] : []),
+    ...(amount === "" && !attempted ? [] : checks.flatMap((check) => check.result.errors)),
+    ...(chosenLots.length === 0 && (amount !== "" || attempted) ? validateLotDiscountDraft({ ...draft, currentRate: null }).errors.filter((error) => !/selling rate/.test(error)) : []),
+  ])];
+  const disabled = !canManage || Boolean(unavailableReason) || failed;
+
+  const chooseProduct = (id) => {
+    setProductId(id);
+    setNotice(null);
+    setSaveError("");
+    setAttempted(false);
+    const lotsForProduct = id ? discountableLots(lots, id) : [];
+    // One lot: nothing to choose, so it is chosen.
+    setSelectedLots(lotsForProduct.length === 1 ? [lotsForProduct[0].id] : []);
+  };
 
   const toggleLot = (lotId) => {
-    setSelectedLotIds((ids) => ids.includes(lotId) ? ids.filter((id) => id !== lotId) : [...ids, lotId]);
+    setNotice(null);
+    setSelectedLots((current) => (current.some((key) => inventoryIdsEqual(key, lotId))
+      ? current.filter((key) => !inventoryIdsEqual(key, lotId))
+      : [...current, lotId]));
   };
 
-  const saveDiscount = async () => {
-    if (!canManage) {
-      alert("Only Owner/Admin can create discounts.");
-      return;
-    }
-    if (!productId || selectedLotIds.length === 0 || Number(form.discount_value || 0) < 0) {
-      alert("Select product, lot and valid discount value.");
-      return;
-    }
+  const startDiscount = async () => {
+    setAttempted(true);
+    setSaveError("");
+    setNotice(null);
+    const blocking = !product || chosenLots.length === 0 || checks.some((check) => check.result.errors.length > 0);
+    if (blocking || saving || disabled) return;
+    setSaving(true);
+    let response;
     try {
-      await axios.post(`${API_URL}/lot-discounts`, {
-        product_id: productId,
-        inventory_batch_ids: selectedLotIds,
-        ...form,
-        created_by: user.id,
+      // No identity in the body: the server records who did it from the signed session.
+      response = await axios.post(`${API_URL}/lot-discounts`, buildLotDiscountPayload({
+        productId: product.id,
+        lotIds: chosenLots.map((lot) => lot.id),
+        type: offerType,
+        value: amount,
+        startDate: effectiveStart,
+        endDate,
+      }));
+    } catch (error) {
+      // Nothing was started (the server does all lots or none); the form keeps what was typed.
+      setSaveError(getErrorMessage(error, "The discount could not be started. Nothing was changed."));
+      setSaving(false);
+      return;
+    }
+    setSaving(false);
+    setAmount("");
+    setEndDate("");
+    setStartLater(false);
+    setStartDate(today);
+    setAttempted(false);
+    setSelectedLots([]);
+    const started = describeStartResult(response?.data, chosenLots.length);
+    const reloaded = await loadDiscounts();
+    onSaved?.();
+    setNotice(reloaded
+      ? { tone: "success", text: started }
+      : { tone: "warning", text: `${started} The list could not be refreshed, so it may not show it yet.` });
+  };
+
+  const confirmStop = async () => {
+    if (!stopping || stopping.saving) return;
+    setStopping({ ...stopping, saving: true, error: "" });
+    try {
+      await axios.post(`${API_URL}/lot-discounts/${encodeURIComponent(String(stopping.row.id))}/deactivate`, {
+        remarks: stopping.reason.trim() || "Discount stopped",
       });
-      setSelectedLotIds([]);
-      setForm({ discount_type: "FIXED_AMOUNT", discount_value: "", start_date: toDateKey(new Date()), end_date: "", active: true, remarks: "" });
-      await onReload();
-      alert("Discount saved");
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save discount"));
-    }
-  };
-
-  const deactivateDiscount = async (discount) => {
-    if (!canManage) {
-      alert("Only Owner/Admin can deactivate discounts.");
+      setStopping({ ...stopping, saving: false, error: getErrorMessage(error, "The discount could not be stopped. It is still running.") });
       return;
     }
-    const remarks = window.prompt("Reason / remarks for deactivation", "Discount deactivated") || "Discount deactivated";
-    try {
-      await axios.post(`${API_URL}/lot-discounts/${discount.id}/deactivate`, { updated_by: user.id, remarks });
-      await onReload();
-      alert("Discount deactivated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to deactivate discount"));
-    }
+    const stopped = `Stopped ${stopping.row.offer} on ${stopping.row.productName} · ${stopping.row.lotLabel}.`;
+    setStopping(null);
+    const reloaded = await loadDiscounts();
+    onSaved?.();
+    setNotice(reloaded
+      ? { tone: "success", text: `${stopped} Counters stop giving it at their next sync.` }
+      : { tone: "warning", text: `${stopped} The list could not be refreshed, so it may still show it.` });
   };
+
+  const priceText = (row) => (row.currentRate === null || row.customerPays === null
+    ? MISSING_VALUE
+    : `${formatDiscountRupees(row.currentRate)} → ${formatDiscountRupees(row.customerPays)} per ${row.unit}`);
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Retail Pricing" title="Discount Management" subtitle="Create item-wise and lot-wise retail POS discounts without changing permanent sale rates.">
-        <div className="form-grid supplier-form-grid">
-          <Field label="Product / Item">
-            <select value={productId} onChange={(event) => { setProductId(event.target.value); setSelectedLotIds([]); }}>
-              <option value="">Select product</option>
-              {products.map((product) => <option key={product.id} value={product.id}>{product.category || "Fruit"} - {product.product_name}</option>)}
-            </select>
-          </Field>
-          <Field label="Discount Type">
-            <select value={form.discount_type} onChange={(event) => setForm({ ...form, discount_type: event.target.value })}>
-              <option value="FIXED_AMOUNT">Fixed Amount Discount</option>
-              <option value="PERCENTAGE">Percentage Discount</option>
-              <option value="SPECIAL_RATE">Special Sale Rate</option>
-            </select>
-          </Field>
-          <Field label="Discount Value"><input min="0" step="0.01" type="number" value={form.discount_value} onChange={(event) => setForm({ ...form, discount_value: event.target.value })} /></Field>
-          <Field label="Start Date"><input type="date" value={form.start_date} onChange={(event) => setForm({ ...form, start_date: event.target.value })} /></Field>
-          <Field label="End Date"><input type="date" value={form.end_date} onChange={(event) => setForm({ ...form, end_date: event.target.value })} /></Field>
-          <Field label="Status">
-            <select value={form.active ? "ACTIVE" : "INACTIVE"} onChange={(event) => setForm({ ...form, active: event.target.value === "ACTIVE" })}>
-              <option value="ACTIVE">Active</option>
-              <option value="INACTIVE">Inactive</option>
-            </select>
-          </Field>
-          <Field label="Remarks"><input value={form.remarks} onChange={(event) => setForm({ ...form, remarks: event.target.value })} /></Field>
-        </div>
-        <div className="button-row">
-          <button className="secondary-button" disabled={productLots.length === 0} onClick={() => setSelectedLotIds(productLots.map((lot) => lot.id))}>Select All Active Lots</button>
-          <button className="primary-button" disabled={!canManage} onClick={saveDiscount}>Save Discount</button>
-        </div>
-      </ModuleCard>
-
-      <ModuleCard eyebrow="Lot Selection" title="Available Lots / Batches" subtitle="Discounts apply only to the selected stock lots.">
-        <DataTable headers={["Select", "Lot Name / Number", "Size / Grade", "Supplier", "Available Qty", "Current Sale Rate", "Cost Rate", "Existing Discount", "Status"]}>
-          {productLots.map((lot) => {
-            const existing = activeDiscountForLot(lot.id);
-            return (
-              <tr key={lot.id}>
-                <td><input checked={selectedLotIds.includes(lot.id)} type="checkbox" onChange={() => toggleLot(lot.id)} /></td>
-                <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}</td>
-                <td>{lot.lot_size || "-"}</td>
-                <td>{lot.supplier_name || "-"}</td>
-                <td>{Number(lot.remaining_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                <td>{currency.format(Number(lot.temporary_sale_rate || 0) > 0 ? Number(lot.temporary_sale_rate) : Number(lot.selling_rate || 0))}</td>
-                <td>{currency.format(Number(lot.effective_cost_per_unit || lot.purchase_rate || 0))}</td>
-                <td>{existing ? `${labelFor("discountType", existing.discount_type)} ${currency.format(Number(existing.discount_value || 0))}` : "-"}</td>
-                <td><span className={statusClass("batchStatus", lot.batch_status || "ACTIVE")}>{labelFor("batchStatus", lot.batch_status || "ACTIVE")}</span></td>
-              </tr>
-            );
-          })}
-        </DataTable>
-        {productId && productLots.length === 0 && <div className="cart-empty">No active lots with stock for this product.</div>}
-        {!productId && <div className="cart-empty">Select a product to view lots.</div>}
-      </ModuleCard>
-
-      <ModuleCard eyebrow="Active Discounts" title="Current Lot-Wise Discounts" subtitle="Reports and Sales History always keep discount accounting, even if receipt display hides it.">
-        <DataTable headers={["Product", "Lot / Size", "Discount Type", "Value", "Start", "End", "Status", "Remarks", "Actions"]}>
-          {discounts.map((discount) => (
-            <tr key={discount.id}>
-              <td className="primary-cell">{discount.product_name}</td>
-              <td>{discount.lot_name || discount.batch_no || "-"}{discount.lot_size ? ` / ${discount.lot_size}` : ""}</td>
-              <td>{labelFor("discountType", discount.discount_type)}</td>
-              <td>{discount.discount_type === "PERCENTAGE" ? `${Number(discount.discount_value || 0)}%` : currency.format(Number(discount.discount_value || 0))}</td>
-              <td>{formatDisplayDate(discount.start_date)}</td>
-              <td>{discount.end_date ? formatDisplayDate(discount.end_date) : "Open"}</td>
-              <td><span className={discount.active ? "stock-ok" : "stock-low"}>{discount.active ? "Active" : "Inactive"}</span></td>
-              <td>{discount.remarks || "-"}</td>
-              <td><button className="remove-button" disabled={!discount.active || !canManage} onClick={() => deactivateDiscount(discount)}>Deactivate</button></td>
-            </tr>
-          ))}
-        </DataTable>
+      <ModuleCard
+        eyebrow="Pricing"
+        title="Discounts"
+        subtitle="Money off a lot of fruit at the counter. Discounts on the whole bill are in Settings → Discount on bill total."
+      >
+        {unavailableReason ? (
+          <div className="warning-note" role="status">{unavailableReason}</div>
+        ) : (
+          <>
+            {failed && (
+              <div className="error-banner discount-load-error" role="alert">
+                {load.message}{" "}
+                <button className="secondary-button compact-button" type="button" onClick={() => loadDiscounts()}>Try again</button>
+              </div>
+            )}
+            {!canManage && !failed && (
+              <p className="form-note">Only the Owner or an Admin can start or stop discounts. You can see what is running.</p>
+            )}
+            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+            {!failed && (
+              <div className="discount-block">
+                <div className="discount-block-head">
+                  <h3>Running now</h3>
+                  {(hiddenCount > 0 || showEnded) && (
+                    <button className="table-action" type="button" onClick={() => setShowEnded((value) => !value)}>
+                      {showEnded ? "Hide ended" : `Show ended (${hiddenCount})`}
+                    </button>
+                  )}
+                </div>
+                <DataTable
+                  className="pm-table discount-table"
+                  headers={["Fruit · lot", "Offer", "Customer pays", "Until", ""]}
+                >
+                  {firstLoad && <tr><td className="empty-cell" colSpan={5}>Loading discounts…</td></tr>}
+                  {!firstLoad && rows.length === 0 && (
+                    <tr><td className="empty-cell" colSpan={5}>{hiddenCount > 0 ? "No discounts running. Ended ones are hidden." : "No discounts running. Start one below."}</td></tr>
+                  )}
+                  {rows.map((row) => (
+                    <React.Fragment key={row.key}>
+                      <tr className={row.canStop ? "" : "discount-row-past"}>
+                        <td className="primary-cell">
+                          {row.productName}
+                          <small className="cell-note">{row.lotLabel}{row.soldOut ? " · sold out" : ""}</small>
+                        </td>
+                        <td data-label="Offer">
+                          <span className="discount-offer">{row.offer}</span>
+                          <span className={statusClass("lotDiscountStatus", row.status)}>{lotDiscountStatusText(row.discount, today)}</span>
+                        </td>
+                        <td data-label="Customer pays">{priceText(row)}</td>
+                        <td data-label="Until">{row.endDate ? formatShortDate(row.endDate, today) : "No end"}</td>
+                        <td className="discount-actions-cell">
+                          {row.canStop && canManage && (
+                            <button
+                              className="danger-text-button compact-button"
+                              disabled={Boolean(stopping)}
+                              type="button"
+                              onClick={() => setStopping({ row, reason: "", saving: false, error: "" })}
+                            >
+                              Stop
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                      {stopping && stopping.row.key === row.key && (
+                        <tr className="discount-confirm-row">
+                          <td colSpan={5}>
+                            <div className="discount-confirm" role="group" aria-label="Stop this discount">
+                              <strong>{`Stop ${row.offer} on ${row.productName} · ${row.lotLabel}?`}</strong>
+                              <label className="discount-confirm-reason">
+                                <span>Reason (optional)</span>
+                                <input
+                                  autoFocus
+                                  maxLength={200}
+                                  placeholder="e.g. Stock sold, price changed"
+                                  value={stopping.reason}
+                                  onChange={(event) => setStopping({ ...stopping, reason: event.target.value })}
+                                />
+                              </label>
+                              <div className="button-row">
+                                <button className="primary-button" disabled={stopping.saving} type="button" onClick={confirmStop}>{stopping.saving ? "Stopping…" : "Stop discount"}</button>
+                                <button className="secondary-button" disabled={stopping.saving} type="button" onClick={() => setStopping(null)}>Keep it</button>
+                              </div>
+                              {stopping.error && <div className="inline-error" role="alert">{stopping.error}</div>}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </DataTable>
+              </div>
+            )}
+            {!failed && (
+              <div className="discount-block discount-start">
+                <h3>Start a discount</h3>
+                <div className="discount-form">
+                  <Field label="Fruit">
+                    <select disabled={disabled || firstLoad} value={productId} onChange={(event) => chooseProduct(event.target.value)}>
+                      <option value="">{products.length === 0 && !firstLoad ? "No fruit in stock" : "Choose a fruit"}</option>
+                      {products.map((item) => (
+                        <option key={String(item.id)} value={String(item.id)}>{item.name}</option>
+                      ))}
+                    </select>
+                  </Field>
+                  {product && (
+                    <fieldset className="discount-lots" disabled={disabled}>
+                      <legend>Lots</legend>
+                      {productLots.map((lot) => {
+                        const rate = lotCurrentRate(lot);
+                        const stock = lotStock(lot);
+                        const existing = currentLotDiscount(discounts, lot.id, today);
+                        const checked = selectedLots.some((key) => inventoryIdsEqual(key, lot.id));
+                        return (
+                          <label className={checked ? "discount-lot discount-lot-checked" : "discount-lot"} key={String(lot.id)}>
+                            <input checked={checked} type="checkbox" onChange={() => toggleLot(lot.id)} />
+                            <span>
+                              <strong>{lotLabel(lot)}</strong>
+                              <small>
+                                {[stock === null ? null : `${formatOptionalQuantity(stock)} ${unit}`, rate === null ? "no rate set" : `${formatDiscountRupees(rate)}/${unit}`].filter(Boolean).join(" · ")}
+                              </small>
+                              {existing && <small className="discount-replaces">{`Replaces ${describeLotOffer(existing, product.unit)}`}</small>}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </fieldset>
+                  )}
+                  <div className="discount-offer-field">
+                    <span className="discount-field-label" id="discount-offer-label">Offer</span>
+                    <div aria-labelledby="discount-offer-label" className="account-tabs" role="group">
+                      {choices.map((choice) => (
+                        <button
+                          aria-pressed={offerType === choice.type}
+                          className={offerType === choice.type ? "account-tab account-tab-active" : "account-tab"}
+                          disabled={disabled}
+                          key={choice.type}
+                          type="button"
+                          onClick={() => { setOfferType(choice.type); setNotice(null); }}
+                        >
+                          {choice.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="discount-inline-fields">
+                    <Field label={offerType === "SPECIAL_RATE" ? `Price per ${unit}` : offerType === "PERCENTAGE" ? "Percent off" : `Off each ${unit}`}>
+                      <span className={`discount-amount-input discount-amount-${suffix === "%" ? "suffix" : "prefix"}`}>
+                        {suffix === "₹" && <span aria-hidden="true">₹</span>}
+                        <input
+                          aria-invalid={refusals.length > 0 || undefined}
+                          disabled={disabled}
+                          inputMode="decimal"
+                          min="0"
+                          step="0.01"
+                          type="number"
+                          value={amount}
+                          onChange={(event) => { setAmount(event.target.value); setNotice(null); setSaveError(""); }}
+                        />
+                        {suffix === "%" && <span aria-hidden="true">%</span>}
+                      </span>
+                    </Field>
+                    <Field label="Until (optional)">
+                      <input disabled={disabled} min={effectiveStart} type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} />
+                    </Field>
+                    {startLater && (
+                      <Field label="Starts on">
+                        <input disabled={disabled} type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} />
+                      </Field>
+                    )}
+                  </div>
+                  <label className="check-field discount-start-later">
+                    <input checked={startLater} disabled={disabled} type="checkbox" onChange={(event) => { setStartLater(event.target.checked); if (!event.target.checked) setStartDate(today); }} />
+                    <span>Start on a later date</span>
+                  </label>
+                  <p className="form-note">
+                    {`${startLater && startDate && startDate !== today ? `Starts ${formatShortDate(startDate, today)}` : "Starts today"}, `}
+                    {endDate ? `runs to the end of ${formatShortDate(endDate, today)}.` : "runs until you stop it."}
+                  </p>
+                  {checks.length > 0 && amount !== "" && (
+                    <ul className="discount-preview-list" aria-label="What the customer pays">
+                      {checks.map(({ lot, rate, result }) => {
+                        const pays = discountedUnitPrice(rate, { discount_type: offerType, discount_value: amount });
+                        return (
+                          <li key={String(lot.id)}>
+                            <span>{lotLabel(lot)}</span>
+                            <strong>{rate === null || pays === null || result.errors.length ? MISSING_VALUE : `${formatDiscountRupees(rate)} → ${formatDiscountRupees(pays)} per ${unit}`}</strong>
+                            {result.errors.length === 0 && result.warnings.map((warning) => <small className="stock-low" key={warning}>{warning}</small>)}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                  {refusals.length === 0 && amount !== "" && checks.some((check) => check.result.warnings.length > 0) && (
+                    <div className="warning-note" role="status">
+                      The customer would pay less than this fruit cost. You can still start it.
+                    </div>
+                  )}
+                  {refusals.length > 0 && (
+                    <div className="inline-error" role="alert">
+                      {refusals.length === 1 ? refusals[0] : <ul>{refusals.map((refusal) => <li key={refusal}>{refusal}</li>)}</ul>}
+                    </div>
+                  )}
+                  {saveError && <div className="inline-error" role="alert">{saveError}</div>}
+                  <div className="button-row">
+                    <button className="primary-button" disabled={disabled || saving} type="button" onClick={startDiscount}>
+                      {saving ? "Starting…" : chosenLots.length > 1 ? `Start discount on ${chosenLots.length} lots` : "Start discount"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
       </ModuleCard>
     </section>
   );
@@ -15754,9 +16080,20 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     discountReport: {
       title: "Discount Report",
       rows: filterRows(data.discountReport),
-      summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Gross Amount", money(totalOf(rows, "gross_amount"))], ["Net Amount", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
-      headers: ["Date", "Product", "Lot", "Discount Type", "Discount Value", "Qty Sold", "Gross Amount", "Discount Amount", "Net Amount", "Profit Impact"],
-      render: (row, index) => <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{row.discount_type ? labelFor("discountType", row.discount_type) : "Bill / Manual"}</td><td>{row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>,
+      // `discount_amount` is item discounts plus each line's share of the bill discount, so the
+      // total counts bill-total (slab) discounts too; they used to be left out of it.
+      summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Bill Discounts", money(totalOf(rows, "bill_discount_share"))], ["Gross Amount", money(totalOf(rows, "gross_amount"))], ["Net Amount", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
+      headers: ["Date", "Product", "Lot", "Discount Type", "Discount Value", "Qty Sold", "Gross Amount", "Item Discount", "Bill Discount Share", "Discount Amount", "Net Amount", "Profit Impact"],
+      render: (row, index) => {
+        // A field the server did not send is unknown, not ₹0.
+        const known = (value) => (value === null || value === undefined || value === "" ? MISSING_VALUE : money(value));
+        const kind = row.discount_type
+          ? labelFor("discountType", row.discount_type)
+          : Number(row.bill_discount_share || 0) > 0
+            ? (row.bill_discount_rule_name ? `Bill: ${row.bill_discount_rule_name}` : "Bill discount")
+            : "Manual";
+        return <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{kind}</td><td>{!row.discount_type ? MISSING_VALUE : row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{known(row.item_discount_amount)}</td><td>{known(row.bill_discount_share)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>;
+      },
     },
     purchasesByDate: {
       title: "Purchases by Date",
@@ -19405,6 +19742,8 @@ function SettingsModule({
   onCheckConnection,
   onConnectivityModeChange,
   onApproveCloudDevice,
+  discountUnavailableReason = null,
+  onDiscountRulesChanged,
   onQueueSyncTest,
   onRegisterCloudDevice,
   onReload,
@@ -19493,15 +19832,15 @@ function SettingsModule({
    */
   const sectionContent = {
     "settings/display-typography": <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} setThemeMode={setThemeMode} systemPrefersDark={systemPrefersDark} themeMode={themeMode} />,
-    "settings/business-identity": <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />,
-    "settings/weighing-scale": <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />,
-    "settings/payment-tax": <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
-    "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
+    "settings/business-identity": <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} onReload={onReload} user={user} />,
+    "settings/weighing-scale": <PosSettingsSection canManage={canManage} onReload={onReload} posSettings={settingsData.posSettings} user={user} />,
+    "settings/payment-tax": <PaymentSettingsSection canManage={canManage} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
+    "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
     "settings/mandi-tax": <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />,
     "settings/other-charges": <OtherChargesSettings canManage={canManage} chargeTypes={settingsData.chargeTypes || []} onReload={onReload} user={user} />,
     "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
-    "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
-    "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
+    "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
+    "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} onChanged={onDiscountRulesChanged} saleRateSettings={settingsData.saleRateSettings} unavailableReason={discountUnavailableReason} />,
     "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
     "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
     "settings/updates": (
@@ -19522,7 +19861,6 @@ function SettingsModule({
         localBackendService={localBackendService || null}
         localDbAudit={localDbAudit}
         startupLogPath={startupLogPath}
-        key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
         onCheckConnection={onCheckConnection}
         onConnectivityModeChange={onConnectivityModeChange}
@@ -19655,13 +19993,44 @@ function AppearanceAccessibilitySettings({
   );
 }
 
+const NO_SETTINGS_DEFAULTS = Object.freeze({});
+
+/**
+ * A settings form's draft: the saved values as they are now, with only the fields this person has
+ * changed laid on top.
+ *
+ * Every settings card used to copy its settings into `useState` once, when it mounted, and was
+ * remounted only when the row's `updated_at` changed. Settings change under an open screen without
+ * that happening -- loaded from this computer's copy first and from the server a moment later, or
+ * refreshed after a sync -- and the card kept showing what it copied: "Show Item Discount Column on
+ * POS" ticked while POS, reading the live value, showed no column. Worse, Save sent the whole stale
+ * copy back, writing old values over every other setting on the card.
+ *
+ * Here nothing is copied. The box shows the live value until it is touched; Save sends the live
+ * values plus the touched fields; the touched fields are dropped once the saved values have been
+ * read back (kept if that read fails, so the screen never shows the pre-save value as current).
+ */
+function useSettingsDraft(saved, defaults = NO_SETTINGS_DEFAULTS) {
+  const [edits, setEdits] = useState({});
+  const draft = useMemo(() => ({ ...defaults, ...(saved || {}), ...edits }), [defaults, saved, edits]);
+  const updateDraft = useCallback((field, value) => setEdits((current) => ({ ...current, [field]: value })), []);
+  const resetDraft = useCallback(() => setEdits({}), []);
+  return { draft, updateDraft, resetDraft };
+}
+
+/** After a save: reload, and drop the touched fields only once the saved values are back. */
+const settleSettingsSave = async (onReload, resetDraft) => {
+  const refreshed = await onReload();
+  if (refreshed !== false) resetDraft();
+  return refreshed;
+};
+
 function BusinessSettingsSection({ businessSettings, canManage, onReload, user }) {
-  const [draft, setDraft] = useState({ ...defaultBusinessSettings, ...businessSettings });
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(businessSettings, defaultBusinessSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("Business settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update business settings"));
@@ -19716,12 +20085,11 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
 }
 
 function PosSettingsSection({ canManage, onReload, posSettings, user }) {
-  const [draft, setDraft] = useState({ ...defaultPosSettings, ...posSettings });
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(posSettings, defaultPosSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/pos`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("POS settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update POS settings"));
@@ -19750,12 +20118,11 @@ function PosSettingsSection({ canManage, onReload, posSettings, user }) {
 }
 
 function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) {
-  const [draft, setDraft] = useState({ ...defaultPaymentSettings, ...paymentSettings });
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(paymentSettings, defaultPaymentSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/payment`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("Payment settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update payment settings"));
@@ -19810,14 +20177,18 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
 }
 
 function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }) {
-  const [draft, setDraft] = useState({ ...defaultWhatsappSettings, ...whatsappSettings, access_token: "" });
+  // The token box always starts empty: the saved token is never sent to the screen, only typed.
+  const { draft: liveDraft, updateDraft, resetDraft } = useSettingsDraft(whatsappSettings, defaultWhatsappSettings);
+  const [tokenTyped, setTokenTyped] = useState(false);
+  const draft = tokenTyped ? liveDraft : { ...liveDraft, access_token: "" };
   const [message, setMessage] = useState("");
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/whatsapp`, { ...draft, updated_by: user.id });
-      setDraft((current) => ({ ...current, access_token: "" }));
-      await onReload();
+      // The token is gone from the screen whatever the reload does.
+      updateDraft("access_token", "");
+      setTokenTyped(false);
+      await settleSettingsSave(onReload, resetDraft);
       setMessage("WhatsApp settings updated.");
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to update WhatsApp settings"));
@@ -19844,7 +20215,7 @@ function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }
           <input disabled={!canManage} placeholder="Meta phone number ID" value={draft.phone_number_id || ""} onChange={(event) => updateDraft("phone_number_id", event.target.value)} />
         </Field>
         <Field label="Access Token">
-          <input disabled={!canManage} placeholder={whatsappSettings?.access_token_configured ? whatsappSettings.access_token_masked || "Token configured - enter new token to replace" : "Paste WhatsApp Cloud API access token"} type="password" value={draft.access_token || ""} onChange={(event) => updateDraft("access_token", event.target.value)} />
+          <input disabled={!canManage} placeholder={whatsappSettings?.access_token_configured ? whatsappSettings.access_token_masked || "Token configured - enter new token to replace" : "Paste WhatsApp Cloud API access token"} type="password" value={draft.access_token || ""} onChange={(event) => { setTokenTyped(true); updateDraft("access_token", event.target.value); }} />
         </Field>
         <Field label="Default Country Code">
           <input disabled={!canManage} placeholder="91" value={draft.default_country_code || "91"} onChange={(event) => updateDraft("default_country_code", event.target.value.replace(/\D/g, "").slice(0, 5))} />
@@ -20081,105 +20452,308 @@ function RebateSettings({ canManage, onReload, rules, user }) {
 }
 
 function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }) {
-  const [draft, setDraft] = useState({ ...defaultSaleRateSettings, ...saleRateSettings });
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(saleRateSettings, defaultSaleRateSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/sale-rate`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("Sale rate settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update sale rate settings"));
     }
   };
   return (
-    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="Default margin and rounding controls used by owner-approved rate updates.">
+    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="How Sale Rate Update suggests a rate from each lot's cost. A suggestion is only filled in when you choose it.">
+      <p className="form-note">The margin is on cost: a ₹100 cost at 25% suggests ₹125. Sale Rate Update starts at this margin; changing it on that screen does not change this setting.</p>
       <div className="form-grid settings-add-grid">
-        <Field label="Desired Margin %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent || ""} onChange={(event) => setDraft({ ...draft, desired_margin_percent: event.target.value })} /></Field>
+        <Field label="Target margin on cost %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent ?? ""} onChange={(event) => updateDraft("desired_margin_percent", event.target.value)} /></Field>
         <Field label="Rounding Rule">
-          <select disabled={!canManage} value={draft.rounding_rule || "NEAREST_RUPEE"} onChange={(event) => setDraft({ ...draft, rounding_rule: event.target.value })}>
+          <select disabled={!canManage} value={draft.rounding_rule || "NEAREST_RUPEE"} onChange={(event) => updateDraft("rounding_rule", event.target.value)}>
             {roundingRules.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
         </Field>
         <Field label="POS Lot Selection Mode">
-          <select disabled={!canManage} value={draft.pos_lot_selection_mode || "ASK_MULTIPLE"} onChange={(event) => setDraft({ ...draft, pos_lot_selection_mode: event.target.value })}>
+          <select disabled={!canManage} value={draft.pos_lot_selection_mode || "ASK_MULTIPLE"} onChange={(event) => updateDraft("pos_lot_selection_mode", event.target.value)}>
             <option value="ASK_MULTIPLE">Ask When Multiple Lots Exist</option>
             <option value="AUTO_FIFO">Use the oldest lot first</option>
             <option value="MANUAL">Manual Lot Selection</option>
           </select>
         </Field>
-        <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, suggestion_enabled: event.target.checked })} /><span>Suggestions Active</span></label>
-        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+        <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => updateDraft("suggestion_enabled", event.target.checked)} /><span>Show suggested rates</span></label>
+        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Sale Rate Settings</button>
     </ModuleCard>
   );
 }
 
-function DiscountSettings({ canManage, discountRules, onReload, saleRateSettings = {}, user }) {
-  const [calculationEnabled, setCalculationEnabled] = useState(saleRateSettings.bill_level_slab_discount_enabled !== false);
-  const [newRule, setNewRule] = useState({
-    rule_name: "",
-    minimum_bill_amount: "",
-    maximum_bill_amount: "",
-    discount_type: "FLAT_AMOUNT",
-    discount_value: "",
-    payment_mode: "ALL",
-    active: true,
-  });
-  const addRule = async () => {
+const EMPTY_SLAB_DRAFT = Object.freeze({ rule_name: "", minimum_bill_amount: "", maximum_bill_amount: "", discount_type: "PERCENTAGE", discount_value: "", payment_mode: "ALL" });
+
+/**
+ * Settings → Discount on bill total (the old "Bill-Level Discount Slabs").
+ *
+ * Loads its own slab list so a failed load is a failure and not "no slabs"; the on/off switch saves
+ * at once; each slab reads as a sentence; a slab that overlaps another is refused before it is sent,
+ * with the same rule and words the server uses. Nothing is sent in Local Only or offline.
+ */
+function DiscountSettings({ canManage, onChanged, saleRateSettings = {}, unavailableReason = null }) {
+  const savedEnabled = saleRateSettings.bill_level_slab_discount_enabled !== false;
+  const [enabled, setEnabled] = useState(savedEnabled);
+  const [toggle, setToggle] = useState({ saving: false, error: "", note: "" });
+  const [rules, setRules] = useState([]);
+  const [load, setLoad] = useState({ status: "idle", message: "" });
+  const [draft, setDraft] = useState(EMPTY_SLAB_DRAFT);
+  const [editingId, setEditingId] = useState(null);
+  const [attempted, setAttempted] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [removing, setRemoving] = useState(null);
+
+  // The switch follows the saved setting whenever that changes (a reload, another screen's save).
+  const [syncedEnabled, setSyncedEnabled] = useState(savedEnabled);
+  if (syncedEnabled !== savedEnabled) {
+    setSyncedEnabled(savedEnabled);
+    setEnabled(savedEnabled);
+  }
+
+  const loadRules = async () => {
+    setLoad((current) => ({ ...current, status: "loading", message: "" }));
     try {
-      await axios.post(`${API_URL}/settings/discount-rules`, { ...newRule, updated_by: user.id });
-      setNewRule({ rule_name: "", minimum_bill_amount: "", maximum_bill_amount: "", discount_type: "FLAT_AMOUNT", discount_value: "", payment_mode: "ALL", active: true });
-      await onReload();
+      const response = await axios.get(`${API_URL}/settings/discount-rules`, { params: { include_inactive: "true" } });
+      if (!Array.isArray(response.data)) throw new Error("the server sent something that is not a list");
+      setRules(response.data);
+      setLoad({ status: "ready", message: "" });
+      return true;
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to add discount rule"));
+      setLoad({ status: "failed", message: `Bill-total discounts could not be loaded (${getErrorMessage(error, error?.message || "no answer from the server")}). Nothing here is current.` });
+      return false;
     }
   };
-  const saveCalculationToggle = async () => {
+
+  useEffect(() => {
+    if (unavailableReason) return;
+    loadRules();
+  }, [unavailableReason]);
+
+  const disabled = !canManage || Boolean(unavailableReason);
+  const failed = load.status === "failed";
+  const firstLoad = (load.status === "idle" || load.status === "loading") && rules.length === 0;
+  const sortedRules = [...rules].sort((left, right) => (Number(left.active === false) - Number(right.active === false))
+    || (Number.parseFloat(left.minimum_bill_amount) || 0) - (Number.parseFloat(right.minimum_bill_amount) || 0));
+  const fieldErrors = attempted ? validateSlabDraft(draft) : {};
+  const overlap = attempted && Object.keys(fieldErrors).length === 0 ? findSlabOverlap(draft, rules, { ignoreId: editingId }) : null;
+  const refusals = [...Object.values(fieldErrors), ...(overlap ? [describeSlabOverlap(overlap)] : [])];
+
+  const saveToggle = async (next) => {
+    if (disabled || toggle.saving) return;
+    setEnabled(next);
+    setToggle({ saving: true, error: "", note: "" });
     try {
+      // The server takes the sale-rate settings as a whole, so the other fields are read fresh
+      // first: sending the copy this page loaded earlier could undo a margin or rounding change
+      // saved on another screen since. Only this switch changes.
+      const fresh = await axios.get(`${API_URL}/settings`);
+      const current = fresh.data?.saleRateSettings;
+      if (!current || typeof current !== "object") throw new Error("the current settings could not be read");
       await axios.put(`${API_URL}/settings/sale-rate`, {
-        ...defaultSaleRateSettings,
-        ...saleRateSettings,
-        bill_level_slab_discount_enabled: calculationEnabled,
-        updated_by: user.id,
+        desired_margin_percent: current.desired_margin_percent,
+        rounding_rule: current.rounding_rule,
+        suggestion_enabled: current.suggestion_enabled,
+        pos_lot_selection_mode: current.pos_lot_selection_mode,
+        notes: current.notes,
+        bill_level_slab_discount_enabled: next,
       });
-      await onReload();
-      alert("Discount calculation setting updated");
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update discount calculation setting"));
+      setEnabled(!next);
+      setToggle({ saving: false, error: `Not saved: ${getErrorMessage(error, error?.message || "no answer from the server")}. Bill-total discounts are still ${next ? "off" : "on"}.`, note: "" });
+      return;
     }
+    const refreshed = await Promise.resolve(onChanged?.()).catch(() => false);
+    setToggle({
+      saving: false,
+      error: "",
+      note: `${next ? "Turned on." : "Turned off."} Counters pick this up at their next sync.${refreshed === false ? " This page could not refresh; open it again to check." : ""}`,
+    });
   };
+
+  const startEdit = (rule) => {
+    // "1000.00" from the database reads as 1000 in the box.
+    const amountText = (value) => {
+      const number = Number.parseFloat(value);
+      return Number.isFinite(number) ? String(number) : "";
+    };
+    const maximum = Number.parseFloat(rule.maximum_bill_amount);
+    // A name made from the range is left blank, so it follows the range if that is changed.
+    const autoName = slabDisplayName({ ...rule, rule_name: "" });
+    setEditingId(rule.id);
+    setDraft({
+      rule_name: String(rule.rule_name || "").trim() === autoName ? "" : rule.rule_name || "",
+      minimum_bill_amount: amountText(rule.minimum_bill_amount),
+      maximum_bill_amount: Number.isFinite(maximum) && maximum !== 0 ? String(maximum) : "",
+      discount_type: String(rule.discount_type || "PERCENTAGE").toUpperCase(),
+      discount_value: amountText(rule.discount_value),
+      payment_mode: String(rule.payment_mode || "ALL").toUpperCase(),
+      active: rule.active !== false,
+    });
+    setAttempted(false);
+    setSaveError("");
+    setNotice("");
+  };
+
+  const resetForm = () => {
+    setEditingId(null);
+    setDraft(EMPTY_SLAB_DRAFT);
+    setAttempted(false);
+    setSaveError("");
+  };
+
+  const saveSlab = async () => {
+    setAttempted(true);
+    setSaveError("");
+    setNotice("");
+    if (disabled || saving) return;
+    if (Object.keys(validateSlabDraft(draft)).length > 0 || findSlabOverlap(draft, rules, { ignoreId: editingId })) return;
+    const body = { ...buildSlabPayload(draft), active: draft.active !== false };
+    setSaving(true);
+    try {
+      if (editingId === null) await axios.post(`${API_URL}/settings/discount-rules`, body);
+      else await axios.put(`${API_URL}/settings/discount-rules/${encodeURIComponent(String(editingId))}`, body);
+    } catch (error) {
+      setSaveError(getErrorMessage(error, "Not saved. Nothing was changed."));
+      setSaving(false);
+      return;
+    }
+    setSaving(false);
+    const saved = `${editingId === null ? "Added" : "Saved"}: ${describeSlab(body)}.`;
+    resetForm();
+    const reloaded = await loadRules();
+    await Promise.resolve(onChanged?.()).catch(() => false);
+    setNotice(reloaded ? `${saved} Counters pick it up at their next sync.` : `${saved} The list could not be refreshed.`);
+  };
+
+  const confirmRemove = async () => {
+    if (!removing || removing.saving) return;
+    setRemoving({ ...removing, saving: true, error: "" });
+    try {
+      await axios.delete(`${API_URL}/settings/discount-rules/${encodeURIComponent(String(removing.rule.id))}`);
+    } catch (error) {
+      setRemoving({ ...removing, saving: false, error: getErrorMessage(error, "Not removed. It is still in use.") });
+      return;
+    }
+    const removed = `Removed: ${describeSlab(removing.rule)}.`;
+    setRemoving(null);
+    if (editingId !== null && inventoryIdsEqual(editingId, removing.rule.id)) resetForm();
+    await loadRules();
+    await Promise.resolve(onChanged?.()).catch(() => false);
+    setNotice(removed);
+  };
+
   return (
-    <ModuleCard eyebrow="Overall Sale Discount Settings" title="Bill-Level Discount Slabs" subtitle="Automatic POS invoice discounts based on total bill amount and optional payment mode.">
-      <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric featured label="Discount Calculation" value={calculationEnabled ? "Enabled" : "Disabled"} />
-        <SummaryMetric label="Active Slabs" value={discountRules.filter((rule) => rule.active !== false).length} />
-      </div>
-      <div className="button-row">
-        <label className="check-field"><input checked={calculationEnabled} disabled={!canManage} type="checkbox" onChange={(event) => setCalculationEnabled(event.target.checked)} /><span>Enable Bill-Level Slab Discount</span></label>
-        <button className="secondary-button" disabled={!canManage} onClick={saveCalculationToggle}>Save Calculation Setting</button>
-      </div>
-      <div className="form-grid discount-rule-grid">
-        <Field label="Rule Name"><input disabled={!canManage} value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
-        <Field label="Minimum Bill Amount"><input disabled={!canManage} min="0" step="0.01" type="number" value={newRule.minimum_bill_amount} onChange={(event) => setNewRule({ ...newRule, minimum_bill_amount: event.target.value })} /></Field>
-        <Field label="Maximum Bill Amount"><input disabled={!canManage} min="0" step="0.01" type="number" value={newRule.maximum_bill_amount} onChange={(event) => setNewRule({ ...newRule, maximum_bill_amount: event.target.value })} /></Field>
-        <Field label="Discount Type">
-          <select disabled={!canManage} value={newRule.discount_type} onChange={(event) => setNewRule({ ...newRule, discount_type: event.target.value })}>
-            {discountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-          </select>
-        </Field>
-        <Field label="Discount Value"><input disabled={!canManage} min="0" step="0.01" type="number" value={newRule.discount_value} onChange={(event) => setNewRule({ ...newRule, discount_value: event.target.value })} /></Field>
-        <Field label="Payment Mode">
-          <select disabled={!canManage} value={newRule.payment_mode} onChange={(event) => setNewRule({ ...newRule, payment_mode: event.target.value })}>
-            {discountPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-          </select>
-        </Field>
-        <label className="check-field"><input disabled={!canManage} checked={newRule.active} type="checkbox" onChange={(event) => setNewRule({ ...newRule, active: event.target.checked })} /><span>Active</span></label>
-      </div>
-      <button className="primary-button" disabled={!canManage} onClick={addRule}>Add Discount Slab</button>
-      <DataTable headers={["Rule", "Range", "Type", "Value", "Payment", "Status", ""]}>
-        {discountRules.map((rule) => <DiscountRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
-      </DataTable>
+    <ModuleCard eyebrow="Bill discounts" title="Discount on bill total" subtitle="Money off the whole bill when its total is in a range. POS works it out by itself.">
+      {unavailableReason ? (
+        <div className="warning-note" role="status">{unavailableReason}</div>
+      ) : (
+        <div className="slab-settings">
+          {!canManage && <p className="form-note">Only the Owner or an Admin can change bill-total discounts.</p>}
+          <div className="slab-switch-row">
+            <div className="slab-switch-line">
+              <label className="check-field slab-switch">
+                <input checked={enabled} disabled={disabled || toggle.saving} type="checkbox" onChange={(event) => saveToggle(event.target.checked)} />
+                <span>Give bill-total discounts at POS</span>
+              </label>
+              <span className={enabled ? "stock-ok" : "tag"}>{toggle.saving ? "Saving…" : enabled ? "On" : "Off"}</span>
+            </div>
+            <p className="form-note">
+              {enabled ? "" : "Off: POS gives no bill-total discount. "}
+              Worked out on the bill before item discounts. Applies to every shop. If two could apply, the one that takes more off is used.
+            </p>
+          </div>
+          {toggle.error && <div className="inline-error" role="alert">{toggle.error}</div>}
+          {toggle.note && <p className="form-note stock-ok" role="status">{toggle.note}</p>}
+          {failed && (
+            <div className="inline-error" role="alert">
+              {load.message}{" "}
+              <button className="secondary-button compact-button" type="button" onClick={() => loadRules()}>Try again</button>
+            </div>
+          )}
+          {notice && <p className="form-note stock-ok" role="status">{notice}</p>}
+          {!failed && (
+            <ul className="slab-list">
+              {firstLoad && <li className="slab-empty">Loading bill-total discounts…</li>}
+              {!firstLoad && sortedRules.length === 0 && <li className="slab-empty">No bill-total discounts yet. Add one below.</li>}
+              {sortedRules.map((rule) => (
+                <li className={rule.active === false ? "slab-item slab-item-off" : "slab-item"} key={String(rule.id)}>
+                  <div className="slab-text">
+                    <strong>{describeSlab(rule)}</strong>
+                    {rule.rule_name && rule.rule_name !== slabDisplayName({ ...rule, rule_name: "" }) && <small>{`On the bill: ${rule.rule_name}`}</small>}
+                    {rule.active === false && <small><span className="tag">Switched off</span> Not given at POS.</small>}
+                  </div>
+                  {!disabled && (
+                    <div className="button-row slab-actions">
+                      <button className="table-action" disabled={saving || Boolean(removing)} type="button" onClick={() => startEdit(rule)}>Edit</button>
+                      <button className="danger-text-button compact-button" disabled={saving || Boolean(removing)} type="button" onClick={() => setRemoving({ rule, saving: false, error: "" })}>Remove</button>
+                    </div>
+                  )}
+                  {removing && inventoryIdsEqual(removing.rule.id, rule.id) && (
+                    <div className="discount-confirm slab-confirm" role="group" aria-label="Remove this bill-total discount">
+                      <strong>{`Remove '${slabDisplayName(rule)}'?`}</strong>
+                      <span className="form-note">Bills already made keep their discount.</span>
+                      <div className="button-row">
+                        <button className="primary-button" disabled={removing.saving} type="button" onClick={confirmRemove}>{removing.saving ? "Removing…" : "Remove"}</button>
+                        <button className="secondary-button" disabled={removing.saving} type="button" onClick={() => setRemoving(null)}>Keep it</button>
+                      </div>
+                      {removing.error && <div className="inline-error" role="alert">{removing.error}</div>}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {!failed && !disabled && (
+            <div className="slab-form">
+              <h3>{editingId === null ? "Add a bill-total discount" : "Change this bill-total discount"}</h3>
+              <div className="slab-form-grid">
+                <Field label="Bill total from ₹">
+                  <input aria-invalid={Boolean(fieldErrors.minimum_bill_amount || overlap) || undefined} inputMode="decimal" min="0" placeholder="0" step="0.01" type="number" value={draft.minimum_bill_amount} onChange={(event) => setDraft({ ...draft, minimum_bill_amount: event.target.value })} />
+                </Field>
+                <Field label="To ₹ (blank = and above)">
+                  <input aria-invalid={Boolean(fieldErrors.maximum_bill_amount || overlap) || undefined} inputMode="decimal" min="0" placeholder="and above" step="0.01" type="number" value={draft.maximum_bill_amount} onChange={(event) => setDraft({ ...draft, maximum_bill_amount: event.target.value })} />
+                </Field>
+                <Field label="Payment">
+                  <select value={draft.payment_mode} onChange={(event) => setDraft({ ...draft, payment_mode: event.target.value })}>
+                    {BILL_DISCOUNT_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{mode === "ALL" ? "Any payment" : labelFor("paymentMode", mode)}</option>)}
+                  </select>
+                </Field>
+                <div className="discount-offer-field">
+                  <span className="discount-field-label" id="slab-type-label">Discount</span>
+                  <div aria-labelledby="slab-type-label" className="account-tabs" role="group">
+                    {[["PERCENTAGE", "% off"], ["FLAT_AMOUNT", "₹ off"]].map(([type, label]) => (
+                      <button aria-pressed={draft.discount_type === type} className={draft.discount_type === type ? "account-tab account-tab-active" : "account-tab"} key={type} type="button" onClick={() => setDraft({ ...draft, discount_type: type })}>{label}</button>
+                    ))}
+                  </div>
+                </div>
+                <Field label={draft.discount_type === "PERCENTAGE" ? "Percent off" : "Rupees off"}>
+                  <input aria-invalid={Boolean(fieldErrors.discount_value) || undefined} inputMode="decimal" min="0" step="0.01" type="number" value={draft.discount_value} onChange={(event) => setDraft({ ...draft, discount_value: event.target.value })} />
+                </Field>
+                <Field label="Name on the bill (optional)">
+                  <input maxLength={80} placeholder={slabDisplayName({ ...buildSlabPayload(draft), rule_name: "" })} value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} />
+                </Field>
+              </div>
+              {refusals.length > 0 && (
+                <div className="inline-error" role="alert">
+                  {refusals.length === 1 ? refusals[0] : <ul>{refusals.map((refusal) => <li key={refusal}>{refusal}</li>)}</ul>}
+                </div>
+              )}
+              {saveError && <div className="inline-error" role="alert">{saveError}</div>}
+              <div className="button-row">
+                <button className="primary-button" disabled={saving} type="button" onClick={saveSlab}>{saving ? "Saving…" : editingId === null ? "Add discount" : "Save changes"}</button>
+                {editingId !== null && <button className="secondary-button" disabled={saving} type="button" onClick={resetForm}>Cancel</button>}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </ModuleCard>
   );
 }
@@ -20240,42 +20814,6 @@ function RebateRuleRow({ canManage, onReload, rule, user }) {
       <td><input className="settings-table-input" disabled={!canManage} value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} /></td>
       <td><input className="table-input" disabled={!canManage} min="0" type="number" value={draft.pay_within_days} onChange={(event) => setDraft({ ...draft, pay_within_days: event.target.value })} /></td>
       <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={draft.rebate_percent} onChange={(event) => setDraft({ ...draft, rebate_percent: event.target.value })} /></td>
-      <td><label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
-      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
-    </tr>
-  );
-}
-
-function DiscountRuleRow({ canManage, onReload, rule, user }) {
-  const [draft, setDraft] = useState(rule);
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/discount-rules/${rule.id}`, { ...draft, updated_by: user.id });
-      await onReload();
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update discount rule"));
-    }
-  };
-  const remove = async () => {
-    try {
-      await axios.delete(`${API_URL}/settings/discount-rules/${rule.id}`, { data: { updated_by: user.id } });
-      await onReload();
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to delete discount rule"));
-    }
-  };
-  return (
-    <tr>
-      <td><input className="settings-table-input" disabled={!canManage} value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} /></td>
-      <td>
-        <div className="table-range-inputs">
-          <input className="table-input" disabled={!canManage} min="0" step="0.01" type="number" value={draft.minimum_bill_amount} onChange={(event) => setDraft({ ...draft, minimum_bill_amount: event.target.value })} />
-          <input className="table-input" disabled={!canManage} min="0" step="0.01" type="number" value={draft.maximum_bill_amount || ""} onChange={(event) => setDraft({ ...draft, maximum_bill_amount: event.target.value })} />
-        </div>
-      </td>
-      <td><select className="settings-table-input" disabled={!canManage} value={draft.discount_type} onChange={(event) => setDraft({ ...draft, discount_type: event.target.value })}>{discountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></td>
-      <td><input className="table-input" disabled={!canManage} min="0" step="0.01" type="number" value={draft.discount_value} onChange={(event) => setDraft({ ...draft, discount_value: event.target.value })} /></td>
-      <td><select className="settings-table-input" disabled={!canManage} value={draft.payment_mode} onChange={(event) => setDraft({ ...draft, payment_mode: event.target.value })}>{discountPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></td>
       <td><label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
       <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
     </tr>
@@ -20367,15 +20905,11 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
 }
 
 function DeviceControlSettingsSection({ canManage, deviceControlSettings = defaultDeviceControlSettings, exitAttemptLogs = [], onReload, user }) {
-  const [draft, setDraft] = useState({ ...defaultDeviceControlSettings, ...deviceControlSettings });
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(deviceControlSettings, defaultDeviceControlSettings);
   const [currentPassword, setCurrentPassword] = useState("");
   const [exitCode, setExitCode] = useState("");
   const [confirmExitCode, setConfirmExitCode] = useState("");
   const [message, setMessage] = useState("");
-  useEffect(() => {
-    setDraft({ ...defaultDeviceControlSettings, ...deviceControlSettings });
-  }, [deviceControlSettings?.updated_at, deviceControlSettings?.fullscreen_lock_enabled, deviceControlSettings?.exit_code_configured]);
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/device-control`, {
@@ -20390,7 +20924,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
       setExitCode("");
       setConfirmExitCode("");
       setMessage("Device control settings updated");
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to update device control settings"));
     }
@@ -21537,7 +22071,7 @@ function SyncSettingsSection({
   timeDiagnostics,
   user,
 }) {
-  const [draft, setDraft] = useState(syncSettings || {});
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(syncSettings);
   const [statusMessage, setStatusMessage] = useState("");
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [cloudReadiness, setCloudReadiness] = useState(null);
@@ -21553,8 +22087,9 @@ function SyncSettingsSection({
         device_display_name: draft.device_display_name || "Main Counter Device",
         updated_by: user.id,
       });
-      setDraft((current) => ({ ...current, ...response.data }));
-      await onReload();
+      // What the server saved stands on screen until the reload brings it back as the live value.
+      if (response.data?.device_display_name !== undefined) updateDraft("device_display_name", response.data.device_display_name);
+      await settleSettingsSave(onReload, resetDraft);
       setStatusMessage("Device display name saved");
       alert("Device display name saved");
     } catch (error) {
@@ -21817,7 +22352,7 @@ function SyncSettingsSection({
             <Field label="This Computer's ID"><input disabled value={localDeviceId} /></Field>
             <Field label="ID in the Cloud"><input disabled value={canonicalCloudDeviceId} /></Field>
             <Field label="Older Device ID (from Settings)"><input disabled value={draft.device_id || "Not set"} /></Field>
-            <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
+            <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => updateDraft("device_display_name", event.target.value)} /></Field>
             <Field label="Local Database File"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
             <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
             <Field label="Local Database Check"><input disabled value={localDbAudit?.integrity || "Not checked"} /></Field>
@@ -22551,177 +23086,288 @@ function SystemInfoSection({ systemInfo }) {
   );
 }
 
-function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, setDesiredMargin, user }) {
+function SaleRateManager({ desiredMargin, history, loadState = {}, onLoad, onSaved, rates, saleRateSettings = {}, setDesiredMargin, unavailableReason = null }) {
   const [search, setSearch] = useState("");
   const [origin, setOrigin] = useState("");
   const [category, setCategory] = useState("");
-  const [draftRates, setDraftRates] = useState({});
-  const [selectedSuggested, setSelectedSuggested] = useState({});
-  const [confirmUpdates, setConfirmUpdates] = useState(null);
-  const categories = [...new Set(rates.map((rate) => rate.category).filter(Boolean))];
-  const filteredRates = rates.filter((rate) =>
-    rate.product_name.toLowerCase().includes(search.toLowerCase()) &&
-    (!origin || rate.origin_type === origin) &&
-    (!category || rate.category === category)
-  );
+  // Row key -> what is typed in that row's box. Only boxes with something in them are here.
+  const [drafts, setDrafts] = useState({});
+  const [confirmChanges, setConfirmChanges] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saveNotice, setSaveNotice] = useState(null);
 
-  const buildRateUpdates = () => Object.entries(draftRates)
-    .map(([rowId, value]) => {
-      const rate = rates.find((item) => String(item.id) === String(rowId));
-      return rate ? {
-        product_id: Number(rate.product_id || rate.id),
-        inventory_batch_id: rate.inventory_batch_id || null,
-        product_name: rate.product_name,
-        lot_name: rate.lot_name,
-        lot_size: rate.lot_size,
-        old_rate: Number(rate.selling_rate || 0),
-        new_selling_rate: Number(value),
-      } : null;
-    })
-    .filter(Boolean);
+  // Loaded here rather than by the menu, so the list is fetched however the screen was reached
+  // (menu, shortcut, command palette or Back/Forward). Never in Local Only or offline.
+  useEffect(() => {
+    if (unavailableReason || typeof onLoad !== "function") return;
+    onLoad();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unavailableReason]);
 
-  const requestSaveRates = () => {
-    const updates = buildRateUpdates();
-    if (updates.length === 0) {
-      alert("Select at least one product rate to update.");
-      return;
-    }
-    const invalid = updates.find((update) => !Number.isFinite(update.new_selling_rate) || update.new_selling_rate <= 0);
-    if (invalid) {
-      alert("New Rate must be greater than 0 for every selected product.");
-      return;
-    }
-    setConfirmUpdates(updates);
-  };
+  const targetMargin = parseTargetMargin(desiredMargin, saleRateSettings.desired_margin_percent);
+  const suggestionsEnabled = saleRateSettings.suggestion_enabled !== false;
+  const rows = useMemo(() => buildSaleRateRows(rates, {
+    targetMargin,
+    roundingRule: saleRateSettings.rounding_rule,
+    suggestionsEnabled,
+  }), [rates, targetMargin, saleRateSettings.rounding_rule, suggestionsEnabled]);
+  const categories = [...new Set(rows.map((row) => row.category).filter(Boolean))].sort();
+  const visibleRows = filterSaleRateRows(rows, { search, category, origin });
+  const { changes, invalid, hiddenCount } = collectSaleRateChanges(rows, drafts, visibleRows);
+  const invalidKeys = new Set(invalid);
+  const status = loadState.status || "idle";
+  const failed = status === "failed";
+  const firstLoad = (status === "idle" || status === "loading") && rows.length === 0;
 
-  const saveRates = async () => {
-    const updates = confirmUpdates || buildRateUpdates();
-    const invalid = updates.find((update) => !Number.isFinite(update.new_selling_rate) || update.new_selling_rate <= 0);
-    if (updates.length === 0 || invalid) {
-      alert("Select valid rates before saving.");
-      return;
-    }
-    const payloadUpdates = updates.map((update) => ({
-      product_id: update.product_id,
-      inventory_batch_id: update.inventory_batch_id || null,
-      new_selling_rate: update.new_selling_rate,
-    }));
-    try {
-      await axios.post(`${API_URL}/sale-rates/bulk`, { updates: payloadUpdates, changed_by: user.id });
-      setDraftRates({});
-      setSelectedSuggested({});
-      setConfirmUpdates(null);
-      await onReload();
-      alert(`${updates.length} selling rate${updates.length === 1 ? "" : "s"} updated successfully.`);
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update selling rates"));
-    }
-  };
-
-  const toggleSuggestedRate = (rate, checked) => {
-    setSelectedSuggested((current) => ({ ...current, [rate.id]: checked }));
-    setDraftRates((current) => {
+  const setDraft = (key, value) => {
+    setSaveNotice(null);
+    setDrafts((current) => {
       const next = { ...current };
-      if (checked) next[rate.id] = Number(rate.suggested_selling_rate || 0);
-      else delete next[rate.id];
+      if (String(value ?? "").trim() === "") delete next[key];
+      else next[key] = value;
       return next;
     });
   };
 
-  const selectVisibleSuggestedRates = () => {
-    const selected = {};
-    const drafts = {};
-    for (const rate of filteredRates) {
-      selected[rate.id] = true;
-      drafts[rate.id] = Number(rate.suggested_selling_rate || 0);
-    }
-    setSelectedSuggested((current) => ({ ...current, ...selected }));
-    setDraftRates((current) => ({ ...current, ...drafts }));
+  const fillSuggested = () => {
+    setSaveNotice(null);
+    setDrafts((current) => ({ ...current, ...suggestedDrafts(visibleRows) }));
   };
 
-  const allVisibleSelected = filteredRates.length > 0 && filteredRates.every((rate) => Boolean(selectedSuggested[rate.id]));
-  const toggleAllVisible = (checked) => {
-    if (checked) {
-      selectVisibleSuggestedRates();
+  const requestSave = () => {
+    setSaveError("");
+    if (invalid.length) {
+      setSaveError(`${invalid.length} new rate${invalid.length === 1 ? " is" : "s are"} not a price above zero. Correct or clear ${invalid.length === 1 ? "it" : "them"} first.`);
       return;
     }
-    const visibleIds = new Set(filteredRates.map((rate) => String(rate.id)));
-    setSelectedSuggested((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !visibleIds.has(String(id)))));
-    setDraftRates((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !visibleIds.has(String(id)))));
+    if (changes.length) setConfirmChanges(changes);
+  };
+
+  const save = async () => {
+    const pending = confirmChanges || [];
+    if (!pending.length || saving) return;
+    setSaving(true);
+    setSaveError("");
+    let response;
+    try {
+      // No identity in the body: the server records who changed the rate from the signed session.
+      response = await axios.post(`${API_URL}/sale-rates/bulk`, { updates: buildBulkRatePayload(pending) });
+    } catch (error) {
+      // Nothing was saved (the server applies all or none), so the typed rates stay for a retry.
+      setSaveError(getErrorMessage(error, "The rates could not be saved. Nothing was changed."));
+      setSaving(false);
+      setConfirmChanges(null);
+      return;
+    }
+    // Saved. Anything that goes wrong from here is about refreshing the screen, never "not saved".
+    setDrafts({});
+    setConfirmChanges(null);
+    setSaving(false);
+    const saved = describeSaveResult(response?.data, pending.length);
+    const reloaded = await Promise.resolve(onSaved?.()).catch(() => false);
+    setSaveNotice(reloaded === false
+      ? { tone: "warning", text: `${saved} The list could not be refreshed, so it may still show the old rates. Open this screen again to check.` }
+      : { tone: "success", text: `${saved} Each counter's POS picks them up at its next sync, usually within a minute.` });
+  };
+
+  const rateCell = (rate, cost, suggestedRate) => {
+    if (rate === null) return MISSING_VALUE;
+    const margin = marginOnCost(rate, cost);
+    const tone = rateTone({ rate, cost, suggestedRate, targetMargin });
+    return margin === null
+      ? <span title="No purchase cost to compare with">{MISSING_VALUE}</span>
+      : <span className={STATUS_TONE_CLASS[tone] || "tag"}>{`${margin.toFixed(1)}%`}</span>;
   };
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Owner Controls" title="Daily Sale Rate Update" subtitle="Review landed costs, suggested rates, and approve daily selling-rate changes. Suggestions never auto-apply.">
-        <div className="rate-toolbar">
-          <input placeholder="Search products" value={search} onChange={(event) => setSearch(event.target.value)} />
-          <select value={origin} onChange={(event) => setOrigin(event.target.value)}><option value="">All Origins</option><option value="LOCAL">Local</option><option value="IMPORTED">Imported</option></select>
-          <select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">All Categories</option>{categories.map((item) => <option key={item}>{item}</option>)}</select>
-          <input min="0" placeholder="Desired margin %" step="0.1" type="number" value={desiredMargin} onChange={(event) => setDesiredMargin(event.target.value)} />
-          <button className="secondary-button" onClick={() => onRefresh(desiredMargin)}>Refresh Suggestions</button>
-          <button className="secondary-button" onClick={selectVisibleSuggestedRates}>Select Visible Suggestions</button>
-          <button className="primary-button" onClick={requestSaveRates}>Save Rates</button>
-        </div>
-        <DataTable headers={[
-          <label className="table-check-label"><input checked={allVisibleSelected} type="checkbox" onChange={(event) => toggleAllVisible(event.target.checked)} /> Select All Suggested Rates</label>,
-          "Product", "Lot", "Size", "Origin", "Current Lot Sale Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Pending Bill Stock", "Margin %", "Updated", "Updated By",
-        ]}>
-          {filteredRates.map((rate) => {
-            const sellingRate = Number(draftRates[rate.id] || rate.selling_rate);
-            const cost = Number(rate.latest_effective_cost || 0);
-            const margin = sellingRate > 0 ? ((sellingRate - cost) / sellingRate) * 100 : 0;
-            return (
-              <tr key={rate.id}>
-                <td><input checked={Boolean(selectedSuggested[rate.id])} type="checkbox" onChange={(event) => toggleSuggestedRate(rate, event.target.checked)} /></td>
-                <td className="primary-cell">{rate.product_name}<small className="cell-note">{rate.category}</small></td>
-                <td>{rate.lot_name || (rate.inventory_batch_id ? `Lot #${rate.inventory_batch_id}` : "Product default")}</td>
-                <td>{rate.lot_size || "-"}</td>
-                <td><span className="tag">{labelFor("origin", rate.origin_type)}</span></td>
-                <td>{currency.format(Number(rate.selling_rate))}</td>
-                <td className="profit-cell">{currency.format(Number(rate.suggested_selling_rate))}</td>
-                <td><input className="table-input" min="0" step="0.01" type="number" value={draftRates[rate.id] || ""} onChange={(event) => setDraftRates({ ...draftRates, [rate.id]: event.target.value })} /></td>
-                <td>{currency.format(cost)}</td>
-                <td>{rate.current_stock}</td>
-                <td>{Number(rate.pending_bill_stock || 0) > 0 ? <span className="stock-low">{rate.pending_bill_stock} - provisional profit</span> : "-"}</td>
-                <td><span className={margin < 15 ? "stock-low" : "stock-ok"}>{margin.toFixed(1)}%</span></td>
-                <td>{rate.selling_rate_updated_at ? new Date(rate.selling_rate_updated_at).toLocaleDateString("en-IN") : "-"}</td>
-                <td>{rate.updated_by_name || "-"}</td>
+      <ModuleCard
+        eyebrow="Owner and Admin"
+        title="Today's selling rates"
+        subtitle="Type a new rate for anything you are re-pricing, then save once. Rows with nothing typed keep their rate."
+      >
+        {unavailableReason ? (
+          <div className="warning-note" role="status">{unavailableReason}</div>
+        ) : (
+          <>
+            <div className="pm-toolbar sale-rate-toolbar">
+              <label className="pm-toolbar-search">
+                <span>Search</span>
+                <span className="icon-input">
+                  <Icon name="search" />
+                  <input placeholder="Product or lot" type="search" value={search} onChange={(event) => setSearch(event.target.value)} />
+                </span>
+              </label>
+              <Field label="Category">
+                <select value={category} onChange={(event) => setCategory(event.target.value)}>
+                  <option value="">All categories</option>
+                  {categories.map((item) => <option key={item} value={item}>{item}</option>)}
+                </select>
+              </Field>
+              <Field label="Origin">
+                <select value={origin} onChange={(event) => setOrigin(event.target.value)}>
+                  <option value="">Local and imported</option>
+                  <option value="LOCAL">{labelFor("origin", "LOCAL")}</option>
+                  <option value="IMPORTED">{labelFor("origin", "IMPORTED")}</option>
+                </select>
+              </Field>
+              {suggestionsEnabled && (
+                <Field label="Target margin on cost %">
+                  <input min="0" step="0.1" type="number" value={desiredMargin} onChange={(event) => setDesiredMargin(event.target.value)} />
+                </Field>
+              )}
+            </div>
+            <div className="pm-list-meta">
+              <span>
+                {failed ? "" : `Showing ${visibleRows.length} of ${rows.length}`}
+                {changes.length > 0 && ` · ${changes.length} new rate${changes.length === 1 ? "" : "s"} to save`}
+                {hiddenCount > 0 && ` (${hiddenCount} not shown by the filter)`}
+              </span>
+              <div className="pm-toolbar-actions">
+                {Object.keys(drafts).length > 0 && (
+                  <button className="secondary-button" type="button" onClick={() => { setDrafts({}); setSaveError(""); }}>Clear typed rates</button>
+                )}
+                {suggestionsEnabled && (
+                  <button className="secondary-button" disabled={failed || visibleRows.every((row) => row.suggestedRate === null)} type="button" onClick={fillSuggested}>Use suggested rates</button>
+                )}
+                <button className="primary-button" disabled={saving || failed || changes.length === 0} type="button" onClick={requestSave}>
+                  {changes.length > 0 ? `Save ${changes.length} rate${changes.length === 1 ? "" : "s"}` : "Save rates"}
+                </button>
+              </div>
+            </div>
+            {failed && (
+              <div className="error-banner" role="alert">
+                {loadState.message}{" "}
+                <button className="secondary-button compact-button" type="button" onClick={() => onLoad?.()}>Try again</button>
+              </div>
+            )}
+            {saveError && <div className="error-banner" role="alert">{saveError}</div>}
+            {saveNotice && <p className={saveNotice.tone === "success" ? "form-note" : "warning-note"} role="status">{saveNotice.text}</p>}
+            {!failed && (
+              <DataTable
+                className="pm-table sale-rate-table"
+                headers={[
+                  "Product",
+                  <span className="pm-num-head" key="cost">Cost</span>,
+                  <span className="pm-num-head" key="current">Current rate</span>,
+                  <span className="pm-num-head" key="margin" title="(rate − cost) ÷ cost">Margin on cost</span>,
+                  ...(suggestionsEnabled ? [<span className="pm-num-head" key="suggested">{`Suggested (${targetMargin}%)`}</span>] : []),
+                  <span className="pm-num-head" key="new">New rate</span>,
+                ]}
+              >
+                {firstLoad && <tr><td className="empty-cell" colSpan={suggestionsEnabled ? 6 : 5}>Loading today's rates…</td></tr>}
+                {!firstLoad && rows.length === 0 && <tr><td className="empty-cell" colSpan={suggestionsEnabled ? 6 : 5}>No active products yet. Add products in Product Master.</td></tr>}
+                {!firstLoad && rows.length > 0 && visibleRows.length === 0 && <tr><td className="empty-cell" colSpan={suggestionsEnabled ? 6 : 5}>Nothing matches the search or filters.</td></tr>}
+                {visibleRows.map((row) => {
+                  const draft = drafts[row.key] ?? "";
+                  const invalidDraft = invalidKeys.has(row.key);
+                  const change = changes.find((item) => item.key === row.key);
+                  const stockNote = row.isLot && row.stock !== null
+                    ? `${formatOptionalQuantity(row.stock)}${row.unit ? ` ${row.unit.toLowerCase()}` : ""} in stock`
+                    : "";
+                  return (
+                    <tr key={row.key}>
+                      <td className="primary-cell">
+                        {row.productName}
+                        <small className="cell-note">{[row.lotLabel, stockNote, row.origin ? labelFor("origin", row.origin) : ""].filter(Boolean).join(" · ")}</small>
+                      </td>
+                      <td className="pm-num">
+                        {formatOptionalMoney(row.cost, currency)}
+                        {row.costIsEstimate && <small className="cell-note">Bill pending · estimate</small>}
+                      </td>
+                      <td className="pm-num">{formatOptionalMoney(row.currentRate, currency)}</td>
+                      <td className="pm-num">
+                        {rateCell(change ? change.newRate : row.currentRate, row.cost, row.suggestedRate)}
+                        {change && <small className="cell-note">at new rate</small>}
+                      </td>
+                      {suggestionsEnabled && (
+                        <td className="pm-num">
+                          {row.suggestedRate === null
+                            ? <span title="No purchase cost to work from">{MISSING_VALUE}</span>
+                            : (
+                              <button
+                                className="table-action"
+                                title="Put this in New rate"
+                                type="button"
+                                onClick={() => setDraft(row.key, String(row.suggestedRate))}
+                              >
+                                {currency.format(row.suggestedRate)}
+                              </button>
+                            )}
+                        </td>
+                      )}
+                      <td className="pm-num">
+                        <input
+                          aria-invalid={invalidDraft || undefined}
+                          aria-label={`New rate for ${row.productName} ${row.lotLabel}`}
+                          className="table-input"
+                          min="0"
+                          step="0.01"
+                          type="number"
+                          value={draft}
+                          onChange={(event) => setDraft(row.key, event.target.value)}
+                        />
+                        {invalidDraft && <small className="cell-note stock-low">Enter a price above 0</small>}
+                        {change?.belowCost && <small className="cell-note stock-low">Below cost</small>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </DataTable>
+            )}
+          </>
+        )}
+      </ModuleCard>
+      {!unavailableReason && (
+        <ModuleCard eyebrow="History" title="Recent rate changes" subtitle="The last 100 changes, newest first, from every screen that sets a sale rate.">
+          {loadState.historyMessage && <div className="error-banner" role="alert">{loadState.historyMessage}</div>}
+          <DataTable className="pm-table" headers={["When", "Product", <span className="pm-num-head" key="old">Old rate</span>, <span className="pm-num-head" key="new">New rate</span>, "Changed by", "Note"]}>
+            {history.length === 0 && !loadState.historyMessage && <tr><td className="empty-cell" colSpan={6}>No rate changes yet.</td></tr>}
+            {history.map((item) => (
+              <tr key={item.id}>
+                <td>{item.changed_at ? new Date(item.changed_at).toLocaleString("en-IN") : MISSING_VALUE}</td>
+                <td className="primary-cell">{item.product_name || MISSING_VALUE}</td>
+                <td className="pm-num">{formatOptionalMoney(item.old_selling_rate, currency)}</td>
+                <td className="pm-num">{formatOptionalMoney(item.new_selling_rate, currency)}</td>
+                <td>{item.changed_by_name || MISSING_VALUE}</td>
+                <td>{item.reason || MISSING_VALUE}</td>
               </tr>
-            );
-          })}
-        </DataTable>
-      </ModuleCard>
-      <ModuleCard eyebrow="Audit Trail" title="Sale Rate History" subtitle="Every approved selling-rate change is stored for reporting and accountability.">
-        <DataTable headers={["Changed At", "Product", "Old Rate", "New Rate", "Changed By", "Reason"]}>
-          {history.map((item) => <tr key={item.id}><td>{new Date(item.changed_at).toLocaleString("en-IN")}</td><td className="primary-cell">{item.product_name}</td><td>{currency.format(Number(item.old_selling_rate))}</td><td className="profit-cell">{currency.format(Number(item.new_selling_rate))}</td><td>{item.changed_by_name}</td><td>{item.reason || "-"}</td></tr>)}
-        </DataTable>
-      </ModuleCard>
-      {confirmUpdates && (
+            ))}
+          </DataTable>
+        </ModuleCard>
+      )}
+      {confirmChanges && (
         <div className="modal-backdrop">
-          <section className="invoice-modal change-history-modal">
+          <section aria-labelledby="sale-rate-confirm-title" aria-modal="true" className="invoice-modal change-history-modal" role="dialog">
             <div className="invoice-toolbar">
               <div>
-                <span className="eyebrow">Confirm Sale Rate Update</span>
-                <strong>Are you sure you want to update selected sale rates?</strong>
+                <span className="eyebrow">Check before saving</span>
+                <strong id="sale-rate-confirm-title">{`Save ${confirmChanges.length} new rate${confirmChanges.length === 1 ? "" : "s"}?`}</strong>
               </div>
-              <button aria-label="Close confirmation" className="remove-button" onClick={() => setConfirmUpdates(null)}><Icon name="close" /></button>
+              <button aria-label="Close" className="remove-button" disabled={saving} onClick={() => setConfirmChanges(null)}><Icon name="close" /></button>
             </div>
             <div className="sale-edit-body">
-              <div className="purchase-summary-grid supplier-payment-preview">
-                <SummaryMetric label="Selected Products" value={confirmUpdates.length} featured />
-              </div>
-              <DataTable headers={["Product", "Old Rate", "New Rate"]}>
-                {confirmUpdates.map((update) => (
-                  <tr key={update.product_id}>
-                    <td className="primary-cell">{update.product_name}<small className="cell-note">{[update.lot_name, update.lot_size].filter(Boolean).join(" / ") || "Product default"}</small></td>
-                    <td>{currency.format(update.old_rate)}</td>
-                    <td className="profit-cell">{currency.format(update.new_selling_rate)}</td>
+              <p className="form-note">POS sells at these rates from the next bill on every counter.</p>
+              {confirmChanges.some((change) => change.belowCost) && (
+                <div className="warning-note">
+                  {confirmChanges.filter((change) => change.belowCost).length === 1
+                    ? "One of these is below its purchase cost."
+                    : `${confirmChanges.filter((change) => change.belowCost).length} of these are below their purchase cost.`}
+                </div>
+              )}
+              <DataTable className="pm-table" headers={["Product", <span className="pm-num-head" key="old">Now</span>, <span className="pm-num-head" key="new">New</span>]}>
+                {confirmChanges.map((change) => (
+                  <tr key={change.key}>
+                    <td className="primary-cell">{change.productName}<small className="cell-note">{change.lotLabel}</small></td>
+                    <td className="pm-num">{formatOptionalMoney(change.oldRate, currency)}</td>
+                    <td className={change.belowCost ? "pm-num stock-low" : "pm-num"}>{currency.format(change.newRate)}</td>
                   </tr>
                 ))}
               </DataTable>
               <div className="button-row">
-                <button className="primary-button" onClick={saveRates}>Confirm Save Rates</button>
-                <button className="secondary-button" onClick={() => setConfirmUpdates(null)}>Cancel</button>
+                <button className="primary-button" disabled={saving} onClick={save}>{saving ? "Saving…" : "Save"}</button>
+                <button className="secondary-button" disabled={saving} onClick={() => setConfirmChanges(null)}>Go back</button>
               </div>
             </div>
           </section>
@@ -22730,30 +23376,6 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
     </section>
   );
 }
-
-const calculateDiscountFromRule = (rule, subtotal) => {
-  if (!rule || subtotal <= 0) return 0;
-  const value = Number(rule.discount_value || 0);
-  const amount = rule.discount_type === "PERCENTAGE" ? subtotal * value / 100 : value;
-  return Math.min(amount, subtotal);
-};
-
-const getMatchingDiscountRule = (rules, subtotal, paymentMode) => {
-  if (subtotal <= 0) return null;
-  const matches = rules
-    .filter((rule) =>
-      rule.active !== false &&
-      Number(rule.minimum_bill_amount || 0) <= subtotal &&
-      (!rule.maximum_bill_amount || Number(rule.maximum_bill_amount) >= subtotal) &&
-      (rule.payment_mode === "ALL" || rule.payment_mode === paymentMode)
-    )
-    .sort((left, right) => {
-      if (left.payment_mode === paymentMode && right.payment_mode !== paymentMode) return -1;
-      if (right.payment_mode === paymentMode && left.payment_mode !== paymentMode) return 1;
-      return Number(right.minimum_bill_amount || 0) - Number(left.minimum_bill_amount || 0) || Number(right.discount_value || 0) - Number(left.discount_value || 0);
-    });
-  return matches[0] || null;
-};
 
 const currentDateTimeLocal = () => {
   const date = new Date();
@@ -22880,7 +23502,14 @@ function OtherChargesPanel({ canTypeAmount = false, chargeTypes = [], lines = []
   );
 }
 
-function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, onWorkChange, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+// A cart line's own id. At module level because the order-seed effect uses it before the rest of
+// POS's helpers are declared.
+const newCartLineId = () => {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -22912,8 +23541,35 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const [customer, setCustomer] = useState({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
   const [creditInfo, setCreditInfo] = useState({ due_date: "", remarks: "" });
   const [billDateTime, setBillDateTime] = useState(currentDateTimeLocal);
+  // Lot discounts are given by the bill's own date, so a back-dated bill gets the discount that
+  // was running that day, the same rule the server checks against.
+  const billDateKey = billDateTime ? billDateTime.slice(0, 10) : toDateKey(new Date());
+  // Said when discounts changed under an open cart (a sync, or checkout refused by the server).
+  const [discountNotice, setDiscountNotice] = useState("");
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
+  /**
+   * An Owner or Admin approving more than 5% off an item (local/discounts.js), or null. Holds the
+   * bill's own reference (`saleRef`, sent as the sale's idempotency key / sync operation id), the
+   * lines over the limit, and how checkout was going when it stopped to ask. The cart itself is
+   * never copied here and never cleared by it.
+   */
+  const [discountApproval, setDiscountApproval] = useState(null);
+  // Owner, Admin and anyone who may already set any rate are never asked.
+  const discountExempt = discountApprovalExempt({ role: user?.role, canManualRateOverride });
+  /**
+   * The cashier's own "Bill discount" box: rupees or a percentage of what is left of the bill after
+   * item discounts and the automatic slab. What was typed, not the amount -- the amount is worked
+   * out in `totals` on every render, so it can never drift from the cart it is a share of. Empty
+   * by default, and emptied after a completed sale and whenever the cart is emptied.
+   */
+  const [billDiscountInput, setBillDiscountInput] = useState({ mode: MANUAL_BILL_DISCOUNT_MODE.AMOUNT, value: "" });
+  const clearBillDiscount = () => setBillDiscountInput({ mode: MANUAL_BILL_DISCOUNT_MODE.AMOUNT, value: "" });
+  // An emptied cart (the last line removed, or a new bill) starts with no bill discount: a
+  // percentage left over from the last customer would otherwise land on the next one.
+  useEffect(() => {
+    if (cart.length === 0) setBillDiscountInput({ mode: MANUAL_BILL_DISCOUNT_MODE.AMOUNT, value: "" });
+  }, [cart.length]);
   /**
    * Tell the shell whether this counter is mid-bill.
    *
@@ -22963,6 +23619,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         available_qty: Number(line.quantity || 0),
         default_selling_rate: Number(line.selling_rate || 0),
         discount_amount: 0,
+        // The order's agreed price: a lot discount that starts later does not re-price it.
+        keep_price: true,
         lot_discount_id: null,
         lot_discount_type: null,
         lot_discount_value: 0,
@@ -22992,10 +23650,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   };
   const lotDateKey = (lot) => toDateKey(lot?.purchase_date || lot?.opening_date || lot?.created_at || "");
   const lotStableName = (lot) => String(lot?.lot_name || lot?.batch_no || lot?.lot_no || lot?.id || "").trim();
-  const newCartLineId = () => {
-    if (window.crypto?.randomUUID) return window.crypto.randomUUID();
-    return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  };
   const normalizeCartIdentityPart = (value) => String(value ?? "").trim().toLowerCase();
   const buildCartIdentity = ({ product, lot, unit, sellingRate }) => [
     product?.id,
@@ -23142,11 +23796,30 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   };
 
   const totals = useMemo(() => {
-    const gross = cart.reduce((sum, item) => sum + item.quantity * Number(item.selling_rate), 0);
+    // Line by line, each rounded to the paisa, the way the server adds the bill up.
+    const gross = billGross(cart);
     const itemDiscount = cart.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
     const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
-    const discountRule = saleRateSettings.bill_level_slab_discount_enabled === false ? null : getMatchingDiscountRule(discountRules, gross, paymentMode);
-    const invoiceDiscountAmount = Math.min(calculateDiscountFromRule(discountRule, gross), subtotalAfterItemDiscounts);
+    // One matching rule shared with the server (local/discounts.js): measured on the bill before
+    // item discounts, capped at the bill after them, the most money off wins.
+    const { rule: discountRule, amount: slabDiscountAmount } = matchBillSlab(discountRules, {
+      gross,
+      subtotalAfterItems: subtotalAfterItemDiscounts,
+      // As the server reads it from the payments: Mixed with one amount is that one mode.
+      paymentMode: slabPaymentMode(paymentMode, mixedPayments),
+      enabled: saleRateSettings.bill_level_slab_discount_enabled !== false,
+    });
+    // The cashier's own bill discount, on top of the slab and never more than what is left. An
+    // entry that cannot be billed is an error (and blocks checkout), never a quiet ₹0.
+    const manualBill = resolveManualBillDiscount({
+      mode: billDiscountInput.mode,
+      value: billDiscountInput.value,
+      itemsSubtotal: subtotalAfterItemDiscounts,
+      slabAmount: slabDiscountAmount,
+    });
+    const manualBillDiscount = manualBill.error ? 0 : manualBill.amount;
+    // The bill discount the bill records (sales.invoice_discount_amount): slab + manual, 2 dp.
+    const invoiceDiscountAmount = roundDiscountMoney(slabDiscountAmount + manualBillDiscount);
     const basis = String(paymentSettings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
     const customerScope = String(paymentSettings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
     const customerEligible = customerScope === "ALL_CUSTOMERS" || (customerScope === "REGISTERED_CUSTOMERS" && Boolean(customer.account_id) && customer.system_account !== true);
@@ -23181,6 +23854,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       gross,
       itemDiscount,
       invoiceDiscount: invoiceDiscountAmount,
+      slabDiscount: slabDiscountAmount,
+      manualBillDiscount,
+      manualBillError: manualBill.error,
+      manualBillRoom: manualBill.room,
       taxableAmount,
       mandiTaxRate: taxEligible ? Number(paymentSettings.sales_mandi_tax_percent || 0) : 0,
       mandiTaxAmount,
@@ -23194,7 +23871,20 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       itemCount: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
       discountRule,
     };
-  }, [cart, chargeSelections, chargeTypes, customer.account_id, customer.system_account, discountRules, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
+  }, [billDiscountInput.mode, billDiscountInput.value, cart, chargeSelections, chargeTypes, customer.account_id, customer.system_account, discountRules, mixedPayments, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
+
+  // More than 5% off an item, or the bill discount taking the whole bill over 5%, needs an Owner or
+  // Admin (local/discounts.js). Worked out from the cart and the bill discount as they are now.
+  const discountApprovalCheck = useMemo(
+    () => posDiscountApproval(cart, { exempt: discountExempt, manualBill: totals.manualBillDiscount }),
+    [cart, discountExempt, totals.manualBillDiscount],
+  );
+  // An approval is asked for the bill as it stood. If the cart or the bill discount changes behind
+  // the dialog (a sync re-pricing a line), the question is dropped -- unless the approval is already
+  // being checked, when checkout carries on with the bill it was asked for.
+  useEffect(() => {
+    setDiscountApproval((current) => (current && !current.saving ? null : current));
+  }, [cart, billDiscountInput.mode, billDiscountInput.value]);
 
   const mixedPaymentModes = [
     ["CASH", "Cash Amount"],
@@ -23225,40 +23915,29 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     return raw.length > 22 ? `${raw.slice(0, 18)}...` : raw;
   };
 
-  const getActiveLotDiscount = (lotId) => {
-    if (!lotId) return null;
-    const today = toDateKey(new Date());
-    return [...lotDiscounts]
-      .filter((discount) =>
-        Number(discount.inventory_batch_id) === Number(lotId) &&
-        discount.active !== false &&
-        (!discount.start_date || toDateKey(discount.start_date) <= today) &&
-        (!discount.end_date || toDateKey(discount.end_date) >= today)
-      )
-      .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0] || null;
-  };
+  // The discount running on a lot for this bill's date: the same pick the Discounts screen and the
+  // server make (local/discounts.js), with ids compared as text.
+  const lotDiscountFor = (lotId) => activeLotDiscount(lotDiscounts, lotId, billDateKey);
 
-  const applyLotDiscount = (baseRate, quantity, discount) => {
-    const rate = Number(baseRate || 0);
-    const qty = Number(quantity || 0);
-    if (!discount) return { sellingRate: rate, discountAmount: 0, discountPerUnit: 0 };
-    const value = Number(discount.discount_value || 0);
-    if (discount.discount_type === "SPECIAL_RATE") {
-      return {
-        sellingRate: value,
-        discountAmount: 0,
-        discountPerUnit: 0,
-      };
-    }
-    const discountPerUnit = discount.discount_type === "PERCENTAGE"
-      ? roundUi(rate * value / 100)
-      : Math.min(value, rate);
-    return {
-      sellingRate: rate,
-      discountAmount: roundUi(discountPerUnit * qty),
-      discountPerUnit,
-    };
-  };
+  // Discounts reloaded (after a sync, a save on the Discounts screen, or a refused checkout) or the
+  // bill date moved: re-price the lines whose lot discount changed, so the till never gives a
+  // stopped discount or bills a changed one the server will refuse. Lines priced by hand are left.
+  useEffect(() => {
+    const { cart: next, changed } = reconcileCartLotDiscounts(cart, lotDiscounts, billDateKey);
+    if (changed.length === 0) return;
+    setCart(next.map((item, index) => (item === cart[index] ? item : {
+      ...item,
+      cart_identity: buildCartIdentity({
+        product: { id: item.product_id, unit: item.unit, selling_rate: item.default_selling_rate },
+        lot: { id: item.inventory_batch_id, lot_name: item.lot_name, lot_size: item.lot_size, unit: item.unit },
+        unit: item.unit,
+        sellingRate: item.selling_rate,
+      }),
+    })));
+    setDiscountNotice(`Discounts changed for ${[...new Set(changed)].join(", ")}. The bill has been updated - check it before saving.`);
+    // Only a new discount list or a new bill date re-prices; the cart is read as it is now.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lotDiscounts, billDateKey]);
 
   const getCartQuantityForLot = (lotId, excludeLineId = "") =>
     cart
@@ -23324,7 +24003,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }
     const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
-    const lotDiscount = getActiveLotDiscount(lot?.id);
+    const lotDiscount = lotDiscountFor(lot?.id);
     const discounted = applyLotDiscount(defaultRate, 1, lotDiscount);
     const cartIdentity = buildCartIdentity({ product, lot, unit: lot.unit || product.unit, sellingRate: discounted.sellingRate });
     const currentItem = cart.find((item) => item.cart_identity === cartIdentity);
@@ -23480,15 +24159,19 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     return `${prefix}-${id}`;
   };
 
-  const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason }) => {
+  const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason, operationId = "", discountApprovalId = "" }) => {
     const invoiceGlobalId = newSyncId("invoice");
     const offlineInvoiceRef = `OFF-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
     const savedCustomer = customer.account_id
       ? customer
       : { ...customer, name: "Walk-in Customer", mobile: customer.mobile || "", system_account: true };
     return {
-      operation_id: newSyncId("op"),
+      // The bill's reference: an Owner/Admin discount approval was issued against exactly this id,
+      // and the cloud reads it back off the queued sync operation.
+      operation_id: operationId || newSyncId("op"),
       invoice_global_id: invoiceGlobalId,
+      // Passed through untouched to the outbox payload (local_db.rs keeps the sale as sent).
+      ...(discountApprovalId ? { discount_approval_id: discountApprovalId } : {}),
       offline_invoice_ref: offlineInvoiceRef,
       branch_id: String(user.branch_id || 1),
       device_id: deviceInfo.device_id || newSyncId("device"),
@@ -23499,7 +24182,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       payment_mode: paymentMode,
       gross_total: Number(totals.gross || 0),
       item_discount_total: Number(totals.itemDiscount || 0),
-      bill_discount_total: Number(totals.invoiceDiscount || 0),
+      bill_discount_total: roundUi(totals.invoiceDiscount),
+      // The cashier's own part of `bill_discount_total` (the rest is the slab). Passed through
+      // untouched to the outbox; the server judges the 5% rule and names the rule with it.
+      manual_bill_discount: roundDiscountMoney(totals.manualBillDiscount),
+      // The slab this bill was given, so the server keeps the discount as billed even when the
+      // owner changes the slabs before this counter syncs (a bill already handed over).
+      ...slabSnapshot(totals.discountRule),
       taxable_amount: Number(totals.taxableAmount || 0),
       mandi_tax_rate: Number(totals.mandiTaxRate || 0),
       mandi_tax_basis: totals.mandiTaxBasis,
@@ -23562,8 +24251,85 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     };
   };
 
+  /**
+   * Stop checkout to ask for an Owner or Admin's approval. A fresh bill reference every time: an
+   * approval is single-use and bound to the reference it was issued for.
+   */
+  const openDiscountApproval = ({ lines, bill = null, printAfterSave, confirmations, notice = "" }) => {
+    const { discount_approval_id: _usedApproval, discount_approval_not_needed: _notNeeded, sale_ref: _usedRef, retry: _retry, ...carried } = confirmations || {};
+    setDiscountApproval({
+      saleRef: newSyncId("op"),
+      lines: Array.isArray(lines) ? lines : [],
+      // The whole bill over 5% because of the bill discount, or null.
+      bill: bill || null,
+      printAfterSave,
+      confirmations: carried,
+      notice,
+      approverUsername: "",
+      approverPassword: "",
+      error: "",
+      saving: false,
+    });
+  };
+
+  const closeDiscountApproval = () => {
+    // The cart stays exactly as it is; only the question is dropped (and the password with it).
+    setDiscountApproval((current) => (current?.saving ? current : null));
+  };
+
+  const confirmDiscountApproval = async () => {
+    const draft = discountApproval;
+    if (!draft || draft.saving) return;
+    // Every way out of here forgets the approver's password, whatever happened.
+    const stop = (error) => setDiscountApproval((current) => (current ? { ...current, approverPassword: "", error, saving: false } : current));
+    // Asked again, not trusted from when the dialog opened: the connection may have gone since.
+    // A refused route makes no request.
+    const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
+    if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
+      stop(route.message);
+      return;
+    }
+    if (!String(draft.approverUsername || "").trim() || !draft.approverPassword) {
+      stop("Owner or Admin username and password are needed.");
+      return;
+    }
+    setDiscountApproval((current) => (current ? { ...current, error: "", saving: true } : current));
+    let approvalId;
+    try {
+      approvalId = await requestSaleChangeApproval(user, {
+        action: DISCOUNT_APPROVAL_ACTION,
+        saleRef: draft.saleRef,
+        // The cart as it is now, in case it changed behind the dialog; the lines it opened with otherwise.
+        reason: discountApprovalCheck.needed
+          ? describePosDiscountApprovalReason(discountApprovalCheck.lines, discountApprovalCheck.bill)
+          : describePosDiscountApprovalReason(draft.lines, draft.bill),
+        approverUsername: draft.approverUsername,
+        approverPassword: draft.approverPassword,
+      });
+    } catch (error) {
+      // The server says this person needs no approval (its role list is newer than this counter's):
+      // bill it as it is. The server still checks the rule on the bill itself.
+      if (approvalErrorCode(error) === "APPROVAL_NOT_NEEDED") {
+        setDiscountApproval(null);
+        await checkout(draft.printAfterSave, { ...draft.confirmations, sale_ref: draft.saleRef, discount_approval_not_needed: true, retry: true });
+        return;
+      }
+      stop(describeDiscountApprovalError(error));
+      return;
+    }
+    setDiscountApproval(null);
+    await checkout(draft.printAfterSave, {
+      ...draft.confirmations,
+      sale_ref: draft.saleRef,
+      discount_approval_id: approvalId,
+      retry: true,
+    });
+  };
+
   const checkout = async (printAfterSave = false, confirmations = {}) => {
     if (saving && !confirmations.retry) return;
+    // The approval dialog is open (F4 pressed behind it): it finishes checkout itself.
+    if (discountApproval && !confirmations.discount_approval_id && !confirmations.discount_approval_not_needed) return;
     if (cart.length === 0) {
       alert("Add at least one product before checkout.");
       return;
@@ -23626,6 +24392,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         belowCostConfirmed = true;
       }
     }
+    // A bill discount that cannot be billed (not a number, over 100%, more than the bill) is said
+    // under the box; it is never billed as ₹0.
+    if (totals.manualBillError) {
+      setDiscountNotice(totals.manualBillError);
+      return;
+    }
     if (totals.invoiceDiscount > totals.gross - totals.itemDiscount) {
       alert("Invoice discount cannot exceed the cart subtotal.");
       return;
@@ -23646,6 +24418,31 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return;
     }
 
+    // What this pass has already asked, so a checkout resumed after an approval asks none of it again.
+    const carriedConfirmations = {
+      ...confirmations,
+      ...dateConfirmations,
+      ...(dateOverrideReason ? { date_override_reason: dateOverrideReason } : {}),
+      below_cost_confirmed: belowCostConfirmed,
+      zero_rate_confirmed: zeroRateConfirmed,
+    };
+    // More than 5% off an item needs an Owner or Admin (local/discounts.js; the server keeps the
+    // same rule). Decided before anything is billed or sent. Offline, Local Only or no cloud:
+    // refused here with no request. Online: the approval dialog, and checkout resumes from it.
+    const discountApprovalId = String(confirmations.discount_approval_id || "").trim();
+    if (!discountApprovalId && confirmations.discount_approval_not_needed !== true && discountApprovalCheck.needed) {
+      const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
+      if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
+        setDiscountNotice(route.message);
+        return;
+      }
+      openDiscountApproval({ lines: discountApprovalCheck.lines, bill: discountApprovalCheck.bill, printAfterSave, confirmations: carriedConfirmations });
+      return;
+    }
+    // The bill's own reference: the approval (if any) was issued for it, and it is the sale's
+    // idempotency key (browser) or sync operation id (desktop).
+    const saleRef = String(confirmations.sale_ref || "").trim() || newSyncId("op");
+
     setSaving(true);
     try {
       if (isTauriRuntime()) {
@@ -23653,7 +24450,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           alert("Desktop local-first POS requires a selected stock lot for every item.");
           return;
         }
-        const localSale = buildLocalSalePayload({ payments, selectedBillDate, dateOverrideReason });
+        const localSale = buildLocalSalePayload({ payments, selectedBillDate, dateOverrideReason, operationId: saleRef, discountApprovalId });
         const result = await completeLocalPosSale(localSale);
         const invoice = {
           id: localSale.invoice_global_id,
@@ -23669,6 +24466,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           gross_amount: localSale.gross_total,
           item_discount_amount: localSale.item_discount_total,
           invoice_discount_amount: localSale.bill_discount_total,
+          // Printed beside the bill discount, as the browser's saved sale does: the name the server
+          // will store -- the slab's, "<slab> + extra" with a cashier's part, none for that part alone.
+          discount_rule_name: billDiscountRuleName(totals.discountRule, totals.slabDiscount, totals.manualBillDiscount),
+          manual_bill_discount: localSale.manual_bill_discount,
           taxable_amount: localSale.taxable_amount,
           mandi_tax_rate: localSale.mandi_tax_rate,
           mandi_tax_basis: localSale.mandi_tax_basis,
@@ -23689,6 +24490,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             amount: item.amount,
             discount_amount: item.discount,
             net_amount: item.amount,
+            // "Discount 10%" and "Special price" on the printed bill, as on the browser's.
+            lot_discount_type: item.lot_discount_type,
+            lot_discount_value: item.lot_discount_value,
           })),
           payments: localSale.payments,
         };
@@ -23701,6 +24505,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       setChargeSelections([]);
         setCreditInfo({ due_date: "", remarks: "" });
         setBillDateTime(currentDateTimeLocal());
+        setDiscountNotice("");
+        clearBillDiscount();
         await onSaved?.({ localSale: invoice, pendingOperations: result?.pending_operations });
         setLastInvoice(invoice);
         onInvoice(invoice);
@@ -23725,7 +24531,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         })),
         customer,
         invoice_discount: Number(totals.invoiceDiscount || 0),
-        discount_rule_id: totals.discountRule?.id || null,
+        // The cashier's own part of `invoice_discount`; the server expects slab + this.
+        manual_bill_discount: roundDiscountMoney(totals.manualBillDiscount),
+        ...slabSnapshot(totals.discountRule),
         taxable_amount: Number(totals.taxableAmount || 0),
         mandi_tax_rate: Number(totals.mandiTaxRate || 0),
         mandi_tax_basis: totals.mandiTaxBasis,
@@ -23754,7 +24562,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         future_date_confirmed: confirmations.future_date_confirmed || dateConfirmations.future_date_confirmed || false,
         below_cost_confirmed: belowCostConfirmed,
         zero_rate_confirmed: zeroRateConfirmed,
-      });
+        ...(discountApprovalId ? { discount_approval_id: discountApprovalId } : {}),
+      }, saleRef);
       const response = await axios.post(`${API_URL}/api/v3/sales`, saleWrite.body, saleWrite.config);
       setCart([]);
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
@@ -23765,6 +24574,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       setChargeSelections([]);
       setCreditInfo({ due_date: "", remarks: "" });
       setBillDateTime(currentDateTimeLocal());
+      setDiscountNotice("");
+      clearBillDiscount();
       // Hand the saved sale to `onSaved`. It was called bare, so a bill raised through this path
       // linked nothing back to the order it came from — and `sale_id` is exactly what the storage
       // layer uses to refuse a second billing, so the order stayed cancellable and re-billable.
@@ -23776,6 +24587,42 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       }
     } catch (error) {
       const responseData = error.response?.data || {};
+      // A discount changed on the server after this till loaded it. Nothing was saved; the cart
+      // stays exactly as it is, discounts are reloaded (which re-prices the affected lines), and
+      // the server's own sentence says what to check.
+      const discountConflict = readDiscountConflict(error.response?.status, responseData);
+      if (discountConflict) {
+        setDiscountNotice(discountConflict.message);
+        await Promise.resolve(onDiscountsStale?.()).catch(() => null);
+        return;
+      }
+      // Slab + bill discount is more than the bill (the slab changed on the server). Nothing was
+      // saved; the cart and the box stay, and the server's sentence says the most it can take.
+      const tooLarge = readBillDiscountTooLarge(error.response?.status, responseData);
+      if (tooLarge) {
+        setDiscountNotice(tooLarge.message);
+        await Promise.resolve(onDiscountsStale?.()).catch(() => null);
+        return;
+      }
+      // The server wants an Owner or Admin's approval for the discount (none sent, or the one sent
+      // was used, expired or for another bill). Nothing was saved; ask for one, cart untouched.
+      const approvalRequired = readDiscountApprovalRequired(error.response?.status, responseData);
+      if (approvalRequired) {
+        const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
+        if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
+          setDiscountNotice(route.message);
+          return;
+        }
+        const asked = posDiscountApproval(cart, { exempt: false, manualBill: totals.manualBillDiscount });
+        openDiscountApproval({
+          lines: asked.lines,
+          bill: asked.bill,
+          printAfterSave,
+          confirmations: carriedConfirmations,
+          notice: approvalRequired.message,
+        });
+        return;
+      }
       if (error.response?.status === 409) {
         if (responseData.requires_below_cost_confirmation && window.confirm(responseData.message || "This rate is below cost. Continue?")) {
           setSaving(false);
@@ -23832,7 +24679,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         const status = lotStatus(lot);
         if (!isSelectableLot(lot)) return false;
         if (lotFilter === "ACTIVE" && status !== "Active") return false;
-        if (lotFilter === "DISCOUNTED" && !getActiveLotDiscount(lot.id)) return false;
+        if (lotFilter === "DISCOUNTED" && !lotDiscountFor(lot.id)) return false;
         if (lotFilter === "AVAILABLE" && lotBalance(lot) <= 0) return false;
         if (lotSizeFilter && String(lot.lot_size || lot.size_grade || "") !== lotSizeFilter) return false;
         if (lotUnitFilter && String(lot.unit || lotSelectorProduct.unit || "") !== lotUnitFilter) return false;
@@ -23863,7 +24710,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         if (lotCompare !== 0) return lotCompare;
         return Number(left.id || 0) - Number(right.id || 0);
       });
-  }, [lotFilter, lotRateMax, lotRateMin, lotSelectorProduct, lotSelectorSearch, lotSizeFilter, lotUnitFilter, lotsByProduct]);
+  }, [billDateKey, lotDiscounts, lotFilter, lotRateMax, lotRateMin, lotSelectorProduct, lotSelectorSearch, lotSizeFilter, lotUnitFilter, lotsByProduct]);
 
   const lotSelectorSizeOptions = useMemo(() => {
     if (!lotSelectorProduct) return [];
@@ -23973,7 +24820,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               const rates = activeLots.map((lot) => lotSaleRateValue(lot, product)).filter((rate) => rate > 0);
               const minRate = rates.length ? Math.min(...rates) : Number(product.selling_rate || 0);
               const maxRate = rates.length ? Math.max(...rates) : minRate;
-              const discountedCount = activeLots.filter((lot) => getActiveLotDiscount(lot.id)).length;
+              const discountedCount = activeLots.filter((lot) => lotDiscountFor(lot.id)).length;
               const rateLabel = minRate === maxRate
                 ? `${currency.format(minRate)}/${product.unit || "Unit"}`
                 : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
@@ -24038,7 +24885,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           ) : (
             <div className="table-wrap cart-table">
               <table>
-                <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount</th>}<th>Total</th><th /></tr></thead>
+                <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount{!discountExempt && <small className="cell-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}</small>}</th>}<th>Total</th><th /></tr></thead>
                 <tbody>
                   {cart.map((item) => (
                     <tr key={item.line_id}>
@@ -24065,7 +24912,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                         />
                       </td>
                       <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.line_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.line_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
-                      {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} /></td>}
+                      {printSettings.show_item_discount_column_pos !== false && (
+                        <td>
+                          <input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} />
+                          {discountApprovalCheck.lines.some((entry) => entry.lineId === item.line_id) && (
+                            <small className="cell-note stock-low pos-discount-over-note">Over 5%: needs Owner/Admin approval</small>
+                          )}
+                        </td>
+                      )}
                       <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
                       <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
                     </tr>
@@ -24126,10 +24980,17 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         </div>
         <div className="checkout-section">
           <div className="discount-preview">
-            <span>Automatic Bill Discount</span>
-            <strong>{currency.format(totals.invoiceDiscount)}</strong>
-            <small>{totals.discountRule ? totals.discountRule.rule_name : "No active slab matched"}</small>
+            {/* The automatic slab only. The cashier's own bill discount is the box above the totals. */}
+            <span>Slab discount</span>
+            <strong>{saleRateSettings.bill_level_slab_discount_enabled === false ? MISSING_VALUE : currency.format(totals.slabDiscount)}</strong>
+            <small>{describeBillDiscountPreview({ enabled: saleRateSettings.bill_level_slab_discount_enabled !== false, rule: totals.discountRule })}</small>
           </div>
+          {discountNotice && (
+            <div className="warning-note pos-discount-notice" role="alert">
+              {discountNotice}
+              <button className="secondary-button compact-button" type="button" onClick={() => setDiscountNotice("")}>OK</button>
+            </div>
+          )}
           <Field label="Payment Mode">
             <select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value)}>
               <option value="CASH">Cash</option>
@@ -24190,25 +25051,43 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           canTypeAmount={canManualRateOverride}
           onChange={setChargeSelections}
         />
+        <PosBillDiscountBox
+          approvalNeeded={Boolean(discountApprovalCheck.bill)}
+          disabled={cart.length === 0 || saving}
+          error={totals.manualBillError}
+          exempt={discountExempt}
+          input={billDiscountInput}
+          manualAmount={totals.manualBillDiscount}
+          onChange={setBillDiscountInput}
+        />
         <div className="totals">
           <TotalLine label="Gross Total" value={totals.gross} />
           <TotalLine label="Item Discount" value={-totals.itemDiscount} />
-          <TotalLine label="Bill Discount" value={-totals.invoiceDiscount} />
+          {/* The slab and the cashier's own bill discount, each on its own line; together they are
+              the bill discount the bill records. */}
+          {totals.discountRule
+            ? <TotalLine label={`Bill discount (${slabDisplayName(totals.discountRule)})`} value={-totals.slabDiscount} />
+            : String(billDiscountInput.value).trim() === "" && <TotalLine label="Bill Discount" value={0} />}
+          {totals.manualBillError
+            ? <div className="total-line total-line-error"><span>Extra discount</span><strong>{MISSING_VALUE}</strong></div>
+            : String(billDiscountInput.value).trim() !== "" && <TotalLine label="Extra discount" value={-totals.manualBillDiscount} />}
           {totals.mandiTaxAmount > 0 && <TotalLine label="Taxable Amount" value={totals.taxableAmount} />}
           {totals.mandiTaxAmount > 0 && <TotalLine label={`Mandi Tax (${totals.mandiTaxRate}%)`} value={totals.mandiTaxAmount} />}
           {totals.mandiTaxAmount === 0 && <TotalLine label="Tax" value={0} muted />}
           {totals.otherChargesAmount > 0 && <TotalLine label="Other Charges" value={totals.otherChargesAmount} />}
-          <TotalLine label="Net Payable" value={totals.total} total />
+          {totals.manualBillError
+            ? <div className="total-line total-line-main total-line-error"><span>Net Payable</span><strong>{MISSING_VALUE}</strong></div>
+            : <TotalLine label="Net Payable" value={totals.total} total />}
           {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
         </div>
         <div className="button-row checkout-actions">
-          <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment} onClick={() => checkout(false)}>
+          <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(false)}>
             <Icon name="receipt" /> {saving ? "Saving..." : "Save Bill"}
           </button>
           <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
             <Icon name="print" /> Print Bill
           </button>
-          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment} onClick={() => checkout(true)}>
+          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(true)}>
             <Icon name="print" /> Save & Print
           </button>
         </div>
@@ -24279,7 +25158,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 <tbody>
                   {lotSelectorLots.map((lot) => {
                     const rate = lotSaleRateValue(lot, lotSelectorProduct);
-                    const activeDiscount = getActiveLotDiscount(lot.id);
+                    const activeDiscount = lotDiscountFor(lot.id);
                     const selectable = isSelectableLot(lot);
                     return (
                       <tr key={lot.id} className={selectable ? "lot-selector-row" : "lot-selector-row lot-selector-row-disabled"} onDoubleClick={() => selectable && addProduct(lotSelectorProduct, lot)}>
@@ -24312,7 +25191,118 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           </section>
         </div>
       )}
+      {discountApproval && (
+        <DiscountApprovalModal
+          draft={discountApproval}
+          onChange={(patch) => setDiscountApproval((current) => (current ? { ...current, ...patch } : current))}
+          onClose={closeDiscountApproval}
+          onConfirm={confirmDiscountApproval}
+        />
+      )}
     </section>
+  );
+}
+
+/**
+ * The cashier's own discount on the whole bill: one box, in rupees or as a percentage of what is
+ * left after item discounts and the slab. Empty by default. The amount it gives is shown under a
+ * percentage; an entry that cannot be billed says why here instead of becoming ₹0.
+ */
+function PosBillDiscountBox({ approvalNeeded = false, disabled = false, error = null, exempt = false, input, manualAmount = 0, onChange }) {
+  const percentMode = input?.mode === MANUAL_BILL_DISCOUNT_MODE.PERCENT;
+  const typed = String(input?.value ?? "").trim() !== "";
+  return (
+    <div className="checkout-section pos-bill-discount">
+      <div className="pos-bill-discount-head">
+        <label className="pos-bill-discount-label" htmlFor="pos-bill-discount-input">Bill discount</label>
+        <div aria-label="Bill discount in" className="account-tabs pos-bill-discount-mode" role="group">
+          {[[MANUAL_BILL_DISCOUNT_MODE.AMOUNT, "₹"], [MANUAL_BILL_DISCOUNT_MODE.PERCENT, "%"]].map(([mode, label]) => (
+            <button
+              aria-label={mode === MANUAL_BILL_DISCOUNT_MODE.PERCENT ? "Percent of the bill" : "Rupees"}
+              aria-pressed={input?.mode === mode}
+              className={input?.mode === mode ? "account-tab account-tab-active" : "account-tab"}
+              disabled={disabled}
+              key={mode}
+              type="button"
+              onClick={() => onChange({ ...input, mode })}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <input
+        aria-describedby="pos-bill-discount-note"
+        aria-invalid={error ? true : undefined}
+        disabled={disabled}
+        id="pos-bill-discount-input"
+        inputMode="decimal"
+        max={percentMode ? "100" : undefined}
+        min="0"
+        placeholder={percentMode ? "% of the bill" : "₹ off the bill"}
+        step="0.01"
+        type="number"
+        value={input?.value ?? ""}
+        onChange={(event) => onChange({ ...input, value: event.target.value })}
+      />
+      <div id="pos-bill-discount-note">
+        {error
+          ? <small className="form-note stock-low" role="alert">{error}</small>
+          : percentMode && typed && <small className="form-note">{currency.format(manualAmount)} off the bill</small>}
+        {approvalNeeded && !error && <small className="form-note stock-low">Over 5% of the bill in all: needs Owner/Admin approval</small>}
+        {!exempt && <small className="form-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}, items and bill together</small>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * An Owner or Admin approves more than 5% off an item, on the counter, before the bill is saved.
+ * The same username and password fields as a cashier's cancel or edit. Closing it keeps the cart;
+ * a refused password says so in the server's words and keeps the dialog open.
+ */
+function DiscountApprovalModal({ draft, onChange, onClose, onConfirm }) {
+  const lines = Array.isArray(draft?.lines) ? draft.lines : [];
+  const missingCredentials = !String(draft?.approverUsername || "").trim() || !draft?.approverPassword;
+  return (
+    <div className="modal-backdrop">
+      <section aria-label="Discount approval" aria-modal="true" className="invoice-modal discount-approval-modal" role="dialog">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Discount approval</span>
+            <strong>A discount over 5% needs an Owner or Admin</strong>
+          </div>
+          <button aria-label="Close discount approval" className="remove-button" disabled={draft.saving} type="button" onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <form
+          className="sale-edit-body"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onConfirm();
+          }}
+        >
+          {draft.notice && <div className="warning-note">{draft.notice}</div>}
+          {(lines.length > 0 || draft.bill) && (
+            <ul className="discount-approval-lines">
+              {lines.map((line, index) => <li key={`${line.lineId ?? "line"}-${index}`}>{describeDiscountApprovalLine(line)}</li>)}
+              {draft.bill && <li key="bill">{describeBillApprovalLine(draft.bill)}</li>}
+            </ul>
+          )}
+          <SaleChangeApprovalFields
+            disabled={draft.saving}
+            form={draft}
+            onChange={onChange}
+            route={{ mode: SALE_CHANGE_APPROVAL_MODE.CLOUD }}
+          />
+          {draft.error && <div className="error-banner" role="alert">{draft.error}</div>}
+          <p className="form-note">The bill is saved only after approval. Close this to change the discount; the cart stays as it is.</p>
+          <div className="button-row">
+            <button className="primary-button" disabled={draft.saving || missingCredentials} type="submit">{draft.saving ? "Checking..." : "Approve and save bill"}</button>
+            <button className="secondary-button" disabled={draft.saving} type="button" onClick={onClose}>Change discount</button>
+          </div>
+        </form>
+      </section>
+    </div>
   );
 }
 

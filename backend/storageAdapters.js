@@ -131,8 +131,35 @@ class WebIndexedDBAdapter extends StorageAdapter {
   }
 }
 
+/**
+ * node-postgres pool settings for the cloud runtime.
+ *
+ * - `max` from `PG_POOL_MAX` (1-100). The default stays 10 -- node-postgres's own default, and what
+ *   the deployment has always run with -- so this is a no-op until a deployment sets it. A small
+ *   managed database (Neon free) wants it lower; `render.yaml` sets it.
+ * - `connectionTimeoutMillis` 15 s. node-postgres's default is 0, which waits forever: a database
+ *   that stopped answering hung every request (and the platform health check) instead of failing.
+ *   15 s matches the desktop gateway's own forwarding timeout.
+ * - `idleTimeoutMillis` 30 s, so a burst of sync traffic does not reconnect (TLS and all) every 10 s.
+ * - `keepAlive`, so a NAT or proxy between the app and the database does not silently drop an idle
+ *   connection that the pool still believes is open.
+ */
+const DEFAULT_PG_POOL_MAX = 10;
+const MAX_PG_POOL_MAX = 100;
+const resolvePoolOptions = (env = {}) => {
+  const raw = String(env.PG_POOL_MAX ?? "").trim();
+  const parsed = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  const max = Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_PG_POOL_MAX ? parsed : DEFAULT_PG_POOL_MAX;
+  return {
+    max,
+    connectionTimeoutMillis: 15000,
+    idleTimeoutMillis: 30000,
+    keepAlive: true,
+  };
+};
+
 class CloudPostgresAdapter extends StorageAdapter {
-  constructor({ connectionString, sslEnabled, rejectUnauthorized, allowIsolatedLoopback = false }) {
+  constructor({ connectionString, sslEnabled, rejectUnauthorized, allowIsolatedLoopback = false, poolOptions = resolvePoolOptions({}) }) {
     super({ kind: "cloud-postgres", databaseType: "postgresql", clientPlatform: "cloud", localFirst: false });
     if (!connectionString) {
       throw new Error("Cloud-server runtime requires DATABASE_URL.");
@@ -154,9 +181,19 @@ class CloudPostgresAdapter extends StorageAdapter {
     types.setTypeParser(1082, (value) => value);
     this.connectionString = connectionString;
     this.host = host;
+    this.poolOptions = poolOptions;
     this.pool = new Pool({
       connectionString,
       ssl: sslEnabled ? { rejectUnauthorized } : undefined,
+      ...poolOptions,
+    });
+    // An idle pooled client whose server end goes away (a managed database suspending its compute,
+    // a failover, a restart) makes pg-pool emit `error`. With no listener, Node treats that as an
+    // unhandled error event and the whole process exits -- every counter loses the cloud because
+    // one unused connection died. The pool has already discarded the client; logging is all that is
+    // left to do, and the next query simply opens a fresh connection.
+    this.pool.on("error", (error) => {
+      console.error(`[postgres] idle client error (connection discarded): ${error?.message || error}`);
     });
     this.pool.on("connect", (client) => {
       client.query("SET TIME ZONE 'UTC'").catch((error) => {
@@ -200,6 +237,7 @@ const createStorageAdapter = (env = process.env) => {
         allowIsolatedLoopback:
           String(env.NODE_ENV || "").trim().toLowerCase() === "test" &&
           /^true$/i.test(env.FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS || ""),
+        poolOptions: resolvePoolOptions(env),
       }),
     };
   }
@@ -222,6 +260,8 @@ module.exports = {
   MobileSQLiteAdapter,
   WebIndexedDBAdapter,
   CloudPostgresAdapter,
+  DEFAULT_PG_POOL_MAX,
+  resolvePoolOptions,
   resolveRuntimeMode,
   resolveDesktopSqlitePath,
   liveDesktopSqlitePath,

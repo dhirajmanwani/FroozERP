@@ -33,8 +33,9 @@ Required production environment values:
 - `RECOVERY_OTP_HASH_SECRET`
 - Email, one of two ways (all sending goes through `backend/emailDelivery.js`):
   - An HTTPS email service: `EMAIL_PROVIDER` (`brevo` or `resend`), `EMAIL_API_KEY`, `EMAIL_FROM`
-    (bare or `Name <address>`). **Required on Railway's Hobby plan**, which blocks outbound SMTP
-    (ports 25, 465, 587): an SMTP connection there never opens. When both ways are set, this one wins.
+    (bare or `Name <address>`). **Required on any host that blocks outbound SMTP** (ports 25, 465,
+    587) -- Railway's Hobby plan did, and Render's free plan reportedly does (verify): an SMTP
+    connection there never opens. When both ways are set, this one wins.
   - SMTP, only on hosts that allow it:
 - `SMTP_HOST`
 - `SMTP_PORT`

@@ -128,12 +128,16 @@ test("a refused Gmail password points at the App Password", async () => {
   assert.match(result.reason, /App Password/);
 });
 
-test("a blocked SMTP port names the Railway plan and the way around it", async () => {
+test("a blocked SMTP port names the likely cause and the way around it, without naming a platform", async () => {
   const block = () => { throw Object.assign(new Error("Connection timeout"), { code: "ETIMEDOUT" }); };
   const result = await sendEmail(MESSAGE, { env: smtpEnv, createTransport: fakeTransport(block) });
   assert.equal(result.status, "unreachable");
   assert.match(result.reason, /smtp\.gmail\.com:587 could not be reached/);
   assert.match(result.reason, /EMAIL_PROVIDER=brevo/);
+  assert.match(result.reason, /block outbound email over SMTP/);
+  // The hint is read by a shop owner on whatever host the cloud runs on; naming one platform's plan
+  // was wrong the day the cloud moved.
+  assert.doesNotMatch(result.reason, /railway|render|hobby/i);
 });
 
 test("an SMTP server that never answers is cut off at the deadline, not left hanging", async () => {

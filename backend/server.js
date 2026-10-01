@@ -63,6 +63,13 @@ const {
 const { callerKey, registerAttempt, throttleMessage } = require("./publicRouteThrottle");
 const { resolveBackupLocation } = require("./backupLocation");
 const {
+  assertHostedDeploymentConfiguration,
+  defaultCloudDeploymentId,
+  resolveTrustProxy,
+} = require("./hostedDeploymentGuard");
+const { createCorsPolicy } = require("./cloudCorsPolicy");
+const { createCloudFreezeMiddleware, healthStatus, readCloudFreeze } = require("./cloudFreeze");
+const {
   issueLicence,
   ActivationLicenceError,
   dayToIso,
@@ -72,6 +79,16 @@ const {
 const { normaliseLicenceRequest } = require("./activationLicenceRequest");
 const { validateProductPhoto } = require("./productPhoto");
 const saleChangeApproval = require("./saleChangeApproval");
+const {
+  effectiveLotRate,
+  normalizeRateUpdate,
+  productRateSyncPayload,
+  resolveDesiredMargin,
+  resolveRoundingRule,
+  sameRate,
+  suggestSellingRate,
+} = require("./saleRateUpdate");
+const discountRules = require("./discounts");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -143,24 +160,16 @@ const serverTimePayload = () => {
     server_timezone: "UTC",
   };
 };
-const legacyProductionRailwayOrigins = new Set(["https://froozerp-production.up.railway.app"]);
-const productionRailwayOrigin = "https://froozerp-production-27bb.up.railway.app";
+// The production cloud's address as this layer knows it, and the retired addresses a saved
+// configuration may still carry. Host-neutral names: the values are the deployment's, not the
+// platform's. `frontend/src/local/cloudOrigins.js` lists every layer that carries a copy; moving the
+// cloud changes all of them together, and puts the old address into every legacy set.
+const legacyProductionCloudOrigins = new Set(["https://froozerp-production.up.railway.app"]);
+const defaultProductionCloudOrigin = "https://froozerp-production-27bb.up.railway.app";
 const canonicalizeCloudApiUrl = (value) => {
   const normalized = String(value || "").trim().replace(/\/$/, "");
-  return legacyProductionRailwayOrigins.has(normalized) ? productionRailwayOrigin : normalized;
+  return legacyProductionCloudOrigins.has(normalized) ? defaultProductionCloudOrigin : normalized;
 };
-const defaultCorsOrigins = [
-  productionRailwayOrigin,
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "http://localhost:5000",
-  "http://127.0.0.1:5000",
-];
-const configuredCorsOrigins = String(process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter((origin) => origin && origin !== "*");
-const allowedCorsOrigins = [...new Set([...defaultCorsOrigins, ...configuredCorsOrigins])];
 const apiContractVersion = "1";
 const frostApiVersion = "1";
 const supportedFrostCapabilities = [
@@ -191,7 +200,7 @@ const deploymentType = cloudServerRuntime ? "cloud" : "local";
 /**
  * A-6 Gate 2.4 — trust exactly one proxy hop when hosted, and none otherwise.
  *
- * Railway terminates TLS and forwards, so without this every request appears to come from the
+ * The hosting platform (Railway, Render) terminates TLS and forwards, so without this every request appears to come from the
  * platform's own address: `req.ip` is the proxy, `X-Forwarded-For` is ignored, and every rate
  * limit, lockout and audit row records the wrong origin. The failure is not that controls stop
  * working — it is that they all key on one shared value, so one attacker looks like every user and
@@ -204,11 +213,32 @@ const deploymentType = cloudServerRuntime ? "cloud" : "local";
  * Off entirely when not hosted: on the desktop the only client is loopback, and trusting a
  * forwarded header there would let anything on the machine claim to be somewhere else.
  */
-app.set("trust proxy", deploymentType === "cloud" ? 1 : false);
+// The hop count is configurable (FROOZERP_TRUST_PROXY_HOPS, default 1) because a platform whose edge
+// adds more than one proxy needs it; see backend/hostedDeploymentGuard.js `resolveTrustProxy`.
+const trustProxy = resolveTrustProxy({ env: process.env, cloud: deploymentType === "cloud" });
+if (trustProxy.warning) console.warn(`[proxy] ${trustProxy.warning}`);
+app.set("trust proxy", trustProxy.value);
 
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
+
+// Fail closed on a hosted process whose own variables say it is not hosted -- cloud-server without
+// APP_MODE=CLOUD_PRODUCTION (the startup bootstrap would rewrite live data), or desktop-local on a
+// hosting platform (it would serve an empty ephemeral SQLite file and report healthy). The rules,
+// and what they deliberately leave alone, are in backend/hostedDeploymentGuard.js. Judged against
+// the connection the storage adapter will actually open, not a variable left in a shell.
+try {
+  assertHostedDeploymentConfiguration({
+    env: process.env,
+    runtimeMode,
+    hostedCloudDeployment,
+    databaseUrl: storageAdapter.connectionString || "",
+  });
+} catch (error) {
+  console.error(`\n${error.message}\n`);
+  throw error;
+}
 
 // Where backups go, and whether writing them there means anything. See backend/backupLocation.js:
 // the old `path.join(__dirname, "..", "backups")` is right on a desktop install and resolves to
@@ -221,13 +251,53 @@ if (backupLocation.warning) {
   // success that means nothing would be worse, so it says so in the same place.
   console.warn(`[backup] ${backupLocation.warning}`);
 }
+/**
+ * In-process backups are skipped where they cannot survive (`backupLocation.durable === false`: a
+ * hosted deployment with no BACKUP_DIR). Each one reads every table into memory and writes it to a
+ * filesystem the next deploy deletes. On a small instance that is an out-of-memory risk, and on a
+ * platform that sends SIGTERM at every deploy and idle spin-down, the shutdown backup also turns
+ * each restart into a full read of the database -- for a file nobody can ever fetch. The real
+ * backups of a hosted database are the provider's own and `node scripts/cloud/backup-cloud.mjs`.
+ */
+const inProcessBackupsEnabled = backupLocation.durable;
+const IN_PROCESS_BACKUP_REFUSAL =
+  "This server has no durable backup location, so it does not write in-process backups: the file "
+  + "would be deleted at the next deploy. Back up the cloud database with "
+  + "`node scripts/cloud/backup-cloud.mjs` (see docs/production/CLOUD_BACKUP.md), or set BACKUP_DIR "
+  + "to a mounted volume.";
+if (!inProcessBackupsEnabled) {
+  console.warn("[backup] Scheduled and shutdown backups are OFF on this deployment (no durable BACKUP_DIR). Use scripts/cloud/backup-cloud.mjs.");
+}
 const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || "").trim() || null;
 const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
 const configuredBranchId = String(process.env.BRANCH_ID || "").trim() || null;
 const configuredDeviceId = String(process.env.DEVICE_ID || "").trim() || null;
 const configuredDeviceName = String(process.env.DEVICE_NAME || "").trim() || null;
-const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || (hostedCloudDeployment ? "railway-production" : "")).trim() || null;
-const publicCloudApiUrl = canonicalizeCloudApiUrl(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || (hostedCloudDeployment ? productionRailwayOrigin : "")) || null;
+const cloudDeploymentId = String(
+  process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || defaultCloudDeploymentId({ env: process.env, hostedCloudDeployment })
+).trim() || null;
+// RENDER_EXTERNAL_URL is set by Render itself to the service's public https URL, so a Render
+// deployment that forgot CLOUD_API_URL still names itself rather than the built-in default.
+const publicCloudApiUrl = canonicalizeCloudApiUrl(
+  process.env.CLOUD_API_URL
+  || process.env.FROOZERP_PUBLIC_API_URL
+  || process.env.RENDER_EXTERNAL_URL
+  || (hostedCloudDeployment ? defaultProductionCloudOrigin : "")
+) || null;
+// Exact origins only -- see backend/cloudCorsPolicy.js for why there is no platform wildcard.
+const corsPolicy = createCorsPolicy({
+  productionOrigin: defaultProductionCloudOrigin,
+  legacyOrigins: [...legacyProductionCloudOrigins],
+  publicCloudApiUrl,
+  configured: process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGINS || "",
+});
+const allowedCorsOrigins = corsPolicy.allowedOrigins;
+// The cut-over freeze (backend/cloudFreeze.js). Read once at startup; changing it is a redeploy.
+const cloudFreeze = readCloudFreeze(process.env);
+if (cloudFreeze.warning) console.warn(`[freeze] ${cloudFreeze.warning}`);
+if (cloudFreeze.frozen) {
+  console.warn("[freeze] FROOZERP_CLOUD_FROZEN=true: every route except GET /api/health, /health, /api/time and /api/version answers 503 CLOUD_UNAVAILABLE.");
+}
 const readOptionalBoolean = (value, defaultValue) => {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return defaultValue;
@@ -308,7 +378,7 @@ const cloudConfigurationChecks = (identity = {}) => ({
   startup_schema_bootstrap_disabled: !runStartupSchemaBootstrap,
   startup_reference_seed_disabled: true,
 });
-const canonicalCloudApiUrl = isRealHostedCloudUrl(publicCloudApiUrl) ? publicCloudApiUrl : productionRailwayOrigin;
+const canonicalCloudApiUrl = isRealHostedCloudUrl(publicCloudApiUrl) ? publicCloudApiUrl : defaultProductionCloudOrigin;
 const cloudPolicyDirectory = path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
 const cloudPolicyPath = path.join(cloudPolicyDirectory, "cloud-network-policy.json");
 const defaultCloudPolicy = Object.freeze({
@@ -500,54 +570,11 @@ const buildCloudHealthPayload = async ({ userId = null, deviceId = "", branchId 
     return { ...base, railwayHttpStatus: safe.httpStatus, errorCode: safe.errorCode, safeErrorMessage: safe.safeErrorMessage };
   }
 };
-const allowedTauriCorsOrigins = new Set([
-  "tauri://localhost",
-  "http://tauri.localhost",
-  "https://tauri.localhost",
-]);
-
-const normalizeCorsHost = (value) => {
-  const hostValue = String(value || "").split(",")[0].trim().toLowerCase();
-  if (!hostValue) return "";
-  try {
-    return new URL(hostValue).host.toLowerCase();
-  } catch {
-    return hostValue.replace(/^\[|\]$/g, "");
-  }
-};
-
-const normalizeCorsHostname = (value) =>
-  String(value || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
-
-const isPrivateNetworkHost = (hostname) => {
-  const hostValue = normalizeCorsHostname(hostname);
-  if (!hostValue) return false;
-  if (hostValue === "localhost" || hostValue === "127.0.0.1" || hostValue === "::1") return true;
-  if (/^10\./.test(hostValue) || /^192\.168\./.test(hostValue)) return true;
-  const private172 = hostValue.match(/^172\.(\d{1,3})\./);
-  return Boolean(private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31);
-};
-
-const isSameOriginHost = (parsedOrigin, req) => {
-  const originHost = normalizeCorsHost(parsedOrigin.host);
-  const requestHosts = [
-    normalizeCorsHost(req.headers.host),
-    normalizeCorsHost(req.headers["x-forwarded-host"]),
-  ].filter(Boolean);
-  return requestHosts.includes(originHost);
-};
-
-const isAllowedDynamicCorsOrigin = (origin, req) => {
-  if (!origin) return true;
-  if (allowedCorsOrigins.includes(origin)) return true;
-  if (allowedTauriCorsOrigins.has(origin)) return true;
-  const parsed = new URL(origin);
-  const hostname = normalizeCorsHostname(parsed.hostname);
-  if (isSameOriginHost(parsed, req)) return true;
-  if (parsed.protocol === "https:" && hostname.endsWith(".up.railway.app")) return true;
-  if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isPrivateNetworkHost(hostname)) return true;
-  return false;
-};
+// Tauri shells, same-origin, private-network hosts and the exact list above. No platform wildcard.
+const isAllowedDynamicCorsOrigin = (origin, req) => corsPolicy.isAllowedOrigin(origin, {
+  host: req.headers.host,
+  forwardedHost: req.headers["x-forwarded-host"],
+});
 
 app.use((req, res, next) => cors({
   credentials: true,
@@ -573,6 +600,10 @@ app.use((req, res, next) => cors({
     return callback(new Error("Origin not allowed by FroozERP CORS"));
   },
 })(req, res, next));
+
+// Mounted straight after CORS, so a frozen cloud refuses before authentication, the protocol gate
+// or any handler can run -- and a browser still gets CORS headers on the refusal it can read.
+app.use(createCloudFreezeMiddleware({ frozen: cloudFreeze.frozen }));
 
 app.use((req, res, next) => {
   if (
@@ -1233,21 +1264,6 @@ const upgradeStoredPassword = async (userId, password, verification) => {
     await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [upgraded, userId]);
   } catch (error) {
     console.error("password rehash skipped", error?.message || error);
-  }
-};
-const applySaleRateRounding = (value, rule) => {
-  const amount = Number(value || 0);
-  if (!Number.isFinite(amount)) return 0;
-  switch (rule) {
-    case "ROUND_UP_5":
-      return Math.ceil(amount / 5) * 5;
-    case "ROUND_UP_10":
-      return Math.ceil(amount / 10) * 10;
-    case "NO_ROUND":
-      return roundCurrency(amount);
-    case "NEAREST_RUPEE":
-    default:
-      return Math.round(amount);
   }
 };
 const toDateKey = (value) =>
@@ -5827,61 +5843,43 @@ const cleanupOldBackups = async () => {
   }
 };
 
-const readDiscountRulePayload = (body) => {
-  const minimumBillAmount = parseNonNegativeNumber(body.minimum_bill_amount);
-  const maximumBillAmount = body.maximum_bill_amount === "" || body.maximum_bill_amount === null || body.maximum_bill_amount === undefined
-    ? null
-    : parseNonNegativeNumber(body.maximum_bill_amount);
-  const discountType = normalizeDiscountType(body.discount_type);
-  const paymentMode = normalizeDiscountPaymentMode(body.payment_mode);
-  return {
-    rule_name: cleanText(body.rule_name),
-    minimum_bill_amount: minimumBillAmount,
-    maximum_bill_amount: maximumBillAmount,
-    discount_type: discountType,
-    discount_value: parseNonNegativeNumber(body.discount_value),
-    payment_mode: paymentMode,
-    active: body.active !== false,
-  };
-};
-
-const hasInvalidDiscountMaximum = (body, rule) =>
-  rule.maximum_bill_amount === null &&
-  body.maximum_bill_amount !== "" &&
-  body.maximum_bill_amount !== null &&
-  body.maximum_bill_amount !== undefined;
-
-const calculateInvoiceDiscount = (rule, subtotal) => {
-  if (!rule) return 0;
-  const value = Number(rule.discount_value || 0);
-  const amount = rule.discount_type === "PERCENTAGE"
-    ? roundCurrency(subtotal * value / 100)
-    : roundCurrency(value);
-  return Math.min(amount, subtotal);
-};
-
-const getMatchingDiscountRule = async (client, subtotal, paymentMode) => {
+/**
+ * The bill slabs a sale is matched against: whether slabs are switched on, and the active slabs.
+ * Matched in JS by `discounts.matchBillSlab`, the same function POS uses, rather than by a SQL
+ * ORDER BY that disagreed with POS at the edges (a maximum of 0, ties across ₹ and %).
+ */
+const loadBillSlabs = async (client) => {
   const settingsResult = await client.query("SELECT bill_level_slab_discount_enabled FROM sale_rate_settings WHERE id = 1");
-  if (settingsResult.rows[0]?.bill_level_slab_discount_enabled === false) return null;
+  const enabled = discountRules.slabsEnabled(settingsResult.rows[0]);
+  if (!enabled) return { enabled, rules: [] };
+  const result = await client.query("SELECT * FROM sale_discount_rules WHERE active = TRUE ORDER BY id");
+  return { enabled, rules: result.rows };
+};
+
+/**
+ * Every lot discount on the given lots, through the lot's branch. Used to check a sale line's
+ * lot-discount claim; `discounts.verifyLotDiscountClaim` decides, by id, type, value and date.
+ */
+const loadLotDiscountsForLots = async (client, lotIds, branchId) => {
+  const ids = [...new Set((lotIds || []).map(parsePositiveInteger).filter(Boolean))];
+  if (ids.length === 0 || !parsePositiveInteger(branchId)) return [];
   const result = await client.query(
     `
-    SELECT *
-    FROM sale_discount_rules
-    WHERE active = TRUE
-      AND minimum_bill_amount <= $1
-      AND (maximum_bill_amount IS NULL OR maximum_bill_amount >= $1)
-      AND (payment_mode = 'ALL' OR payment_mode = $2)
-    ORDER BY
-      CASE WHEN payment_mode = $2 THEN 0 ELSE 1 END,
-      minimum_bill_amount DESC,
-      discount_value DESC,
-      id DESC
-    LIMIT 1
+    SELECT ld.id, ld.product_id, ld.inventory_batch_id, ld.discount_type, ld.discount_value,
+           ld.start_date, ld.end_date, ld.active
+    FROM lot_discounts ld
+    JOIN inventory_batches ib ON ib.id = ld.inventory_batch_id
+    WHERE ld.inventory_batch_id = ANY($1::INT[])
+      AND ib.branch_id = $2
     `,
-    [subtotal, paymentMode]
+    [ids, parsePositiveInteger(branchId)]
   );
-  return result.rows[0] || null;
+  return result.rows;
 };
+
+/** The first value that is present (not null, undefined or blank text). 0 is present. */
+const firstPresentValue = (...values) =>
+  values.find((value) => value !== null && value !== undefined && !(typeof value === "string" && value.trim() === ""));
 
 const SALES_MANDI_TAX_BASIS = new Set([
   "GROSS_BEFORE_DISCOUNTS",
@@ -6060,6 +6058,121 @@ const authorizeSaleChange = async (client, { actor, action, approvalId, sale, co
     [id, sale.id]
   );
   return { ok: true, approverId: row.approver_id };
+};
+
+/**
+ * The signed-in user as the 5% discount rule needs them: role and role permissions, re-read from
+ * the database. Null for an unknown or inactive user, who is never exempt.
+ */
+const getManualDiscountActor = async (userId, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return null;
+  const result = await client.query(
+    `
+    SELECT u.id, u.full_name, r.role_name, COALESCE(rps.permissions, '{}'::jsonb) AS permissions
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    LEFT JOIN role_permission_settings rps ON rps.role_name = r.role_name
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  return result.rows[0] || null;
+};
+
+/** A new bill's lines, as the 5% rule reads them (`discounts.assessManualDiscounts`). */
+const manualDiscountLinesOf = (invoiceItems) => (invoiceItems || []).map((item) => ({
+  productId: item.productId,
+  inventoryBatchId: item.inventoryBatchId,
+  quantity: item.quantity,
+  rate: item.sellingRate,
+  discountAmount: item.discountAmount,
+  lotDiscount: item.lotDiscountOfRecord || null,
+}));
+
+/**
+ * The owner's rule for a cashier's own item discount, shared by browser checkout
+ * (`createSaleHandler`) and desktop sync (`processPosSaleFoundationOperation`).
+ *
+ * Nothing is asked unless a line's own discount is over 5% (`assessment.needsApproval`). An Owner,
+ * an Admin, or a holder of `manual_pos_rate_override` -- re-read from the database, never from the
+ * token -- needs nothing. Anyone else needs an ISSUED `discount` approval bound to one of this new
+ * bill's client references, themselves, this company and this device. It is locked FOR UPDATE
+ * here and consumed by `recordManualDiscountDecision` once the bill has an id, in the same
+ * transaction, so a rolled-back bill leaves it usable and two bills cannot both spend it.
+ *
+ * Returns `{ ok: true, needed, exempt, approvalId, approverId }` or
+ * `{ ok: false, code: "DISCOUNT_APPROVAL_REQUIRED", detail, message, approvalId }`.
+ */
+const authorizeManualDiscount = async (client, { assessment, actorId, approvalId, saleRefs, companyId, deviceId }) => {
+  if (!assessment?.needsApproval) return { ok: true, needed: false, exempt: false, approvalId: null, approverId: null };
+  const actor = await getManualDiscountActor(actorId, client);
+  if (discountRules.manualDiscountExempt(actor)) {
+    return { ok: true, needed: true, exempt: true, approvalId: null, approverId: null };
+  }
+  const id = saleChangeApproval.normalizeApprovalId(approvalId);
+  if (!id) return { ...saleChangeApproval.missingDiscountApproval(), approvalId: null };
+  const result = await client.query(
+    `SELECT a.*, r.role_name AS approver_role, u.active AS approver_active
+     FROM sale_change_approvals a
+     LEFT JOIN users u ON u.id = a.approver_id
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE a.id = $1
+     FOR UPDATE OF a`,
+    [id]
+  );
+  const row = result.rows[0];
+  const binding = saleChangeApproval.checkDiscountApprovalBinding(row, {
+    saleRefs,
+    requesterId: actorId,
+    companyId,
+    deviceId,
+    nowMs: Date.now(),
+  });
+  if (!binding.ok) return { ...binding, approvalId: id };
+  return { ok: true, needed: true, exempt: false, approvalId: id, approverId: row.approver_id };
+};
+
+const MANUAL_DISCOUNT_UNAPPROVED_REASON = "Discount over 5% without approval";
+
+/**
+ * After the bill is written: spend the approval and name the approver on the bill's audit trail
+ * (`DISCOUNT_APPROVED`, `approved_by`), or -- on the sync path only, where the bill is already in
+ * the customer's hands and is never refused for this -- leave `DISCOUNT_UNAPPROVED` with the
+ * binding that failed. Existing columns only. Nothing is written when no line was over 5% or the
+ * cashier was exempt.
+ */
+const recordManualDiscountDecision = async (client, { saleId, decision, assessment, actorId }) => {
+  if (!assessment?.needsApproval || !decision || decision.exempt) return;
+  const trace = discountRules.manualDiscountTrace(assessment);
+  if (decision.ok && decision.approvalId) {
+    await client.query(
+      `UPDATE sale_change_approvals
+       SET status = 'CONSUMED', consumed_at = CURRENT_TIMESTAMP, consumed_sale_id = $2
+       WHERE id = $1 AND status = 'ISSUED'`,
+      [decision.approvalId, saleId]
+    );
+    await client.query(
+      `
+      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+      VALUES ($1, 'DISCOUNT_APPROVED', 'item_discount', NULL, $2::jsonb, $3, $4, $5)
+      `,
+      [saleId, JSON.stringify({ ...trace, approval_id: decision.approvalId }), "Discount over 5% approved", actorId || null, decision.approverId]
+    );
+    return;
+  }
+  await client.query(
+    `
+    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+    VALUES ($1, 'DISCOUNT_UNAPPROVED', 'item_discount', NULL, $2::jsonb, $3, $4, NULL)
+    `,
+    [
+      saleId,
+      JSON.stringify({ ...trace, approval_id: decision.approvalId || null, detail: decision.detail || null }),
+      MANUAL_DISCOUNT_UNAPPROVED_REASON,
+      actorId || null,
+    ]
+  );
 };
 
 /** The browser path's refusal: roll back and answer 403 with the binding's code and reason. */
@@ -6549,6 +6662,20 @@ const buildSalePayload = async (
     operationalLocationId = null,
     charges = null,
     allowManualChargeAmount = false,
+    // How the bill discount is decided -- see `discounts.resolveInvoiceDiscount`. Every caller of
+    // this function records a bill that already exists (a desktop bill handed to the customer, or
+    // an edit), so they pass AS_BILLED with the rule snapshot to store. SLAB is the default only
+    // so a caller that forgets gets the server's slabs, never a client's number.
+    invoiceDiscountMode = "SLAB",
+    discountRuleSnapshot = null,
+    // The payload's `manual_bill_discount`, as sent (undefined when the device sent none). Splits
+    // the bill discount into the cashier's part and the slab's -- see `resolveInvoiceDiscount`.
+    manualBillDiscount = undefined,
+    // The day the bill belongs to, for checking a SPECIAL_RATE line against the lot's discount.
+    billDate = null,
+    // For an edit: the lot discounts the sale already carried (its `sale_items` rows). A special
+    // price the sale was billed at is not an override just because the discount stopped since.
+    priorLotDiscounts = [],
   }
 ) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
@@ -6607,6 +6734,17 @@ const buildSalePayload = async (
   }
 
   const productsById = new Map(productResult.rows.map((product) => [product.id, product]));
+  // A SPECIAL_RATE line is checked against the lot's own discount before its rate is judged: a
+  // verified special price is the discount POS was told to give, not a cashier typing a rate. It
+  // used to be treated as an override here, which refused every edit of such a bill by a
+  // non-Owner editor and logged every offline special price as an override.
+  const specialRateLots = parsedItems
+    .filter((item) => item.lotDiscountType === "SPECIAL_RATE" && item.inventoryBatchId)
+    .map((item) => item.inventoryBatchId);
+  const lotDiscountRows = specialRateLots.length > 0
+    ? await loadLotDiscountsForLots(client, specialRateLots, branchId)
+    : [];
+  const verificationDay = discountRules.dateKey(billDate) || toDateKey(new Date());
   const invoiceItems = [];
   let grossAmount = 0;
   let itemDiscountAmount = 0;
@@ -6663,7 +6801,20 @@ const buildSalePayload = async (
     );
     const hasRequestedRate = requestedItem.requestedRate !== null && requestedItem.requestedRate !== undefined;
     const sellingRate = hasRequestedRate ? Number(requestedItem.requestedRate) : defaultSellingRate;
-    const manualRateOverride = hasRequestedRate && roundCurrency(sellingRate) !== roundCurrency(defaultSellingRate);
+    const verifiedSpecialRate = hasRequestedRate
+      && requestedItem.lotDiscountType === "SPECIAL_RATE"
+      && discountRules.verifyLotDiscountClaim({
+        claim: { id: requestedItem.lotDiscountId, type: requestedItem.lotDiscountType, value: requestedItem.lotDiscountValue },
+        discounts: lotDiscountRows,
+        lotId: requestedItem.inventoryBatchId,
+        productId: requestedItem.productId,
+        day: verificationDay,
+        priorClaims: priorLotDiscounts,
+      })
+      && roundCurrency(sellingRate) === roundCurrency(requestedItem.lotDiscountValue);
+    const manualRateOverride = hasRequestedRate
+      && !verifiedSpecialRate
+      && roundCurrency(sellingRate) !== roundCurrency(defaultSellingRate);
     if (!Number.isFinite(sellingRate) || sellingRate <= 0) {
       return { error: { status: 400, message: `${product.product_name} does not have a valid selling rate` } };
     }
@@ -6730,15 +6881,25 @@ const buildSalePayload = async (
     return { error: { status: 400, message: "Select a valid payment mode" } };
   }
   const paymentMode = paymentModes.length > 1 ? "MIXED" : paymentModes[0];
-  const discountRule = await getMatchingDiscountRule(client, grossAmount, paymentMode);
-  const parsedInvoiceDiscount = parseNonNegativeNumber(invoiceDiscount);
-  if (parsedInvoiceDiscount === null) return { error: { status: 400, message: "Enter a valid invoice discount" } };
-  const invoiceDiscountAmount = discountRule
-    ? Math.min(calculateInvoiceDiscount(discountRule, grossAmount), subtotalAfterItemDiscounts)
-    : parsedInvoiceDiscount;
-  if (invoiceDiscountAmount > subtotalAfterItemDiscounts) {
-    return { error: { status: 400, message: "Invoice discount cannot exceed the cart subtotal" } };
-  }
+  // AS_BILLED (every current caller): the bill discount the customer was given, bounded by the
+  // subtotal, with the rule snapshot the device or editor sent. Re-pricing it against today's
+  // slabs refused a desktop bill whenever a slab changed while it was offline, and quietly
+  // re-discounted an old bill on edit.
+  const slabs = invoiceDiscountMode === "AS_BILLED" ? { enabled: false, rules: [] } : await loadBillSlabs(client);
+  const invoiceDiscountDecision = discountRules.resolveInvoiceDiscount({
+    mode: invoiceDiscountMode,
+    requested: invoiceDiscount,
+    gross: grossAmount,
+    subtotalAfterItems: subtotalAfterItemDiscounts,
+    paymentMode,
+    rules: slabs.rules,
+    enabled: slabs.enabled,
+    snapshot: discountRuleSnapshot,
+    manualBill: manualBillDiscount,
+  });
+  if (invoiceDiscountDecision.error) return { error: invoiceDiscountDecision.error };
+  const invoiceDiscountAmount = invoiceDiscountDecision.amount;
+  const discountRule = invoiceDiscountDecision.rule;
 
   const salesMandiTaxConfig = await getSalesMandiTaxConfig(client);
   const salesMandiTax = calculateSalesMandiTax({
@@ -6806,6 +6967,10 @@ const buildSalePayload = async (
     totalCost,
     profit,
     discountRule,
+    // Set only when the payload carried `manual_bill_discount`: the cashier's part of the bill
+    // discount (null when it could not be read) and the slab's.
+    manualBillDiscount: invoiceDiscountDecision.manualBill,
+    slabDiscountAmount: invoiceDiscountDecision.slabAmount,
     createdBy,
     branchId,
   };
@@ -9175,37 +9340,93 @@ app.get("/settings/discount-rules", async (req, res) => {
   }
 });
 
+/**
+ * Save a bill slab: checked by `discounts.validateSlabInput` (value above 0, at most 100%, maximum
+ * blank or above the minimum), and refused with SLAB_OVERLAP when an active slab could match the
+ * same bill. Overlaps used to be allowed and settled by an ORDER BY the POS did not share, so the
+ * counter and the server gave different discounts on the same bill.
+ *
+ * The table is locked for the check-and-write so two saves cannot each pass the check against the
+ * other's missing row. Slabs are company-wide; the lock is brief and slab saves are rare.
+ */
+const saveDiscountRule = async (req, res, { ruleId, manager }) => {
+  if (ruleId !== null && !ruleId) return res.status(400).json({ message: "Invalid discount rule" });
+  const client = await pool.connect();
+  let began = false;
+  try {
+    const checked = discountRules.validateSlabInput(req.body);
+    if (checked.error) return res.status(400).json({ code: "SLAB_INVALID", message: checked.error });
+    const rule = checked.rule;
+
+    await client.query("BEGIN");
+    began = true;
+    await client.query("LOCK TABLE sale_discount_rules IN SHARE ROW EXCLUSIVE MODE");
+    if (ruleId !== null) {
+      const existing = await client.query("SELECT id FROM sale_discount_rules WHERE id = $1", [ruleId]);
+      if (existing.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Discount rule not found" });
+      }
+    }
+    const activeRules = await client.query("SELECT * FROM sale_discount_rules WHERE active = TRUE ORDER BY id");
+    const clash = discountRules.findSlabOverlap(rule, activeRules.rows, { excludeId: ruleId });
+    if (clash) {
+      await client.query("ROLLBACK");
+      return res.status(409).json(discountRules.slabOverlapRefusal(clash));
+    }
+    const result = ruleId === null
+      ? await client.query(
+        `
+        INSERT INTO sale_discount_rules (
+          rule_name, minimum_bill_amount, maximum_bill_amount, discount_type,
+          discount_value, payment_mode, active, updated_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+        `,
+        [
+          rule.rule_name, rule.minimum_bill_amount, rule.maximum_bill_amount, rule.discount_type,
+          rule.discount_value, rule.payment_mode, rule.active, manager.id,
+        ]
+      )
+      : await client.query(
+        `
+        UPDATE sale_discount_rules
+        SET
+          rule_name = $1,
+          minimum_bill_amount = $2,
+          maximum_bill_amount = $3,
+          discount_type = $4,
+          discount_value = $5,
+          payment_mode = $6,
+          active = $7,
+          updated_by = $8,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $9
+        RETURNING *
+        `,
+        [
+          rule.rule_name, rule.minimum_bill_amount, rule.maximum_bill_amount, rule.discount_type,
+          rule.discount_value, rule.payment_mode, rule.active, manager.id, ruleId,
+        ]
+      );
+    await client.query("COMMIT");
+    began = false;
+    return res.status(ruleId === null ? 201 : 200).json(result.rows[0]);
+  } catch (error) {
+    if (began) await client.query("ROLLBACK").catch(() => {});
+    console.error(error);
+    return res.status(500).json({ message: ruleId === null ? "Error Adding Discount Rule" : "Error Updating Discount Rule" });
+  } finally {
+    client.release();
+  }
+};
+
 app.post("/settings/discount-rules", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
-    const rule = readDiscountRulePayload(req.body);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
-    if (
-      !rule.rule_name ||
-      rule.minimum_bill_amount === null ||
-      hasInvalidDiscountMaximum(req.body, rule) ||
-      rule.discount_value === null ||
-      !DISCOUNT_TYPES.has(rule.discount_type) ||
-      !DISCOUNT_PAYMENT_MODES.has(rule.payment_mode) ||
-      (rule.maximum_bill_amount !== null && rule.maximum_bill_amount < rule.minimum_bill_amount)
-    ) {
-      return res.status(400).json({ message: "Enter valid discount rule details" });
-    }
-    const result = await pool.query(
-      `
-      INSERT INTO sale_discount_rules (
-        rule_name, minimum_bill_amount, maximum_bill_amount, discount_type,
-        discount_value, payment_mode, active, updated_by
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-      `,
-      [
-        rule.rule_name, rule.minimum_bill_amount, rule.maximum_bill_amount, rule.discount_type,
-        rule.discount_value, rule.payment_mode, rule.active, manager.id,
-      ]
-    );
-    return res.status(201).json(result.rows[0]);
+    return await saveDiscountRule(req, res, { ruleId: null, manager });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Adding Discount Rule" });
@@ -9214,44 +9435,9 @@ app.post("/settings/discount-rules", async (req, res) => {
 
 app.put("/settings/discount-rules/:id", async (req, res) => {
   try {
-    const ruleId = parsePositiveInteger(req.params.id);
     const manager = await requireRateManager(req.auth.userId);
-    const rule = readDiscountRulePayload(req.body);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
-    if (
-      !ruleId ||
-      !rule.rule_name ||
-      rule.minimum_bill_amount === null ||
-      hasInvalidDiscountMaximum(req.body, rule) ||
-      rule.discount_value === null ||
-      !DISCOUNT_TYPES.has(rule.discount_type) ||
-      !DISCOUNT_PAYMENT_MODES.has(rule.payment_mode) ||
-      (rule.maximum_bill_amount !== null && rule.maximum_bill_amount < rule.minimum_bill_amount)
-    ) {
-      return res.status(400).json({ message: "Enter valid discount rule details" });
-    }
-    const result = await pool.query(
-      `
-      UPDATE sale_discount_rules
-      SET
-        rule_name = $1,
-        minimum_bill_amount = $2,
-        maximum_bill_amount = $3,
-        discount_type = $4,
-        discount_value = $5,
-        payment_mode = $6,
-        active = $7,
-        updated_by = $8,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $9
-      RETURNING *
-      `,
-      [
-        rule.rule_name, rule.minimum_bill_amount, rule.maximum_bill_amount, rule.discount_type,
-        rule.discount_value, rule.payment_mode, rule.active, manager.id, ruleId,
-      ]
-    );
-    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Discount rule not found" });
+    return await saveDiscountRule(req, res, { ruleId: parsePositiveInteger(req.params.id) || 0, manager });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Updating Discount Rule" });
@@ -9298,8 +9484,10 @@ app.get("/lot-discounts", async (req, res) => {
         ib.lot_size,
         ib.supplier_name,
         ib.remaining_qty,
-        COALESCE(ib.temporary_sale_rate, p.selling_rate, 0) AS current_sale_rate,
-        COALESCE(ib.effective_cost_per_unit, ib.purchase_rate, 0) AS cost_rate,
+        -- What POS charges for the lot: its own rate when above 0, else the product rate (a lot at
+        -- the product rate carries 0, which is not its price). Unknown cost stays null, never 0.
+        COALESCE(NULLIF(ib.temporary_sale_rate, 0), p.selling_rate) AS current_sale_rate,
+        NULLIF(COALESCE(ib.effective_cost_per_unit, ib.purchase_rate), 0) AS cost_rate,
         ib.batch_status
       FROM lot_discounts ld
       JOIN products p ON p.id = ld.product_id
@@ -9316,43 +9504,126 @@ app.get("/lot-discounts", async (req, res) => {
   }
 });
 
+const LOT_DISCOUNT_AUDIT_SQL = `
+  INSERT INTO lot_discount_audit (
+    discount_id, product_id, inventory_batch_id, action, old_value, new_value, remarks, changed_by
+  )
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+`;
+
+/**
+ * One running-or-upcoming discount per lot. Stops every other running or upcoming discount on the
+ * lot, in the caller's transaction, each with a REPLACE audit row naming the discount that took
+ * its place. Two at once used to stack: POS applied the highest id, the screen showed another.
+ */
+const replaceOtherLotDiscounts = async (client, { lotId, keepId, managerId, today }) => {
+  const others = await client.query(
+    `
+    SELECT *
+    FROM lot_discounts
+    WHERE inventory_batch_id = $1
+      AND id <> $2
+      AND active = TRUE
+      AND (end_date IS NULL OR end_date >= $3::DATE)
+    ORDER BY id
+    FOR UPDATE
+    `,
+    [lotId, keepId, today]
+  );
+  const replaced = [];
+  for (const old of others.rows) {
+    if (!discountRules.isRunningOrUpcoming(old, today)) continue;
+    const result = await client.query(
+      `
+      UPDATE lot_discounts
+      SET active = FALSE, deactivated_by = $1, deactivated_at = CURRENT_TIMESTAMP,
+          edited_by = $1, edited_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING *
+      `,
+      [managerId, old.id]
+    );
+    const stopped = result.rows[0];
+    await client.query(LOT_DISCOUNT_AUDIT_SQL, [
+      old.id, old.product_id, old.inventory_batch_id, "REPLACE", old, stopped,
+      `Replaced by discount ${keepId}`, managerId,
+    ]);
+    replaced.push(stopped);
+  }
+  return replaced;
+};
+
+/** The lot's name for a message: "Lot A", else its batch number, else "This lot". */
+const lotLabel = (lot) => cleanText(lot?.lot_name) || cleanText(lot?.batch_no) || "This lot";
+
 app.post("/lot-discounts", async (req, res) => {
   const client = await pool.connect();
+  let began = false;
   try {
     const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
     const productId = parsePositiveInteger(req.body.product_id);
-    const lotIds = Array.isArray(req.body.inventory_batch_ids)
-      ? req.body.inventory_batch_ids.map(parsePositiveInteger).filter(Boolean)
-      : [parsePositiveInteger(req.body.inventory_batch_id)].filter(Boolean);
+    const rawLotIds = Array.isArray(req.body.inventory_batch_ids) ? req.body.inventory_batch_ids : [req.body.inventory_batch_id];
+    const lotIds = [...new Set(rawLotIds.map(parsePositiveInteger).filter(Boolean))];
     const discountType = String(req.body.discount_type || "").trim().toUpperCase();
-    const discountValue = parseNonNegativeNumber(req.body.discount_value);
     const startDate = toBusinessDateKey(req.body.start_date || new Date());
     const endDate = req.body.end_date ? toBusinessDateKey(req.body.end_date) : null;
-    if (!productId || lotIds.length === 0 || !LOT_DISCOUNT_TYPES.has(discountType) || discountValue === null || (endDate && endDate < startDate)) {
-      return res.status(400).json({ message: "Enter valid lot discount details" });
+    // A basic check before any lot is read; the price checks need each lot's rate, below.
+    const shape = discountRules.validateLotDiscountInput({
+      type: discountType, value: req.body.discount_value, currentRate: Number.MAX_SAFE_INTEGER, startDate, endDate,
+    });
+    if (!productId || lotIds.length === 0 || rawLotIds.some((value) => !parsePositiveInteger(value))) {
+      return res.status(400).json({ code: "LOT_DISCOUNT_INVALID", message: "Choose a fruit and at least one lot." });
     }
+    if (shape.error) return res.status(400).json({ code: "LOT_DISCOUNT_INVALID", message: shape.error });
 
     await client.query("BEGIN");
+    began = true;
+    // Only this shop's lots: a lot id from another branch is "not found", never discounted.
     const lotsResult = await client.query(
       `
-      SELECT ib.id, ib.product_id, ib.lot_name, ib.batch_no, p.product_name
+      SELECT ib.id, ib.product_id, ib.lot_name, ib.batch_no, ib.temporary_sale_rate,
+             COALESCE(ib.effective_cost_per_unit, ib.purchase_rate) AS cost_rate,
+             p.product_name, p.selling_rate AS product_selling_rate
       FROM inventory_batches ib
       JOIN products p ON p.id = ib.product_id
       WHERE ib.id = ANY($1::INT[])
         AND ib.product_id = $2
+        AND ib.branch_id = $3
         AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-      FOR SHARE
+      FOR SHARE OF ib
       `,
-      [lotIds, productId]
+      [lotIds, productId, req.auth.branchId]
     );
     if (lotsResult.rows.length !== lotIds.length) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Select valid active lots for this product" });
+      began = false;
+      return res.status(404).json({ code: "LOT_NOT_FOUND", message: "One or more lots were not found in this shop for this fruit." });
     }
 
-    const created = [];
+    const checkedLots = [];
     for (const lot of lotsResult.rows) {
+      const checked = discountRules.validateLotDiscountInput({
+        type: discountType,
+        value: req.body.discount_value,
+        currentRate: effectiveLotRate(lot.temporary_sale_rate, lot.product_selling_rate),
+        cost: lot.cost_rate,
+        startDate,
+        endDate,
+        lotLabel: lotLabel(lot),
+      });
+      if (checked.error) {
+        await client.query("ROLLBACK");
+        began = false;
+        return res.status(400).json({ code: "LOT_DISCOUNT_INVALID", message: checked.error, inventory_batch_id: lot.id });
+      }
+      checkedLots.push({ lot, checked });
+    }
+
+    const active = req.body.active !== false;
+    const today = toDateKey(new Date());
+    const created = [];
+    for (const { lot, checked } of checkedLots) {
       const result = await client.query(
         `
         INSERT INTO lot_discounts (
@@ -9363,26 +9634,25 @@ app.post("/lot-discounts", async (req, res) => {
         RETURNING *
         `,
         [
-          productId, lot.id, discountType, discountValue, startDate, endDate,
-          req.body.active !== false, nullableText(req.body.remarks), manager.id,
+          productId, lot.id, checked.type, checked.value, startDate, endDate,
+          active, nullableText(req.body.remarks), manager.id,
         ]
       );
       const discount = result.rows[0];
-      created.push(discount);
-      await client.query(
-        `
-        INSERT INTO lot_discount_audit (
-          discount_id, product_id, inventory_batch_id, action, old_value, new_value, remarks, changed_by
-        )
-        VALUES ($1, $2, $3, 'CREATE', NULL, $4, $5, $6)
-        `,
-        [discount.id, productId, lot.id, discount, nullableText(req.body.remarks), manager.id]
-      );
+      await client.query(LOT_DISCOUNT_AUDIT_SQL, [
+        discount.id, productId, lot.id, "CREATE", null, discount, nullableText(req.body.remarks), manager.id,
+      ]);
+      const replaced = active && discountRules.isRunningOrUpcoming({ active, start_date: startDate, end_date: endDate }, today)
+        ? await replaceOtherLotDiscounts(client, { lotId: lot.id, keepId: discount.id, managerId: manager.id, today })
+        : [];
+      // Still one row per discount made, as before, with what it replaced and any below-cost note.
+      created.push({ ...discount, replaced_discount_ids: replaced.map((row) => row.id), warning: checked.warning });
     }
     await client.query("COMMIT");
+    began = false;
     return res.status(201).json(created);
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (began) await client.query("ROLLBACK").catch(() => {});
     console.error(error);
     return res.status(500).json({ message: "Error Saving Lot Discount" });
   } finally {
@@ -9390,25 +9660,73 @@ app.post("/lot-discounts", async (req, res) => {
   }
 });
 
+/**
+ * A lot discount of this shop, locked, with the lot's current rate and cost -- or nothing. PUT and
+ * deactivate used to find the discount by id alone, so an Admin of one shop could change or stop
+ * another shop's discounts by guessing ids.
+ */
+const lockBranchLotDiscount = (client, discountId, branchId) => client.query(
+  `
+  SELECT ld.*, ib.lot_name, ib.batch_no, ib.temporary_sale_rate,
+         COALESCE(ib.effective_cost_per_unit, ib.purchase_rate) AS cost_rate,
+         p.selling_rate AS product_selling_rate
+  FROM lot_discounts ld
+  JOIN inventory_batches ib ON ib.id = ld.inventory_batch_id
+  JOIN products p ON p.id = ld.product_id
+  WHERE ld.id = $1
+    AND ib.branch_id = $2
+  FOR UPDATE OF ld
+  `,
+  [discountId, branchId]
+);
+
+/** A `lot_discounts` row without the lot and product columns the lock query joined in. */
+const lotDiscountRow = (row) => {
+  if (!row) return row;
+  const { lot_name, batch_no, temporary_sale_rate, cost_rate, product_selling_rate, ...discount } = row;
+  return discount;
+};
+
 app.put("/lot-discounts/:id", async (req, res) => {
   const client = await pool.connect();
+  let began = false;
   try {
     const discountId = parsePositiveInteger(req.params.id);
     const manager = await requireRateManager(req.auth.userId, client);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
     const discountType = String(req.body.discount_type || "").trim().toUpperCase();
-    const discountValue = parseNonNegativeNumber(req.body.discount_value);
     const startDate = toBusinessDateKey(req.body.start_date || new Date());
     const endDate = req.body.end_date ? toBusinessDateKey(req.body.end_date) : null;
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
-    if (!discountId || !LOT_DISCOUNT_TYPES.has(discountType) || discountValue === null || (endDate && endDate < startDate)) {
-      return res.status(400).json({ message: "Enter valid lot discount details" });
-    }
+    if (!discountId) return res.status(400).json({ code: "LOT_DISCOUNT_INVALID", message: "Invalid discount" });
+    const shape = discountRules.validateLotDiscountInput({
+      type: discountType, value: req.body.discount_value, currentRate: Number.MAX_SAFE_INTEGER, startDate, endDate,
+    });
+    if (shape.error) return res.status(400).json({ code: "LOT_DISCOUNT_INVALID", message: shape.error });
+
     await client.query("BEGIN");
-    const oldResult = await client.query("SELECT * FROM lot_discounts WHERE id = $1 FOR UPDATE", [discountId]);
-    if (oldResult.rows.length === 0) {
+    began = true;
+    const oldResult = await lockBranchLotDiscount(client, discountId, req.auth.branchId);
+    const locked = oldResult.rows[0];
+    if (!locked) {
       await client.query("ROLLBACK");
+      began = false;
       return res.status(404).json({ message: "Lot discount not found" });
     }
+    const checked = discountRules.validateLotDiscountInput({
+      type: discountType,
+      value: req.body.discount_value,
+      currentRate: effectiveLotRate(locked.temporary_sale_rate, locked.product_selling_rate),
+      cost: locked.cost_rate,
+      startDate,
+      endDate,
+      lotLabel: lotLabel(locked),
+    });
+    if (checked.error) {
+      await client.query("ROLLBACK");
+      began = false;
+      return res.status(400).json({ code: "LOT_DISCOUNT_INVALID", message: checked.error });
+    }
+    const active = req.body.active !== false;
     const result = await client.query(
       `
       UPDATE lot_discounts
@@ -9419,22 +9737,22 @@ app.put("/lot-discounts/:id", async (req, res) => {
       WHERE id = $8
       RETURNING *
       `,
-      [discountType, discountValue, startDate, endDate, req.body.active !== false, nullableText(req.body.remarks), manager.id, discountId]
+      [checked.type, checked.value, startDate, endDate, active, nullableText(req.body.remarks), manager.id, discountId]
     );
     const updated = result.rows[0];
-    await client.query(
-      `
-      INSERT INTO lot_discount_audit (
-        discount_id, product_id, inventory_batch_id, action, old_value, new_value, remarks, changed_by
-      )
-      VALUES ($1, $2, $3, 'UPDATE', $4, $5, $6, $7)
-      `,
-      [discountId, updated.product_id, updated.inventory_batch_id, oldResult.rows[0], updated, nullableText(req.body.remarks), manager.id]
-    );
+    await client.query(LOT_DISCOUNT_AUDIT_SQL, [
+      discountId, updated.product_id, updated.inventory_batch_id, "UPDATE", lotDiscountRow(locked), updated,
+      nullableText(req.body.remarks), manager.id,
+    ]);
+    const today = toDateKey(new Date());
+    const replaced = active && discountRules.isRunningOrUpcoming({ active, start_date: startDate, end_date: endDate }, today)
+      ? await replaceOtherLotDiscounts(client, { lotId: updated.inventory_batch_id, keepId: discountId, managerId: manager.id, today })
+      : [];
     await client.query("COMMIT");
-    return res.json(updated);
+    began = false;
+    return res.json({ ...updated, replaced_discount_ids: replaced.map((row) => row.id), warning: checked.warning });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (began) await client.query("ROLLBACK").catch(() => {});
     console.error(error);
     return res.status(500).json({ message: "Error Updating Lot Discount" });
   } finally {
@@ -9444,15 +9762,18 @@ app.put("/lot-discounts/:id", async (req, res) => {
 
 app.post("/lot-discounts/:id/deactivate", async (req, res) => {
   const client = await pool.connect();
+  let began = false;
   try {
     const discountId = parsePositiveInteger(req.params.id);
     const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
     if (!discountId) return res.status(400).json({ message: "Invalid discount" });
     await client.query("BEGIN");
-    const oldResult = await client.query("SELECT * FROM lot_discounts WHERE id = $1 FOR UPDATE", [discountId]);
+    began = true;
+    const oldResult = await lockBranchLotDiscount(client, discountId, req.auth.branchId);
     if (oldResult.rows.length === 0) {
       await client.query("ROLLBACK");
+      began = false;
       return res.status(404).json({ message: "Lot discount not found" });
     }
     const result = await client.query(
@@ -9465,19 +9786,15 @@ app.post("/lot-discounts/:id/deactivate", async (req, res) => {
       `,
       [manager.id, discountId]
     );
-    await client.query(
-      `
-      INSERT INTO lot_discount_audit (
-        discount_id, product_id, inventory_batch_id, action, old_value, new_value, remarks, changed_by
-      )
-      VALUES ($1, $2, $3, 'DEACTIVATE', $4, $5, $6, $7)
-      `,
-      [discountId, result.rows[0].product_id, result.rows[0].inventory_batch_id, oldResult.rows[0], result.rows[0], nullableText(req.body.remarks), manager.id]
-    );
+    await client.query(LOT_DISCOUNT_AUDIT_SQL, [
+      discountId, result.rows[0].product_id, result.rows[0].inventory_batch_id, "DEACTIVATE",
+      lotDiscountRow(oldResult.rows[0]), result.rows[0], nullableText(req.body.remarks), manager.id,
+    ]);
     await client.query("COMMIT");
+    began = false;
     return res.json({ success: true, discount: result.rows[0] });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (began) await client.query("ROLLBACK").catch(() => {});
     console.error(error);
     return res.status(500).json({ message: "Error Deactivating Lot Discount" });
   } finally {
@@ -10710,7 +11027,17 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     branchId: context.branchId,
     createdBy: context.user.id,
     customer: payload.customer || {},
-    invoiceDiscount: payload.bill_discount_total || payload.invoice_discount || 0,
+    invoiceDiscount: firstPresentValue(payload.bill_discount_total, payload.invoice_discount, 0),
+    // The bill was handed to the customer with this discount, worked out from the slabs the
+    // counter had. It is recorded as billed (bounded by the subtotal) with the counter's rule
+    // snapshot. Re-pricing it against the server's current slabs rejected the bill whenever a slab
+    // had changed while the counter was offline -- the same trap the charges below avoid.
+    invoiceDiscountMode: "AS_BILLED",
+    discountRuleSnapshot: discountRules.readDiscountRuleSnapshot(payload),
+    // The cashier's own part of that discount, when the counter has the bill-discount box. Never a
+    // reason to refuse the bill; it decides the rule name stored and the 5% trace below.
+    manualBillDiscount: payload.manual_bill_discount,
+    billDate: toBusinessDateKey(payload.bill_date || payload.bill_datetime || new Date()),
     payments: payload.payments || [],
     allowRateOverride: true,
     companyId: context.companyId,
@@ -10731,6 +11058,53 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     }
     return rejectOperation(operation, "VALIDATION_ERROR", salePayload.error.message || "POS sale validation failed");
   }
+
+  // The owner's 5% rule, on a bill the customer already has: it is NEVER refused for this. A valid
+  // approval is spent and its approver recorded; a missing or invalid one leaves a
+  // DISCOUNT_UNAPPROVED row on the bill's audit trail. The lot's own discount is not the
+  // cashier's: a ₹ or % lot discount the lot really has (or had -- one stopped since billing
+  // still was the lot's) is set aside before the 5% is measured.
+  const claimedLotIds = salePayload.invoiceItems
+    .filter((item) => ["PERCENTAGE", "FIXED_AMOUNT"].includes(item.lotDiscountType) && item.lotDiscountId && item.inventoryBatchId)
+    .map((item) => item.inventoryBatchId);
+  const lotDiscountsOfRecord = claimedLotIds.length > 0
+    ? await loadLotDiscountsForLots(client, claimedLotIds, context.branchId)
+    : [];
+  const syncDiscountLines = manualDiscountLinesOf(
+    salePayload.invoiceItems.map((item) => ({
+      ...item,
+      lotDiscountOfRecord: discountRules.lotDiscountOfRecord({
+        claim: { id: item.lotDiscountId, type: item.lotDiscountType, value: item.lotDiscountValue },
+        discounts: lotDiscountsOfRecord,
+        lotId: item.inventoryBatchId,
+        productId: item.productId,
+      }),
+    }))
+  );
+  // A counter with the bill-discount box sends `manual_bill_discount`: the cashier's part of the
+  // bill discount is then held to the bill-level 5% too, capped at the discount billed. One that
+  // cannot be read is measured as unreadable (needs approval), never as none.
+  const syncManualBill = discountRules.readManualBillDiscount(payload.manual_bill_discount);
+  const manualDiscountAssessment = syncManualBill.present
+    ? discountRules.assessBillManualDiscount({
+      lines: syncDiscountLines,
+      manualBill: syncManualBill.unreadable ? payload.manual_bill_discount : salePayload.manualBillDiscount,
+    })
+    : discountRules.assessManualDiscounts(syncDiscountLines);
+  const manualDiscountDecision = await authorizeManualDiscount(client, {
+    assessment: manualDiscountAssessment,
+    actorId: context.user.id,
+    approvalId: cleanText(payload.discount_approval_id),
+    saleRefs: saleChangeApproval.newSaleRefsOf(
+      operation.operation_id,
+      operation.idempotency_key,
+      payload.operation_id,
+      invoiceGlobalId,
+      offlineInvoiceRef
+    ),
+    companyId: context.companyId,
+    deviceId: context.deviceId,
+  });
 
   const transactionDate = toBusinessDateKey(payload.bill_date || payload.bill_datetime || new Date());
   const requestedBillDateTime = cleanText(payload.bill_datetime) || `${transactionDate}T00:00`;
@@ -10798,6 +11172,12 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   const invoiceNo = `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`;
   await client.query("UPDATE sales SET invoice_no = $1 WHERE id = $2", [invoiceNo, sale.id]);
   await insertSaleCharges(client, sale.id, salePayload.chargeLines);
+  await recordManualDiscountDecision(client, {
+    saleId: sale.id,
+    decision: manualDiscountDecision,
+    assessment: manualDiscountAssessment,
+    actorId: context.user.id,
+  });
 
   for (const item of salePayload.invoiceItems) {
     const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
@@ -10996,6 +11376,7 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   await client.query("DELETE FROM sale_charges WHERE sale_id = $1", [currentSale.id]);
 
   const normalizedItems = await normalizeSyncSaleItems(client, sale.items || payload.items);
+  const syncEditInvoiceDiscount = firstPresentValue(invoice.bill_discount_total, invoice.invoice_discount_amount, 0);
   const salePayload = await buildSalePayload(client, {
     items: normalizedItems,
     branchId: parsePositiveInteger(invoice.branch_id) || context.branchId,
@@ -11006,7 +11387,17 @@ const processPosSaleEditOperation = async (client, operation, context) => {
       mobile: invoice.customer_mobile || "",
       notes: invoice.customer_notes || "",
     },
-    invoiceDiscount: invoice.bill_discount_total || invoice.invoice_discount_amount || 0,
+    invoiceDiscount: syncEditInvoiceDiscount,
+    // An edit records the bill discount the editor left on the bill, not today's slab for the
+    // edited total (which refused the edit, or quietly re-discounted an old bill).
+    invoiceDiscountMode: "AS_BILLED",
+    discountRuleSnapshot: discountRules.editDiscountRule({
+      requestSnapshot: discountRules.readDiscountRuleSnapshot(invoice),
+      currentSale,
+      invoiceDiscountAmount: syncEditInvoiceDiscount,
+    }),
+    billDate: requestedSaleDate,
+    priorLotDiscounts: oldSnapshot.items,
     payments: (sale.payments || []).filter((payment) => payment.posting_type !== "PAYMENT_REVERSAL"),
     allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
     // Re-priced here from the stored slabs, exactly as a new offline bill is. The device's own
@@ -12022,7 +12413,10 @@ const healthHandler = async (req, res) => {
     const cloudChecks = cloudConfigurationChecks(cloudIdentity);
     const cloudReady = Object.values(cloudChecks).every(Boolean);
     return res.json({
-      status: "ok",
+      // "frozen" during a cut-over (backend/cloudFreeze.js): still 200 so the platform keeps the
+      // deployment, but not "ok", so no client treats this cloud as reachable.
+      status: healthStatus(cloudFreeze.frozen),
+      ...(cloudFreeze.frozen ? { cloud_frozen: true } : {}),
       app: "FroozERP",
       api_version: apiContractVersion,
       ...serverTimePayload(),
@@ -12057,14 +12451,15 @@ app.get("/health", healthHandler);
 
 app.get("/api/time", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  return res.json({ status: "ok", app: "FroozERP", ...serverTimePayload() });
+  return res.json({ status: healthStatus(cloudFreeze.frozen), app: "FroozERP", ...serverTimePayload() });
 });
 
 app.get("/api/version", async (req, res) => {
   const cloudIdentity = await resolveCloudDeploymentIdentity();
   const cloudReady = Object.values(cloudConfigurationChecks(cloudIdentity)).every(Boolean);
   res.json({
-    status: "ok",
+    status: healthStatus(cloudFreeze.frozen),
+    ...(cloudFreeze.frozen ? { cloud_frozen: true } : {}),
     app: "FroozERP",
     api_version: apiContractVersion,
     version: appVersion,
@@ -14099,6 +14494,9 @@ app.post("/settings/backup-now", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can run backups" });
+    if (!inProcessBackupsEnabled) {
+      return res.status(409).json({ code: "BACKUP_LOCATION_NOT_DURABLE", message: IN_PROCESS_BACKUP_REFUSAL });
+    }
     const backup = await createDatabaseBackup({ backupType: req.body.backup_type || "Manual", createdBy: manager.id });
     return res.json(backup);
   } catch (error) {
@@ -14111,6 +14509,9 @@ app.post("/settings/safe-shutdown", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can safely close software" });
+    if (!inProcessBackupsEnabled) {
+      return res.status(409).json({ code: "BACKUP_LOCATION_NOT_DURABLE", message: IN_PROCESS_BACKUP_REFUSAL });
+    }
     const backup = await createDatabaseBackup({ backupType: "Shutdown", createdBy: manager.id });
     return res.json({
       ...backup,
@@ -14644,7 +15045,7 @@ app.post("/login", async (req, res) => {
       authentication_source: canonicalAliasUsed
         ? "cloud_canonical_alias"
         : cloudServerRuntime ? "cloud_postgresql" : "cloud_api_proxy",
-      canonical_cloud_api_url: productionRailwayOrigin,
+      canonical_cloud_api_url: canonicalCloudApiUrl,
       force_password_change: user.force_password_change === true,
       session_revocation_version: user.session_revocation_version || 0,
       device_session_token: deviceSessionToken,
@@ -16685,10 +17086,8 @@ app.get("/sale-rates", async (req, res) => {
     }
     const settingsResult = await pool.query("SELECT * FROM sale_rate_settings WHERE id = 1");
     const saleRateSettings = settingsResult.rows[0] || {};
-    const desiredMargin = parseNonNegativeNumber(req.query.desired_margin) ?? Number(saleRateSettings.desired_margin_percent || 25);
-    const roundingRule = ROUNDING_RULES.has(saleRateSettings.rounding_rule)
-      ? saleRateSettings.rounding_rule
-      : "NEAREST_RUPEE";
+    const desiredMargin = resolveDesiredMargin(req.query.desired_margin, saleRateSettings.desired_margin_percent);
+    const roundingRule = resolveRoundingRule(saleRateSettings.rounding_rule);
     const result = await pool.query(
       `
       SELECT
@@ -16707,24 +17106,19 @@ app.get("/sale-rates", async (req, res) => {
         COALESCE(ib.remaining_qty, stock.current_stock, 0) AS current_stock,
         CASE WHEN COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING' THEN COALESCE(ib.remaining_qty, 0) ELSE 0 END AS pending_bill_stock,
         COALESCE(ib.temporary_sale_rate, 0) AS temporary_sale_rate,
-        COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) AS latest_effective_cost,
-        CASE
-          WHEN COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) > 0
-            THEN COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) * (1 + $1 / 100.0)
-          ELSE COALESCE(NULLIF(ib.temporary_sale_rate, 0), p.selling_rate)
-        END AS suggested_selling_rate
+        COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) AS latest_effective_cost
       FROM products p
       LEFT JOIN users u ON u.id = p.selling_rate_updated_by
       LEFT JOIN inventory_batches ib ON ib.product_id = p.id
         AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
         AND ib.remaining_qty > 0
-        AND ib.branch_id = $2
+        AND ib.branch_id = $1
       LEFT JOIN LATERAL (
         SELECT ib.effective_cost_per_unit
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-          AND ib.branch_id = $2
+          AND ib.branch_id = $1
         ORDER BY ib.purchase_date DESC, ib.created_at DESC, ib.id DESC
         LIMIT 1
       ) latest ON TRUE
@@ -16736,16 +17130,17 @@ app.get("/sale-rates", async (req, res) => {
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-          AND ib.branch_id = $2
+          AND ib.branch_id = $1
       ) stock ON TRUE
       WHERE p.active = TRUE
       ORDER BY p.product_name, ib.purchase_date, ib.created_at, ib.id
       `,
-      [desiredMargin, req.auth.branchId]
+      [req.auth.branchId]
     );
+    // No purchase cost means no suggestion (null), not the current rate handed back as one.
     return res.json(result.rows.map((row) => ({
       ...row,
-      suggested_selling_rate: applySaleRateRounding(row.suggested_selling_rate, roundingRule),
+      suggested_selling_rate: suggestSellingRate(row.latest_effective_cost, desiredMargin, roundingRule),
     })));
   } catch (error) {
     console.error(error);
@@ -16753,6 +17148,18 @@ app.get("/sale-rates", async (req, res) => {
   }
 });
 
+/**
+ * The owner's daily rate update, all or nothing.
+ *
+ * A lot row writes that lot's `temporary_sale_rate`; the `inventory_batches` publish trigger (cloud
+ * migration 011) turns that into an `inventory_lot` change every counter pulls. A product row writes
+ * `products.selling_rate`, which has no trigger: it reaches a counter only through a
+ * `logSyncChange` row, exactly as a Product Master edit does. Without one (as it was until
+ * 27 Sep 2026) a desktop counter's SQLite kept the old product rate until a full re-bootstrap.
+ *
+ * A lot must be in the caller's branch -- the list this saves from is `ib.branch_id = branchId`,
+ * and a hand-made request must not re-price another branch's fruit.
+ */
 app.post("/sale-rates/bulk", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -16764,32 +17171,34 @@ app.post("/sale-rates/bulk", async (req, res) => {
     await client.query("BEGIN");
     const saved = [];
     for (const update of updates) {
-      const productId = parsePositiveInteger(update.product_id);
-      const inventoryBatchId = parsePositiveInteger(update.inventory_batch_id);
-      const newRate = parsePositiveNumber(update.new_selling_rate);
-      if (!productId || !newRate) {
+      // Ids parsed as the server's integers; the rate rounded to 2 dp before it is compared,
+      // stored or written to history, so 12.345 is 12.35 everywhere.
+      const entry = normalizeRateUpdate(update);
+      if (entry.error) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: "Enter valid selling rates" });
+        return res.status(400).json({ message: entry.error });
       }
+      const { productId, inventoryBatchId, newRate, reason } = entry;
       if (inventoryBatchId) {
         const batchResult = await client.query(
-          "SELECT ib.*, p.product_name, p.selling_rate AS product_selling_rate FROM inventory_batches ib JOIN products p ON p.id = ib.product_id WHERE ib.id = $1 AND ib.product_id = $2 AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' FOR UPDATE",
-          [inventoryBatchId, productId]
+          "SELECT ib.*, p.product_name, p.selling_rate AS product_selling_rate FROM inventory_batches ib JOIN products p ON p.id = ib.product_id WHERE ib.id = $1 AND ib.product_id = $2 AND ib.branch_id = $3 AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' FOR UPDATE OF ib",
+          [inventoryBatchId, productId, req.auth.branchId]
         );
         if (batchResult.rows.length === 0) {
           await client.query("ROLLBACK");
-          return res.status(404).json({ message: "Inventory lot not found" });
+          return res.status(404).json({ message: "Inventory lot not found in this branch" });
         }
         const batch = batchResult.rows[0];
-        const oldRate = Number(batch.temporary_sale_rate || batch.product_selling_rate || 0);
-        if (oldRate === newRate) continue;
+        // What POS charges today: the lot's own rate, else the product rate (the list's rule).
+        const oldRate = effectiveLotRate(batch.temporary_sale_rate, batch.product_selling_rate);
+        if (sameRate(oldRate, newRate)) continue;
         const updatedBatch = await client.query(
-          "UPDATE inventory_batches SET temporary_sale_rate = $1 WHERE id = $2 RETURNING *",
-          [newRate, inventoryBatchId]
+          "UPDATE inventory_batches SET temporary_sale_rate = $1 WHERE id = $2 AND branch_id = $3 RETURNING *",
+          [newRate, inventoryBatchId, req.auth.branchId]
         );
         await client.query(
           "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
-          [productId, oldRate, newRate, manager.id, update.reason?.trim() || `Lot rate update ${batch.lot_name || batch.batch_no}`]
+          [productId, oldRate, newRate, manager.id, reason || `Lot rate update ${batch.lot_name || batch.batch_no}`]
         );
         saved.push({ ...updatedBatch.rows[0], product_name: batch.product_name });
         continue;
@@ -16799,12 +17208,13 @@ app.post("/sale-rates/bulk", async (req, res) => {
         await client.query("ROLLBACK");
         return res.status(404).json({ message: "Product not found" });
       }
-      const oldRate = Number(currentResult.rows[0].selling_rate);
-      if (oldRate === newRate) continue;
+      const oldRate = Number(currentResult.rows[0].selling_rate || 0);
+      if (sameRate(oldRate, newRate)) continue;
       const productResult = await client.query(
         `
         UPDATE products
-        SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2
+        SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2,
+            entity_version = entity_version + 1
         WHERE id = $3
         RETURNING *
         `,
@@ -16815,8 +17225,18 @@ app.post("/sale-rates/bulk", async (req, res) => {
         INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason)
         VALUES ($1, $2, $3, $4, $5)
         `,
-        [productId, oldRate, newRate, manager.id, update.reason?.trim() || "Daily sale rate update"]
+        [productId, oldRate, newRate, manager.id, reason || "Daily sale rate update"]
       );
+      // Published to the owner's branch, as a Product Master rate edit is, so that branch's
+      // desktop counters pick the new product rate up at their next pull.
+      await logSyncChange(client, {
+        branchId: req.auth.branchId || 1,
+        entityType: "sale_rate",
+        entityId: productResult.rows[0].global_id,
+        operationType: "UPSERT",
+        version: productResult.rows[0].entity_version || 1,
+        payload: productRateSyncPayload(productResult.rows[0]),
+      });
       saved.push(productResult.rows[0]);
     }
     await client.query("COMMIT");
@@ -19359,56 +19779,7 @@ app.get("/reports/summary", async (req, res) => {
       ),
       getSupplierSummaryRows({ branchId: req.auth.branchId }),
       getCustomerSummaryRows({ branchId: req.auth.branchId }),
-      pool.query(
-        `
-        SELECT
-          s.sale_date,
-          s.invoice_no,
-          s.payment_mode,
-          p.product_name,
-          p.unit,
-          COALESCE(ib.lot_name, ib.batch_no, '') AS lot_name,
-          ib.lot_size,
-          si.lot_discount_type AS discount_type,
-          si.lot_discount_value AS discount_value,
-          SUM(si.quantity) AS quantity_sold,
-          SUM(
-            CASE
-              WHEN si.lot_discount_type = 'SPECIAL_RATE'
-              THEN si.quantity * COALESCE(si.default_selling_rate, si.selling_rate)
-              ELSE si.amount
-            END
-          ) AS gross_amount,
-          SUM(
-            COALESCE(si.discount_amount, 0) +
-            CASE
-              WHEN si.lot_discount_type = 'SPECIAL_RATE'
-              THEN GREATEST((COALESCE(si.default_selling_rate, si.selling_rate) - si.selling_rate) * si.quantity, 0)
-              ELSE 0
-            END
-          ) AS discount_amount,
-          SUM(COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0))) AS net_amount,
-          SUM(COALESCE(si.profit, 0)) AS profit_impact
-        FROM sales s
-        JOIN sale_items si ON si.sale_id = s.id
-        JOIN products p ON p.id = si.product_id
-        LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
-        LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
-        WHERE s.sale_status <> 'CANCELLED' AND s.branch_id = $3
-          AND s.sale_date BETWEEN $1 AND $2
-          AND (
-            COALESCE(si.discount_amount, 0) > 0
-            OR si.lot_discount_id IS NOT NULL
-            OR COALESCE(s.invoice_discount_amount, 0) > 0
-          )
-        GROUP BY
-          s.sale_date, s.invoice_no, s.payment_mode, p.product_name, p.unit,
-          COALESCE(ib.lot_name, ib.batch_no, ''), ib.lot_size,
-          si.lot_discount_type, si.lot_discount_value
-        ORDER BY s.sale_date DESC, p.product_name, lot_name
-        `,
-        [dateFrom, dateTo, req.auth.branchId]
-      ),
+      pool.query(discountRules.DISCOUNT_REPORT_SQL, [dateFrom, dateTo, req.auth.branchId]),
       pool.query(
         `
         SELECT
@@ -22606,6 +22977,9 @@ const createSaleHandler = async (req, res) => {
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = req.auth.userId;
     const parsedInvoiceDiscount = parseNonNegativeNumber(invoice_discount);
+    // A cashier's own bill discount (owner's rule, 1 Oct 2026). An older POS sends none and bills
+    // exactly as before; see `discounts.resolveInvoiceDiscount` and `assessBillManualDiscount`.
+    const manualBillDiscount = discountRules.readManualBillDiscount(req.body.manual_bill_discount);
     const rawBillDateTime = cleanText(bill_datetime || "");
     const rawBillDate = cleanText(bill_date || rawBillDateTime || "");
     const transactionDate = toBusinessDateKey(rawBillDate);
@@ -22675,6 +23049,9 @@ const createSaleHandler = async (req, res) => {
       )
     ) {
       return res.status(400).json({ message: "Add valid products and quantities before checkout" });
+    }
+    if (manualBillDiscount.unreadable) {
+      return res.status(400).json({ message: "Enter a valid bill discount" });
     }
     const itemKeys = parsedItems.map((item) => `${item.productId}-${item.inventoryBatchId || "FIFO"}`);
     if (new Set(itemKeys).size !== itemKeys.length) {
@@ -22767,7 +23144,34 @@ const createSaleHandler = async (req, res) => {
       const defaultSellingRate = Number(requestedItem.inventoryBatchId && Number(batchesResult.rows[0]?.temporary_sale_rate || 0) > 0
         ? batchesResult.rows[0].temporary_sale_rate
         : product.selling_rate);
-      const lotSpecialRate = requestedItem.lotDiscountType === "SPECIAL_RATE" && requestedItem.hasRequestedRate;
+      // A line that claims a lot discount gets it only when the lot has that discount running on
+      // the bill date, in this branch, with the same id, type and value. A POS that has not
+      // picked up a stopped or changed discount is told so, and reloads; the claim used to be
+      // taken on the line's word, so any rate labelled SPECIAL_RATE skipped the override check.
+      let verifiedLotDiscount = null;
+      if (requestedItem.lotDiscountId || requestedItem.lotDiscountType) {
+        const lotDiscounts = requestedItem.inventoryBatchId
+          ? await loadLotDiscountsForLots(client, [requestedItem.inventoryBatchId], parsedBranchId)
+          : [];
+        verifiedLotDiscount = discountRules.verifyLotDiscountClaim({
+          claim: { id: requestedItem.lotDiscountId, type: requestedItem.lotDiscountType, value: requestedItem.lotDiscountValue },
+          discounts: lotDiscounts,
+          lotId: requestedItem.inventoryBatchId,
+          productId: requestedItem.productId,
+          day: transactionDate,
+        });
+        if (!verifiedLotDiscount) {
+          await client.query("ROLLBACK");
+          const { status, ...refusal } = discountRules.discountChangedRefusal(product.product_name);
+          return res.status(status).json(refusal);
+        }
+      }
+      // A verified special price stands in for the lot's rate. A different rate on that line is a
+      // typed rate like any other, and goes through the override permission below.
+      const lotSpecialRate = Boolean(verifiedLotDiscount)
+        && requestedItem.lotDiscountType === "SPECIAL_RATE"
+        && requestedItem.hasRequestedRate
+        && roundCurrency(requestedItem.requestedRate) === roundCurrency(verifiedLotDiscount.discount_value);
       const manualRateOverride = requestedItem.hasRequestedRate && !lotSpecialRate && roundCurrency(requestedItem.requestedRate) !== roundCurrency(defaultSellingRate);
       if (manualRateOverride && !rateOverrideUser) {
         rateOverrideUser = await getPermissionUser(parsedCreatedBy, "manual_pos_rate_override", ["Owner", "Admin"], client);
@@ -22862,6 +23266,9 @@ const createSaleHandler = async (req, res) => {
         sellingRate,
         defaultSellingRate,
         manualRateOverride,
+        // The lot discount this line was verified against above: the part of its discount that is
+        // the lot's, not the cashier's, for the 5% rule below.
+        lotDiscountOfRecord: verifiedLotDiscount,
         inventoryBatchId: requestedItem.inventoryBatchId || allocations[0]?.inventoryBatchId || null,
         lotName: allocations[0]?.lotName || null,
         lotSize: allocations[0]?.lotSize || null,
@@ -22895,14 +23302,64 @@ const createSaleHandler = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Credit sale cannot be mixed with cash or bank payment in one bill" });
     }
-    const discountRule = await getMatchingDiscountRule(client, grossAmount, paymentMode);
-    const automaticInvoiceDiscount = Math.min(calculateInvoiceDiscount(discountRule, grossAmount), subtotalAfterItemDiscounts);
-    const invoiceDiscountAmount = discountRule ? automaticInvoiceDiscount : parsedInvoiceDiscount;
+    // The bill discount is the server's current slab for this bill. When the POS worked out a
+    // different one (it had older slabs), the bill is refused with the amount the server expects,
+    // so POS can reload its slabs and show the cashier the new total -- rather than the bare
+    // "Payment amounts must match the invoice total" a stale slab used to produce. Loaded before
+    // the 5% check, which needs the slab to tell the cashier's part of the bill discount from it.
+    const slabs = await loadBillSlabs(client);
 
-    if (invoiceDiscountAmount > subtotalAfterItemDiscounts) {
+    // The owner's rule: a cashier's own discount above 5% of a line needs an Owner or Admin's
+    // password first. The approval is bound to this bill's operation id (the idempotency key the
+    // POS sends with every bill), so it cannot be carried to another bill. Refused here, before
+    // anything is committed; the cart stays on the counter. The cashier's whole manual discount
+    // (lines + bill) is held to 5% of the bill as well. The bill part is `manual_bill_discount`
+    // when sent (the bill is then held to slab + it below, or DISCOUNT_RULES_CHANGED). When it is
+    // not sent, the bill part is whatever the invoice discount gives beyond the server's slab for
+    // this bill, so a hand-made request cannot carry an unchecked bill discount. Browser POS
+    // clients are served from the same build as this server, so none predates the field.
+    const manualDiscountBill = manualBillDiscount.present
+      ? manualBillDiscount.amount
+      : discountRules.impliedManualBillDiscount({
+        requested: parsedInvoiceDiscount,
+        gross: grossAmount,
+        subtotalAfterItems: subtotalAfterItemDiscounts,
+        paymentMode,
+        rules: slabs.rules,
+        enabled: slabs.enabled,
+      });
+    const manualDiscountAssessment = discountRules.assessBillManualDiscount({ lines: manualDiscountLinesOf(invoiceItems), manualBill: manualDiscountBill });
+    const manualDiscountDecision = await authorizeManualDiscount(client, {
+      assessment: manualDiscountAssessment,
+      actorId: parsedCreatedBy,
+      approvalId: req.body.discount_approval_id,
+      saleRefs: saleChangeApproval.newSaleRefsOf(v3OperationKey(req)),
+      companyId: context?.company_id ?? req.auth.companyId,
+      deviceId: context?.device_id ?? req.auth.deviceId,
+    });
+    if (!manualDiscountDecision.ok) return rejectSaleChange(client, res, manualDiscountDecision);
+
+    const invoiceDiscountDecision = discountRules.resolveInvoiceDiscount({
+      mode: "SLAB",
+      requested: parsedInvoiceDiscount,
+      gross: grossAmount,
+      subtotalAfterItems: subtotalAfterItemDiscounts,
+      paymentMode,
+      rules: slabs.rules,
+      enabled: slabs.enabled,
+      snapshot: discountRules.readDiscountRuleSnapshot(req.body),
+      // Present: the bill discount must be the server's slab plus this, and the rule stored says
+      // so (" + extra", or none when the slab gave nothing). Absent: the amount and rule as before
+      // (the 5% check above already measured any part beyond the slab).
+      manualBill: manualBillDiscount.present ? manualBillDiscount.amount : undefined,
+    });
+    if (invoiceDiscountDecision.error) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Invoice discount cannot exceed the cart subtotal" });
+      const { status, ...refusal } = invoiceDiscountDecision.error;
+      return res.status(status).json(refusal);
     }
+    const invoiceDiscountAmount = invoiceDiscountDecision.amount;
+    const discountRule = invoiceDiscountDecision.rule;
 
     const salesMandiTaxConfig = await getSalesMandiTaxConfig(client);
     const salesMandiTax = calculateSalesMandiTax({
@@ -23017,6 +23474,12 @@ const createSaleHandler = async (req, res) => {
       [invoiceNo, sale.id]
     );
     await insertSaleCharges(client, sale.id, resolvedCharges.lines);
+    await recordManualDiscountDecision(client, {
+      saleId: sale.id,
+      decision: manualDiscountDecision,
+      assessment: manualDiscountAssessment,
+      actorId: parsedCreatedBy,
+    });
 
     for (const item of invoiceItems) {
       const invoiceDiscountShare = subtotalAfterItemDiscounts === 0
@@ -24086,6 +24549,17 @@ const updateSaleHandler = async (req, res) => {
       createdBy: editor.id,
       customer: req.body.customer,
       invoiceDiscount: req.body.invoice_discount,
+      // The Bill Discount the editor typed (the edit itself needs sale-edit approval), bounded by
+      // the subtotal. Today's slab for the edited total used to override it: an edit that changed
+      // the discount was refused, and an old bill could be quietly re-discounted.
+      invoiceDiscountMode: "AS_BILLED",
+      discountRuleSnapshot: discountRules.editDiscountRule({
+        requestSnapshot: discountRules.readDiscountRuleSnapshot(req.body),
+        currentSale,
+        invoiceDiscountAmount: req.body.invoice_discount,
+      }),
+      billDate: requestedSaleDate,
+      priorLotDiscounts: oldSnapshot.items,
       payments: req.body.payments,
       allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
       // Re-priced from the stored slabs on the way through, exactly as on a new bill. An edit is
@@ -24409,6 +24883,9 @@ app.post("/api/v3/sales/:id/cancel", rateLimitSyncRequest, v3WriteAdapter(cancel
  *
  * - The requester is `req.auth.userId` and nothing else, and must already hold the cancel or edit
  *   permission: approval adds a second person, it does not grant the right.
+ * - `action: "discount"` approves a cashier's item discount over 5% on a bill being made. Its
+ *   `sale_ref` is that bill's operation id; the requester need only be an active user who is not
+ *   already exempt from the 5% rule. Credentials, attempt limits and audit are the same.
  * - The approver is looked up by username and must be an active Owner or Admin of the same company.
  * - A wrong attempt is recorded as a FAILED row against the **requester**; five inside fifteen
  *   minutes refuses further attempts. The approver's own login lockout is never touched, so a
@@ -24446,19 +24923,32 @@ const createSaleChangeApprovalHandler = async (req, res) => {
     return res.status(400).json({ code: parsed.code, message: parsed.message });
   }
 
-  const requester = await getSalePermissionUser(requesterId, request.action);
+  // A discount over 5% is approved for a bill being made, so the requester needs no bill-change
+  // permission -- only to be an active user. Anyone the 5% rule already exempts (Owner, Admin,
+  // holder of manual_pos_rate_override) is told they need no approval.
+  const discountRequest = request.action === "discount";
+  const requester = discountRequest
+    ? await getManualDiscountActor(requesterId)
+    : await getSalePermissionUser(requesterId, request.action);
   if (!requester) {
     await audit(CODES.REQUESTER_NOT_ALLOWED, { stage: "requester_permission" });
     return res.status(403).json({
       code: CODES.REQUESTER_NOT_ALLOWED,
-      message: request.action === "cancel"
-        ? "You do not have permission to cancel completed sales."
-        : "You do not have permission to edit completed sales.",
+      message: discountRequest
+        ? "Your account is not active."
+        : request.action === "cancel"
+          ? "You do not have permission to cancel completed sales."
+          : "You do not have permission to edit completed sales.",
     });
   }
-  if (!saleChangeApproval.approvalRequired(requester.role_name)) {
+  if (discountRequest ? discountRules.manualDiscountExempt(requester) : !saleChangeApproval.approvalRequired(requester.role_name)) {
     await audit(CODES.NOT_NEEDED, { stage: "requester_role" });
-    return res.status(400).json({ code: CODES.NOT_NEEDED, message: "Owners and Admins do not need approval to change a bill." });
+    return res.status(400).json({
+      code: CODES.NOT_NEEDED,
+      message: discountRequest
+        ? "You can give this discount without approval."
+        : "Owners and Admins do not need approval to change a bill.",
+    });
   }
 
   const client = await pool.connect();
@@ -24881,7 +25371,7 @@ app.use((error, req, res, next) => {
 prepareDatabaseForStartup()
   .then(async () => {
     let lastScheduledBackupDate = "";
-    if (!desktopLocalRuntime) {
+    if (!desktopLocalRuntime && inProcessBackupsEnabled) {
       setInterval(async () => {
         try {
           const settingsResult = await pool.query("SELECT * FROM backup_settings WHERE id = 1");
@@ -24902,7 +25392,7 @@ prepareDatabaseForStartup()
 
     const runShutdownBackup = async (signal) => {
       try {
-        if (!desktopLocalRuntime) {
+        if (!desktopLocalRuntime && inProcessBackupsEnabled) {
           const settingsResult = await pool.query("SELECT backup_on_shutdown FROM backup_settings WHERE id = 1");
           if (settingsResult.rows[0]?.backup_on_shutdown !== false) {
             await createDatabaseBackup({ backupType: "Shutdown" });
@@ -24957,4 +25447,7 @@ module.exports = {
   normaliseChargeSlabs,
   resolveChargeRateFromType,
   resolveSaleCharges,
+  // Exported so `discounts.test.js` can drive how a recorded bill (desktop sync, edit) takes its
+  // bill discount and its special-price lines, against a scripted client.
+  buildSalePayload,
 };

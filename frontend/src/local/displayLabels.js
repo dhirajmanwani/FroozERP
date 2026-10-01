@@ -185,12 +185,24 @@ export const TRANSACTION_TYPE_LABELS = freeze({
   CASH_BOOK_DATE_SUMMARY: "Day summary",
 });
 
-/** `discount_type` on bill discounts (FLAT_AMOUNT, PERCENTAGE) and lot discounts (FIXED_AMOUNT, PERCENTAGE, SPECIAL_RATE). */
+/**
+ * `discount_type` on bill discounts (FLAT_AMOUNT, PERCENTAGE) and lot discounts (FIXED_AMOUNT,
+ * PERCENTAGE, SPECIAL_RATE). FIXED_AMOUNT is money off *each unit* -- "Fixed amount" read as money
+ * off the line, which it never was -- and SPECIAL_RATE is the price the customer pays.
+ */
 export const DISCOUNT_TYPE_LABELS = freeze({
-  FLAT_AMOUNT: "Flat amount",
-  FIXED_AMOUNT: "Fixed amount",
-  PERCENTAGE: "Percentage",
-  SPECIAL_RATE: "Special rate",
+  FLAT_AMOUNT: "Rupees off bill",
+  FIXED_AMOUNT: "Rupees off per unit",
+  PERCENTAGE: "Percent off",
+  SPECIAL_RATE: "Fixed price",
+});
+
+/** A lot discount's state by date (`lotDiscountStatus` in local/discounts.js). */
+export const LOT_DISCOUNT_STATUS_LABELS = freeze({
+  RUNNING: "Running",
+  UPCOMING: "Starts later",
+  ENDED: "Ended",
+  STOPPED: "Stopped",
 });
 
 /** `refund_type` on sale returns. backend REFUND_TYPES. */
@@ -454,6 +466,7 @@ const FAMILY_MAPS = {
   customerType: CUSTOMER_TYPE_LABELS,
   transactionType: TRANSACTION_TYPE_LABELS,
   discountType: DISCOUNT_TYPE_LABELS,
+  lotDiscountStatus: LOT_DISCOUNT_STATUS_LABELS,
   refundType: REFUND_TYPE_LABELS,
   unit: UNIT_LABELS,
   origin: ORIGIN_LABELS,
@@ -570,6 +583,7 @@ export const ACTIVATION_CODE_STATUS_TONES = freeze({ ACTIVE: S, USED: N, REVOKED
 export const BACKUP_STATUS_TONES = freeze({ SUCCESS: S, RUNNING: I, FAILED: D });
 export const SYNC_STATUS_TONES = freeze({ COMPLETED: S, SYNCED: S, SYNCING: I, PENDING: W, FAILED: D, CONFLICT: D, BLOCKED: D });
 export const MESSAGE_STATUS_TONES = freeze({ SENT: S, FAILED: D });
+export const LOT_DISCOUNT_STATUS_TONES = freeze({ RUNNING: S, UPCOMING: W, ENDED: N, STOPPED: N });
 
 const TONE_MAPS = {
   recordStatus: RECORD_STATUS_TONES,
@@ -583,6 +597,7 @@ const TONE_MAPS = {
   backupStatus: BACKUP_STATUS_TONES,
   syncStatus: SYNC_STATUS_TONES,
   messageStatus: MESSAGE_STATUS_TONES,
+  lotDiscountStatus: LOT_DISCOUNT_STATUS_TONES,
 };
 
 /** Families that carry a tone. Every other family is always "neutral". */

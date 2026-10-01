@@ -216,6 +216,22 @@ const buildLine = (item, index, { showItemDiscounts }) => {
 // Totals
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * What the bill-discount row is called. It always prints the bill's whole bill discount; the slab's
+ * name is beside it only when the slab gave all of it. A bill that also carries the cashier's own
+ * bill discount (`manual_bill_discount`, or a stored rule name the server marked " + extra") reads
+ * plain "Bill discount", because the slab's name over the larger amount would claim the slab gave
+ * money it did not.
+ */
+export const MANUAL_BILL_DISCOUNT_RULE_SUFFIX = " + extra";
+export const billDiscountLabel = (sale = {}) => {
+  const ruleName = text(sale?.discount_rule_name);
+  const manual = readAmount(sale?.manual_bill_discount);
+  const hasManualPart = (manual !== null && manual >= 0.005) || ruleName.endsWith(MANUAL_BILL_DISCOUNT_RULE_SUFFIX);
+  if (!ruleName || hasManualPart) return "Bill discount";
+  return `Bill discount · ${ruleName}`;
+};
+
 const buildTotals = (sale, lines, settings) => {
   const grandTotal = firstAmount(sale.total_amount, sale.net_total);
   const storedGross = firstAmount(sale.gross_amount, sale.gross_total);
@@ -301,8 +317,7 @@ const buildTotals = (sale, lines, settings) => {
   const rows = [{ key: "items-total", label: "Items total", amount: itemsTotal, amountText: formatBillMoney(itemsTotal), kind: "row" }];
   if (discountPaise > 0) {
     const both = itemDiscountValue > 0 && billDiscountValue > 0;
-    const ruleName = text(sale.discount_rule_name);
-    const billLabel = ruleName ? `Bill discount · ${ruleName}` : "Bill discount";
+    const billLabel = billDiscountLabel(sale);
     rows.push({
       key: "total-discount",
       label: "Total discount",

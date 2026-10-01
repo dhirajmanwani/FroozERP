@@ -67,3 +67,29 @@ test("a deployment where backups mean nothing says so at startup and in the sett
   assert.match(SERVER, /backupDurable: backupLocation\.durable/, "the app must be able to say it too");
   assert.match(SERVER, /backupLocationWarning: backupLocation\.warning/);
 });
+
+test("where backups cannot survive, the server does not pretend: no scheduled or shutdown backup", () => {
+  // `durable: false` is a hosted deployment with no BACKUP_DIR: the file would be deleted at the next
+  // deploy, and producing it reads every table into memory. On a platform that sends SIGTERM at each
+  // deploy and idle spin-down, the shutdown backup would do that at every restart.
+  assert.match(SERVER, /const inProcessBackupsEnabled = backupLocation\.durable;/);
+  assert.match(SERVER, /if \(!desktopLocalRuntime && inProcessBackupsEnabled\) \{\n\s+setInterval\(/, "the scheduler is gated");
+  assert.match(
+    SERVER,
+    /if \(!desktopLocalRuntime && inProcessBackupsEnabled\) \{\n\s+const settingsResult = await pool\.query\("SELECT backup_on_shutdown/,
+    "the shutdown backup is gated",
+  );
+});
+
+test("a manual backup on such a deployment is refused with the command that does work", () => {
+  assert.match(SERVER, /scripts\/cloud\/backup-cloud\.mjs/);
+  for (const route of ['app.post("/settings/backup-now"', 'app.post("/settings/safe-shutdown"']) {
+    const start = SERVER.indexOf(route);
+    assert.notEqual(start, -1, `${route} is gone`);
+    const body = SERVER.slice(start, SERVER.indexOf("\napp.", start + route.length));
+    const refuseAt = body.indexOf("if (!inProcessBackupsEnabled)");
+    assert.ok(refuseAt > 0, `${route} must refuse when backups are not durable`);
+    assert.ok(refuseAt < body.indexOf("createDatabaseBackup("), `${route} must refuse before it starts a backup`);
+    assert.match(body, /BACKUP_LOCATION_NOT_DURABLE/);
+  }
+});

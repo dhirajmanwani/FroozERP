@@ -852,8 +852,8 @@ morning of ticking boxes rather than a decision made under pressure.
 | 2.1 | `DEVICE_SESSION_SECRET` set explicitly to a fresh random value ≥32 chars | **Enforced by the server** — an exposed instance refuses to start on a borrowed credential. Generate with `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"` |
 | 2.2 | No secret is committed to the repository | **Met 2026-08-22, and now verified on every run.** `scripts/scan-secrets.mjs` scans the working tree by default and `--history` scans every blob that has ever existed; it is registered in `verify:production` so it runs where ordinary commits are checked. Nothing has ever been committed &mdash; all 3,571 historical blobs were scanned and the only matches were test fixtures and vendored dependency READMEs. **The scan did find a real gap: `.gitignore` had no `.env` rule.** Nothing prevented a real `DATABASE_URL`, signing key, WhatsApp token or SMTP password from being committed except the file not existing yet, and the deployment docs instruct you to create it. Fixed, with the templates kept tracked |
 | 2.3 | TLS terminates in front of the app; no plaintext HTTP listener is reachable | **Not configured.** Sessions are bearer tokens: over plaintext, one interception is a full account takeover |
-| 2.4 | `trust proxy` set correctly if behind a load balancer | **Met.** This row was stale &mdash; corrected 2026-08-27 while surveying what was left. `server.js:191` sets `app.set("trust proxy", deploymentType === "cloud" ? 1 : false)`: one hop for the hosted deployment, and off entirely on the desktop, where the only client is loopback and trusting a forwarded header would let anything on the machine claim to be somewhere else. `publicRouteThrottle.js` depends on this being right, so a wrong answer here would have made every per-IP control key on the proxy's address &mdash; one shared bucket for the whole internet |
-| 2.5 | CORS allow-list contains real origins and never `*` | **Partly met.** `cloudConfigurationChecks` already asserts this for the cloud backend. The **desktop gateway still sends `access-control-allow-origin: *`** — acceptable while it is loopback-only, and it must never be exposed |
+| 2.4 | `trust proxy` set correctly if behind a load balancer | **Met.** This row was stale &mdash; corrected 2026-08-27 while surveying what was left. `server.js:191` sets `app.set("trust proxy", deploymentType === "cloud" ? 1 : false)`: one hop for the hosted deployment, and off entirely on the desktop, where the only client is loopback and trusting a forwarded header would let anything on the machine claim to be somewhere else. `publicRouteThrottle.js` depends on this being right, so a wrong answer here would have made every per-IP control key on the proxy's address &mdash; one shared bucket for the whole internet. **2026-10-01 (Render + Neon prep):** the hop count is now `resolveTrustProxy` in `backend/hostedDeploymentGuard.js` &mdash; still `false` off the cloud and `1` by default on it, with `FROOZERP_TRUST_PROXY_HOPS` (a whole number 1&ndash;10, never `true`) for a platform whose edge adds more than one hop. How to check `req.ip` on Render before relying on it is in `docs/production/RENDER_NEON_CUTOVER.md` |
+| 2.5 | CORS allow-list contains real origins and never `*` | **Partly met.** `cloudConfigurationChecks` already asserts this for the cloud backend. **2026-10-01:** the cloud backend also allowed any `https://*.up.railway.app` origin &mdash; every app on the platform, not this one. That wildcard is gone: `backend/cloudCorsPolicy.js` allows exact origins (production, retired production, this deployment's own public URL, local dev, `ALLOWED_ORIGINS`) plus the Tauri shells, same-origin and private-network hosts, and no `*.onrender.com` wildcard replaced it (`cloudCorsPolicy.test.js`). The **desktop gateway still sends `access-control-allow-origin: *`** — acceptable while it is loopback-only, and it must never be exposed |
 
 ### Gate 3 — What an unauthenticated caller can still learn
 
@@ -1928,7 +1928,8 @@ place since A-3 where the server checks a password for someone who is **not** th
 so it is recorded here next to `/login`.
 
 - **`POST /api/v3/sale-change-approvals`** (through `v3WriteAdapter`). Body
-  `{action: "cancel"|"edit", sale_ref, approver_username, approver_password, reason}`.
+  `{action: "cancel"|"edit"|"discount", sale_ref, approver_username, approver_password, reason}`
+  (`"discount"` since 2026-09-30, below).
   The requester is `req.auth.userId` and nothing else, and must already hold the cancel or edit
   permission (`getSalePermissionUser`) — approval adds a second person, it does not grant the right.
   The approver is looked up by username (case-insensitive, as `/login` does) and must be an active
@@ -1983,3 +1984,116 @@ The rules are pure functions in `backend/saleChangeApproval.js`, tested in
 - **Sync binds the approval to the requester and the device.** An offline change pushed later under
   a different user's session, or from a different device, is refused. That is deliberate, and means
   a counter where cashiers swap sessions before the outbox drains will see those changes rejected.
+
+### Discount over 5% (2026-09-30)
+
+The owner's rule: a cashier may take up to 5% off an item on their own; above that an Owner or
+Admin types their password on the counter. It reuses the machinery above rather than adding a
+second password path. No schema change: `sale_change_approvals.action` is VARCHAR(20) and the
+trace uses `sale_audit_trail`'s existing columns.
+
+- **The rule** (`discounts.manualDiscountLine`, mirrored in `frontend/src/local/discounts.js`).
+  Per line, the lot's own discount is set aside (`lotPart`: what a ₹-off or %-off lot discount gives
+  at that rate and quantity; 0 for none and for SPECIAL_RATE, whose discount is the price itself).
+  `manualPart = max(0, round2(discount_amount - lotPart))`, `base = round2(round2(qty x rate) -
+  lotPart)` at the special price on a SPECIAL_RATE line, and the line needs approval when
+  `manualPart > round2(round2(base x 5 / 100) + 0.01)`. The bill needs approval if any line does;
+  lines do not lend each other headroom. A line whose numbers cannot be read and that carries any
+  discount needs approval -- it is never read as "no discount".
+- **Who is exempt**: Owner, Admin, or a role holding `manual_pos_rate_override` (who can already set
+  any rate). Always re-read from `users` / `role_permission_settings`, never the token's role claim.
+  Such a user asking for a discount approval gets 400 `APPROVAL_NOT_NEEDED`; an unknown or
+  inactive requester 403 `REQUESTER_NOT_ALLOWED`. The requester needs no bill-change permission --
+  the bill does not exist yet.
+- **The approval** is `POST /api/v3/sale-change-approvals` with `action: "discount"`, same
+  credential check, per-requester failure limits, audit rows and 7-day single use. `reason` is
+  optional for a discount (stored as "Item discount over 5%"). `sale_ref` is the new bill's
+  **operation id**: `operation_id` on the browser bill (the browser also sends it as
+  `idempotency_key` and `x-idempotency-key`, and `v3WriteAdapter` makes all three one value) and
+  `operation_id` in the desktop's queued sale payload, which the Rust outbox also uses as the sync
+  operation's id. The sync path also accepts the bill's `invoice_global_id` or
+  `offline_invoice_ref`. The POS must fix that id *before* asking, and send the bill under it.
+- **Browser checkout** (`createSaleHandler`) runs `authorizeManualDiscount` after every line is
+  priced and verified and before the bill is written. Needed and missing or not binding: ROLLBACK
+  and 403 `{code: "DISCOUNT_APPROVAL_REQUIRED", detail, message: "A discount over 5% needs an
+  Owner or Admin to approve it."}`, `detail` being the same binding codes as above
+  (`APPROVAL_MISSING`, `APPROVAL_WRONG_SALE`, `APPROVAL_WRONG_DEVICE`, ...). Valid: the approval
+  is locked `FOR UPDATE`, then consumed with `consumed_sale_id` once the bill has an id, and a
+  `sale_audit_trail` row `DISCOUNT_APPROVED` names the cashier (`edited_by`) and the approver
+  (`approved_by`), with the lines that needed it in `new_value`.
+- **Desktop sync** (`processPosSaleFoundationOperation`) **never refuses the bill for this** -- the
+  customer already has it. A valid `discount_approval_id` in the payload is consumed and recorded
+  as above. Missing or not binding: the bill is accepted and a `DISCOUNT_UNAPPROVED` audit row is
+  left, reason "Discount over 5% without approval", `approved_by` NULL, with the failed binding in
+  `new_value.detail`. A ₹/% lot discount on a synced line counts as the lot's when the lot has, or
+  had, a discount of that id, type and value (`lotDiscountOfRecord`) -- one stopped between billing
+  and sync still was the lot's. A lot discount the lot never had is the cashier's.
+- The bill-change reports read `EDIT`/`CANCEL` rows only, so the new rows do not appear as bill
+  changes there; `GET /sales/:id/audit` lists them.
+
+Tested in `discounts.test.js` (the rule, browser checkout, sync and the approval route, driven) and
+`saleChangeApproval.test.js` (bindings and wiring).
+
+#### Bill discount under the same 5% (2026-10-01)
+
+The owner added a manual discount on the whole bill at the POS ("Bill discount", ₹ or %), held to
+the same 5%. Same approval, same exemptions, same audit rows; no schema change.
+
+- **Payload.** A new optional field `manual_bill_discount` (₹, 2 dp) on the browser sale and the
+  desktop's queued sale. `invoice_discount` / `bill_discount_total` stay the *whole* bill discount
+  (`round2(slab + manual)`), stored in `sales.invoice_discount_amount` as before.
+  `discounts.readManualBillDiscount` reads it: absent (undefined, null, blank) is "an older POS",
+  a number >= 0 is the amount, anything else is unreadable -- never read as 0.
+- **The rule** (`discounts.assessBillManualDiscount({ lines, manualBill })`, mirrored in
+  `frontend/src/local/discounts.js`). Every line is still held to its own 5%. When `manualBill > 0`,
+  `manualTotal = round2(sum(line manualPart) + manualBill)` is also held to
+  `round2(round2(base x 5 / 100) + 0.01)` with `base = round2(sum(line base))`, so the cashier may
+  give up to 5% in all, on the lines or the bill. With no bill part the bill-level test is not run,
+  so a bill with no bill discount answers exactly as before (per-line headroom of a paisa a line
+  could otherwise add up past the bill's paisa). An unreadable `manualBill`, or a positive one on a
+  bill with an unreadable line, needs approval. The trace (`manualDiscountTrace`) gains a `bill`
+  key -- `manual_bill_discount, line_manual_total, manual_total, base, free_limit, needs_approval,
+  unreadable` -- on every browser bill, and on a synced bill that carried the field.
+- **Browser checkout.** An unreadable `manual_bill_discount` is 400 "Enter a valid bill discount"
+  before anything opens. Payment mode and the server's slabs are now read *before* the 5% check
+  (so a bad payment mode is 400 ahead of a 403), and the check always includes the bill part:
+  `manual_bill_discount` when sent; when **not** sent, `discounts.impliedManualBillDiscount` --
+  `max(0, round2(bounded invoice_discount - server slab amount for this bill))` -- so a request
+  without the field cannot carry an unchecked bill discount. Browser clients are served from the
+  same build as the server, so none predates the field; the desktop goes through sync (never
+  refused) and is unaffected. Then `resolveInvoiceDiscount` with `manualBill`: expected =
+  `round2(server's slab + manual)`; expected past the subtotal is 400 `BILL_DISCOUNT_TOO_LARGE`
+  with `max_manual_bill_discount`; a client `invoice_discount` more than a paisa from expected is
+  the existing 409 `DISCOUNT_RULES_CHANGED` with `expected_invoice_discount` (and
+  `expected_slab_discount`, the slab's part alone). A client cannot dodge the 5% by under-reporting
+  `manual_bill_discount`: the invoice discount must then equal slab + that figure.
+- **Desktop sync.** Still never refused. The bill discount is recorded as billed; the manual part
+  is the device's figure capped at the discount billed, the slab part is the rest. The 5% check and
+  its `DISCOUNT_APPROVED` / `DISCOUNT_UNAPPROVED` trace include the bill part. An unreadable figure is
+  traced as `unreadable` (needs approval), the bill kept.
+- **Rule snapshot.** When the cashier's part is > 0, `sales.discount_rule_name` no longer claims
+  the whole amount was the slab: slab and manual stores the slab's name + `" + extra"` (cut to fit
+  VARCHAR(140); a nameless slab is named by its range, a nameless device snapshot "Bill slab"); manual
+  only stores no rule at all. `discounts.billDiscountRule` decides; the slab row is not renamed.
+- **Requests without `manual_bill_discount`** keep the old amount and rule decision on every route
+  (same `{amount, rule}`, same 409 body, no " + extra"). On browser checkout the part beyond the slab
+  is now held to the 5% (above); a desktop sync without the field takes the old 5% check and trace
+  unchanged (no `bill` key). Sale edits do not send the field and keep their bill discount as
+  billed.
+
+Still open:
+
+- **The approval covers the bill, not an amount.** Once approved, the cashier could raise the
+  discount before completing the bill and the approval would still cover it. The approver is
+  standing at the counter with the cart on screen, and the `DISCOUNT_APPROVED` row keeps what was
+  actually given, so it is visible after the fact -- but binding the approved amount would need a
+  column, and this change adds none.
+- **Offline counters.** An approval needs the cloud. The POS refuses a >5% discount before billing
+  when it cannot reach it; a bill that still arrives without one is kept and traced, not refused.
+- ~~A manual *bill-level* discount is out of scope.~~ Added 2026-10-01, above. Changing the bill
+  discount on an *existing* bill still goes through sale-edit approval, not this rule.
+- ~~A browser request without `manual_bill_discount` carries an unchecked bill discount.~~ Closed
+  2026-10-01 (lead's decision): the part of `invoice_discount` beyond the server's slab is measured
+  as the cashier's (`impliedManualBillDiscount`). Still unchecked by design: a *desktop* bill synced
+  without the field (an older desktop build) -- its bill discount is recorded as billed with the
+  per-line check only, since the device could not have had a bill-discount box.

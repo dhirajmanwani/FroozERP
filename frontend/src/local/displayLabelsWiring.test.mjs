@@ -18,7 +18,9 @@ test("the tables that printed raw codes now print labels", () => {
     'labelFor("paymentMode", expense.payment_mode)',
     'labelFor("recordStatus", status)',
     'labelFor("accountType", account.account_type)',
-    'labelFor("discountType", discount.discount_type)',
+    // The Discount report. The Discounts screen itself reads offers as sentences
+    // (describeLotOffer in local/discounts.js: "₹10 off per kg").
+    'labelFor("discountType", row.discount_type)',
     'labelFor("orderStatus", order.status)',
     'labelFor("orderSource", order.source)',
     'labelFor("auditAction", row.action)',
@@ -35,12 +37,12 @@ test("the tables that printed raw codes now print labels", () => {
 test("comparisons still use the raw code, only the words changed", () => {
   // Filters and option values keep the stored value.
   assert.match(app, /<option key=\{mode\} value=\{mode\}>\{labelFor\("paymentMode", mode\)\}<\/option>/);
-  assert.match(app, /discount\.discount_type === "PERCENTAGE"/);
+  assert.match(app, /row\.discount_type === "PERCENTAGE"/);
 });
 
 test("labels read as words and a missing value never reads as zero", () => {
   assert.equal(labelFor("paymentMode", "BANK_TRANSFER"), "Bank transfer");
-  assert.equal(labelFor("discountType", "FIXED_AMOUNT"), "Fixed amount");
+  assert.equal(labelFor("discountType", "FIXED_AMOUNT"), "Rupees off per unit");
   assert.equal(labelFor("paymentMode", ""), "—");
   assert.equal(toneFor("recordStatus", "CANCELLED"), "danger");
 });

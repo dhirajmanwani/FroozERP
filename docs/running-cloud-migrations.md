@@ -12,9 +12,12 @@ something else. So the order below is the order.
 counter is syncing at that moment, one of the two waits, and if the app is busy enough it can
 fail. Nothing is corrupted by that — it rolls back — but you would rather not find out at 11am.
 
-**Take a backup.** On Railway: your Postgres service, then **Backups**, then create one. Wait for
-it to finish before going further. Nothing below is expected to need it. That is not the same as
-not needing it.
+**Take a backup.** On Railway: your Postgres service, then **Backups**, then create one. On Neon
+(after the move in `docs/production/RENDER_NEON_CUTOVER.md`): create a **branch** of the production
+branch first. A branch is an instant copy you can restore from or point a rehearsal at. Either way,
+also take a `node scripts/cloud/backup-cloud.mjs` copy (`docs/production/CLOUD_BACKUP.md`). Wait
+for it to finish before going further. Nothing below is expected to need it. That is not the same
+as not needing it.
 
 **Have this branch's code on the laptop you are running from:**
 
@@ -32,6 +35,12 @@ not starting the backend.
 
 On Railway, open your Postgres service, then **Variables**. You want `DATABASE_PUBLIC_URL` — the
 public one, because you are connecting from your laptop, not from inside Railway.
+
+On Neon, open the project, then **Connect**, and copy the **direct** connection string. Turn the
+"connection pooling" toggle **off**: the pooled host has `-pooler` in its name and runs
+transaction-mode PgBouncer, which is the wrong thing for schema changes. Make sure it ends in
+`sslmode=require`, or better `sslmode=verify-full`. Put it in the same variable below; the runner
+does not care which platform it came from.
 
 Copy it. Do not paste it into a file, a chat, or a commit. It is the whole database in one line.
 

@@ -10,7 +10,9 @@ const {
   MobileSQLiteAdapter,
   WebIndexedDBAdapter,
   createStorageAdapter,
+  DEFAULT_PG_POOL_MAX,
   resolveDesktopSqlitePath,
+  resolvePoolOptions,
   resolveRuntimeMode,
 } = require("./storageAdapters");
 
@@ -168,6 +170,53 @@ test("loopback PostgreSQL is allowed only for explicitly isolated staging tests"
   });
   assert.equal(adapter.host, "127.0.0.1");
   await adapter.pool.end();
+});
+
+test("pool options: PG_POOL_MAX is honoured within bounds, and the default is unchanged from before", () => {
+  // The default stays node-postgres's own 10 so a deployment that sets nothing behaves as it always
+  // has; a small managed database sets PG_POOL_MAX (render.yaml does).
+  assert.equal(DEFAULT_PG_POOL_MAX, 10);
+  assert.equal(resolvePoolOptions({}).max, 10);
+  assert.equal(resolvePoolOptions({ PG_POOL_MAX: "5" }).max, 5);
+  assert.equal(resolvePoolOptions({ PG_POOL_MAX: " 20 " }).max, 20);
+  for (const bad of ["0", "-3", "abc", "2.5", "101", "1e2"]) {
+    assert.equal(resolvePoolOptions({ PG_POOL_MAX: bad }).max, 10, bad);
+  }
+  const options = resolvePoolOptions({});
+  // A connection attempt that never answers must fail, not hang a request (and the health check)
+  // forever, which is what node-postgres's default of 0 does.
+  assert.equal(options.connectionTimeoutMillis, 15000);
+  assert.equal(options.idleTimeoutMillis, 30000);
+  assert.equal(options.keepAlive, true);
+});
+
+test("the cloud pool carries those options and survives an idle client dying", async () => {
+  // Constructing a pool opens nothing; this host is never contacted.
+  const { adapter } = createStorageAdapter({
+    FROOZERP_RUNTIME_MODE: "cloud-server",
+    DATABASE_URL: "postgresql://u:p@db.invalid:5432/froozerp",
+    PG_POOL_MAX: "5",
+  });
+  try {
+    assert.equal(adapter.pool.options.max, 5);
+    assert.equal(adapter.pool.options.connectionTimeoutMillis, 15000);
+    assert.equal(adapter.pool.options.idleTimeoutMillis, 30000);
+    assert.equal(adapter.pool.options.keepAlive, true);
+    // Without an `error` listener, an idle client dropped by the server (a managed database
+    // suspending, a failover) is an unhandled error event and the process exits.
+    assert.ok(adapter.pool.listenerCount("error") >= 1, "the pool must handle idle-client errors");
+    const saved = console.error;
+    const logged = [];
+    console.error = (...args) => logged.push(args.join(" "));
+    try {
+      adapter.pool.emit("error", new Error("terminating connection due to administrator command"));
+    } finally {
+      console.error = saved;
+    }
+    assert.match(logged.join("\n"), /idle client error/);
+  } finally {
+    await adapter.pool.end();
+  }
 });
 
 test("desktop SQLite path resolves from a clean profile without user configuration", async () => {

@@ -3,8 +3,9 @@
 //
 // Two ways to send:
 // - An HTTPS email service (`EMAIL_PROVIDER` = brevo or resend, with `EMAIL_API_KEY`). This is
-//   the one that works on Railway's Hobby plan, which blocks outbound SMTP (ports 25, 465 and
-//   587): an SMTP connection there never opens, so every code "failed to send" after a long wait.
+//   the one that works on hosts that block outbound SMTP (ports 25, 465 and 587) -- Railway's
+//   Hobby plan did, and free tiers commonly do: an SMTP connection there never opens, so every
+//   code "failed to send" after a long wait.
 // - Plain SMTP (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`), for hosts that allow it.
 // When both are set the HTTPS service wins, because it is the one that was set up on purpose
 // for a host where SMTP does not get out.
@@ -58,7 +59,7 @@ const EMAIL_SEND_DEADLINE_MS = 12000;
 const SMTP_TIMEOUTS = { connectionTimeout: 10000, greetingTimeout: 8000, socketTimeout: 10000 };
 const API_TIMEOUT_MS = EMAIL_SEND_DEADLINE_MS;
 
-const SMTP_BLOCKED_HINT = "Railway's Hobby plan blocks email over SMTP; set EMAIL_PROVIDER=brevo and EMAIL_API_KEY instead";
+const SMTP_BLOCKED_HINT = "this host may block outbound email over SMTP; set EMAIL_PROVIDER=brevo and EMAIL_API_KEY instead";
 
 const emailSettings = (env = process.env) => {
   const apiProvider = clean(env.EMAIL_PROVIDER).toLowerCase();

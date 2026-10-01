@@ -53,8 +53,12 @@ export const apiModeUsesCloudBackend = (value) =>
   CLOUD_CAPABLE_API_MODES.includes(normalizeConfiguredApiMode(value));
 
 /**
- * Precedence: a Railway-hosted origin, then saved device config, then build env, then the
- * runtime global, then the unconfigured default.
+ * Precedence: a page served by the hosted cloud itself, then saved device config, then build env,
+ * then the runtime global, then the unconfigured default.
+ *
+ * `hostedCloudOrigin` is `isHostedCloudOrigin()` from cloudOrigins.js. It was called
+ * `railwayProductionHost` while the cloud could only live on Railway; that name is still accepted
+ * for one release so nothing passing it silently loses the hosted rung.
  *
  * The unconfigured desktop default is LOCAL_SINGLE_DEVICE, not HYBRID (ruled: an
  * unconfigured desktop performs no cloud login and no background sync).
@@ -63,10 +67,13 @@ export const resolveApiMode = ({
   savedMode,
   envMode,
   globalMode,
+  hostedCloudOrigin = false,
   railwayProductionHost = false,
   desktopRuntime = false,
 } = {}) => {
-  if (railwayProductionHost) return { mode: "CLOUD_PRODUCTION", source: "railway-production-host", configured: true };
+  if (hostedCloudOrigin || railwayProductionHost) {
+    return { mode: "CLOUD_PRODUCTION", source: "hosted-cloud-origin", configured: true };
+  }
   // The saved rung existed to carry the App Mode dropdown's choice. That control is gone -- the app
   // decides for itself whether to use the cloud now -- so on the desktop a saved mode is a decision
   // nobody can revisit, and one machine was already stuck behind it: a `mode: "LOCAL_ONLY"` written

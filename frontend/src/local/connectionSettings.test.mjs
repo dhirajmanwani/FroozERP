@@ -93,7 +93,9 @@ test("the cloud address comes from the build, not from saved settings", () => {
   assert.notEqual(start, -1, "the built-in address must exist");
   const declaration = app.slice(start, app.indexOf("const CLOUD_API_URL", start));
   assert.match(declaration, /isDesktopShell\(\) && !import\.meta\.env\.DEV/, "desktop release builds only");
-  assert.match(declaration, /DEFAULT_PRODUCTION_CLOUD_API_URL/, "and it must be the one production address");
+  // The one production address is imported from local/cloudOrigins.js, never re-declared here.
+  assert.match(declaration, /\bPRODUCTION_CLOUD_API_URL\b/, "and it must be the one production address");
+  assert.match(app, /import \{[^}]*\bPRODUCTION_CLOUD_API_URL\b[^}]*\} from "\.\/local\/cloudOrigins\.js";/);
   assert.doesNotMatch(declaration, /writeSavedApiConfig/, "it must never be persisted");
 
   // Order matters: anything explicitly configured has to win over the built-in fallback, or a

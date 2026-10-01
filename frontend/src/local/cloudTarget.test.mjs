@@ -59,7 +59,7 @@ test("no shipped source treats an unconfigured cloud URL as a reason to use prod
   for (const [name, source] of Object.entries(sources)) {
     assert.doesNotMatch(
       source,
-      /\|\|\s*DEFAULT_(PRODUCTION_)?CLOUD_API_URL/,
+      /\|\|\s*(?:DEFAULT_PRODUCTION_CLOUD_API_URL|PRODUCTION_CLOUD_API_URL|DEFAULT_CLOUD_API_URL)\b/,
       `${name} must not fall back to a production cloud URL`,
     );
   }
@@ -70,13 +70,21 @@ test("no shipped source treats an unconfigured cloud URL as a reason to use prod
   );
   assert.doesNotMatch(
     sources["frontend/src/App.jsx"],
-    /isDesktopShell\(\)\s*\?\s*DEFAULT_PRODUCTION_CLOUD_API_URL/,
+    /isDesktopShell\(\)\s*\?\s*(?:DEFAULT_)?PRODUCTION_CLOUD_API_URL/,
     "The desktop rung of the CLOUD_API_URL chain must resolve to no target",
   );
   // The constant itself stays: it is still needed to recognise and migrate a legacy saved
-  // URL. What must not exist is a chain that lands on it when nothing is configured.
-  assert.match(sources["frontend/src/App.jsx"], /LEGACY_PRODUCTION_CLOUD_API_URLS/);
-  assert.match(sources["frontend/src/local/syncService.js"], /LEGACY_PRODUCTION_CLOUD_API_URLS/);
+  // URL. What must not exist is a chain that lands on it when nothing is configured. It now lives
+  // once, in cloudOrigins.js, and both callers migrate saved URLs through it.
+  assert.match(read("frontend", "src", "local", "cloudOrigins.js"), /export const LEGACY_PRODUCTION_CLOUD_API_URLS/);
+  for (const name of ["frontend/src/App.jsx", "frontend/src/local/syncService.js"]) {
+    assert.match(
+      sources[name],
+      /import \{[^}]*\bcanonicalizeCloudApiUrl\b[^}]*\} from "\.\/(?:local\/)?cloudOrigins\.js";/,
+      `${name} must migrate legacy saved URLs through the shared cloudOrigins.js`,
+    );
+    assert.doesNotMatch(sources[name], /const (?:LEGACY_PRODUCTION_CLOUD_API_URLS|canonicalizeCloudApiUrl) =/, `${name} must not keep its own copy`);
+  }
 });
 
 test("this module never names a production host", () => {

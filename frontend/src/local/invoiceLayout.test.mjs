@@ -6,6 +6,8 @@ import {
   INVOICE_COLUMNS,
   INVOICE_FALLBACK_FOOTER,
   INVOICE_FALLBACK_SHOP_NAME,
+  MANUAL_BILL_DISCOUNT_RULE_SUFFIX,
+  billDiscountLabel,
   buildInvoiceLayout,
   buildInvoiceText,
   formatBillMoney,
@@ -304,6 +306,39 @@ test("a bill discount only", () => {
   assert.equal(layout.totals.billDiscount, 12);
   assert.equal(layout.lines[0].discount, null);
   assert.equal(layout.savings.text, "You saved ₹12.00 on this bill");
+});
+
+test("the bill-discount row prints the whole bill discount; the slab's name only when the slab gave all of it", () => {
+  assert.equal(MANUAL_BILL_DISCOUNT_RULE_SUFFIX, " + extra");
+  assert.equal(billDiscountLabel({ discount_rule_name: "Sample slab" }), "Bill discount · Sample slab");
+  assert.equal(billDiscountLabel({ discount_rule_name: "Sample slab", manual_bill_discount: 0 }), "Bill discount · Sample slab");
+  // A cashier's part on top: the slab did not give all of it, so it is not named over the total.
+  assert.equal(billDiscountLabel({ discount_rule_name: "Sample slab", manual_bill_discount: 15 }), "Bill discount");
+  assert.equal(billDiscountLabel({ discount_rule_name: "Sample slab + extra" }), "Bill discount", "the server's stored mark");
+  assert.equal(billDiscountLabel({ discount_rule_name: null, manual_bill_discount: "15.00" }), "Bill discount");
+  assert.equal(billDiscountLabel({}), "Bill discount");
+
+  // On a printed bill: slab ₹12 + cashier's ₹8 = ₹20 bill discount, one row, the total, plain label.
+  const sale = serverSale({
+    gross_amount: "240.00", item_discount_amount: "0.00", invoice_discount_amount: "20.00", total_amount: "220.00",
+    discount_rule_name: "Sample slab + extra",
+    items: [serverSale().items[1]],
+    payments: [{ mode: "CASH", amount: "220.00" }],
+  });
+  const layout = buildInvoiceLayout(sale, settings);
+  assert.deepEqual(rowKeys(layout), ["items-total", "total-discount"]);
+  assert.equal(row(layout, "total-discount").note, "Bill discount");
+  assert.equal(row(layout, "total-discount").amountText, "−₹20.00");
+  assert.equal(layout.totals.billDiscount, 20);
+
+  // With item discounts too, the detail row carries the label and the bill's whole bill discount.
+  const both = buildInvoiceLayout(serverSale({
+    gross_amount: "480.00", item_discount_amount: "24.00", invoice_discount_amount: "20.00", total_amount: "436.00",
+    discount_rule_name: "Sample slab", manual_bill_discount: 8,
+    payments: [{ mode: "CASH", amount: "436.00" }],
+  }), settings);
+  assert.equal(row(both, "bill-discount").label, "Bill discount");
+  assert.equal(row(both, "bill-discount").amountText, "₹20.00");
 });
 
 test("item and bill discounts together, with tax and charges, all foot to the grand total", () => {
