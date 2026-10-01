@@ -101,7 +101,7 @@ import { resolveShellStatus } from "./local/shellStatus";
 import { plainServerMessage } from "./local/plainServerMessage";
 import { describeReport } from "./local/reportDescriptions";
 import { labelFor, toneFor } from "./local/displayLabels";
-import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, cartDiscountApproval, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, describeDiscountApprovalReason, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, resolveDiscountApprovalRoute, resolveDiscountAvailability, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
+import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, MANUAL_BILL_DISCOUNT_MODE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, billDiscountRuleName, describeBillApprovalLine, describePosDiscountApprovalReason, posDiscountApproval, readBillDiscountTooLarge, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, resolveDiscountApprovalRoute, resolveDiscountAvailability, resolveManualBillDiscount, roundMoney as roundDiscountMoney, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
 import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, describeSaveResult, filterSaleRateRows, marginOnCost, parseTargetMargin, rateTone, resolveSaleRateAvailability, suggestedDrafts } from "./local/saleRateUpdate";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
@@ -670,7 +670,7 @@ const resolveSaleChangeRoute = ({ user, offlineMode = false, connectivityMode } 
 /**
  * Which way a POS bill's discount approval goes (local/discounts.js decides): the same Local Only,
  * offline and cloud-gate checks as a cancel or edit, in the same order, so a refused route makes no
- * request and bills nothing. `needsApproval` comes from `cartDiscountApproval`, which already
+ * request and bills nothing. `needsApproval` comes from `posDiscountApproval`, which already
  * waves Owner, Admin and rate-override holders through.
  */
 const resolvePosDiscountApprovalRoute = ({ needsApproval, user, offlineMode = false, connectivityMode } = {}) => {
@@ -3533,6 +3533,14 @@ function App() {
             discountRules: bundle.discountRules,
             saleRateSettings: { ...current.saleRateSettings, ...(bundle.saleRateSettings || {}) },
           }));
+        }
+        // The shop's print and POS display switches ("Show Item Discount Column on POS" and the
+        // rest) from the same snapshot -- no extra request. Without this an open counter kept the
+        // switches it signed in with until someone opened Settings on it, so a switch changed on
+        // another machine never reached its POS, while Settings (which reloads on open) showed it.
+        const businessBundle = bundle?.businessSettings;
+        if (businessBundle && typeof businessBundle === "object" && !Array.isArray(businessBundle) && Object.keys(businessBundle).length > 0) {
+          setSettingsData((current) => ({ ...current, businessSettings: { ...defaultBusinessSettings, ...businessBundle } }));
         }
       } catch (error) {
         failures.push({ status: "rejected", reason: error });
@@ -19832,14 +19840,14 @@ function SettingsModule({
    */
   const sectionContent = {
     "settings/display-typography": <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} setThemeMode={setThemeMode} systemPrefersDark={systemPrefersDark} themeMode={themeMode} />,
-    "settings/business-identity": <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />,
-    "settings/weighing-scale": <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />,
-    "settings/payment-tax": <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
-    "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
+    "settings/business-identity": <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} onReload={onReload} user={user} />,
+    "settings/weighing-scale": <PosSettingsSection canManage={canManage} onReload={onReload} posSettings={settingsData.posSettings} user={user} />,
+    "settings/payment-tax": <PaymentSettingsSection canManage={canManage} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
+    "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
     "settings/mandi-tax": <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />,
     "settings/other-charges": <OtherChargesSettings canManage={canManage} chargeTypes={settingsData.chargeTypes || []} onReload={onReload} user={user} />,
     "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
-    "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
+    "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
     "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} onChanged={onDiscountRulesChanged} saleRateSettings={settingsData.saleRateSettings} unavailableReason={discountUnavailableReason} />,
     "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
     "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
@@ -19861,7 +19869,6 @@ function SettingsModule({
         localBackendService={localBackendService || null}
         localDbAudit={localDbAudit}
         startupLogPath={startupLogPath}
-        key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
         onCheckConnection={onCheckConnection}
         onConnectivityModeChange={onConnectivityModeChange}
@@ -19994,13 +20001,44 @@ function AppearanceAccessibilitySettings({
   );
 }
 
+const NO_SETTINGS_DEFAULTS = Object.freeze({});
+
+/**
+ * A settings form's draft: the saved values as they are now, with only the fields this person has
+ * changed laid on top.
+ *
+ * Every settings card used to copy its settings into `useState` once, when it mounted, and was
+ * remounted only when the row's `updated_at` changed. Settings change under an open screen without
+ * that happening -- loaded from this computer's copy first and from the server a moment later, or
+ * refreshed after a sync -- and the card kept showing what it copied: "Show Item Discount Column on
+ * POS" ticked while POS, reading the live value, showed no column. Worse, Save sent the whole stale
+ * copy back, writing old values over every other setting on the card.
+ *
+ * Here nothing is copied. The box shows the live value until it is touched; Save sends the live
+ * values plus the touched fields; the touched fields are dropped once the saved values have been
+ * read back (kept if that read fails, so the screen never shows the pre-save value as current).
+ */
+function useSettingsDraft(saved, defaults = NO_SETTINGS_DEFAULTS) {
+  const [edits, setEdits] = useState({});
+  const draft = useMemo(() => ({ ...defaults, ...(saved || {}), ...edits }), [defaults, saved, edits]);
+  const updateDraft = useCallback((field, value) => setEdits((current) => ({ ...current, [field]: value })), []);
+  const resetDraft = useCallback(() => setEdits({}), []);
+  return { draft, updateDraft, resetDraft };
+}
+
+/** After a save: reload, and drop the touched fields only once the saved values are back. */
+const settleSettingsSave = async (onReload, resetDraft) => {
+  const refreshed = await onReload();
+  if (refreshed !== false) resetDraft();
+  return refreshed;
+};
+
 function BusinessSettingsSection({ businessSettings, canManage, onReload, user }) {
-  const [draft, setDraft] = useState({ ...defaultBusinessSettings, ...businessSettings });
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(businessSettings, defaultBusinessSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("Business settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update business settings"));
@@ -20055,12 +20093,11 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
 }
 
 function PosSettingsSection({ canManage, onReload, posSettings, user }) {
-  const [draft, setDraft] = useState({ ...defaultPosSettings, ...posSettings });
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(posSettings, defaultPosSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/pos`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("POS settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update POS settings"));
@@ -20089,12 +20126,11 @@ function PosSettingsSection({ canManage, onReload, posSettings, user }) {
 }
 
 function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) {
-  const [draft, setDraft] = useState({ ...defaultPaymentSettings, ...paymentSettings });
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(paymentSettings, defaultPaymentSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/payment`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("Payment settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update payment settings"));
@@ -20149,14 +20185,18 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
 }
 
 function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }) {
-  const [draft, setDraft] = useState({ ...defaultWhatsappSettings, ...whatsappSettings, access_token: "" });
+  // The token box always starts empty: the saved token is never sent to the screen, only typed.
+  const { draft: liveDraft, updateDraft, resetDraft } = useSettingsDraft(whatsappSettings, defaultWhatsappSettings);
+  const [tokenTyped, setTokenTyped] = useState(false);
+  const draft = tokenTyped ? liveDraft : { ...liveDraft, access_token: "" };
   const [message, setMessage] = useState("");
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/whatsapp`, { ...draft, updated_by: user.id });
-      setDraft((current) => ({ ...current, access_token: "" }));
-      await onReload();
+      // The token is gone from the screen whatever the reload does.
+      updateDraft("access_token", "");
+      setTokenTyped(false);
+      await settleSettingsSave(onReload, resetDraft);
       setMessage("WhatsApp settings updated.");
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to update WhatsApp settings"));
@@ -20183,7 +20223,7 @@ function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }
           <input disabled={!canManage} placeholder="Meta phone number ID" value={draft.phone_number_id || ""} onChange={(event) => updateDraft("phone_number_id", event.target.value)} />
         </Field>
         <Field label="Access Token">
-          <input disabled={!canManage} placeholder={whatsappSettings?.access_token_configured ? whatsappSettings.access_token_masked || "Token configured - enter new token to replace" : "Paste WhatsApp Cloud API access token"} type="password" value={draft.access_token || ""} onChange={(event) => updateDraft("access_token", event.target.value)} />
+          <input disabled={!canManage} placeholder={whatsappSettings?.access_token_configured ? whatsappSettings.access_token_masked || "Token configured - enter new token to replace" : "Paste WhatsApp Cloud API access token"} type="password" value={draft.access_token || ""} onChange={(event) => { setTokenTyped(true); updateDraft("access_token", event.target.value); }} />
         </Field>
         <Field label="Default Country Code">
           <input disabled={!canManage} placeholder="91" value={draft.default_country_code || "91"} onChange={(event) => updateDraft("default_country_code", event.target.value.replace(/\D/g, "").slice(0, 5))} />
@@ -20420,11 +20460,11 @@ function RebateSettings({ canManage, onReload, rules, user }) {
 }
 
 function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }) {
-  const [draft, setDraft] = useState({ ...defaultSaleRateSettings, ...saleRateSettings });
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(saleRateSettings, defaultSaleRateSettings);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/sale-rate`, { ...draft, updated_by: user.id });
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
       alert("Sale rate settings updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update sale rate settings"));
@@ -20434,21 +20474,21 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
     <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="How Sale Rate Update suggests a rate from each lot's cost. A suggestion is only filled in when you choose it.">
       <p className="form-note">The margin is on cost: a ₹100 cost at 25% suggests ₹125. Sale Rate Update starts at this margin; changing it on that screen does not change this setting.</p>
       <div className="form-grid settings-add-grid">
-        <Field label="Target margin on cost %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent ?? ""} onChange={(event) => setDraft({ ...draft, desired_margin_percent: event.target.value })} /></Field>
+        <Field label="Target margin on cost %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent ?? ""} onChange={(event) => updateDraft("desired_margin_percent", event.target.value)} /></Field>
         <Field label="Rounding Rule">
-          <select disabled={!canManage} value={draft.rounding_rule || "NEAREST_RUPEE"} onChange={(event) => setDraft({ ...draft, rounding_rule: event.target.value })}>
+          <select disabled={!canManage} value={draft.rounding_rule || "NEAREST_RUPEE"} onChange={(event) => updateDraft("rounding_rule", event.target.value)}>
             {roundingRules.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
         </Field>
         <Field label="POS Lot Selection Mode">
-          <select disabled={!canManage} value={draft.pos_lot_selection_mode || "ASK_MULTIPLE"} onChange={(event) => setDraft({ ...draft, pos_lot_selection_mode: event.target.value })}>
+          <select disabled={!canManage} value={draft.pos_lot_selection_mode || "ASK_MULTIPLE"} onChange={(event) => updateDraft("pos_lot_selection_mode", event.target.value)}>
             <option value="ASK_MULTIPLE">Ask When Multiple Lots Exist</option>
             <option value="AUTO_FIFO">Use the oldest lot first</option>
             <option value="MANUAL">Manual Lot Selection</option>
           </select>
         </Field>
-        <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, suggestion_enabled: event.target.checked })} /><span>Show suggested rates</span></label>
-        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+        <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => updateDraft("suggestion_enabled", event.target.checked)} /><span>Show suggested rates</span></label>
+        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Sale Rate Settings</button>
     </ModuleCard>
@@ -20873,15 +20913,11 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
 }
 
 function DeviceControlSettingsSection({ canManage, deviceControlSettings = defaultDeviceControlSettings, exitAttemptLogs = [], onReload, user }) {
-  const [draft, setDraft] = useState({ ...defaultDeviceControlSettings, ...deviceControlSettings });
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(deviceControlSettings, defaultDeviceControlSettings);
   const [currentPassword, setCurrentPassword] = useState("");
   const [exitCode, setExitCode] = useState("");
   const [confirmExitCode, setConfirmExitCode] = useState("");
   const [message, setMessage] = useState("");
-  useEffect(() => {
-    setDraft({ ...defaultDeviceControlSettings, ...deviceControlSettings });
-  }, [deviceControlSettings?.updated_at, deviceControlSettings?.fullscreen_lock_enabled, deviceControlSettings?.exit_code_configured]);
-  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/device-control`, {
@@ -20896,7 +20932,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
       setExitCode("");
       setConfirmExitCode("");
       setMessage("Device control settings updated");
-      await onReload();
+      await settleSettingsSave(onReload, resetDraft);
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to update device control settings"));
     }
@@ -22043,7 +22079,7 @@ function SyncSettingsSection({
   timeDiagnostics,
   user,
 }) {
-  const [draft, setDraft] = useState(syncSettings || {});
+  const { draft, updateDraft, resetDraft } = useSettingsDraft(syncSettings);
   const [statusMessage, setStatusMessage] = useState("");
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [cloudReadiness, setCloudReadiness] = useState(null);
@@ -22059,8 +22095,9 @@ function SyncSettingsSection({
         device_display_name: draft.device_display_name || "Main Counter Device",
         updated_by: user.id,
       });
-      setDraft((current) => ({ ...current, ...response.data }));
-      await onReload();
+      // What the server saved stands on screen until the reload brings it back as the live value.
+      if (response.data?.device_display_name !== undefined) updateDraft("device_display_name", response.data.device_display_name);
+      await settleSettingsSave(onReload, resetDraft);
       setStatusMessage("Device display name saved");
       alert("Device display name saved");
     } catch (error) {
@@ -22323,7 +22360,7 @@ function SyncSettingsSection({
             <Field label="This Computer's ID"><input disabled value={localDeviceId} /></Field>
             <Field label="ID in the Cloud"><input disabled value={canonicalCloudDeviceId} /></Field>
             <Field label="Older Device ID (from Settings)"><input disabled value={draft.device_id || "Not set"} /></Field>
-            <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
+            <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => updateDraft("device_display_name", event.target.value)} /></Field>
             <Field label="Local Database File"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
             <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
             <Field label="Local Database Check"><input disabled value={localDbAudit?.integrity || "Not checked"} /></Field>
@@ -23528,7 +23565,19 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const [discountApproval, setDiscountApproval] = useState(null);
   // Owner, Admin and anyone who may already set any rate are never asked.
   const discountExempt = discountApprovalExempt({ role: user?.role, canManualRateOverride });
-  const discountApprovalCheck = useMemo(() => cartDiscountApproval(cart, { exempt: discountExempt }), [cart, discountExempt]);
+  /**
+   * The cashier's own "Bill discount" box: rupees or a percentage of what is left of the bill after
+   * item discounts and the automatic slab. What was typed, not the amount -- the amount is worked
+   * out in `totals` on every render, so it can never drift from the cart it is a share of. Empty
+   * by default, and emptied after a completed sale and whenever the cart is emptied.
+   */
+  const [billDiscountInput, setBillDiscountInput] = useState({ mode: MANUAL_BILL_DISCOUNT_MODE.AMOUNT, value: "" });
+  const clearBillDiscount = () => setBillDiscountInput({ mode: MANUAL_BILL_DISCOUNT_MODE.AMOUNT, value: "" });
+  // An emptied cart (the last line removed, or a new bill) starts with no bill discount: a
+  // percentage left over from the last customer would otherwise land on the next one.
+  useEffect(() => {
+    if (cart.length === 0) setBillDiscountInput({ mode: MANUAL_BILL_DISCOUNT_MODE.AMOUNT, value: "" });
+  }, [cart.length]);
   /**
    * Tell the shell whether this counter is mid-bill.
    *
@@ -23761,13 +23810,24 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
     // One matching rule shared with the server (local/discounts.js): measured on the bill before
     // item discounts, capped at the bill after them, the most money off wins.
-    const { rule: discountRule, amount: invoiceDiscountAmount } = matchBillSlab(discountRules, {
+    const { rule: discountRule, amount: slabDiscountAmount } = matchBillSlab(discountRules, {
       gross,
       subtotalAfterItems: subtotalAfterItemDiscounts,
       // As the server reads it from the payments: Mixed with one amount is that one mode.
       paymentMode: slabPaymentMode(paymentMode, mixedPayments),
       enabled: saleRateSettings.bill_level_slab_discount_enabled !== false,
     });
+    // The cashier's own bill discount, on top of the slab and never more than what is left. An
+    // entry that cannot be billed is an error (and blocks checkout), never a quiet ₹0.
+    const manualBill = resolveManualBillDiscount({
+      mode: billDiscountInput.mode,
+      value: billDiscountInput.value,
+      itemsSubtotal: subtotalAfterItemDiscounts,
+      slabAmount: slabDiscountAmount,
+    });
+    const manualBillDiscount = manualBill.error ? 0 : manualBill.amount;
+    // The bill discount the bill records (sales.invoice_discount_amount): slab + manual, 2 dp.
+    const invoiceDiscountAmount = roundDiscountMoney(slabDiscountAmount + manualBillDiscount);
     const basis = String(paymentSettings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
     const customerScope = String(paymentSettings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
     const customerEligible = customerScope === "ALL_CUSTOMERS" || (customerScope === "REGISTERED_CUSTOMERS" && Boolean(customer.account_id) && customer.system_account !== true);
@@ -23802,6 +23862,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       gross,
       itemDiscount,
       invoiceDiscount: invoiceDiscountAmount,
+      slabDiscount: slabDiscountAmount,
+      manualBillDiscount,
+      manualBillError: manualBill.error,
+      manualBillRoom: manualBill.room,
       taxableAmount,
       mandiTaxRate: taxEligible ? Number(paymentSettings.sales_mandi_tax_percent || 0) : 0,
       mandiTaxAmount,
@@ -23815,7 +23879,20 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       itemCount: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
       discountRule,
     };
-  }, [cart, chargeSelections, chargeTypes, customer.account_id, customer.system_account, discountRules, mixedPayments, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
+  }, [billDiscountInput.mode, billDiscountInput.value, cart, chargeSelections, chargeTypes, customer.account_id, customer.system_account, discountRules, mixedPayments, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
+
+  // More than 5% off an item, or the bill discount taking the whole bill over 5%, needs an Owner or
+  // Admin (local/discounts.js). Worked out from the cart and the bill discount as they are now.
+  const discountApprovalCheck = useMemo(
+    () => posDiscountApproval(cart, { exempt: discountExempt, manualBill: totals.manualBillDiscount }),
+    [cart, discountExempt, totals.manualBillDiscount],
+  );
+  // An approval is asked for the bill as it stood. If the cart or the bill discount changes behind
+  // the dialog (a sync re-pricing a line), the question is dropped -- unless the approval is already
+  // being checked, when checkout carries on with the bill it was asked for.
+  useEffect(() => {
+    setDiscountApproval((current) => (current && !current.saving ? null : current));
+  }, [cart, billDiscountInput.mode, billDiscountInput.value]);
 
   const mixedPaymentModes = [
     ["CASH", "Cash Amount"],
@@ -24114,6 +24191,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       gross_total: Number(totals.gross || 0),
       item_discount_total: Number(totals.itemDiscount || 0),
       bill_discount_total: roundUi(totals.invoiceDiscount),
+      // The cashier's own part of `bill_discount_total` (the rest is the slab). Passed through
+      // untouched to the outbox; the server judges the 5% rule and names the rule with it.
+      manual_bill_discount: roundDiscountMoney(totals.manualBillDiscount),
       // The slab this bill was given, so the server keeps the discount as billed even when the
       // owner changes the slabs before this counter syncs (a bill already handed over).
       ...slabSnapshot(totals.discountRule),
@@ -24183,11 +24263,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    * Stop checkout to ask for an Owner or Admin's approval. A fresh bill reference every time: an
    * approval is single-use and bound to the reference it was issued for.
    */
-  const openDiscountApproval = ({ lines, printAfterSave, confirmations, notice = "" }) => {
+  const openDiscountApproval = ({ lines, bill = null, printAfterSave, confirmations, notice = "" }) => {
     const { discount_approval_id: _usedApproval, discount_approval_not_needed: _notNeeded, sale_ref: _usedRef, retry: _retry, ...carried } = confirmations || {};
     setDiscountApproval({
       saleRef: newSyncId("op"),
       lines: Array.isArray(lines) ? lines : [],
+      // The whole bill over 5% because of the bill discount, or null.
+      bill: bill || null,
       printAfterSave,
       confirmations: carried,
       notice,
@@ -24226,7 +24308,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         action: DISCOUNT_APPROVAL_ACTION,
         saleRef: draft.saleRef,
         // The cart as it is now, in case it changed behind the dialog; the lines it opened with otherwise.
-        reason: describeDiscountApprovalReason(discountApprovalCheck.lines.length ? discountApprovalCheck.lines : draft.lines),
+        reason: discountApprovalCheck.needed
+          ? describePosDiscountApprovalReason(discountApprovalCheck.lines, discountApprovalCheck.bill)
+          : describePosDiscountApprovalReason(draft.lines, draft.bill),
         approverUsername: draft.approverUsername,
         approverPassword: draft.approverPassword,
       });
@@ -24316,6 +24400,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         belowCostConfirmed = true;
       }
     }
+    // A bill discount that cannot be billed (not a number, over 100%, more than the bill) is said
+    // under the box; it is never billed as ₹0.
+    if (totals.manualBillError) {
+      setDiscountNotice(totals.manualBillError);
+      return;
+    }
     if (totals.invoiceDiscount > totals.gross - totals.itemDiscount) {
       alert("Invoice discount cannot exceed the cart subtotal.");
       return;
@@ -24354,7 +24444,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         setDiscountNotice(route.message);
         return;
       }
-      openDiscountApproval({ lines: discountApprovalCheck.lines, printAfterSave, confirmations: carriedConfirmations });
+      openDiscountApproval({ lines: discountApprovalCheck.lines, bill: discountApprovalCheck.bill, printAfterSave, confirmations: carriedConfirmations });
       return;
     }
     // The bill's own reference: the approval (if any) was issued for it, and it is the sale's
@@ -24384,8 +24474,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           gross_amount: localSale.gross_total,
           item_discount_amount: localSale.item_discount_total,
           invoice_discount_amount: localSale.bill_discount_total,
-          // Printed beside the bill discount, as the browser's saved sale does.
-          discount_rule_name: localSale.discount_rule_name,
+          // Printed beside the bill discount, as the browser's saved sale does: the name the server
+          // will store -- the slab's, "<slab> + extra" with a cashier's part, none for that part alone.
+          discount_rule_name: billDiscountRuleName(totals.discountRule, totals.slabDiscount, totals.manualBillDiscount),
+          manual_bill_discount: localSale.manual_bill_discount,
           taxable_amount: localSale.taxable_amount,
           mandi_tax_rate: localSale.mandi_tax_rate,
           mandi_tax_basis: localSale.mandi_tax_basis,
@@ -24422,6 +24514,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         setCreditInfo({ due_date: "", remarks: "" });
         setBillDateTime(currentDateTimeLocal());
         setDiscountNotice("");
+        clearBillDiscount();
         await onSaved?.({ localSale: invoice, pendingOperations: result?.pending_operations });
         setLastInvoice(invoice);
         onInvoice(invoice);
@@ -24446,6 +24539,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         })),
         customer,
         invoice_discount: Number(totals.invoiceDiscount || 0),
+        // The cashier's own part of `invoice_discount`; the server expects slab + this.
+        manual_bill_discount: roundDiscountMoney(totals.manualBillDiscount),
         ...slabSnapshot(totals.discountRule),
         taxable_amount: Number(totals.taxableAmount || 0),
         mandi_tax_rate: Number(totals.mandiTaxRate || 0),
@@ -24488,6 +24583,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       setCreditInfo({ due_date: "", remarks: "" });
       setBillDateTime(currentDateTimeLocal());
       setDiscountNotice("");
+      clearBillDiscount();
       // Hand the saved sale to `onSaved`. It was called bare, so a bill raised through this path
       // linked nothing back to the order it came from — and `sale_id` is exactly what the storage
       // layer uses to refuse a second billing, so the order stayed cancellable and re-billable.
@@ -24508,6 +24604,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         await Promise.resolve(onDiscountsStale?.()).catch(() => null);
         return;
       }
+      // Slab + bill discount is more than the bill (the slab changed on the server). Nothing was
+      // saved; the cart and the box stay, and the server's sentence says the most it can take.
+      const tooLarge = readBillDiscountTooLarge(error.response?.status, responseData);
+      if (tooLarge) {
+        setDiscountNotice(tooLarge.message);
+        await Promise.resolve(onDiscountsStale?.()).catch(() => null);
+        return;
+      }
       // The server wants an Owner or Admin's approval for the discount (none sent, or the one sent
       // was used, expired or for another bill). Nothing was saved; ask for one, cart untouched.
       const approvalRequired = readDiscountApprovalRequired(error.response?.status, responseData);
@@ -24517,8 +24621,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           setDiscountNotice(route.message);
           return;
         }
+        const asked = posDiscountApproval(cart, { exempt: false, manualBill: totals.manualBillDiscount });
         openDiscountApproval({
-          lines: cartDiscountApproval(cart, { exempt: false }).lines,
+          lines: asked.lines,
+          bill: asked.bill,
           printAfterSave,
           confirmations: carriedConfirmations,
           notice: approvalRequired.message,
@@ -24882,8 +24988,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         </div>
         <div className="checkout-section">
           <div className="discount-preview">
-            <span>Bill discount</span>
-            <strong>{saleRateSettings.bill_level_slab_discount_enabled === false ? MISSING_VALUE : currency.format(totals.invoiceDiscount)}</strong>
+            {/* The automatic slab only. The cashier's own bill discount is the box above the totals. */}
+            <span>Slab discount</span>
+            <strong>{saleRateSettings.bill_level_slab_discount_enabled === false ? MISSING_VALUE : currency.format(totals.slabDiscount)}</strong>
             <small>{describeBillDiscountPreview({ enabled: saleRateSettings.bill_level_slab_discount_enabled !== false, rule: totals.discountRule })}</small>
           </div>
           {discountNotice && (
@@ -24952,25 +25059,43 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           canTypeAmount={canManualRateOverride}
           onChange={setChargeSelections}
         />
+        <PosBillDiscountBox
+          approvalNeeded={Boolean(discountApprovalCheck.bill)}
+          disabled={cart.length === 0 || saving}
+          error={totals.manualBillError}
+          exempt={discountExempt}
+          input={billDiscountInput}
+          manualAmount={totals.manualBillDiscount}
+          onChange={setBillDiscountInput}
+        />
         <div className="totals">
           <TotalLine label="Gross Total" value={totals.gross} />
           <TotalLine label="Item Discount" value={-totals.itemDiscount} />
-          <TotalLine label="Bill Discount" value={-totals.invoiceDiscount} />
+          {/* The slab and the cashier's own bill discount, each on its own line; together they are
+              the bill discount the bill records. */}
+          {totals.discountRule
+            ? <TotalLine label={`Bill discount (${slabDisplayName(totals.discountRule)})`} value={-totals.slabDiscount} />
+            : String(billDiscountInput.value).trim() === "" && <TotalLine label="Bill Discount" value={0} />}
+          {totals.manualBillError
+            ? <div className="total-line total-line-error"><span>Extra discount</span><strong>{MISSING_VALUE}</strong></div>
+            : String(billDiscountInput.value).trim() !== "" && <TotalLine label="Extra discount" value={-totals.manualBillDiscount} />}
           {totals.mandiTaxAmount > 0 && <TotalLine label="Taxable Amount" value={totals.taxableAmount} />}
           {totals.mandiTaxAmount > 0 && <TotalLine label={`Mandi Tax (${totals.mandiTaxRate}%)`} value={totals.mandiTaxAmount} />}
           {totals.mandiTaxAmount === 0 && <TotalLine label="Tax" value={0} muted />}
           {totals.otherChargesAmount > 0 && <TotalLine label="Other Charges" value={totals.otherChargesAmount} />}
-          <TotalLine label="Net Payable" value={totals.total} total />
+          {totals.manualBillError
+            ? <div className="total-line total-line-main total-line-error"><span>Net Payable</span><strong>{MISSING_VALUE}</strong></div>
+            : <TotalLine label="Net Payable" value={totals.total} total />}
           {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
         </div>
         <div className="button-row checkout-actions">
-          <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment} onClick={() => checkout(false)}>
+          <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(false)}>
             <Icon name="receipt" /> {saving ? "Saving..." : "Save Bill"}
           </button>
           <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
             <Icon name="print" /> Print Bill
           </button>
-          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment} onClick={() => checkout(true)}>
+          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(true)}>
             <Icon name="print" /> Save & Print
           </button>
         </div>
@@ -25087,6 +25212,59 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
 }
 
 /**
+ * The cashier's own discount on the whole bill: one box, in rupees or as a percentage of what is
+ * left after item discounts and the slab. Empty by default. The amount it gives is shown under a
+ * percentage; an entry that cannot be billed says why here instead of becoming ₹0.
+ */
+function PosBillDiscountBox({ approvalNeeded = false, disabled = false, error = null, exempt = false, input, manualAmount = 0, onChange }) {
+  const percentMode = input?.mode === MANUAL_BILL_DISCOUNT_MODE.PERCENT;
+  const typed = String(input?.value ?? "").trim() !== "";
+  return (
+    <div className="checkout-section pos-bill-discount">
+      <div className="pos-bill-discount-head">
+        <label className="pos-bill-discount-label" htmlFor="pos-bill-discount-input">Bill discount</label>
+        <div aria-label="Bill discount in" className="account-tabs pos-bill-discount-mode" role="group">
+          {[[MANUAL_BILL_DISCOUNT_MODE.AMOUNT, "₹"], [MANUAL_BILL_DISCOUNT_MODE.PERCENT, "%"]].map(([mode, label]) => (
+            <button
+              aria-label={mode === MANUAL_BILL_DISCOUNT_MODE.PERCENT ? "Percent of the bill" : "Rupees"}
+              aria-pressed={input?.mode === mode}
+              className={input?.mode === mode ? "account-tab account-tab-active" : "account-tab"}
+              disabled={disabled}
+              key={mode}
+              type="button"
+              onClick={() => onChange({ ...input, mode })}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <input
+        aria-describedby="pos-bill-discount-note"
+        aria-invalid={error ? true : undefined}
+        disabled={disabled}
+        id="pos-bill-discount-input"
+        inputMode="decimal"
+        max={percentMode ? "100" : undefined}
+        min="0"
+        placeholder={percentMode ? "% of the bill" : "₹ off the bill"}
+        step="0.01"
+        type="number"
+        value={input?.value ?? ""}
+        onChange={(event) => onChange({ ...input, value: event.target.value })}
+      />
+      <div id="pos-bill-discount-note">
+        {error
+          ? <small className="form-note stock-low" role="alert">{error}</small>
+          : percentMode && typed && <small className="form-note">{currency.format(manualAmount)} off the bill</small>}
+        {approvalNeeded && !error && <small className="form-note stock-low">Over 5% of the bill in all: needs Owner/Admin approval</small>}
+        {!exempt && <small className="form-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}, items and bill together</small>}
+      </div>
+    </div>
+  );
+}
+
+/**
  * An Owner or Admin approves more than 5% off an item, on the counter, before the bill is saved.
  * The same username and password fields as a cashier's cancel or edit. Closing it keeps the cart;
  * a refused password says so in the server's words and keeps the dialog open.
@@ -25112,9 +25290,10 @@ function DiscountApprovalModal({ draft, onChange, onClose, onConfirm }) {
           }}
         >
           {draft.notice && <div className="warning-note">{draft.notice}</div>}
-          {lines.length > 0 && (
+          {(lines.length > 0 || draft.bill) && (
             <ul className="discount-approval-lines">
               {lines.map((line, index) => <li key={`${line.lineId ?? "line"}-${index}`}>{describeDiscountApprovalLine(line)}</li>)}
+              {draft.bill && <li key="bill">{describeBillApprovalLine(draft.bill)}</li>}
             </ul>
           )}
           <SaleChangeApprovalFields

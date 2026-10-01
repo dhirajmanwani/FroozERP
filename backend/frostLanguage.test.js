@@ -231,10 +231,13 @@ test("every period the question layer can name is a period the range layer serve
     // must therefore describe a different span -- that is what "served" means here, and checking the
     // label alone would not catch it, because the default carries a perfectly convincing one.
     if (key === "today") continue;
+    // Span and label together: on the first of a month "this_month" is legitimately today's span
+    // (and "this_year" on 1 January), but it still says "This Month". Only the fall-through answers
+    // with today's span *and* today's label, so that pair is what an unserved key looks like.
     assert.notEqual(
-      `${range.dateFrom}:${range.dateTo}`,
-      `${today.dateFrom}:${today.dateTo}`,
-      `"${key}" resolves to the same span as today, so it is not really served`,
+      `${range.dateFrom}:${range.dateTo}:${range.label}`,
+      `${today.dateFrom}:${today.dateTo}:${today.label}`,
+      `"${key}" resolves to today's span and label, so it is not really served`,
     );
   }
 });

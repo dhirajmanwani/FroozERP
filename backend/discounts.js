@@ -298,6 +298,49 @@ const boundBillDiscount = (requested, subtotalAfterItems) => {
 };
 
 /**
+ * A cashier's own bill discount, as a sale payload carries it (`manual_bill_discount`, 1 Oct 2026).
+ *
+ *   absent      (undefined, null, blank)  -> `{ present: false, amount: 0 }`: an older POS, which has
+ *               no such box. Every path then behaves exactly as it did before the field existed.
+ *   readable    a number >= 0             -> `{ present: true, amount }`, 2 dp.
+ *   unreadable  text, negative, NaN       -> `{ present: true, amount: null, unreadable: true }`.
+ *               Never read as "no discount".
+ */
+const readManualBillDiscount = (value) => {
+  if (isBlank(value)) return { present: false, amount: 0, unreadable: false };
+  const number = finiteOrNull(value);
+  if (number === null || number < 0) return { present: true, amount: null, unreadable: true };
+  return { present: true, amount: roundMoney(number), unreadable: false };
+};
+
+/** Appended to a slab's name on a bill that also carries a cashier's own bill discount. */
+const EXTRA_DISCOUNT_SUFFIX = " + extra";
+/** `sales.discount_rule_name` is VARCHAR(140). */
+const RULE_NAME_MAX = 140;
+
+/**
+ * The rule snapshot a bill stores when its bill discount is a slab plus a cashier's own amount:
+ * the slab's name with " + extra", so the stored row never claims the whole amount was the slab.
+ * A slab row with no name is named by its range; a device snapshot with no name is "Bill slab".
+ */
+const withExtraDiscountName = (rule) => {
+  if (!rule) return null;
+  const hasRange = Object.prototype.hasOwnProperty.call(rule, "minimum_bill_amount");
+  const name = cleanName(rule.rule_name) || (hasRange ? describeSlabRange(rule) : "Bill slab");
+  return { ...rule, rule_name: `${name.slice(0, RULE_NAME_MAX - EXTRA_DISCOUNT_SUFFIX.length)}${EXTRA_DISCOUNT_SUFFIX}` };
+};
+
+/**
+ * The rule a bill stores given how its bill discount splits. No cashier's part: the slab's rule as
+ * it is. A cashier's part and a slab part: the slab with " + extra". A cashier's part only: none.
+ */
+const billDiscountRule = (rule, slabAmount, manualAmount) => {
+  if (!rule) return null;
+  if (!(manualAmount > 0)) return rule;
+  return slabAmount > BILL_DISCOUNT_TOLERANCE ? withExtraDiscountName(rule) : null;
+};
+
+/**
  * The bill discount a sale records, and the rule snapshot stored with it.
  *
  *   SLAB       browser checkout. The server's current slabs decide. When one matches and the
@@ -306,6 +349,10 @@ const boundBillDiscount = (requested, subtotalAfterItems) => {
  *              With no slab and no claim, the client's amount stands (a manual bill discount).
  *   AS_BILLED  a bill already handed to a customer (desktop sync) or an edit. The amount billed,
  *              bounded; the rule snapshot the caller passes (`snapshot`), else none.
+ *
+ * `manualBill` is the payload's `manual_bill_discount`. Absent, the above is all, unchanged; the
+ * result is `{ amount, rule }`. Present (`resolveWithManualBill`), the cashier's own part is
+ * separated from the slab's and the result also carries `slabAmount` and `manualBill`.
  *
  * Returns `{ amount, rule }` or `{ error: { status, code?, message, ... } }`.
  */
@@ -318,9 +365,15 @@ const resolveInvoiceDiscount = ({
   rules = [],
   enabled = true,
   snapshot = null,
+  manualBill,
 } = {}) => {
   const bounded = boundBillDiscount(requested, subtotalAfterItems);
   if (bounded.error) return { error: { status: 400, message: bounded.error } };
+
+  const manual = readManualBillDiscount(manualBill);
+  if (manual.present) {
+    return resolveWithManualBill({ mode, billed: bounded.amount, manual, gross, subtotalAfterItems, paymentMode, rules, enabled, snapshot });
+  }
 
   if (mode === "AS_BILLED") {
     return { amount: bounded.amount, rule: bounded.amount > 0 && snapshot ? snapshot : null };
@@ -343,6 +396,83 @@ const resolveInvoiceDiscount = ({
   }
   if (rule) return { amount: expected, rule };
   return { amount: bounded.amount, rule: null };
+};
+
+/**
+ * The cashier's part of a browser bill discount that came without `manual_bill_discount`: what the
+ * invoice discount gives beyond the server's slab for this bill, max(0, round2(bounded invoice
+ * discount - slab amount)). 0 when the invoice discount cannot be bounded (that bill is refused by
+ * `resolveInvoiceDiscount` anyway). Only for the 5% check; the amount stored is still decided by
+ * `resolveInvoiceDiscount`.
+ */
+const impliedManualBillDiscount = ({ requested, gross, subtotalAfterItems, paymentMode, rules = [], enabled = true } = {}) => {
+  const bounded = boundBillDiscount(requested, subtotalAfterItems);
+  if (bounded.error) return 0;
+  const rule = matchBillSlab(rules, gross, paymentMode, { enabled });
+  const slabAmount = rule ? billSlabAmount(rule, gross, subtotalAfterItems) : 0;
+  return roundMoney(Math.max(0, bounded.amount - slabAmount));
+};
+
+const rulesChangedRefusal = (expected, extra = {}) => ({
+  error: {
+    status: 409,
+    code: "DISCOUNT_RULES_CHANGED",
+    expected_invoice_discount: expected,
+    ...extra,
+    message: "Bill discount rules changed. POS has reloaded them - check the total and try again.",
+  },
+});
+
+/**
+ * `resolveInvoiceDiscount` for a payload that carries `manual_bill_discount`.
+ *
+ *   SLAB       expected = round2(server's slab amount + manual). An unreadable manual amount is
+ *              400; expected past the subtotal (by over a paisa) is 400 BILL_DISCOUNT_TOO_LARGE with
+ *              `max_manual_bill_discount`. Then the client's invoice discount must be expected,
+ *              within a paisa, or 409 DISCOUNT_RULES_CHANGED with `expected_invoice_discount` (and
+ *              `expected_slab_discount`, the slab's part alone). The amount stored is expected,
+ *              capped at the subtotal.
+ *   AS_BILLED  never refused for the manual part (the customer has the bill). The amount billed,
+ *              bounded as always; the manual part is the cashier's figure capped at that amount, the
+ *              slab part is the rest. An unreadable manual part is `manualBill: null` and the
+ *              snapshot is kept as the device sent it.
+ *
+ * The rule stored follows `billDiscountRule`: " + extra" when both parts, none when manual only.
+ */
+const resolveWithManualBill = ({ mode, billed, manual, gross, subtotalAfterItems, paymentMode, rules, enabled, snapshot }) => {
+  if (mode === "AS_BILLED") {
+    if (manual.unreadable) {
+      return { amount: billed, rule: billed > 0 && snapshot ? snapshot : null, slabAmount: null, manualBill: null };
+    }
+    const manualPart = roundMoney(Math.min(manual.amount, billed));
+    const slabPart = roundMoney(billed - manualPart);
+    const rule = billed > 0 ? billDiscountRule(snapshot, slabPart, manualPart) : null;
+    return { amount: billed, rule, slabAmount: slabPart, manualBill: manualPart };
+  }
+
+  if (manual.unreadable) return { error: { status: 400, message: "Enter a valid bill discount" } };
+  const rule = matchBillSlab(rules, gross, paymentMode, { enabled });
+  const slabAmount = rule ? billSlabAmount(rule, gross, subtotalAfterItems) : 0;
+  const expected = roundMoney(slabAmount + manual.amount);
+  // The slab plus the cashier's part may not pass the subtotal. Said as such (with the most the
+  // cashier may give), not as "rules changed" with an amount larger than the bill.
+  const subtotal = Math.max(0, roundMoney(finiteOrNull(subtotalAfterItems) ?? 0));
+  if (expected > subtotal + BILL_DISCOUNT_TOLERANCE) {
+    return {
+      error: {
+        status: 400,
+        code: "BILL_DISCOUNT_TOO_LARGE",
+        max_manual_bill_discount: roundMoney(Math.max(0, subtotal - slabAmount)),
+        message: "Bill discount cannot be more than the bill after its slab discount",
+      },
+    };
+  }
+  if (Math.abs(billed - expected) > BILL_DISCOUNT_TOLERANCE) {
+    return rulesChangedRefusal(expected, { expected_slab_discount: slabAmount });
+  }
+  const amount = roundMoney(Math.min(expected, subtotal));
+  const manualPart = roundMoney(Math.max(0, amount - slabAmount));
+  return { amount, rule: billDiscountRule(rule, slabAmount, manualPart), slabAmount, manualBill: manualPart };
 };
 
 /** The `sales.discount_rule_*` values for a stored rule (a slab row or a snapshot), in column order. */
@@ -593,6 +723,54 @@ const assessManualDiscounts = (lines) => {
 };
 
 /**
+ * The bill against the 5% rule, with a cashier's own bill discount (`manualBill`, the payload's
+ * `manual_bill_discount`) on top of the lines (owner's rule, 1 Oct 2026).
+ *
+ *   - Every line is held to the per-line rule exactly as `assessManualDiscounts` does.
+ *   - When `manualBill` > 0, the bill as a whole is held to 5% too:
+ *       base        = round2(sum of line bases)                 -- line base as `manualDiscountLine`
+ *       manualTotal = round2(sum of line manual parts + manualBill)
+ *       freeLimit   = round2(base x 5 / 100)
+ *       needsApproval when manualTotal > round2(freeLimit + 0.01)
+ *     So a cashier may give up to 5% in all, on the lines or on the bill, however they spread it.
+ *   - With `manualBill` 0 or blank the bill-level test is not applied: the per-line rule already
+ *     holds the bill to 5% (give or take a paisa a line), and a bill with no bill discount must
+ *     answer exactly as it did before this rule existed.
+ *   - An unreadable `manualBill` (text, negative) needs approval; so does a positive one on a bill
+ *     with a line that cannot be read (its base is unknown).
+ *
+ * Returns the `assessManualDiscounts` shape -- `{ needsApproval, lines, manualDiscountTotal }`,
+ * where `manualDiscountTotal` now includes the bill part -- plus `lineManualDiscountTotal` and
+ * `bill: { manualBill, base, freeLimit, manualTotal, needsApproval, unreadable }`.
+ */
+const assessBillManualDiscount = ({ lines, manualBill = 0 } = {}) => {
+  const items = assessManualDiscounts(lines);
+  const read = isBlank(manualBill) ? 0 : finiteOrNull(manualBill);
+  const unreadable = read === null || read < 0;
+  const billPart = unreadable ? 0 : roundMoney(read);
+  const bases = items.lines.map((line) => line.base);
+  const base = bases.every((value) => value !== null) ? roundMoney(bases.reduce((sum, value) => sum + value, 0)) : null;
+  const freeLimit = base === null ? 0 : Math.max(0, roundMoney((base * MANUAL_DISCOUNT_FREE_PERCENT) / 100));
+  const manualTotal = roundMoney(items.manualDiscountTotal + billPart);
+  const billNeedsApproval = unreadable
+    || (billPart > 0 && (base === null || manualTotal > roundMoney(freeLimit + MANUAL_DISCOUNT_TOLERANCE)));
+  return {
+    needsApproval: items.needsApproval || billNeedsApproval,
+    lines: items.lines,
+    lineManualDiscountTotal: items.manualDiscountTotal,
+    manualDiscountTotal: manualTotal,
+    bill: {
+      manualBill: unreadable ? null : billPart,
+      base,
+      freeLimit,
+      manualTotal,
+      needsApproval: billNeedsApproval,
+      unreadable,
+    },
+  };
+};
+
+/**
  * Who never needs approval for a discount: an Owner or Admin, or anyone whose role holds
  * `manual_pos_rate_override` (they can already set any rate). `actor` is a database row
  * (`role_name`, `permissions`), never a token claim. No actor is not exempt.
@@ -605,7 +783,11 @@ const manualDiscountExempt = (actor) => {
   return permissions[MANUAL_DISCOUNT_EXEMPT_PERMISSION] === true;
 };
 
-/** The lines that broke the rule, as stored with the bill's audit row. Money at 2 dp. */
+/**
+ * The lines that broke the rule, as stored with the bill's audit row. Money at 2 dp. An
+ * assessment from `assessBillManualDiscount` also carries the bill part (`bill`), whether or not
+ * it was the bill part that broke the rule; one from `assessManualDiscounts` has no `bill` key.
+ */
 const manualDiscountTrace = (assessment) => ({
   free_percent: MANUAL_DISCOUNT_FREE_PERCENT,
   manual_discount_total: assessment?.manualDiscountTotal ?? null,
@@ -620,6 +802,19 @@ const manualDiscountTrace = (assessment) => ({
     free_limit: line.freeLimit,
     unreadable: line.unreadable === true,
   })),
+  ...(assessment?.bill
+    ? {
+      bill: {
+        manual_bill_discount: assessment.bill.manualBill,
+        line_manual_total: assessment.lineManualDiscountTotal ?? null,
+        manual_total: assessment.bill.manualTotal,
+        base: assessment.bill.base,
+        free_limit: assessment.bill.freeLimit,
+        needs_approval: assessment.bill.needsApproval === true,
+        unreadable: assessment.bill.unreadable === true,
+      },
+    }
+    : {}),
 });
 
 const discountChangedRefusal = (productName) => ({
@@ -732,6 +927,7 @@ const DISCOUNT_REPORT_SQL = `
 module.exports = {
   BILL_DISCOUNT_TOLERANCE,
   DISCOUNT_REPORT_SQL,
+  EXTRA_DISCOUNT_SUFFIX,
   LOT_DISCOUNT_STATUSES,
   LOT_DISCOUNT_TYPES,
   MANUAL_DISCOUNT_EXEMPT_PERMISSION,
@@ -741,7 +937,12 @@ module.exports = {
   SLAB_PAYMENT_MODES,
   SLAB_TYPES,
   activeLotDiscount,
+  assessBillManualDiscount,
   assessManualDiscounts,
+  billDiscountRule,
+  impliedManualBillDiscount,
+  readManualBillDiscount,
+  withExtraDiscountName,
   lotDiscountOfRecord,
   lotDiscountPart,
   manualDiscountExempt,

@@ -845,3 +845,156 @@ export const describeDiscountApprovalError = (error) => {
   if (axiosLike && !error.response) return `The approval could not be checked because the server could not be reached. ${CART_KEPT}`;
   return `The approval could not be completed. ${CART_KEPT}`;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Manual bill discount: the cashier's own money off the whole bill, under the same 5% rule
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The owner's rule (1 Oct 2026): "agar kal ko item pr nhi du aur poore total pr dedu" -- a cashier
+ * may give the discount on the whole bill instead of on an item, in rupees or as a percentage, and
+ * the 5% rule covers both together. `backend/discounts.js` keeps the same rule.
+ *
+ * Amounts, all 2 dp:
+ *   itemsSubtotal = sum(line gross) - sum(line discounts)
+ *   slabAmount    = the automatic bill-total discount (matchBillSlab), unchanged
+ *   room          = itemsSubtotal - slabAmount           -- what the box can still take off
+ *   manualBill    = typed rupees, or typed % of room
+ *   invoice_discount = slabAmount + manualBill           -- the bill discount the bill records
+ */
+export const MANUAL_BILL_DISCOUNT_MODE = Object.freeze({ AMOUNT: "AMOUNT", PERCENT: "PERCENT" });
+/** Appended to a slab's name on a bill that also has a manual bill discount (server snapshot). */
+export const MANUAL_BILL_DISCOUNT_RULE_SUFFIX = " + extra";
+
+/**
+ * What the "Bill discount" box takes off, or why it cannot. A blank box is no discount (₹0, no
+ * error). Anything that is not a number, below 0, over 100%, or more than the bill has left after
+ * its other discounts is an error with `amount: null` -- never quietly ₹0, so POS can refuse to
+ * bill it and say why.
+ */
+export const resolveManualBillDiscount = ({ mode = MANUAL_BILL_DISCOUNT_MODE.AMOUNT, value = "", itemsSubtotal = 0, slabAmount = 0 } = {}) => {
+  const room = Math.max(0, roundMoney((finiteOrNull(itemsSubtotal) ?? 0) - (finiteOrNull(slabAmount) ?? 0)));
+  const percentMode = text(mode).toUpperCase() === MANUAL_BILL_DISCOUNT_MODE.PERCENT;
+  if (text(value) === "") return { amount: 0, percent: null, room, error: null };
+  const typed = finiteOrNull(value);
+  if (typed === null) return { amount: null, percent: null, room, error: "Enter the bill discount as a number." };
+  if (typed < 0) return { amount: null, percent: null, room, error: "The bill discount cannot be less than 0." };
+  if (percentMode && typed > 100) return { amount: null, percent: null, room, error: "A discount cannot be more than 100%." };
+  const amount = percentMode ? roundMoney((room * typed) / 100) : roundMoney(typed);
+  if (amount > room) {
+    return { amount: null, percent: null, room, error: `The bill discount cannot be more than what is left of the bill (${formatRupees(room)}).` };
+  }
+  return { amount, percent: percentMode ? typed : null, room, error: null };
+};
+
+/**
+ * The whole bill against the 5% rule, with the manual bill discount in it -- the `bill` part of
+ * `assessBillManualDiscount` in backend/discounts.js, to the paisa:
+ *
+ *   base        = round2(sum of line bases)          -- null when any line cannot be read
+ *   manualTotal = round2(sum of line manual parts + manualBill)
+ *   freeLimit   = max(0, round2(base x 5 / 100))
+ *   needs approval when manualBill > 0 and manualTotal > round2(freeLimit + 0.01)
+ *
+ * So a cashier can give up to 5% in all, on items or on the bill, however they like. The per-line
+ * rule still applies on its own (`cartDiscountApproval`). With no bill discount (0 or blank) this
+ * asks nothing, so a bill billed without the box is judged exactly as before. A bill discount that
+ * cannot be read (`unreadable`), or a positive one on a bill with a line that cannot be measured,
+ * is not waved through.
+ */
+export const assessBillManualDiscount = ({ lines = [], manualBill = 0 } = {}) => {
+  const read = text(manualBill) === "" ? 0 : finiteOrNull(manualBill);
+  const unreadable = read === null || read < 0;
+  const billPart = unreadable ? 0 : roundMoney(read);
+  const assessed = (Array.isArray(lines) ? lines : []).map(lineManualDiscount);
+  const lineManual = roundMoney(assessed.reduce((sum, line) => sum + line.manualPart, 0));
+  const base = assessed.every((line) => line.base !== null)
+    ? roundMoney(assessed.reduce((sum, line) => sum + line.base, 0))
+    : null;
+  const freeLimit = base === null ? 0 : Math.max(0, roundMoney((base * MANUAL_DISCOUNT_FREE_PERCENT) / 100));
+  const manualTotal = roundMoney(lineManual + billPart);
+  const needsApproval = unreadable
+    || (billPart > 0 && (base === null || manualTotal > roundMoney(freeLimit + MANUAL_DISCOUNT_TOLERANCE)));
+  return {
+    manualBill: unreadable ? null : billPart,
+    lineManual,
+    manualTotal,
+    base,
+    freeLimit,
+    percent: base !== null && base > 0 ? roundMoney((manualTotal / base) * 100) : null,
+    needsApproval,
+    unreadable,
+  };
+};
+
+/**
+ * Everything POS asks before billing: the lines over 5% (`lines`) and, when the bill discount
+ * takes the whole bill over 5%, the bill (`bill`, else null). An exempt user is never asked.
+ */
+export const posDiscountApproval = (cart, { exempt = false, manualBill = 0 } = {}) => {
+  if (exempt === true) return { needed: false, lines: [], bill: null };
+  const { lines } = cartDiscountApproval(cart);
+  const assessment = assessBillManualDiscount({ lines: cart, manualBill });
+  const bill = assessment.needsApproval ? assessment : null;
+  return { needed: lines.length > 0 || bill !== null, lines, bill };
+};
+
+/** "Whole bill 6.2% with the bill discount (₹62 of ₹1,000)" -- for the dialog and the reason. */
+export const describeBillApprovalLine = (bill) => {
+  if (!bill) return "";
+  if (bill.percent === null || bill.percent === undefined) {
+    return bill.manualBill === null ? "Bill discount that cannot be read" : `Bill discount ${formatRupees(bill.manualBill)} off`;
+  }
+  return `Whole bill ${formatPercent(bill.percent)} with the bill discount (${formatRupees(bill.manualTotal)} of ${formatRupees(bill.base)})`;
+};
+
+/** The approval reason with the bill in it (the server takes at most 500 characters). */
+export const describePosDiscountApprovalReason = (lines, bill = null) => {
+  const list = Array.isArray(lines) ? lines : [];
+  if (!bill) return describeDiscountApprovalReason(list);
+  const billPart = describeBillApprovalLine(bill);
+  const reason = list.length
+    ? `${describeDiscountApprovalReason(list)}; ${billPart}`
+    : `Bill discount over ${MANUAL_DISCOUNT_FREE_PERCENT}%: ${billPart}`;
+  return reason.length > REASON_LIMIT ? `${reason.slice(0, REASON_LIMIT - 1)}…` : reason;
+};
+
+/**
+ * The rule name a bill stores for its bill discount -- `billDiscountRule` in backend/discounts.js.
+ * No cashier's part: the slab's own name. A slab part and a cashier's part: the slab's name with
+ * " + extra", so the bill never claims the slab gave all of it. A cashier's part only: none.
+ *
+ * Only for what POS shows and prints straight after billing. The payload still carries the slab's
+ * own snapshot (`slabSnapshot`): the server adds " + extra" itself from `manual_bill_discount`, and
+ * a name sent already marked would come back marked twice.
+ */
+const RULE_NAME_MAX = 140;
+export const billDiscountRuleName = (rule, slabAmount, manualAmount) => {
+  if (!rule) return null;
+  const name = slabDisplayName(rule);
+  if (!((finiteOrNull(manualAmount) ?? 0) > 0)) return name;
+  if (!((finiteOrNull(slabAmount) ?? 0) > MANUAL_DISCOUNT_TOLERANCE)) return null;
+  return `${name.slice(0, RULE_NAME_MAX - MANUAL_BILL_DISCOUNT_RULE_SUFFIX.length)}${MANUAL_BILL_DISCOUNT_RULE_SUFFIX}`;
+};
+
+/** The server's code when slab + bill discount is more than the bill. */
+export const BILL_DISCOUNT_TOO_LARGE_CODE = "BILL_DISCOUNT_TOO_LARGE";
+
+/**
+ * A checkout refusal because the bill discount is more than the bill can take, or null for any
+ * other answer. `maxManualBillDiscount` is the most the box may give (null when not sent).
+ */
+export const readBillDiscountTooLarge = (status, data) => {
+  if (Number(status) !== 400) return null;
+  if (text(data?.code).toUpperCase() !== BILL_DISCOUNT_TOO_LARGE_CODE) return null;
+  const most = finiteOrNull(data?.max_manual_bill_discount);
+  const maxManualBillDiscount = most === null ? null : roundMoney(Math.max(0, most));
+  const sentence = text(data?.message) || "The bill discount is more than the bill after its slab discount.";
+  const ending = /[.!?]$/.test(sentence) ? "" : ".";
+  return {
+    maxManualBillDiscount,
+    message: maxManualBillDiscount === null
+      ? `${sentence}${ending} ${CART_KEPT}`
+      : `${sentence}${ending} The most this bill can take off is ${formatRupees(maxManualBillDiscount)}. ${CART_KEPT}`,
+  };
+};

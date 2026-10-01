@@ -460,7 +460,13 @@ test("a new bill's references are opaque strings, blanks and repeats dropped", (
 
 test("browser checkout checks the discount approval before the bill is written, against its operation id", () => {
   const body = handlerBody("const createSaleHandler");
-  assert.match(body, /discountRules\.assessManualDiscounts\(manualDiscountLinesOf\(invoiceItems\)\)/);
+  // Lines and the cashier's bill part (1 Oct 2026) are measured together, before the check. With no
+  // `manual_bill_discount` the bill part is what the invoice discount gives beyond the slab.
+  assert.match(body, /discountRules\.assessBillManualDiscount\(\{ lines: manualDiscountLinesOf\(invoiceItems\), manualBill: manualDiscountBill \}\)/);
+  assert.match(body, /manualBillDiscount\.present\s*\?\s*manualBillDiscount\.amount\s*:\s*discountRules\.impliedManualBillDiscount\(/);
+  assert.doesNotMatch(body, /discountRules\.assessManualDiscounts\(/, "no browser path skips the bill part");
+  assert.ok(body.indexOf("loadBillSlabs(client)") < body.indexOf("impliedManualBillDiscount("), "the slab is known before the bill part is");
+  assert.ok(body.indexOf("assessBillManualDiscount(") < body.indexOf("authorizeManualDiscount("));
   assert.match(body, /await authorizeManualDiscount\(client, \{[\s\S]*?actorId: parsedCreatedBy,[\s\S]*?approvalId: req\.body\.discount_approval_id,[\s\S]*?saleRefs: saleChangeApproval\.newSaleRefsOf\(v3OperationKey\(req\)\),/);
   assert.match(body, /if \(!manualDiscountDecision\.ok\) return rejectSaleChange\(client, res, manualDiscountDecision\);/);
   assert.ok(body.indexOf("authorizeManualDiscount(") < body.indexOf("INSERT INTO sales"), "refused before the bill is written");
@@ -477,6 +483,7 @@ test("desktop sync never rejects a bill for the discount rule, and records the d
   const after = body.slice(start);
   assert.doesNotMatch(after.slice(0, after.indexOf("INSERT INTO sales")), /rejectOperation|conflict\(/, "nothing between the check and the insert refuses the bill");
   assert.match(body, /approvalId: cleanText\(payload\.discount_approval_id\)/);
+  assert.ok(body.indexOf("assessBillManualDiscount(") > 0 && body.indexOf("assessBillManualDiscount(") < start, "the bill part is measured before the check");
   assert.match(body, /actorId: context\.user\.id/);
   assert.match(body, /deviceId: context\.deviceId/);
   assert.match(body, /newSaleRefsOf\(\s*operation\.operation_id,\s*operation\.idempotency_key,\s*payload\.operation_id,\s*invoiceGlobalId,\s*offlineInvoiceRef\s*\)/);

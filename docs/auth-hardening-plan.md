@@ -2034,6 +2034,53 @@ trace uses `sale_audit_trail`'s existing columns.
 Tested in `discounts.test.js` (the rule, browser checkout, sync and the approval route, driven) and
 `saleChangeApproval.test.js` (bindings and wiring).
 
+#### Bill discount under the same 5% (2026-10-01)
+
+The owner added a manual discount on the whole bill at the POS ("Bill discount", ₹ or %), held to
+the same 5%. Same approval, same exemptions, same audit rows; no schema change.
+
+- **Payload.** A new optional field `manual_bill_discount` (₹, 2 dp) on the browser sale and the
+  desktop's queued sale. `invoice_discount` / `bill_discount_total` stay the *whole* bill discount
+  (`round2(slab + manual)`), stored in `sales.invoice_discount_amount` as before.
+  `discounts.readManualBillDiscount` reads it: absent (undefined, null, blank) is "an older POS",
+  a number >= 0 is the amount, anything else is unreadable -- never read as 0.
+- **The rule** (`discounts.assessBillManualDiscount({ lines, manualBill })`, mirrored in
+  `frontend/src/local/discounts.js`). Every line is still held to its own 5%. When `manualBill > 0`,
+  `manualTotal = round2(sum(line manualPart) + manualBill)` is also held to
+  `round2(round2(base x 5 / 100) + 0.01)` with `base = round2(sum(line base))`, so the cashier may
+  give up to 5% in all, on the lines or the bill. With no bill part the bill-level test is not run,
+  so a bill with no bill discount answers exactly as before (per-line headroom of a paisa a line
+  could otherwise add up past the bill's paisa). An unreadable `manualBill`, or a positive one on a
+  bill with an unreadable line, needs approval. The trace (`manualDiscountTrace`) gains a `bill`
+  key -- `manual_bill_discount, line_manual_total, manual_total, base, free_limit, needs_approval,
+  unreadable` -- on every browser bill, and on a synced bill that carried the field.
+- **Browser checkout.** An unreadable `manual_bill_discount` is 400 "Enter a valid bill discount"
+  before anything opens. Payment mode and the server's slabs are now read *before* the 5% check
+  (so a bad payment mode is 400 ahead of a 403), and the check always includes the bill part:
+  `manual_bill_discount` when sent; when **not** sent, `discounts.impliedManualBillDiscount` --
+  `max(0, round2(bounded invoice_discount - server slab amount for this bill))` -- so a request
+  without the field cannot carry an unchecked bill discount. Browser clients are served from the
+  same build as the server, so none predates the field; the desktop goes through sync (never
+  refused) and is unaffected. Then `resolveInvoiceDiscount` with `manualBill`: expected =
+  `round2(server's slab + manual)`; expected past the subtotal is 400 `BILL_DISCOUNT_TOO_LARGE`
+  with `max_manual_bill_discount`; a client `invoice_discount` more than a paisa from expected is
+  the existing 409 `DISCOUNT_RULES_CHANGED` with `expected_invoice_discount` (and
+  `expected_slab_discount`, the slab's part alone). A client cannot dodge the 5% by under-reporting
+  `manual_bill_discount`: the invoice discount must then equal slab + that figure.
+- **Desktop sync.** Still never refused. The bill discount is recorded as billed; the manual part
+  is the device's figure capped at the discount billed, the slab part is the rest. The 5% check and
+  its `DISCOUNT_APPROVED` / `DISCOUNT_UNAPPROVED` trace include the bill part. An unreadable figure is
+  traced as `unreadable` (needs approval), the bill kept.
+- **Rule snapshot.** When the cashier's part is > 0, `sales.discount_rule_name` no longer claims
+  the whole amount was the slab: slab and manual stores the slab's name + `" + extra"` (cut to fit
+  VARCHAR(140); a nameless slab is named by its range, a nameless device snapshot "Bill slab"); manual
+  only stores no rule at all. `discounts.billDiscountRule` decides; the slab row is not renamed.
+- **Requests without `manual_bill_discount`** keep the old amount and rule decision on every route
+  (same `{amount, rule}`, same 409 body, no " + extra"). On browser checkout the part beyond the slab
+  is now held to the 5% (above); a desktop sync without the field takes the old 5% check and trace
+  unchanged (no `bill` key). Sale edits do not send the field and keep their bill discount as
+  billed.
+
 Still open:
 
 - **The approval covers the bill, not an amount.** Once approved, the cashier could raise the
@@ -2043,5 +2090,10 @@ Still open:
   column, and this change adds none.
 - **Offline counters.** An approval needs the cloud. The POS refuses a >5% discount before billing
   when it cannot reach it; a bill that still arrives without one is kept and traced, not refused.
-- A manual *bill-level* discount is out of scope: the POS has no field for it, and changing one on
-  an existing bill already needs sale-edit approval.
+- ~~A manual *bill-level* discount is out of scope.~~ Added 2026-10-01, above. Changing the bill
+  discount on an *existing* bill still goes through sale-edit approval, not this rule.
+- ~~A browser request without `manual_bill_discount` carries an unchecked bill discount.~~ Closed
+  2026-10-01 (lead's decision): the part of `invoice_discount` beyond the server's slab is measured
+  as the cashier's (`impliedManualBillDiscount`). Still unchecked by design: a *desktop* bill synced
+  without the field (an older desktop build) -- its bill discount is recorded as billed with the
+  per-line check only, since the device could not have had a bill-discount box.

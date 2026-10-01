@@ -3163,6 +3163,56 @@ tbody tr:has(> .empty-cell):hover {
   white-space: nowrap;
 }
 
+/* The cashier's own "Bill discount" box, just above the totals: a label with a small ₹ / % switch,
+   one input, and the notes under it (the amount a percentage gives, a refusal, the 5% hint). */
+.pos-bill-discount {
+  gap: 7px;
+}
+
+.pos-bill-discount-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.pos-bill-discount-label {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.pos-bill-discount-mode {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.pos-bill-discount-mode .account-tab {
+  min-width: 38px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.pos-bill-discount input[aria-invalid="true"] {
+  border-color: var(--danger-ink);
+}
+
+.pos-bill-discount #pos-bill-discount-note {
+  display: grid;
+  gap: 2px;
+}
+
+.pos-bill-discount .form-note {
+  margin: 0;
+  font-size: 11px;
+}
+
+/* A figure that cannot be worked out is shown as a dash in the danger colour, never as ₹0. */
+.totals .total-line-error,
+.totals .total-line-error strong {
+  color: var(--danger-ink);
+}
+
 .mixed-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

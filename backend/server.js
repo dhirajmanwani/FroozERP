@@ -6647,6 +6647,9 @@ const buildSalePayload = async (
     // so a caller that forgets gets the server's slabs, never a client's number.
     invoiceDiscountMode = "SLAB",
     discountRuleSnapshot = null,
+    // The payload's `manual_bill_discount`, as sent (undefined when the device sent none). Splits
+    // the bill discount into the cashier's part and the slab's -- see `resolveInvoiceDiscount`.
+    manualBillDiscount = undefined,
     // The day the bill belongs to, for checking a SPECIAL_RATE line against the lot's discount.
     billDate = null,
     // For an edit: the lot discounts the sale already carried (its `sale_items` rows). A special
@@ -6871,6 +6874,7 @@ const buildSalePayload = async (
     rules: slabs.rules,
     enabled: slabs.enabled,
     snapshot: discountRuleSnapshot,
+    manualBill: manualBillDiscount,
   });
   if (invoiceDiscountDecision.error) return { error: invoiceDiscountDecision.error };
   const invoiceDiscountAmount = invoiceDiscountDecision.amount;
@@ -6942,6 +6946,10 @@ const buildSalePayload = async (
     totalCost,
     profit,
     discountRule,
+    // Set only when the payload carried `manual_bill_discount`: the cashier's part of the bill
+    // discount (null when it could not be read) and the slab's.
+    manualBillDiscount: invoiceDiscountDecision.manualBill,
+    slabDiscountAmount: invoiceDiscountDecision.slabAmount,
     createdBy,
     branchId,
   };
@@ -11005,6 +11013,9 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     // had changed while the counter was offline -- the same trap the charges below avoid.
     invoiceDiscountMode: "AS_BILLED",
     discountRuleSnapshot: discountRules.readDiscountRuleSnapshot(payload),
+    // The cashier's own part of that discount, when the counter has the bill-discount box. Never a
+    // reason to refuse the bill; it decides the rule name stored and the 5% trace below.
+    manualBillDiscount: payload.manual_bill_discount,
     billDate: toBusinessDateKey(payload.bill_date || payload.bill_datetime || new Date()),
     payments: payload.payments || [],
     allowRateOverride: true,
@@ -11038,7 +11049,7 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   const lotDiscountsOfRecord = claimedLotIds.length > 0
     ? await loadLotDiscountsForLots(client, claimedLotIds, context.branchId)
     : [];
-  const manualDiscountAssessment = discountRules.assessManualDiscounts(manualDiscountLinesOf(
+  const syncDiscountLines = manualDiscountLinesOf(
     salePayload.invoiceItems.map((item) => ({
       ...item,
       lotDiscountOfRecord: discountRules.lotDiscountOfRecord({
@@ -11048,7 +11059,17 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
         productId: item.productId,
       }),
     }))
-  ));
+  );
+  // A counter with the bill-discount box sends `manual_bill_discount`: the cashier's part of the
+  // bill discount is then held to the bill-level 5% too, capped at the discount billed. One that
+  // cannot be read is measured as unreadable (needs approval), never as none.
+  const syncManualBill = discountRules.readManualBillDiscount(payload.manual_bill_discount);
+  const manualDiscountAssessment = syncManualBill.present
+    ? discountRules.assessBillManualDiscount({
+      lines: syncDiscountLines,
+      manualBill: syncManualBill.unreadable ? payload.manual_bill_discount : salePayload.manualBillDiscount,
+    })
+    : discountRules.assessManualDiscounts(syncDiscountLines);
   const manualDiscountDecision = await authorizeManualDiscount(client, {
     assessment: manualDiscountAssessment,
     actorId: context.user.id,
@@ -22925,6 +22946,9 @@ const createSaleHandler = async (req, res) => {
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = req.auth.userId;
     const parsedInvoiceDiscount = parseNonNegativeNumber(invoice_discount);
+    // A cashier's own bill discount (owner's rule, 1 Oct 2026). An older POS sends none and bills
+    // exactly as before; see `discounts.resolveInvoiceDiscount` and `assessBillManualDiscount`.
+    const manualBillDiscount = discountRules.readManualBillDiscount(req.body.manual_bill_discount);
     const rawBillDateTime = cleanText(bill_datetime || "");
     const rawBillDate = cleanText(bill_date || rawBillDateTime || "");
     const transactionDate = toBusinessDateKey(rawBillDate);
@@ -22994,6 +23018,9 @@ const createSaleHandler = async (req, res) => {
       )
     ) {
       return res.status(400).json({ message: "Add valid products and quantities before checkout" });
+    }
+    if (manualBillDiscount.unreadable) {
+      return res.status(400).json({ message: "Enter a valid bill discount" });
     }
     const itemKeys = parsedItems.map((item) => `${item.productId}-${item.inventoryBatchId || "FIFO"}`);
     if (new Set(itemKeys).size !== itemKeys.length) {
@@ -23230,21 +23257,6 @@ const createSaleHandler = async (req, res) => {
     totalCost = roundCurrency(totalCost);
     const subtotalAfterItemDiscounts = roundCurrency(grossAmount - itemDiscountAmount);
 
-    // The owner's rule: a cashier's own discount above 5% of a line needs an Owner or Admin's
-    // password first. The approval is bound to this bill's operation id (the idempotency key the
-    // POS sends with every bill), so it cannot be carried to another bill. Refused here, before
-    // anything is committed; the cart stays on the counter.
-    const manualDiscountAssessment = discountRules.assessManualDiscounts(manualDiscountLinesOf(invoiceItems));
-    const manualDiscountDecision = await authorizeManualDiscount(client, {
-      assessment: manualDiscountAssessment,
-      actorId: parsedCreatedBy,
-      approvalId: req.body.discount_approval_id,
-      saleRefs: saleChangeApproval.newSaleRefsOf(v3OperationKey(req)),
-      companyId: context?.company_id ?? req.auth.companyId,
-      deviceId: context?.device_id ?? req.auth.deviceId,
-    });
-    if (!manualDiscountDecision.ok) return rejectSaleChange(client, res, manualDiscountDecision);
-
     const requestedPaymentsInput = Array.isArray(payments) && payments.length > 0 ? payments : null;
     const allowedPaymentModes = new Set(["CASH", "UPI", "CARD", "BANK_TRANSFER", "CREDIT"]);
     const paymentModes = requestedPaymentsInput
@@ -23262,8 +23274,40 @@ const createSaleHandler = async (req, res) => {
     // The bill discount is the server's current slab for this bill. When the POS worked out a
     // different one (it had older slabs), the bill is refused with the amount the server expects,
     // so POS can reload its slabs and show the cashier the new total -- rather than the bare
-    // "Payment amounts must match the invoice total" a stale slab used to produce.
+    // "Payment amounts must match the invoice total" a stale slab used to produce. Loaded before
+    // the 5% check, which needs the slab to tell the cashier's part of the bill discount from it.
     const slabs = await loadBillSlabs(client);
+
+    // The owner's rule: a cashier's own discount above 5% of a line needs an Owner or Admin's
+    // password first. The approval is bound to this bill's operation id (the idempotency key the
+    // POS sends with every bill), so it cannot be carried to another bill. Refused here, before
+    // anything is committed; the cart stays on the counter. The cashier's whole manual discount
+    // (lines + bill) is held to 5% of the bill as well. The bill part is `manual_bill_discount`
+    // when sent (the bill is then held to slab + it below, or DISCOUNT_RULES_CHANGED). When it is
+    // not sent, the bill part is whatever the invoice discount gives beyond the server's slab for
+    // this bill, so a hand-made request cannot carry an unchecked bill discount. Browser POS
+    // clients are served from the same build as this server, so none predates the field.
+    const manualDiscountBill = manualBillDiscount.present
+      ? manualBillDiscount.amount
+      : discountRules.impliedManualBillDiscount({
+        requested: parsedInvoiceDiscount,
+        gross: grossAmount,
+        subtotalAfterItems: subtotalAfterItemDiscounts,
+        paymentMode,
+        rules: slabs.rules,
+        enabled: slabs.enabled,
+      });
+    const manualDiscountAssessment = discountRules.assessBillManualDiscount({ lines: manualDiscountLinesOf(invoiceItems), manualBill: manualDiscountBill });
+    const manualDiscountDecision = await authorizeManualDiscount(client, {
+      assessment: manualDiscountAssessment,
+      actorId: parsedCreatedBy,
+      approvalId: req.body.discount_approval_id,
+      saleRefs: saleChangeApproval.newSaleRefsOf(v3OperationKey(req)),
+      companyId: context?.company_id ?? req.auth.companyId,
+      deviceId: context?.device_id ?? req.auth.deviceId,
+    });
+    if (!manualDiscountDecision.ok) return rejectSaleChange(client, res, manualDiscountDecision);
+
     const invoiceDiscountDecision = discountRules.resolveInvoiceDiscount({
       mode: "SLAB",
       requested: parsedInvoiceDiscount,
@@ -23273,6 +23317,10 @@ const createSaleHandler = async (req, res) => {
       rules: slabs.rules,
       enabled: slabs.enabled,
       snapshot: discountRules.readDiscountRuleSnapshot(req.body),
+      // Present: the bill discount must be the server's slab plus this, and the rule stored says
+      // so (" + extra", or none when the slab gave nothing). Absent: the amount and rule as before
+      // (the 5% check above already measured any part beyond the slab).
+      manualBill: manualBillDiscount.present ? manualBillDiscount.amount : undefined,
     });
     if (invoiceDiscountDecision.error) {
       await client.query("ROLLBACK");

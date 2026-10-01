@@ -1055,7 +1055,7 @@ const syncContext = () => ({
   assignmentGeneration: null,
 });
 
-const syncBill = async ({ items, payments, approvalId, lotDiscounts = [], store }) => {
+const syncBill = async ({ items, payments, approvalId, lotDiscounts = [], store, extra = {} }) => {
   const client = saleClient({ lotDiscounts });
   const wrapped = {
     ...client,
@@ -1105,6 +1105,7 @@ const syncBill = async ({ items, payments, approvalId, lotDiscounts = [], store 
       items,
       payments,
       ...(approvalId ? { discount_approval_id: approvalId } : {}),
+      ...extra,
     },
   }, syncContext());
   return { ack, statements: client.statements };
@@ -1238,6 +1239,350 @@ test("approval route: someone the 5% rule already exempts is told they need no a
   const inactive = await askApproval({ action: "discount", sale_ref: "bill-op-1", approver_username: "owner", approver_password: APPROVER_PASSWORD }, { role: null });
   assert.equal(inactive.response.status, 403);
   assert.equal(inactive.response.body.code, "REQUESTER_NOT_ALLOWED");
+});
+
+// ---------------------------------------------------------------------------------------------
+// A cashier's own bill discount, under the same 5% (owner's rule, 1 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+const { assessBillManualDiscount, readManualBillDiscount, withExtraDiscountName, EXTRA_DISCOUNT_SUFFIX } = rules;
+
+// One ₹1,000 line (10 x ₹100); 5% of the bill is ₹50.
+const thousand = (discountAmount = 0) => [{ quantity: 10, rate: 100, discountAmount }];
+
+test("bill rule: exactly 5% of the bill in total is free, a paisa of rounding too, anything more needs approval", () => {
+  assert.equal(assessBillManualDiscount({ lines: thousand(), manualBill: 50 }).needsApproval, false, "5.00% on the bill");
+  assert.equal(assessBillManualDiscount({ lines: thousand(), manualBill: 50.01 }).needsApproval, false, "a paisa is rounding");
+  assert.equal(assessBillManualDiscount({ lines: thousand(), manualBill: 50.02 }).needsApproval, true, "just over");
+  assert.equal(assessBillManualDiscount({ lines: thousand(), manualBill: 50.1 }).needsApproval, true);
+  assert.deepEqual(assessBillManualDiscount({ lines: thousand(), manualBill: 50.1 }).bill, {
+    manualBill: 50.1, base: 1000, freeLimit: 50, manualTotal: 50.1, needsApproval: true, unreadable: false,
+  });
+});
+
+test("bill rule: the 5% is shared between the lines and the bill, spread however the cashier likes", () => {
+  const lines = [{ quantity: 6, rate: 100, discountAmount: 30 }, { quantity: 4, rate: 100, discountAmount: 0 }];
+  // ₹30 on the ₹600 line (5%) + ₹20 on the bill = ₹50 = 5% of ₹1,000.
+  const spread = assessBillManualDiscount({ lines, manualBill: 20 });
+  assert.equal(spread.needsApproval, false);
+  assert.equal(spread.manualDiscountTotal, 50);
+  assert.equal(spread.lineManualDiscountTotal, 30);
+  assert.equal(assessBillManualDiscount({ lines, manualBill: 20.02 }).needsApproval, true, "₹50.02 in all");
+  assert.equal(assessBillManualDiscount({ lines, manualBill: 20.02 }).bill.needsApproval, true);
+  // The per-line rule still holds: ₹31 on a ₹600 line is over 5% of that line, whatever the bill.
+  const lineOver = assessBillManualDiscount({ lines: [{ quantity: 6, rate: 100, discountAmount: 31 }, { quantity: 4, rate: 100, discountAmount: 0 }], manualBill: 1 });
+  assert.equal(lineOver.needsApproval, true);
+  assert.equal(lineOver.bill.needsApproval, false, "₹32 is within 5% of the bill; the line alone is over");
+});
+
+test("bill rule: the lot's own discount is set aside from the base, as on a line", () => {
+  const tenPercentLot = { discount_type: "PERCENTAGE", discount_value: "10.00" };
+  // ₹1,000 line, lot gives ₹100: base ₹900, 5% = ₹45.
+  const lines = [{ quantity: 10, rate: 100, discountAmount: 100, lotDiscount: tenPercentLot }];
+  assert.equal(assessBillManualDiscount({ lines, manualBill: 45 }).needsApproval, false);
+  assert.equal(assessBillManualDiscount({ lines, manualBill: 45.02 }).needsApproval, true);
+  assert.equal(assessBillManualDiscount({ lines, manualBill: 45 }).bill.base, 900);
+});
+
+test("bill rule: no bill discount answers exactly as the per-line rule did", () => {
+  // Three lines each a paisa over their own 5% pass the line rule; summed they are three paise
+  // over the bill's 5%. With no bill discount of the cashier's, that bill must not change answer.
+  const lines = [1, 2, 3].map(() => ({ quantity: 1, rate: 100, discountAmount: 5.01 }));
+  for (const manualBill of [0, "", null, undefined]) {
+    const bill = assessBillManualDiscount({ lines, manualBill });
+    assert.equal(bill.needsApproval, assessManualDiscounts(lines).needsApproval, JSON.stringify(manualBill));
+    assert.equal(bill.needsApproval, false);
+  }
+  assert.equal(assessBillManualDiscount({ lines, manualBill: 0.01 }).needsApproval, true, "once the bill has a part, the bill total counts");
+});
+
+test("bill rule: an unreadable bill discount, or one on a bill with an unreadable line, needs approval", () => {
+  for (const manualBill of ["abc", -1, NaN]) {
+    const bill = assessBillManualDiscount({ lines: thousand(), manualBill });
+    assert.equal(bill.needsApproval, true, String(manualBill));
+    assert.equal(bill.bill.unreadable, true);
+    assert.equal(bill.bill.manualBill, null, "unreadable is not ₹0");
+  }
+  const unknownLine = [{ quantity: "abc", rate: 100, discountAmount: 0 }];
+  assert.equal(assessBillManualDiscount({ lines: unknownLine, manualBill: 0 }).needsApproval, false);
+  assert.equal(assessBillManualDiscount({ lines: unknownLine, manualBill: 1 }).needsApproval, true, "5% of an unknown base is not known");
+});
+
+test("manual_bill_discount: absent, readable at 2 dp, or unreadable -- never read as 0", () => {
+  for (const value of [undefined, null, "", "  "]) assert.deepEqual(readManualBillDiscount(value), { present: false, amount: 0, unreadable: false });
+  assert.deepEqual(readManualBillDiscount(0), { present: true, amount: 0, unreadable: false });
+  assert.deepEqual(readManualBillDiscount("12.345"), { present: true, amount: 12.35, unreadable: false });
+  for (const value of ["abc", -0.5, true, Infinity]) assert.equal(readManualBillDiscount(value).unreadable, true, String(value));
+});
+
+test("browser checkout, manual part: expected = server's slab + manual; differ by over a paisa is 409", () => {
+  const base = { mode: "SLAB", gross: 400, subtotalAfterItems: 400, paymentMode: "CASH", rules: [TEN_PERCENT] };
+  const ok = resolveInvoiceDiscount({ ...base, requested: 60, manualBill: 20 });
+  assert.equal(ok.amount, 60);
+  assert.equal(ok.slabAmount, 40);
+  assert.equal(ok.manualBill, 20);
+  assert.equal(ok.rule.id, 3);
+  assert.equal(ok.rule.rule_name, "Big bills + extra", "the stored name does not claim ₹60 was the slab");
+  assert.equal(TEN_PERCENT.rule_name, "Big bills", "the slab row itself is not renamed");
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 60.01, manualBill: 20 }).amount, 60, "a paisa is tolerance");
+
+  const stale = resolveInvoiceDiscount({ ...base, requested: 40, manualBill: 20 });
+  assert.deepEqual(stale.error, {
+    status: 409,
+    code: "DISCOUNT_RULES_CHANGED",
+    expected_invoice_discount: 60,
+    expected_slab_discount: 40,
+    message: "Bill discount rules changed. POS has reloaded them - check the total and try again.",
+  });
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 60.02, manualBill: 20 }).error.code, "DISCOUNT_RULES_CHANGED");
+
+  // Manual only: no slab matches; the amount stands and no rule name is stored.
+  const manualOnly = resolveInvoiceDiscount({ ...base, rules: [], requested: 15, manualBill: 15 });
+  assert.deepEqual(manualOnly, { amount: 15, rule: null, slabAmount: 0, manualBill: 15 });
+  // A slab the POS claims that no longer matches: the server expects the manual part alone.
+  const claim = readDiscountRuleSnapshot({ discount_rule_id: 3, discount_rule_name: "Big bills" });
+  assert.equal(resolveInvoiceDiscount({ ...base, rules: [], requested: 55, manualBill: 15, snapshot: claim }).error.expected_invoice_discount, 15);
+  // A manual part of 0 is the slab exactly as before, with its own name.
+  assert.deepEqual(resolveInvoiceDiscount({ ...base, requested: 40, manualBill: 0 }), { amount: 40, rule: TEN_PERCENT, slabAmount: 40, manualBill: 0 });
+});
+
+test("browser checkout, manual part: bounded -- never negative, unreadable, or past the subtotal", () => {
+  const base = { mode: "SLAB", gross: 400, subtotalAfterItems: 400, paymentMode: "CASH", rules: [TEN_PERCENT] };
+  assert.deepEqual(resolveInvoiceDiscount({ ...base, requested: 40, manualBill: "abc" }).error, { status: 400, message: "Enter a valid bill discount" });
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 40, manualBill: -5 }).error.status, 400);
+  // ₹40 slab + ₹370 manual is ₹410 on a ₹400 bill: the total is refused before anything else.
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 410, manualBill: 370 }).error.status, 400);
+  // ₹360 manual + ₹40 slab = the whole subtotal is allowed (the cashier's 5% rule is separate).
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 400, manualBill: 360 }).amount, 400);
+  // ₹40 slab + ₹380 manual = ₹420 on a ₹400 bill, though the client sent ₹400: said as too large,
+  // with the most the cashier may give -- not as "rules changed" with an amount above the bill.
+  assert.deepEqual(resolveInvoiceDiscount({ ...base, requested: 400, manualBill: 380 }).error, {
+    status: 400,
+    code: "BILL_DISCOUNT_TOO_LARGE",
+    max_manual_bill_discount: 360,
+    message: "Bill discount cannot be more than the bill after its slab discount",
+  });
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 400, manualBill: 360.01 }).amount, 400, "a paisa over is rounding, capped at the subtotal");
+});
+
+test("old clients: no manual_bill_discount resolves exactly as before, shape and all", () => {
+  for (const manualBill of [undefined, null, ""]) {
+    assert.deepEqual(resolveInvoiceDiscount({ mode: "SLAB", requested: 40, gross: 400, subtotalAfterItems: 400, paymentMode: "CASH", rules: [TEN_PERCENT], manualBill }), { amount: 40, rule: TEN_PERCENT });
+    assert.deepEqual(resolveInvoiceDiscount({ mode: "SLAB", requested: 15, gross: 400, subtotalAfterItems: 400, paymentMode: "CASH", rules: [], manualBill }), { amount: 15, rule: null });
+    const snapshot = readDiscountRuleSnapshot({ discount_rule_name: "Old slab" });
+    assert.deepEqual(resolveInvoiceDiscount({ mode: "AS_BILLED", requested: 25, subtotalAfterItems: 400, snapshot, manualBill }), { amount: 25, rule: snapshot });
+  }
+});
+
+test("as billed, manual part: never refused; the rule says ' + extra', or nothing when manual only", () => {
+  const snapshot = readDiscountRuleSnapshot({ discount_rule_id: "7", discount_rule_name: "Old slab", discount_rule_type: "FLAT_AMOUNT", discount_rule_value: "25", discount_rule_payment_mode: "ALL" });
+  const base = { mode: "AS_BILLED", gross: 400, subtotalAfterItems: 400, paymentMode: "CASH", rules: [TEN_PERCENT], snapshot };
+  const both = resolveInvoiceDiscount({ ...base, requested: 45, manualBill: 20 });
+  assert.equal(both.amount, 45);
+  assert.deepEqual(both.rule, { id: "7", rule_name: "Old slab + extra", discount_type: "FLAT_AMOUNT", discount_value: 25, payment_mode: "ALL" });
+  assert.equal(both.slabAmount, 25);
+  assert.equal(both.manualBill, 20);
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 20, manualBill: 20 }).rule, null, "manual only: no slab name");
+  const over = resolveInvoiceDiscount({ ...base, requested: 20, manualBill: 999 });
+  assert.equal(over.error, undefined, "a desktop's manual figure above its own bill discount is not a refusal");
+  assert.equal(over.manualBill, 20, "the cashier gave at most the discount billed");
+  const unreadable = resolveInvoiceDiscount({ ...base, requested: 45, manualBill: "abc" });
+  assert.equal(unreadable.error, undefined);
+  assert.equal(unreadable.manualBill, null);
+  assert.equal(unreadable.rule, snapshot, "kept as the device sent it");
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 0, manualBill: 0 }).rule, null);
+  assert.equal(resolveInvoiceDiscount({ ...base, requested: 25, manualBill: 0 }).rule, snapshot, "no manual part: the snapshot as sent");
+});
+
+test("the ' + extra' name fits VARCHAR(140), and a nameless slab is named", () => {
+  assert.equal(EXTRA_DISCOUNT_SUFFIX, " + extra");
+  const long = withExtraDiscountName({ id: "9", rule_name: "x".repeat(140) });
+  assert.equal(long.rule_name.length, 140);
+  assert.ok(long.rule_name.endsWith(" + extra"));
+  assert.equal(withExtraDiscountName(slab({ rule_name: "" })).rule_name, "Bills ₹1,000 and above + extra");
+  assert.equal(withExtraDiscountName({ id: "9", rule_name: null }).rule_name, "Bill slab + extra");
+});
+
+// --- Browser checkout with a bill discount ---------------------------------------------------
+
+const billOf = (manual, { line = 0, slabPart = 0 } = {}) => ({
+  items: [plainLine(line)],
+  manual_bill_discount: manual,
+  invoice_discount: Math.round((slabPart + manual) * 100) / 100,
+  payments: paid(Math.round((1000 - line - slabPart - manual) * 100) / 100),
+});
+
+test("checkout: a cashier's 5.00% bill discount bills without asking anyone; no slab name is stored", async () => {
+  const { response, statements } = await checkout(billOf(50), {}, discountStore());
+  assert.equal(response.status, 201, response.text);
+  assert.equal(find(statements, ACTOR_SQL).length, 0, "within 5%, nobody is looked up");
+  const sale = columnsOf(find(statements, /^INSERT INTO sales/)[0]);
+  assert.equal(Number(sale.invoice_discount_amount), 50);
+  assert.equal(sale.discount_rule_name, null);
+  assert.equal(sale.discount_rule_id, null);
+});
+
+test("checkout: a bill discount just over 5% is 403 DISCOUNT_APPROVAL_REQUIRED, nothing kept", async () => {
+  const { response, statements } = await checkout(billOf(50.02), {}, discountStore());
+  assert.equal(response.status, 403);
+  assert.equal(response.body.code, "DISCOUNT_APPROVAL_REQUIRED");
+  assert.equal(response.body.detail, "APPROVAL_MISSING");
+  assert.equal(find(statements, /^INSERT INTO sales/).length, 0);
+});
+
+test("checkout: 5% spread across a line and the bill is free; a paisa past it on the bill is not", async () => {
+  const ok = await checkout(billOf(20, { line: 30 }), {}, discountStore());
+  assert.equal(ok.response.status, 201, ok.response.text);
+  const over = await checkout(billOf(20.02, { line: 30 }), {}, discountStore());
+  assert.equal(over.response.status, 403);
+  assert.equal(over.response.body.code, "DISCOUNT_APPROVAL_REQUIRED");
+});
+
+test("checkout: slab + manual must be the server's slab plus the manual part, or 409 with the amount expected", async () => {
+  // 10 kg x ₹100 = ₹1,000; TEN_PERCENT gives ₹100; ₹40 on top is within 5%.
+  const slabs = { slabs: [TEN_PERCENT], slabsOn: true };
+  const ok = await checkout({ ...billOf(40, { slabPart: 100 }), discount_rule_id: 3 }, slabs, discountStore());
+  assert.equal(ok.response.status, 201, ok.response.text);
+  const sale = columnsOf(find(ok.statements, /^INSERT INTO sales/)[0]);
+  assert.equal(Number(sale.invoice_discount_amount), 140);
+  assert.equal(sale.discount_rule_id, 3);
+  assert.equal(sale.discount_rule_name, "Big bills + extra");
+
+  const stale = await checkout({ ...billOf(40, { slabPart: 50 }), discount_rule_id: 3 }, slabs, discountStore());
+  assert.equal(stale.response.status, 409);
+  assert.deepEqual(stale.response.body, {
+    code: "DISCOUNT_RULES_CHANGED",
+    expected_invoice_discount: 140,
+    expected_slab_discount: 100,
+    message: "Bill discount rules changed. POS has reloaded them - check the total and try again.",
+  });
+  assert.equal(find(stale.statements, /^INSERT INTO sales/).length, 0);
+});
+
+test("checkout: an unreadable bill discount is 400 before anything is opened", async () => {
+  const { response, statements } = await checkout({ ...billOf(0), manual_bill_discount: "ten" }, {}, discountStore());
+  assert.equal(response.status, 400);
+  assert.equal(response.body.message, "Enter a valid bill discount");
+  assert.equal(find(statements, /^BEGIN$/).length, 0);
+});
+
+test("checkout: Owner, Admin and a holder of manual_pos_rate_override give any bill discount without approval", async () => {
+  for (const actor of [
+    { role: "Owner" },
+    { role: "Admin" },
+    { role: "Cashier", permissions: { manual_pos_rate_override: true } },
+  ]) {
+    const { response, statements } = await checkout(billOf(200), {}, discountStore(actor));
+    assert.equal(response.status, 201, `${actor.role}: ${response.text}`);
+    assert.equal(find(statements, /sale_change_approvals|sale_audit_trail/).length, 0, actor.role);
+  }
+});
+
+test("checkout: an approval covers a bill discount over 5%, and the trace carries the bill part", async () => {
+  const approval = discountApproval();
+  const { response, statements } = await checkout({ idempotency_key: "bill-op-1", discount_approval_id: approval.id, ...billOf(80) }, {}, discountStore({ approval }));
+  assert.equal(response.status, 201, response.text);
+  const [audit] = find(statements, /^INSERT INTO sale_audit_trail/);
+  assert.match(audit.sql, /'DISCOUNT_APPROVED'/);
+  const trace = JSON.parse(audit.values[1]);
+  assert.deepEqual(trace.lines, [], "no line was over 5% on its own");
+  assert.equal(trace.manual_discount_total, 80);
+  assert.deepEqual(trace.bill, {
+    manual_bill_discount: 80, line_manual_total: 0, manual_total: 80, base: 1000, free_limit: 50, needs_approval: true, unreadable: false,
+  });
+});
+
+test("bill part without manual_bill_discount: what the invoice discount gives beyond the server's slab", () => {
+  const { impliedManualBillDiscount } = rules;
+  const base = { gross: 1000, subtotalAfterItems: 1000, paymentMode: "CASH" };
+  assert.equal(impliedManualBillDiscount({ ...base, requested: 100, rules: [] }), 100, "no slab: all of it is the cashier's");
+  assert.equal(impliedManualBillDiscount({ ...base, requested: 0, rules: [] }), 0);
+  assert.equal(impliedManualBillDiscount({ ...base, requested: 100, rules: [TEN_PERCENT] }), 0, "exactly the slab");
+  assert.equal(impliedManualBillDiscount({ ...base, requested: 160.004, rules: [TEN_PERCENT] }), 60);
+  assert.equal(impliedManualBillDiscount({ ...base, requested: 40, rules: [TEN_PERCENT] }), 0, "under the slab is not negative");
+  assert.equal(impliedManualBillDiscount({ ...base, requested: 100, rules: [TEN_PERCENT], enabled: false }), 100, "slabs off: no slab part");
+  assert.equal(impliedManualBillDiscount({ ...base, requested: 1001, rules: [] }), 0, "unboundable: refused later by resolveInvoiceDiscount");
+});
+
+test("checkout without manual_bill_discount: a bill discount beyond the slab is held to the 5% (no unchecked shape)", async () => {
+  // No slab: ₹100 off ₹1,000 sent as a bare invoice_discount is 10% of the cashier's own.
+  const bare = await checkout({ items: [plainLine(0)], invoice_discount: 100, payments: paid(900) }, {}, discountStore());
+  assert.equal(bare.response.status, 403, bare.response.text);
+  assert.equal(bare.response.body.code, "DISCOUNT_APPROVAL_REQUIRED");
+  assert.equal(find(bare.statements, /^INSERT INTO sales/).length, 0);
+  // Within 5% it bills, as before, with no rule name.
+  const within = await checkout({ items: [plainLine(0)], invoice_discount: 50, payments: paid(950) }, {}, discountStore());
+  assert.equal(within.response.status, 201, within.response.text);
+  assert.equal(columnsOf(find(within.statements, /^INSERT INTO sales/)[0]).discount_rule_name, null);
+  // Shared with the lines: ₹30 on the line + ₹20.02 bare on the bill is past 5%.
+  const spread = await checkout({ items: [plainLine(30)], invoice_discount: 20.02, payments: paid(949.98) }, {}, discountStore());
+  assert.equal(spread.response.status, 403);
+  // The slab is not the cashier's: a ₹100 slab bill asks nobody.
+  const slabbed = await checkout({ items: [plainLine(0)], invoice_discount: 100, discount_rule_id: 3, payments: paid(900) }, { slabs: [TEN_PERCENT], slabsOn: true }, discountStore());
+  assert.equal(slabbed.response.status, 201, slabbed.response.text);
+  assert.equal(find(slabbed.statements, ACTOR_SQL).length, 0);
+  assert.equal(columnsOf(find(slabbed.statements, /^INSERT INTO sales/)[0]).discount_rule_name, "Big bills", "no ' + extra' without the field");
+  // An exempt user still gives it without approval.
+  const owner = await checkout({ items: [plainLine(0)], invoice_discount: 100, payments: paid(900) }, {}, discountStore({ role: "Owner" }));
+  assert.equal(owner.response.status, 201, owner.response.text);
+  // With an approval, the trace names the bill part.
+  const approval = discountApproval();
+  const approved = await checkout({ idempotency_key: "bill-op-1", discount_approval_id: approval.id, items: [plainLine(0)], invoice_discount: 100, payments: paid(900) }, {}, discountStore({ approval }));
+  assert.equal(approved.response.status, 201, approved.response.text);
+  const trace = JSON.parse(find(approved.statements, /^INSERT INTO sale_audit_trail/)[0].values[1]);
+  assert.equal(trace.bill.manual_bill_discount, 100);
+  assert.equal(trace.bill.needs_approval, true);
+});
+
+// --- Desktop sync with a bill discount -------------------------------------------------------
+
+test("sync: a bill discount over 5% is never refused; the DISCOUNT_UNAPPROVED trace carries the bill part", async () => {
+  const { ack, statements } = await syncBill({
+    items: [plainLine(0)], payments: paid(940), store: discountStore(),
+    extra: { bill_discount_total: 60, manual_bill_discount: 60 },
+  });
+  assert.equal(ack.status, "accepted", ack.message);
+  assert.equal(find(statements, /^INSERT INTO sales/).length, 1);
+  const [audit] = find(statements, /^INSERT INTO sale_audit_trail/);
+  assert.match(audit.sql, /'DISCOUNT_UNAPPROVED'/);
+  const trace = JSON.parse(audit.values[1]);
+  assert.equal(trace.detail, "APPROVAL_MISSING");
+  assert.equal(trace.bill.manual_bill_discount, 60);
+  assert.equal(trace.bill.free_limit, 50);
+  assert.equal(trace.bill.needs_approval, true);
+});
+
+test("sync: a bill discount within 5% (or spread within it), or by an exempt user, leaves no trace", async () => {
+  const within = await syncBill({ items: [plainLine(30)], payments: paid(950), store: discountStore(), extra: { bill_discount_total: 20, manual_bill_discount: 20 } });
+  assert.equal(within.ack.status, "accepted", within.ack.message);
+  assert.equal(find(within.statements, /sale_audit_trail|sale_change_approvals/).length, 0);
+  const owner = await syncBill({ items: [plainLine(0)], payments: paid(800), store: discountStore({ role: "Owner" }), extra: { bill_discount_total: 200, manual_bill_discount: 200 } });
+  assert.equal(owner.ack.status, "accepted", owner.ack.message);
+  assert.equal(find(owner.statements, /sale_audit_trail|sale_change_approvals/).length, 0);
+});
+
+test("sync: the rule stored is the slab's name + extra, or none for a manual-only bill", async () => {
+  const slabFields = { discount_rule_id: 7, discount_rule_name: "Old slab", discount_rule_type: "FLAT_AMOUNT", discount_rule_value: 25, discount_rule_payment_mode: "ALL" };
+  const both = await syncBill({ items: [plainLine(0)], payments: paid(955), store: discountStore(), extra: { ...slabFields, bill_discount_total: 45, manual_bill_discount: 20 } });
+  assert.equal(both.ack.status, "accepted", both.ack.message);
+  const bothSale = columnsOf(find(both.statements, /^INSERT INTO sales/)[0]);
+  assert.equal(Number(bothSale.invoice_discount_amount), 45);
+  assert.equal(bothSale.discount_rule_name, "Old slab + extra");
+  assert.equal(String(bothSale.discount_rule_id), "7");
+
+  const manualOnly = await syncBill({ items: [plainLine(0)], payments: paid(980), store: discountStore(), extra: { ...slabFields, bill_discount_total: 20, manual_bill_discount: 20 } });
+  assert.equal(manualOnly.ack.status, "accepted", manualOnly.ack.message);
+  const manualSale = columnsOf(find(manualOnly.statements, /^INSERT INTO sales/)[0]);
+  assert.equal(manualSale.discount_rule_name, null);
+  assert.equal(manualSale.discount_rule_id, null);
+});
+
+test("sync: an unreadable bill discount is accepted and traced as unreadable, never as none", async () => {
+  const { ack, statements } = await syncBill({ items: [plainLine(0)], payments: paid(990), store: discountStore(), extra: { bill_discount_total: 10, manual_bill_discount: "ten" } });
+  assert.equal(ack.status, "accepted", ack.message);
+  const trace = JSON.parse(find(statements, /^INSERT INTO sale_audit_trail/)[0].values[1]);
+  assert.equal(trace.bill.unreadable, true);
+  assert.equal(trace.bill.manual_bill_discount, null);
 });
 
 // ---------------------------------------------------------------------------------------------
