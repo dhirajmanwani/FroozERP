@@ -944,8 +944,11 @@ pub fn retry_failed_operations(app: &AppHandle) -> Result<LocalDbStatus, String>
     let path = database_path(app)?;
     initialize_at(&path)?;
     let conn = Connection::open(&path).map_err(to_error)?;
+    // Held-back ('conflict') operations go back too. The cloud judges a held-back new bill again
+    // and accepts it once the cause is gone; for anything else it returns its stored answer, so
+    // retrying one changes nothing. Before this, a conflict could never leave this computer.
     conn.execute(
-        "UPDATE sync_outbox SET status = 'pending' WHERE status = 'failed'",
+        "UPDATE sync_outbox SET status = 'pending' WHERE status IN ('failed', 'conflict')",
         [],
     )
     .map_err(to_error)?;

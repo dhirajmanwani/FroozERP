@@ -123,7 +123,7 @@ export const resolveShellStatus = ({
   } else if (conflicts) {
     notice = {
       tone: "warning",
-      message: `${changes(conflicts)} clash with the copy in the cloud and were held back. Ask the Owner to check Settings, Sync & Connection.`,
+      message: `${changes(conflicts)} clash with the copy in the cloud and were held back. Ask the Owner to open Settings, Sync & Connection, and press Retry Failed.`,
       offerRestart: false,
     };
   }

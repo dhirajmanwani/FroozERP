@@ -4073,7 +4073,7 @@ function App() {
   const retrySyncFailures = async () => {
     const status = await retryFailedOperations();
     setSyncStatus(status);
-    setSyncMessage("Failed sync operations moved back to pending");
+    setSyncMessage("Failed and held-back changes moved back to pending");
   };
 
   useEffect(() => {

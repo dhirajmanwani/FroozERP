@@ -6770,10 +6770,12 @@ const buildSalePayload = async (
       FROM inventory_batches
       WHERE product_id = $1
         AND branch_id = $2
-        AND ($${batchParams.length + 1}::INTEGER IS NULL OR (
-          company_id = $${batchParams.length + 1}
-          AND operational_location_id = $${batchParams.length + 2}
-        ))
+        -- Company and location are each applied only when known, as in the sync pre-check. A
+        -- desktop sync outside enforce mode knows the company but not the location; tying the two
+        -- together compared operational_location_id = NULL, matched no lot, and refused every
+        -- offline bill as "Selected lot does not have enough stock" while the lot had plenty.
+        AND ($${batchParams.length + 1}::INTEGER IS NULL OR company_id = $${batchParams.length + 1})
+        AND ($${batchParams.length + 2}::INTEGER IS NULL OR operational_location_id = $${batchParams.length + 2})
         ${batchFilter}
         AND remaining_qty > 0
         AND UPPER(COALESCE(batch_status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
@@ -10671,7 +10673,14 @@ const processedAckFromRow = (row) => ({
   message: row.result_payload?.message || "Already processed",
 });
 
-const storeProcessedOperation = async (client, operation, context, ack) => {
+/** A new desktop bill (not an edit or a cancel): the only stored conflict that is judged again. */
+const isRetryableSaleConflict = (operation) =>
+  operation.entity_type === "pos_sale"
+  && !["SALE_EDIT", "SALE_CANCEL"].includes(operation.operation_type);
+
+const storeProcessedOperation = async (client, operation, context, ack, { replacingConflict = false } = {}) => {
+  // `replacingConflict`: the row holds a stored conflict that was just judged again, so the new
+  // outcome replaces it. Otherwise the first stored outcome stands.
   await client.query(
     `
     INSERT INTO sync_processed_operations (
@@ -10680,7 +10689,13 @@ const storeProcessedOperation = async (client, operation, context, ack) => {
       entity_type, entity_id, result_status, result_payload, processed_at
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $2, $8, $9, $10, $11::jsonb, CURRENT_TIMESTAMP)
-    ON CONFLICT (operation_id) DO NOTHING
+    ${replacingConflict
+      ? `ON CONFLICT (operation_id) DO UPDATE SET
+           result_status = EXCLUDED.result_status,
+           result_payload = EXCLUDED.result_payload,
+           processed_at = EXCLUDED.processed_at
+         WHERE sync_processed_operations.result_status = 'conflict'`
+      : "ON CONFLICT (operation_id) DO NOTHING"}
     `,
     [
       operation.operation_id,
@@ -12351,7 +12366,16 @@ const processSyncOperation = async (client, operation, context) => {
     "SELECT * FROM sync_processed_operations WHERE operation_id = $1 AND company_id = $2 AND branch_id = $3 FOR UPDATE",
     [operation.operation_id, context.companyId, context.branchId]
   );
-  if (processed.rows[0]) return processedAckFromRow(processed.rows[0]);
+  // A stored acknowledgement is final, with one exception: a new desktop bill that was held back as
+  // a conflict. Nothing of it was written (every conflict in `processPosSaleFoundationOperation`
+  // returns before the first insert), so judging it again cannot apply it twice, and returning the
+  // stored refusal kept a bill out of the books forever even after its cause was fixed -- which is
+  // what the lot-scope bug of 27 Sep 2026 did. Edits and cancels keep the stored answer: replaying
+  // a stale edit later could overwrite a newer one.
+  const storedConflictedSale = processed.rows[0]
+    && processed.rows[0].result_status === "conflict"
+    && isRetryableSaleConflict(operation);
+  if (processed.rows[0] && !storedConflictedSale) return processedAckFromRow(processed.rows[0]);
   // Keyed on entity_type first, with a default that refuses by name.
   //
   // This used to test `entity_type === "sync_test"` and then fall through to the POS sale handlers
@@ -12388,7 +12412,15 @@ const processSyncOperation = async (client, operation, context) => {
       );
       break;
   }
-  await storeProcessedOperation(client, operation, context, ack);
+  await storeProcessedOperation(client, operation, context, ack, { replacingConflict: storedConflictedSale });
+  if (storedConflictedSale && ack.status === "accepted") {
+    await client.query(
+      `UPDATE sync_conflict_log
+       SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP
+       WHERE operation_id = $1 AND status = 'open'`,
+      [operation.operation_id]
+    );
+  }
   return ack;
 };
 
