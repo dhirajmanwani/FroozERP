@@ -12,15 +12,17 @@
  *
  * 1. **A shortcut must never fire while somebody is typing.** The person at the counter spends
  *    the whole day in a product search box with a customer waiting. A key that jumped screens
- *    mid-sale would abandon a half-built bill. Hence Alt+digit rather than bare letters, and
- *    hence `isTypingContext` — suppression is the default and firing is the exception.
+ *    mid-sale would abandon a half-built bill. Hence Alt+key rather than bare keys, and hence
+ *    `isTypingContext` — suppression is the default and firing is the exception.
  * 2. **An unknown id is named, not guessed.** `resolveNavigationTarget` reports UNKNOWN rather
  *    than falling back to the dashboard, because a confident default sends somebody to a screen
  *    they did not ask for and looks like the app working.
  */
 
-/** The one modifier. Alt+digit avoids both the browser's Alt+letter access keys and, being a
- *  modified chord, avoids every bare-letter collision with a form field. */
+/** The one modifier. Being a modified chord, Alt+key avoids every bare-key collision with a form
+ *  field. Alt+D, Alt+E and Alt+F are left alone because a browser keeps them for its own address
+ *  bar and menus, and the owner opens the web build in Chrome on a phone or another computer. */
+export const RESERVED_SHORTCUT_LETTERS = Object.freeze(["D", "E", "F"]);
 export const SHORTCUT_MODIFIER = "Alt";
 
 export const NAVIGATION_KIND = Object.freeze({
@@ -51,10 +53,22 @@ export const NAVIGATION_LOOKUP = Object.freeze({
  *
  * Alt+0 is Dashboard. 0 sits at the far end of the number row, which makes it both the "back to
  * the start" key and the one most likely to be hit by accident — so it lands on a read-only
- * overview, where a mis-hit costs nothing. That is also why Settings, which is where the damage
- * lives, carries no shortcut at all: it is reachable from the sidebar and the palette, which are
- * both deliberate acts. Waste, Discounts, Expenses and All Shops are unassigned for the plainer
- * reason that there are ten digits and fifteen modules, and these are the five least-opened.
+ * overview, where a mis-hit costs nothing.
+ *
+ * There are ten digits and seventeen modules. The seven opened least get a letter instead, named
+ * after the screen where a letter is free (2 Oct 2026, the owner asked for a key on every screen):
+ *
+ *   Alt+W  Waste Management       Alt+A  All Shops
+ *   Alt+C  Discounts (chhoot)     Alt+B  Branches & Counters
+ *   Alt+X  Expenses               Alt+S  Settings
+ *   Alt+T  Stock Distribution (transfer)
+ *
+ * Settings used to carry no key because that is where the damage lives. Opening it changes
+ * nothing, every card still needs its own Save, and Owner-only cards stay Owner-only, so a key
+ * that only opens it is no more dangerous than the sidebar button beside it.
+ *
+ * `RESERVED_SHORTCUT_LETTERS` are never assigned. The full list a person reads is built by
+ * `local/keyboardShortcuts.js` from this same registry.
  */
 const modules = [
   {
@@ -109,7 +123,7 @@ const modules = [
     id: "waste",
     label: "Waste Management",
     icon: "alert",
-    shortcut: null,
+    shortcut: "W",
     keywords: ["spoilage", "damage", "rotten", "wastage", "throw"],
     sections: [],
   },
@@ -125,7 +139,7 @@ const modules = [
     id: "discounts",
     label: "Discounts",
     icon: "wallet",
-    shortcut: null,
+    shortcut: "C",
     keywords: ["offer", "lot discount", "special price", "price off", "concession"],
     sections: [],
   },
@@ -141,7 +155,7 @@ const modules = [
     id: "expenses",
     label: "Expenses",
     icon: "wallet",
-    shortcut: null,
+    shortcut: "X",
     keywords: ["spending", "petty cash", "overheads", "paid out"],
     sections: [],
   },
@@ -157,10 +171,9 @@ const modules = [
     id: "distribution",
     label: "Stock Distribution",
     icon: "truck",
-    // No shortcut: Alt+0 to Alt+9 are all taken by the modules a counter opens all day, and this is
-    // a warehouse screen opened a few times a day. Taking a digit off POS Billing or Products to
-    // give it one would be the wrong trade. Findable through the palette, like Settings.
-    shortcut: null,
+    // A letter, not a digit: Alt+0 to Alt+9 belong to the modules a counter opens all day, and
+    // this is a warehouse screen opened a few times a day. T for transfer.
+    shortcut: "T",
     keywords: [
       "warehouse", "transfer", "consignment", "send stock", "dispatch", "receive",
       "branch transfer", "godown", "distribute", "delivery to shop",
@@ -190,7 +203,7 @@ const modules = [
     id: "all-shops",
     label: "All Shops",
     icon: "layers",
-    shortcut: null,
+    shortcut: "A",
     keywords: ["branches", "consolidated", "group", "other shop", "owner"],
     sections: [],
   },
@@ -198,9 +211,9 @@ const modules = [
     id: "branches",
     label: "Branches & Counters",
     icon: "shopfront",
-    // No shortcut. Alt+0 to Alt+9 belong to the screens a counter opens all day; this is a setup
-    // screen opened when a shop or a machine is added. Reachable from the sidebar and the palette.
-    shortcut: null,
+    // A letter, not a digit: Alt+0 to Alt+9 belong to the screens a counter opens all day, and this
+    // is a setup screen opened when a shop or a machine is added.
+    shortcut: "B",
     keywords: [
       "branch", "shop", "location", "counter", "warehouse", "godown",
       "device", "machine", "till", "staff posting", "assignment", "add branch", "new shop",
@@ -222,7 +235,7 @@ const modules = [
     id: "settings",
     label: "Settings",
     icon: "settings",
-    shortcut: null,
+    shortcut: "S",
     keywords: ["configuration", "setup", "preferences", "admin", "master"],
     // Sixteen cards, grouped below. The screen lock and the activation licences moved to Branches
     // & Counters on 27 Sep 2026, beside the approval they belong to. The `eyebrow` is kept exactly as `SettingsModule`
@@ -376,7 +389,7 @@ export const resolveNavigationTarget = (id) => {
 };
 
 /**
- * The chip text, e.g. "Alt 1". Exported so the sidebar and the palette cannot print different
+ * The chip text, e.g. "Alt 1" or "Alt W". Exported so the sidebar and the palette cannot print different
  * things for the same key.
  *
  * The emptiness test is explicit rather than `shortcut ? ... : ...`, because `0` is a real
@@ -386,7 +399,7 @@ export const resolveNavigationTarget = (id) => {
  */
 export const formatShortcut = (shortcut) => {
   if (shortcut === null || shortcut === undefined) return "";
-  const key = typeof shortcut === "number" ? String(shortcut) : String(shortcut).trim();
+  const key = typeof shortcut === "number" ? String(shortcut) : String(shortcut).trim().toUpperCase();
   if (key === "") return "";
   return `${SHORTCUT_MODIFIER} ${key}`;
 };
@@ -428,20 +441,25 @@ export const isTypingContext = (target) => {
 };
 
 const DIGIT_CODE = /^(?:Digit|Numpad)([0-9])$/;
+const LETTER_CODE = /^Key([A-Z])$/;
 
 /**
- * The digit a keyboard event names, or `""`.
+ * The digit or capital letter a keyboard event names, or `""`.
  *
  * `event.code` is read first and `event.key` only as a fallback: under Alt, `key` is unreliable
  * across layouts — some report a dead key, some a composed character, some the unmodified letter
- * — while `code` describes the physical key and does not move.
+ * — while `code` describes the physical key and does not move. That matters most for letters: a
+ * counter typing in Hindi still presses the key marked W, and `code` still says `KeyW`.
  */
 export const shortcutKeyFromEvent = (event) => {
   const code = typeof event?.code === "string" ? event.code : "";
-  const matched = DIGIT_CODE.exec(code);
-  if (matched) return matched[1];
+  const digit = DIGIT_CODE.exec(code);
+  if (digit) return digit[1];
+  const letter = LETTER_CODE.exec(code);
+  if (letter) return letter[1];
   const key = typeof event?.key === "string" ? event.key : "";
-  return /^[0-9]$/.test(key) ? key : "";
+  if (/^[0-9]$/.test(key)) return key;
+  return /^[a-z]$/i.test(key) ? key.toUpperCase() : "";
 };
 
 /**

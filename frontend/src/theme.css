@@ -224,6 +224,8 @@
      actions and chips the short one. Scaled with the app's text size setting. */
   --control-height: calc(38px * var(--font-scale, 1));
   --control-height-sm: calc(30px * var(--font-scale, 1));
+  /* The pinned top bar's height; anything else that sticks while the page scrolls starts below it. */
+  --topbar-height: 76px;
 }
 
 /* Block 2: the System state on a machine set to dark.

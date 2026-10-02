@@ -385,8 +385,14 @@ input[type="number"] {
   margin-left: 252px;
 }
 
+/* Pinned to the top of the window (2 Oct 2026, asked for by the owner): search, back and forward
+   stay one click away however far down a long report or ledger somebody has scrolled. Anything
+   else that sticks while the page scrolls must start below it, at `--topbar-height`. */
 .topbar {
-  min-height: 76px;
+  position: sticky;
+  top: 0;
+  z-index: 18;
+  min-height: var(--topbar-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3104,8 +3110,8 @@ tbody tr:has(> .empty-cell):hover {
 
 .checkout-card {
   position: sticky;
-  top: 18px;
-  max-height: calc(100vh - 104px);
+  top: calc(var(--topbar-height, 0px) + 18px);
+  max-height: calc(100vh - 104px - var(--topbar-height, 0px));
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -3382,7 +3388,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .sticky-report-filters {
   position: sticky;
-  top: 10px;
+  top: calc(var(--topbar-height, 0px) + 10px);
   z-index: 8;
   align-items: end;
   padding: 12px;
@@ -5099,13 +5105,13 @@ tbody tr:has(> .empty-cell):hover {
     border-radius: 8px;
   }
 
+  .content-shell {
+    --topbar-height: 68px;
+  }
+
   .topbar {
-    min-height: 68px;
     height: auto;
     padding: 0 19px;
-    position: sticky;
-    top: 0;
-    z-index: 18;
   }
 
   .topbar h1 {
@@ -7754,6 +7760,9 @@ tbody tr:has(> .empty-cell):hover {
 /* The keyboard chip beside a module name. Deliberately quiet: it is a thing to notice once and
    then stop seeing, not a second label competing with the first. */
 .nav-shortcut {
+  /* Every screen has a key now, long labels included: the label may wrap, the chip never does. */
+  flex: 0 0 auto;
+  white-space: nowrap;
   margin-left: auto;
   padding: 1px 6px;
   border-radius: 5px;
@@ -7851,6 +7860,56 @@ tbody tr:has(> .empty-cell):hover {
 
 .command-result-active {
   background: var(--accent-soft);
+}
+
+.shortcut-sheet {
+  width: min(720px, calc(100vw - 28px));
+  overflow-y: auto;
+}
+
+.shortcut-sheet .form-note {
+  margin: 0;
+}
+
+.shortcut-sheet-group {
+  display: grid;
+  gap: 8px;
+}
+
+.shortcut-sheet-rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 210px), 1fr));
+  gap: 6px;
+}
+
+.shortcut-sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink-strong);
+  background: var(--card);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+
+button.shortcut-sheet-row {
+  cursor: pointer;
+}
+
+button.shortcut-sheet-row:hover,
+button.shortcut-sheet-row:focus-visible {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.shortcut-sheet-row kbd {
+  flex: 0 0 auto;
+  font-size: 11px;
 }
 
 .command-palette-notice {

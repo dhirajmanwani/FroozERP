@@ -67,6 +67,7 @@ import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./loc
 import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
 import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
+import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
@@ -2058,6 +2059,7 @@ function Icon({ name, size = 18 }) {
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
+    keyboard: <><rect x="2" y="6" width="20" height="12" rx="2" /><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8" /></>,
     "arrow-left": <><path d="M19 12H5" /><path d="m12 19-7-7 7-7" /></>,
     "arrow-right": <><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></>,
     truck: <><path d="M3 7h11v9H3z" /><path d="M14 10h4l3 3v3h-7z" /><circle cx="7" cy="18" r="1.6" /><circle cx="17" cy="18" r="1.6" /></>,
@@ -2547,6 +2549,7 @@ function App() {
   });
   const [frostDrawerOpen, setFrostDrawerOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [shortcutSheetOpen, setShortcutSheetOpen] = useState(false);
   // FROST live voice. The controller (local/frostLiveVoice.js) owns the microphone; this component
   // only hands it the browser objects and the two routes it may use. `frostLiveVoice` is what the
   // switch and the indicator draw; `frostSpeechSetup` is the gateway's word on whether whisper is
@@ -2932,6 +2935,17 @@ function App() {
       if (event.key === "Escape") {
         setFrostDrawerOpen(false);
         setCommandPaletteOpen(false);
+        setShortcutSheetOpen(false);
+      }
+      if (isShortcutSheetChord(event)) {
+        // Works while typing, like Ctrl K: it only opens a list over the screen, so a bill being
+        // built underneath is still there when the list closes.
+        event.preventDefault();
+        if (user) {
+          setCommandPaletteOpen(false);
+          setShortcutSheetOpen((current) => !current);
+        }
+        return;
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         // Deliberately still works while typing, unlike the Alt shortcuts below. That is the whole
@@ -2941,7 +2955,7 @@ function App() {
         event.preventDefault();
         if (user) setCommandPaletteOpen((current) => !current);
       }
-      // Alt + digit jumps straight to a module. `resolveShortcutTarget` returns null while any
+      // Alt + digit or letter jumps straight to a module. `resolveShortcutTarget` returns null while any
       // input, textarea, select or contenteditable has focus, and during IME composition - a
       // cashier types into a search box all day, and a keystroke that changed screens mid-sale
       // would be a defect, not a nuisance. The guard lives in the module because that is where it
@@ -2950,6 +2964,7 @@ function App() {
       if (shortcutTarget && user) {
         event.preventDefault();
         setCommandPaletteOpen(false);
+        setShortcutSheetOpen(false);
         navigateRef.current?.(shortcutTarget.id);
       }
     };
@@ -9400,6 +9415,9 @@ function App() {
     devicePending: connectionStatus.devicePending,
   });
 
+  // What the sidebar shows this person, computed once so the shortcut list names the same screens.
+  const visibleNavigationItems = navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates"));
+
   return (
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""} ${sidebarCollapsed ? "sidebar-rail" : ""}`}>
@@ -9411,7 +9429,7 @@ function App() {
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
-          {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => {
+          {visibleNavigationItems.map(([view, label]) => {
             const shortcut = navigationRegistry.find((item) => item.id === view)?.shortcut || null;
             return (
               <button
@@ -9513,6 +9531,16 @@ function App() {
                 type="button"
               >
                 <Icon name="search" />
+              </button>
+              <button
+                aria-label="Keyboard shortcuts"
+                aria-pressed={shortcutSheetOpen}
+                className="chrome-button"
+                onClick={() => setShortcutSheetOpen((current) => !current)}
+                title={`Keyboard shortcuts (${SHORTCUT_SHEET_CHORD})`}
+                type="button"
+              >
+                <Icon name="keyboard" />
               </button>
               <button
                 aria-label="Back"
@@ -11025,6 +11053,13 @@ function App() {
           onClose={() => setCommandPaletteOpen(false)}
         />
       )}
+      {shortcutSheetOpen && (
+        <ShortcutSheet
+          onClose={() => setShortcutSheetOpen(false)}
+          onNavigate={(viewId) => { setShortcutSheetOpen(false); navigate(viewId); }}
+          sheet={buildShortcutSheet({ visibleModuleIds: visibleNavigationItems.map(([view]) => view) })}
+        />
+      )}
       {profileOpen && <UserProfilePanel onClose={() => setProfileOpen(false)} onLogout={() => setUser(null)} user={user} />}
     </main>
   );
@@ -11073,8 +11108,7 @@ function FrostFloatingCopilot({
 }) {
   return (
     <>
-      {/* The launcher is fixed on screen while the topbar scrolls away, so it also shows when the
-          microphone is on. */}
+      {/* The launcher is fixed on screen, so it also shows when the microphone is on. */}
       <button
         aria-label={micOn ? "Open FROST. The microphone is on." : "Open FROST"}
         className={`frost-floating-launcher ${unreadCount ? "frost-floating-launcher-alert" : ""} ${micOn ? "frost-floating-launcher-listening" : ""}`}
@@ -11250,6 +11284,53 @@ function CommandPalette({ index, recentIds = [], onNavigate, onClose }) {
     </div>
   );
 }
+
+/**
+ * Every keyboard shortcut, in one place. The list itself is built and tested in
+ * `local/keyboardShortcuts.js`; this only draws it. A screen row is also a button, so the list
+ * doubles as a way to get somewhere for anybody who would rather click.
+ */
+function ShortcutSheet({ sheet, onClose, onNavigate }) {
+  return (
+    <div className="command-palette-backdrop" onClick={onClose}>
+      {/* Not marked as a dialog on purpose: `isTypingContext` mutes the Alt keys inside dialogs,
+          and somebody reading this list is about to press one of them. */}
+      <section aria-label="Keyboard shortcuts" className="command-palette shortcut-sheet" onClick={(event) => event.stopPropagation()}>
+        <div className="command-palette-header">
+          <span className="eyebrow">Keyboard shortcuts</span>
+          <button aria-label="Close keyboard shortcuts" autoFocus className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
+        </div>
+        <p className="form-note">
+          Alt keys do nothing while the cursor is in a typing box, so a half-made bill is never lost. Click outside the box first.
+        </p>
+        {sheet.groups.map((group) => (
+          <div className="shortcut-sheet-group" key={group.id}>
+            <span className="eyebrow">{group.title}</span>
+            {group.id === "screens" && sheet.status === SHORTCUT_SHEET_STATUS.NO_SCREENS && (
+              <div className="cart-empty">No screen is open to this sign-in, so there is no screen key to list.</div>
+            )}
+            <div className="shortcut-sheet-rows">
+              {group.rows.map((row) => (
+                row.moduleId ? (
+                  <button className="shortcut-sheet-row" key={row.keys} onClick={() => onNavigate?.(row.moduleId)} type="button">
+                    <span>{row.label}</span>
+                    <kbd className="command-result-key">{row.keys}</kbd>
+                  </button>
+                ) : (
+                  <div className="shortcut-sheet-row" key={row.keys}>
+                    <span>{row.label}</span>
+                    <kbd className="command-result-key">{row.keys}</kbd>
+                  </div>
+                )
+              ))}
+            </div>
+          </div>
+        ))}
+      </section>
+    </div>
+  );
+}
+
 const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String(severity).toLowerCase()}`;
 
 function AiBusinessAssistantModule({
