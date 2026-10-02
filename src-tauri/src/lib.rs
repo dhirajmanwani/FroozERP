@@ -98,7 +98,7 @@ const DEV_BACKEND_PORT: &str = "5051";
 /// FroozERP now contacts this address by itself whenever it can reach it.** That is the product
 /// working as intended -- this computer when there is no internet, the cloud when there is, with
 /// nothing to switch -- and it is the behaviour that was asked for.
-const PRODUCTION_CLOUD_API_URL: &str = "https://froozerp-production-27bb.up.railway.app";
+const PRODUCTION_CLOUD_API_URL: &str = "https://froozerp-cloud.onrender.com";
 
 const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
 const BACKEND_STARTUP_LOCK_FILE: &str = "local-backend-startup.lock";

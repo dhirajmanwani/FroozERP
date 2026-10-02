@@ -395,10 +395,13 @@ test("a misconfigured server exits before it listens or opens anything (spawned)
 });
 
 test("server.js names the cloud host-neutrally and lets the deployment name itself", () => {
-  // B1: no platform in the constant names; the values are unchanged in this phase.
+  // B1: no platform in the constant names. Since the cut-over release the default is Render, and
+  // both Railway addresses are retired (rewritten to it).
   assert.doesNotMatch(SERVER, /productionRailwayOrigin|legacyProductionRailwayOrigins/);
-  assert.match(SERVER, /const defaultProductionCloudOrigin = "https:\/\/froozerp-production-27bb\.up\.railway\.app";/);
-  assert.match(SERVER, /const legacyProductionCloudOrigins = new Set\(\["https:\/\/froozerp-production\.up\.railway\.app"\]\);/);
+  assert.match(SERVER, /const defaultProductionCloudOrigin = "https:\/\/froozerp-cloud\.onrender\.com";/);
+  const legacy = SERVER.match(/const legacyProductionCloudOrigins = new Set\(\[([^\]]*)\]\);/)?.[1] || "";
+  assert.match(legacy, /"https:\/\/froozerp-production\.up\.railway\.app"/);
+  assert.match(legacy, /"https:\/\/froozerp-production-27bb\.up\.railway\.app"/);
   // B2: Render's own URL is consulted after the explicit variables and before the built-in default.
   const chain = SERVER.slice(SERVER.indexOf("const publicCloudApiUrl = canonicalizeCloudApiUrl("));
   const order = ["process.env.CLOUD_API_URL", "process.env.FROOZERP_PUBLIC_API_URL", "process.env.RENDER_EXTERNAL_URL", "defaultProductionCloudOrigin"]

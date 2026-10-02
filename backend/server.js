@@ -164,8 +164,11 @@ const serverTimePayload = () => {
 // configuration may still carry. Host-neutral names: the values are the deployment's, not the
 // platform's. `frontend/src/local/cloudOrigins.js` lists every layer that carries a copy; moving the
 // cloud changes all of them together, and puts the old address into every legacy set.
-const legacyProductionCloudOrigins = new Set(["https://froozerp-production.up.railway.app"]);
-const defaultProductionCloudOrigin = "https://froozerp-production-27bb.up.railway.app";
+const legacyProductionCloudOrigins = new Set([
+  "https://froozerp-production.up.railway.app",
+  "https://froozerp-production-27bb.up.railway.app",
+]);
+const defaultProductionCloudOrigin = "https://froozerp-cloud.onrender.com";
 const canonicalizeCloudApiUrl = (value) => {
   const normalized = String(value || "").trim().replace(/\/$/, "");
   return legacyProductionCloudOrigins.has(normalized) ? defaultProductionCloudOrigin : normalized;

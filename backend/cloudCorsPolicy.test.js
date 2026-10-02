@@ -117,7 +117,7 @@ const SERVER = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
 
 test("server.js has no platform wildcard left and builds its list from this policy", () => {
   assert.doesNotMatch(SERVER, /endsWith\("\.up\.railway\.app"\)/);
-  assert.doesNotMatch(SERVER, /onrender\.com/);
+  assert.doesNotMatch(SERVER, /endsWith\("\.onrender\.com"\)/);
   assert.match(SERVER, /const corsPolicy = createCorsPolicy\(\{/);
   assert.match(SERVER, /publicCloudApiUrl,\n/);
 });
