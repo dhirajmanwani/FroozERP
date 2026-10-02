@@ -9,8 +9,11 @@ const { WAV_MAX_BYTES, createLocalSpeech, resolveSpeechDir } = require("./localS
 
 const PORT = Number(process.env.PORT || 5000);
 const APP_VERSION = String(process.env.APP_VERSION || "0.0.0");
-const LEGACY_CLOUD_API_URLS = new Set(["https://froozerp-production.up.railway.app"]);
-const DEFAULT_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+const LEGACY_CLOUD_API_URLS = new Set([
+  "https://froozerp-production.up.railway.app",
+  "https://froozerp-production-27bb.up.railway.app",
+]);
+const DEFAULT_CLOUD_API_URL = "https://froozerp-cloud.onrender.com";
 const normalizeCloudApiUrl = (value) => {
   const normalized = String(value || "").trim().replace(/\/$/, "");
   return LEGACY_CLOUD_API_URLS.has(normalized) ? DEFAULT_CLOUD_API_URL : normalized;

@@ -51,7 +51,10 @@ pub const POLICY_FILE_NAME: &str = "cloud-network-policy.json";
 pub const AUDIT_FILE_NAME: &str = "cloud-request-audit.jsonl";
 
 const SPEECH_ROUTE_PREFIX: &str = "/api/local/speech/";
-const LEGACY_CLOUD_API_URLS: [&str; 1] = ["https://froozerp-production.up.railway.app"];
+const LEGACY_CLOUD_API_URLS: [&str; 2] = [
+    "https://froozerp-production.up.railway.app",
+    "https://froozerp-production-27bb.up.railway.app",
+];
 
 /// desktopGateway.js `CLOUD_NOT_CONFIGURED_MESSAGE` (the gateway's own, used by /api/cloud/health).
 const GATEWAY_CLOUD_NOT_CONFIGURED_MESSAGE: &str = "No cloud backend is configured for this installation. The request was refused instead of being sent to a default target.";
@@ -2213,6 +2216,11 @@ mod tests {
     fn legacy_cloud_address_is_normalised() {
         assert_eq!(
             normalize_cloud_api_url(" https://froozerp-production.up.railway.app/ "),
+            crate::PRODUCTION_CLOUD_API_URL
+        );
+        // Railway, retired by the move to Render: a phone that saved it moves with everyone else.
+        assert_eq!(
+            normalize_cloud_api_url("https://froozerp-production-27bb.up.railway.app"),
             crate::PRODUCTION_CLOUD_API_URL
         );
         assert_eq!(normalize_cloud_api_url("https://sandbox.example/"), "https://sandbox.example");

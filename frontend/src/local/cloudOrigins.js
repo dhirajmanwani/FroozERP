@@ -29,11 +29,13 @@
 //
 // Pure: no `import.meta.env`, no React, so `node --test` can load it.
 
-export const PRODUCTION_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+export const PRODUCTION_CLOUD_API_URL = "https://froozerp-cloud.onrender.com";
 
 /** Retired production addresses. A saved one is rewritten to `PRODUCTION_CLOUD_API_URL`. */
 export const LEGACY_PRODUCTION_CLOUD_API_URLS = Object.freeze([
   "https://froozerp-production.up.railway.app",
+  // Railway, retired by the move to Render + Neon (October 2026).
+  "https://froozerp-production-27bb.up.railway.app",
 ]);
 
 /**

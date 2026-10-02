@@ -19,11 +19,14 @@ const browserAt = (href) => {
 const browser = { tauriRuntime: false };
 const tauri = { tauriRuntime: true };
 
-test("the production cloud is still the Railway 27bb service in this phase", () => {
-  // Phase 1 of the Render move changes no target. Switching this literal is the cut-over release,
-  // and it must move lib.rs and desktopGateway.js in the same change (cloudAddress.test.mjs).
-  assert.equal(PRODUCTION_CLOUD_API_URL, "https://froozerp-production-27bb.up.railway.app");
-  assert.deepEqual([...LEGACY_PRODUCTION_CLOUD_API_URLS], ["https://froozerp-production.up.railway.app"]);
+test("the production cloud is Render, and both Railway addresses are retired", () => {
+  // The cut-over release of the Render + Neon move. lib.rs, desktopGateway.js, server.js and
+  // mobile_gateway.rs move in the same change (cloudAddress.test.mjs).
+  assert.equal(PRODUCTION_CLOUD_API_URL, "https://froozerp-cloud.onrender.com");
+  assert.deepEqual([...LEGACY_PRODUCTION_CLOUD_API_URLS].sort(), [
+    "https://froozerp-production-27bb.up.railway.app",
+    "https://froozerp-production.up.railway.app",
+  ]);
   assert.equal(Object.isFrozen(LEGACY_PRODUCTION_CLOUD_API_URLS), true, "nobody may push onto the shared list at runtime");
   assert.equal(LEGACY_PRODUCTION_CLOUD_API_URLS.includes(PRODUCTION_CLOUD_API_URL), false, "the current cloud cannot also be retired");
 });
@@ -33,6 +36,10 @@ test("a retired production URL is rewritten to the current one, in any spelling 
     "https://froozerp-production.up.railway.app",
     "https://froozerp-production.up.railway.app/",
     "  https://froozerp-production.up.railway.app/  ",
+    // Saved on every counter that signed in before the move: without this they keep syncing to
+    // Railway, which is frozen, and their bills never reach Neon.
+    "https://froozerp-production-27bb.up.railway.app",
+    "https://froozerp-production-27bb.up.railway.app/",
   ]) {
     assert.equal(canonicalizeCloudApiUrl(saved), PRODUCTION_CLOUD_API_URL, JSON.stringify(saved));
     assert.equal(isLegacyProductionCloudApiUrl(saved), true);

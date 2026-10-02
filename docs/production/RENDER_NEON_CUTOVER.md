@@ -293,6 +293,11 @@ findable while they last.
 
 ## Phase 2 code (the cut-over release)
 
+**Done 2 Oct 2026, release 1.0.76**, after the Render rehearsal passed (a desktop bill synced to
+Render + the Neon `rehearsal` branch; it also found and fixed the lot-scope sync bug, PR #29). Merging
+it changes only the URL constants the next *build* carries; nothing reaches a counter until 1.0.76 is
+published, which happens on cut-over night after step 11.
+
 The code changes for the release itself, made only once Render + Neon is live and verified:
 
 - The new URL goes into `src-tauri/src/lib.rs` `PRODUCTION_CLOUD_API_URL`,
