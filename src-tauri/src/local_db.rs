@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
+use crate::machine_identity::{self, AnchorOutcome, AnchorWritePolicy, MachineContext};
 
-const CURRENT_SCHEMA_VERSION: &str = "024_other_charges";
+const CURRENT_SCHEMA_VERSION: &str = "025_device_machine_fingerprint";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -33,6 +34,7 @@ const MIGRATION_021: &str = include_str!("../migrations/sqlite/021_customer_orde
 const MIGRATION_022: &str = include_str!("../migrations/sqlite/022_customer_order_sync.sql");
 const MIGRATION_023: &str = include_str!("../migrations/sqlite/023_customer_order_transfer.sql");
 const MIGRATION_024: &str = include_str!("../migrations/sqlite/024_other_charges.sql");
+const MIGRATION_025: &str = include_str!("../migrations/sqlite/025_device_machine_fingerprint.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -151,7 +153,10 @@ pub fn ensure_device_identity(
 ) -> Result<serde_json::Value, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
-    ensure_device_identity_with_preference_at(&path, preferred_device_id)
+    // The real machine: its fingerprint and its anchor (see `machine_identity`). Local registry and
+    // file access only - nothing here touches the network, so LOCAL_ONLY is unaffected.
+    let machine = MachineContext::current();
+    ensure_device_identity_for_machine_at(&path, preferred_device_id, &machine)
 }
 
 pub fn cache_reference_snapshot(app: &AppHandle, snapshot: &serde_json::Value) -> Result<LocalDbStatus, String> {
@@ -3572,6 +3577,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "022_customer_order_sync", MIGRATION_022)?;
     apply_migration(&mut conn, "023_customer_order_transfer", MIGRATION_023)?;
     apply_migration(&mut conn, "024_other_charges", MIGRATION_024)?;
+    apply_migration(&mut conn, "025_device_machine_fingerprint", MIGRATION_025)?;
     Ok(())
 }
 
@@ -3727,26 +3733,52 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
     let canonical_role = optional_text(&user_profile, "role_name")
         .or_else(|| optional_text(&user_profile, "role"));
 
-    tx.execute(
-        "INSERT INTO local_device_identity (
-            device_id, device_name, platform, app_version, branch_id, registration_status,
-            company_id, user_id, role, last_seen_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                   strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-         ON CONFLICT(device_id) DO UPDATE SET
-           device_name = excluded.device_name,
-           platform = excluded.platform,
-           app_version = excluded.app_version,
-           branch_id = excluded.branch_id,
-           registration_status = excluded.registration_status,
-           company_id = COALESCE(excluded.company_id, local_device_identity.company_id),
-           user_id = COALESCE(excluded.user_id, local_device_identity.user_id),
-           role = COALESCE(excluded.role, local_device_identity.role),
-           last_seen_at = excluded.last_seen_at,
-           updated_at = excluded.updated_at",
-        params![device_id, device_name, platform, app_version, branch_id, registration_status, company_id, canonical_user_id, canonical_role],
-    )
-    .map_err(to_error)?;
+    // A snapshot refreshes the identity it names; it never creates a second one. The frontend
+    // ensures this profile's identity before it builds a snapshot, so a `device_id` that is not
+    // already a row is a stale id carried over from somewhere else - and upserting it is exactly how
+    // a single computer used to end up with three identity rows. The one exception is a profile
+    // with no identity at all (only the legacy `default` row, or nothing), where the snapshot's id is
+    // the only one there is and refusing it would leave the device with none.
+    let identity_known: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM local_device_identity WHERE device_id = ?1",
+            params![device_id],
+            |row| row.get(0),
+        )
+        .map_err(to_error)?;
+    let identities_present: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM local_device_identity WHERE LOWER(device_id) <> 'default'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(to_error)?;
+    if identity_known == 0 && identities_present > 0 {
+        eprintln!(
+            "reference snapshot names device {device_id}, which is not an identity of this profile; identity rows left unchanged"
+        );
+    } else {
+        tx.execute(
+            "INSERT INTO local_device_identity (
+                device_id, device_name, platform, app_version, branch_id, registration_status,
+                company_id, user_id, role, last_seen_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                       strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(device_id) DO UPDATE SET
+               device_name = excluded.device_name,
+               platform = excluded.platform,
+               app_version = excluded.app_version,
+               branch_id = excluded.branch_id,
+               registration_status = excluded.registration_status,
+               company_id = COALESCE(excluded.company_id, local_device_identity.company_id),
+               user_id = COALESCE(excluded.user_id, local_device_identity.user_id),
+               role = COALESCE(excluded.role, local_device_identity.role),
+               last_seen_at = excluded.last_seen_at,
+               updated_at = excluded.updated_at",
+            params![device_id, device_name, platform, app_version, branch_id, registration_status, company_id, canonical_user_id, canonical_role],
+        )
+        .map_err(to_error)?;
+    }
 
     if let Some(username) = optional_text(&user_profile, "username") {
         let key = format!("offline_user_profile::{}::{}", device_id, username.to_lowercase());
@@ -5704,6 +5736,80 @@ fn ensure_device_identity_with_preference_at(
     path: &Path,
     preferred_device_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    // Path-addressed callers (tests, tools) never see the real machine: no fingerprint, no anchor,
+    // so a `cargo test` on a developer's Windows laptop cannot read or write its ProgramData anchor.
+    ensure_device_identity_for_machine_at(path, preferred_device_id, &MachineContext::none())
+}
+
+/// Add the current machine's fingerprint (`""` when unknown) to an identity returned to the
+/// frontend. It is the machine the app is running on *now*, not the stored column, so the cloud can
+/// group every id a single computer ever presented under one box. Never the raw MachineGuid.
+fn with_machine_fp(mut identity: serde_json::Value, machine: &MachineContext) -> serde_json::Value {
+    if let Some(fields) = identity.as_object_mut() {
+        fields.insert(
+            "machine_fp".to_string(),
+            serde_json::Value::String(machine.machine_fp.clone()),
+        );
+    }
+    identity
+}
+
+fn log_anchor_outcome(device_id: &str, outcome: &AnchorOutcome) {
+    match outcome {
+        AnchorOutcome::NotApplicable | AnchorOutcome::AlreadyCurrent => {}
+        AnchorOutcome::Written => eprintln!("device anchor recorded for {device_id}"),
+        AnchorOutcome::LeftAlone(reason) => {
+            eprintln!("device anchor left unchanged for {device_id}: {reason}")
+        }
+        AnchorOutcome::NotWellFormed => {
+            eprintln!("device anchor not written: {device_id} is not a well-formed FZDEV id")
+        }
+        AnchorOutcome::WriteFailed(error) => eprintln!("device anchor not written: {error}"),
+    }
+}
+
+/// Tie an identity that already exists to this machine, without ever re-keying it.
+///
+/// The `device_id` is untouchable - the entitlement binding hashes it and sales and outbox rows
+/// reference it - so all this does is (1) record the fingerprint on the row while the row has none,
+/// and (2) back-fill a missing or damaged anchor with this id. An anchor that names a different id
+/// (another Windows user's profile, an older install) is left exactly as it is. Every failure is
+/// logged and ignored: none of this may stop a shop from opening.
+fn bind_identity_to_machine(
+    conn: &Connection,
+    device_id: &str,
+    machine: &MachineContext,
+    policy: AnchorWritePolicy,
+) {
+    if !machine.machine_fp.is_empty() {
+        if let Err(error) = conn.execute(
+            "UPDATE local_device_identity SET machine_fp = ?2
+             WHERE device_id = ?1 AND (machine_fp IS NULL OR machine_fp = '')",
+            params![device_id, machine.machine_fp],
+        ) {
+            eprintln!("device machine fingerprint not recorded: {error}");
+        }
+    }
+    let outcome = machine_identity::settle_anchor(machine, device_id, policy);
+    log_anchor_outcome(device_id, &outcome);
+}
+
+/// `ensure_device_identity_with_preference_at`, for a given machine.
+///
+/// Selection among existing rows is unchanged. What the machine adds:
+///
+/// * **Rows exist:** the chosen identity is bound to the machine (`bind_identity_to_machine`) and
+///   nothing else changes - no id is ever re-keyed.
+/// * **No rows, no preferred id:** a well-formed anchor written under this machine's (non-empty)
+///   fingerprint gives back the id this computer already had. Otherwise a new id is minted exactly
+///   as before and the anchor is written - replacing one that came from another computer.
+/// * **No rows, a preferred id from the frontend:** today's behaviour; the anchor is written only if
+///   there is none (or it is unreadable as an anchor).
+fn ensure_device_identity_for_machine_at(
+    path: &Path,
+    preferred_device_id: Option<&str>,
+    machine: &MachineContext,
+) -> Result<serde_json::Value, String> {
     let conn = Connection::open(path).map_err(to_error)?;
     let preferred_device_id = preferred_device_id
         .map(str::trim)
@@ -5730,7 +5836,8 @@ fn ensure_device_identity_with_preference_at(
     // metadata problem from stopping a shop: real field profiles carry two or three rows
     // (backlog item 5). Both conflict shapes therefore resolve to a deterministic pick and
     // report the conflict as data on the returned identity instead of returning Err, which
-    // used to surface as a 503 and a blocked startup. Nothing is written here.
+    // used to surface as a 503 and a blocked startup. No identity row is created, deleted or
+    // re-keyed here; the selected row only gains its machine fingerprint if it had none.
     let conflict = if approved.len() > 1 {
         Some(("MULTIPLE_APPROVED", approved.clone()))
     } else if approved.is_empty() && identities.len() > 1 {
@@ -5758,6 +5865,12 @@ fn ensure_device_identity_with_preference_at(
                     eprintln!("entitlement grandfathering skipped: {error}");
                 }
             }
+            bind_identity_to_machine(
+                &conn,
+                &selected_device_id,
+                machine,
+                AnchorWritePolicy::IfMissingOrInvalid,
+            );
             let mut identity = selected.clone();
             if let Some(fields) = identity.as_object_mut() {
                 fields.insert(
@@ -5777,7 +5890,7 @@ fn ensure_device_identity_with_preference_at(
                     serde_json::Value::String(selected_device_id),
                 );
             }
-            return Ok(identity);
+            return Ok(with_machine_fp(identity, machine));
         }
     }
     if let Some(identity) = approved.first() {
@@ -5788,25 +5901,64 @@ fn ensure_device_identity_with_preference_at(
         if let Err(error) = grandfather_existing_device(&conn, identity) {
             eprintln!("entitlement grandfathering skipped: {error}");
         }
-        return Ok((*identity).clone());
+        let device_id = optional_text(identity, "device_id").unwrap_or_default();
+        bind_identity_to_machine(&conn, &device_id, machine, AnchorWritePolicy::IfMissingOrInvalid);
+        return Ok(with_machine_fp((*identity).clone(), machine));
     }
     if let Some(identity) = identities.first() {
-        return Ok(identity.clone());
+        let device_id = optional_text(identity, "device_id").unwrap_or_default();
+        bind_identity_to_machine(&conn, &device_id, machine, AnchorWritePolicy::IfMissingOrInvalid);
+        return Ok(with_machine_fp(identity.clone(), machine));
     }
 
-    let device_id = preferred_device_id
-        .map(ToOwned::to_owned)
-        .map(Ok)
-        .unwrap_or_else(generate_opaque_device_id)?;
+    // No identity at all. The order matters: the frontend's remembered id first (unchanged), then
+    // the id this very computer was already given (the anchor), and only then a new one.
+    let (device_id, anchor_policy) = match preferred_device_id {
+        Some(preferred) => (preferred.to_owned(), AnchorWritePolicy::IfMissingOrInvalid),
+        None => {
+            let anchored = machine
+                .anchor_path
+                .as_deref()
+                .filter(|_| !machine.machine_fp.is_empty())
+                .and_then(|anchor_path| {
+                    machine_identity::reusable_anchor_device_id(
+                        &machine.machine_fp,
+                        &machine_identity::read_anchor(anchor_path),
+                    )
+                });
+            match anchored {
+                Some(anchored_id) => {
+                    eprintln!("device identity restored from this machine's anchor: {anchored_id}");
+                    (anchored_id, AnchorWritePolicy::IfMissingOrInvalid)
+                }
+                None => match machine_identity::stable_device_id(
+                    &machine.machine_fp,
+                    cfg!(target_os = "android"),
+                ) {
+                    // A phone: the id follows from the phone itself, so a reinstall is the same
+                    // device. There is no anchor on a phone, so the policy is moot.
+                    Some(stable_id) => {
+                        eprintln!("device identity derived from this phone: {stable_id}");
+                        (stable_id, AnchorWritePolicy::IfMissingOrInvalid)
+                    }
+                    None => (generate_opaque_device_id()?, AnchorWritePolicy::ReplaceForeignMachine),
+                },
+            }
+        }
+    };
     let device_name = format!("{} - FroozERP", local_device_host_name(&device_id));
     let app_version = env!("CARGO_PKG_VERSION");
     conn.execute(
         "INSERT INTO local_device_identity (
-            device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
-         ) VALUES (?1, ?2, ?4, ?3, 'unassigned', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![device_id, device_name, app_version, LOCAL_DEVICE_PLATFORM],
+            device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at,
+            machine_fp
+         ) VALUES (?1, ?2, ?4, ?3, 'unassigned', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            NULLIF(?5, ''))",
+        params![device_id, device_name, app_version, LOCAL_DEVICE_PLATFORM, machine.machine_fp],
     )
     .map_err(to_error)?;
+    let outcome = machine_identity::settle_anchor(machine, &device_id, anchor_policy);
+    log_anchor_outcome(&device_id, &outcome);
 
     Ok(serde_json::json!({
         "device_id": device_id,
@@ -5817,6 +5969,7 @@ fn ensure_device_identity_with_preference_at(
         "registration_status": "pending",
         "last_seen_at": null,
         "last_sync_at": null,
+        "machine_fp": machine.machine_fp,
     }))
 }
 
@@ -7234,7 +7387,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 23;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 24;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -13079,5 +13232,231 @@ mod tests {
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             assert_eq!(LOCAL_DEVICE_PLATFORM, "tauri-windows", "desktop registration is unchanged");
         }
+    }
+
+    // ---- One computer, one device id (machine fingerprint + ProgramData anchor) ----------------
+
+    const MACHINE_FP_HERE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const MACHINE_FP_ELSEWHERE: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// A fresh profile database plus an anchor location of its own, never the real ProgramData.
+    fn machine_test_paths(label: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "froozerp-machine-{label}-{}-{}",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create machine test dir");
+        (
+            dir.join(LOCAL_DB_FILE),
+            dir.join("ProgramData").join("FroozERP").join(machine_identity::DEVICE_ANCHOR_FILE),
+        )
+    }
+
+    fn test_machine(fp: &str, anchor: &Path) -> MachineContext {
+        MachineContext { machine_fp: fp.to_string(), anchor_path: Some(anchor.to_path_buf()) }
+    }
+
+    fn stored_machine_fp(path: &Path, device_id: &str) -> Option<String> {
+        let conn = Connection::open(path).expect("open");
+        conn.query_row(
+            "SELECT machine_fp FROM local_device_identity WHERE device_id = ?1",
+            params![device_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("identity row")
+    }
+
+    fn identity_count(path: &Path) -> i64 {
+        let conn = Connection::open(path).expect("open");
+        conn.query_row("SELECT COUNT(*) FROM local_device_identity", [], |row| row.get(0))
+            .expect("count identities")
+    }
+
+    #[test]
+    fn a_rebuilt_profile_on_the_same_machine_gets_its_old_device_id_back() {
+        let (first_db, anchor) = machine_test_paths("rebuilt");
+        let here = test_machine(MACHINE_FP_HERE, &anchor);
+        initialize_at(&first_db).expect("init first profile");
+        let first = ensure_device_identity_for_machine_at(&first_db, None, &here).expect("mint");
+        let device_id = first["device_id"].as_str().expect("device id").to_string();
+        assert_eq!(first["machine_fp"], MACHINE_FP_HERE);
+        assert_eq!(stored_machine_fp(&first_db, &device_id).as_deref(), Some(MACHINE_FP_HERE));
+        assert!(
+            matches!(machine_identity::read_anchor(&anchor), machine_identity::AnchorRead::Present(ref found) if found.device_id == device_id),
+            "a minted id is anchored"
+        );
+
+        // "Uninstall and delete app data", another Windows user, a lost SQLite file: a brand-new
+        // profile on the same computer.
+        let second_db = first_db.with_file_name("rebuilt-profile.sqlite3");
+        initialize_at(&second_db).expect("init rebuilt profile");
+        let second = ensure_device_identity_for_machine_at(&second_db, None, &here).expect("restore");
+        assert_eq!(second["device_id"], serde_json::json!(device_id), "one computer, one id");
+        assert_eq!(identity_count(&second_db), 1);
+        assert_eq!(stored_machine_fp(&second_db, &device_id).as_deref(), Some(MACHINE_FP_HERE));
+        let _ = fs::remove_dir_all(first_db.parent().unwrap());
+    }
+
+    #[test]
+    fn another_computers_anchor_is_never_reused() {
+        let (db, anchor) = machine_test_paths("foreign-anchor");
+        let elsewhere = test_machine(MACHINE_FP_ELSEWHERE, &anchor);
+        let other_db = db.with_file_name("elsewhere.sqlite3");
+        initialize_at(&other_db).expect("init");
+        let foreign = ensure_device_identity_for_machine_at(&other_db, None, &elsewhere).expect("mint");
+
+        // The same ProgramData folder, now on this computer.
+        initialize_at(&db).expect("init");
+        let here = test_machine(MACHINE_FP_HERE, &anchor);
+        let mine = ensure_device_identity_for_machine_at(&db, None, &here).expect("mint");
+        assert_ne!(mine["device_id"], foreign["device_id"]);
+        // And the anchor now belongs to this computer.
+        assert_eq!(
+            machine_identity::reusable_anchor_device_id(MACHINE_FP_HERE, &machine_identity::read_anchor(&anchor)),
+            mine["device_id"].as_str().map(str::to_string)
+        );
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn an_existing_identity_is_never_rekeyed_and_backfills_a_missing_anchor() {
+        let (db, anchor) = machine_test_paths("backfill");
+        let device = "FZDEV-AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        seed_pending_identity(&db, device);
+        let here = test_machine(MACHINE_FP_HERE, &anchor);
+
+        let identity = ensure_device_identity_for_machine_at(&db, None, &here).expect("resolve");
+        assert_eq!(identity["device_id"], device);
+        assert_eq!(identity["machine_fp"], MACHINE_FP_HERE);
+        assert_eq!(stored_machine_fp(&db, device).as_deref(), Some(MACHINE_FP_HERE));
+        assert_eq!(
+            machine_identity::reusable_anchor_device_id(MACHINE_FP_HERE, &machine_identity::read_anchor(&anchor)),
+            Some(device.to_string())
+        );
+        assert_eq!(identity_count(&db), 1);
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn an_anchor_naming_another_id_is_left_alone_and_so_is_the_identity() {
+        let (db, anchor) = machine_test_paths("other-user");
+        let anchored = "FZDEV-11111111-2222-3333-4444-555555555555";
+        machine_identity::write_anchor(
+            &anchor,
+            &machine_identity::DeviceAnchor {
+                device_id: anchored.to_string(),
+                machine_fp: MACHINE_FP_HERE.to_string(),
+            },
+        )
+        .expect("pre-existing anchor");
+        let device = "FZDEV-99999999-8888-7777-6666-555555555555";
+        seed_pending_identity(&db, device);
+
+        let here = test_machine(MACHINE_FP_HERE, &anchor);
+        let identity = ensure_device_identity_for_machine_at(&db, None, &here).expect("resolve");
+        assert_eq!(identity["device_id"], device, "an existing identity is never re-keyed");
+        assert_eq!(
+            machine_identity::reusable_anchor_device_id(MACHINE_FP_HERE, &machine_identity::read_anchor(&anchor)),
+            Some(anchored.to_string()),
+            "and another profile's anchor is not overwritten"
+        );
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn a_preferred_id_still_wins_on_an_empty_profile_and_anchors_only_when_none_exists() {
+        let (db, anchor) = machine_test_paths("preferred");
+        let here = test_machine(MACHINE_FP_HERE, &anchor);
+        let preferred = "FZDEV-ABCDEF01-2345-6789-ABCD-EF0123456789";
+        initialize_at(&db).expect("init");
+        let identity = ensure_device_identity_for_machine_at(&db, Some(preferred), &here).expect("create");
+        assert_eq!(identity["device_id"], preferred);
+        assert_eq!(
+            machine_identity::reusable_anchor_device_id(MACHINE_FP_HERE, &machine_identity::read_anchor(&anchor)),
+            Some(preferred.to_string())
+        );
+
+        let second_db = db.with_file_name("second.sqlite3");
+        initialize_at(&second_db).expect("init");
+        let other = "FZDEV-00000000-0000-0000-0000-000000000001";
+        let second = ensure_device_identity_for_machine_at(&second_db, Some(other), &here).expect("create");
+        assert_eq!(second["device_id"], other, "today's behaviour for a remembered id is unchanged");
+        assert_eq!(
+            machine_identity::reusable_anchor_device_id(MACHINE_FP_HERE, &machine_identity::read_anchor(&anchor)),
+            Some(preferred.to_string()),
+            "an existing anchor is not overwritten by a preferred id"
+        );
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unknown_machine_keeps_todays_behaviour_and_reports_an_empty_fingerprint() {
+        let (db, anchor) = machine_test_paths("unknown-machine");
+        initialize_at(&db).expect("init");
+        let unknown = test_machine("", &anchor);
+        let identity = ensure_device_identity_for_machine_at(&db, None, &unknown).expect("mint");
+        assert_eq!(identity["machine_fp"], "");
+        let device_id = identity["device_id"].as_str().unwrap().to_string();
+        assert_eq!(stored_machine_fp(&db, &device_id), None);
+        assert_eq!(machine_identity::read_anchor(&anchor), machine_identity::AnchorRead::Missing);
+
+        // The inert context every path-addressed caller uses: same shape, nothing touched.
+        let again = ensure_device_identity_at(&db).expect("resolve");
+        assert_eq!(again["device_id"], serde_json::json!(device_id));
+        assert_eq!(again["machine_fp"], "");
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn migration_025_adds_the_machine_fingerprint_column_once() {
+        let (db, _) = machine_test_paths("migration-025");
+        initialize_at(&db).expect("init");
+        initialize_at(&db).expect("restart");
+        let conn = Connection::open(&db).expect("open");
+        let applications: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_schema_migrations WHERE version = '025_device_machine_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("025 application count");
+        assert_eq!(applications, 1);
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('local_device_identity') WHERE name = 'machine_fp'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("column check");
+        assert_eq!(columns, 1);
+        drop(conn);
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn a_snapshot_never_adds_an_identity_for_a_stale_device_id() {
+        let (db, _) = machine_test_paths("stale-snapshot-id");
+        let device = "FZDEV-CURRENT-0001";
+        seed_pending_identity(&db, device);
+        let snapshot = |id: &str, branch: &str| {
+            serde_json::json!({
+                "device_identity": { "device_id": id, "branch_id": branch },
+                "branch_context": { "branch_id": branch },
+                "user_profile": {},
+                "products": [],
+                "inventory_lots": [],
+            })
+        };
+        cache_reference_snapshot_at(&db, &snapshot("FZDEV-STALE-0002", "5")).expect("snapshot caches");
+        assert_eq!(identity_count(&db), 1, "a stale id must not become a second identity");
+        assert!(identity_status(&db, "FZDEV-STALE-0002").is_none());
+
+        // The identity it does name is still refreshed.
+        cache_reference_snapshot_at(&db, &snapshot(device, "6")).expect("snapshot caches");
+        assert_eq!(identity_count(&db), 1);
+        assert_eq!(identity_status(&db, device).expect("row").1, "6");
+        let _ = fs::remove_dir_all(db.parent().unwrap());
     }
 }

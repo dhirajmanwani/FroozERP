@@ -41,6 +41,7 @@ const {
   validateSyncBatchScope,
 } = require("./operationalScope");
 const { registerOperationalV3Routes } = require("./operationalV3");
+const { normalizeMachineFingerprint } = require("./scopeManagement");
 const {
   VIEW_ONLY_TTL_SECONDS,
   issueDeviceSession,
@@ -2875,6 +2876,13 @@ const initializeDatabase = async () => {
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS app_version VARCHAR(40) DEFAULT '1.0.0';
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMP;
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS sync_status VARCHAR(40) DEFAULT 'IDLE';
+    -- One computer, one box. A device id is minted per installation, so a reinstalled counter
+    -- registers under a new id; the machine fingerprint (sha256, 64 lowercase hex, never the raw
+    -- machine GUID) is what lets the Owner's device list fold those ids into one machine. NULL
+    -- when the client did not send one. backend/migrations/cloud/022_device_machine_fingerprint.sql
+    -- carries the same two statements to the hosted database, where this function never runs.
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS machine_fp VARCHAR(80);
+    CREATE INDEX IF NOT EXISTS authorized_devices_machine_fp_idx ON authorized_devices (machine_fp);
 
     CREATE TABLE IF NOT EXISTS activation_codes (
       id SERIAL PRIMARY KEY,
@@ -7139,6 +7147,9 @@ app.post("/api/cloud/device/register", async (req, res) => {
     const payload = {
       device_id: device.device_id,
       device_name: device.device_name,
+      // Forwarded only when well-formed; `undefined` drops out of the JSON body, so a client that
+      // sends none (or garbage) reaches the cloud exactly as before.
+      machine_fp: device.machine_fp || undefined,
       platform: req.body.platform || device.device_type,
       app_version: cleanText(req.body.app_version) || appVersion,
       branch_id: device.assigned_branch_id || req.body.branch_id,
@@ -10458,6 +10469,9 @@ const readDevicePayload = (body = {}, req = {}) => ({
   local_ip: cleanText(body.local_ip || req.ip),
   assigned_branch_id: parsePositiveInteger(body.assigned_branch_id || body.branch_id) || 1,
   assigned_counter_id: parsePositiveInteger(body.assigned_counter_id),
+  // The machine fingerprint (sha256 hex) or null. Anything malformed is treated as absent, and the
+  // upsert below never lets an absent value erase one already stored.
+  machine_fp: normalizeMachineFingerprint(body.machine_fp),
 });
 
 const upsertDeviceRequest = async (device, client = pool) => {
@@ -10466,14 +10480,15 @@ const upsertDeviceRequest = async (device, client = pool) => {
     `
     INSERT INTO authorized_devices (
       device_id, device_name, device_type, user_agent, local_ip,
-      assigned_branch_id, assigned_counter_id, status, request_time, updated_at
+      assigned_branch_id, assigned_counter_id, status, request_time, updated_at, machine_fp
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $8)
     ON CONFLICT (device_id) DO UPDATE
     SET device_name = EXCLUDED.device_name,
         device_type = EXCLUDED.device_type,
         user_agent = EXCLUDED.user_agent,
         local_ip = EXCLUDED.local_ip,
+        machine_fp = COALESCE(EXCLUDED.machine_fp, authorized_devices.machine_fp),
         updated_at = CURRENT_TIMESTAMP
     RETURNING *
     `,
@@ -10485,6 +10500,7 @@ const upsertDeviceRequest = async (device, client = pool) => {
       device.local_ip,
       device.assigned_branch_id,
       device.assigned_counter_id,
+      normalizeMachineFingerprint(device.machine_fp),
     ]
   );
   return result.rows[0];
@@ -14950,7 +14966,10 @@ app.post("/login", async (req, res) => {
     }
     if (device.status !== "APPROVED") {
       const deviceStatus = String(device.status || "").toUpperCase();
-      const code = deviceStatus === "DISABLED"
+      // RETIRED is the Owner tidying an old box off "Computers & phones". It answers as DISABLED so
+      // every shipped client already handles it, rather than as "pending approval" -- a retired id is
+      // never listed for approval again, so that message would be a wait with no end.
+      const code = deviceStatus === "DISABLED" || deviceStatus === "RETIRED"
         ? "DEVICE_DISABLED"
         : deviceStatus === "REVOKED"
           ? "DEVICE_REVOKED"
@@ -24270,7 +24289,6 @@ const createSaleReturnHandler = async (req, res) => {
     const refundType = normalizeRefundType(req.body.refund_type);
     const returnReason = cleanText(req.body.return_reason);
     const createdBy = req.auth.userId;
-    const branchId = parsePositiveInteger(req.body.branch_id);
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     if (!saleId || !REFUND_TYPES.has(refundType) || !returnReason || items.length === 0) {
       return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
@@ -24296,24 +24314,51 @@ const createSaleReturnHandler = async (req, res) => {
     const replay = await beginV3BusinessOperation(client, req, "sale_return");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+    // The bill must be this shop's: the same branch the invoice list and the options read are
+    // scoped to. It used to also demand the bill's own counter (operational location) equal the
+    // one recording the return, so a bill made on one counter -- or any bill when the return was
+    // entered on the Owner's laptop -- was refused as "Select an active invoice for return" even
+    // though it was picked from the list. Older bills with no company recorded still qualify.
     const saleResult = await client.query(
       `SELECT * FROM sales
        WHERE id = $1
-         AND ($2::INTEGER IS NULL OR (
-           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
-         ))
+         AND branch_id = $2
+         AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
        FOR SHARE`,
       [
         saleId,
-        context?.company_id || null,
-        context?.branch_id || null,
-        context?.operational_location_id || null,
+        parsePositiveInteger(context?.branch_id) || parsePositiveInteger(req.auth.branchId),
+        parsePositiveInteger(context?.company_id) || parsePositiveInteger(req.auth.companyId) || null,
       ]
     );
     const sale = saleResult.rows[0];
-    if (!sale || sale.sale_status === "CANCELLED") {
+    if (!sale) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Select an active invoice for return" });
+      return res.status(400).json({ code: "SALE_RETURN_INVOICE_NOT_FOUND", message: "This bill is not in this shop's records. Pick the bill again from the list." });
+    }
+    if (sale.sale_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ code: "SALE_RETURN_INVOICE_CANCELLED", message: "This bill is cancelled, so nothing on it can be returned." });
+    }
+    // A Cashier needs an Owner or Admin to approve the return on the counter (their own username and
+    // password, checked by POST /api/v3/sale-change-approvals with action "return"). Owner and
+    // Admin need nothing. The approval is single-use and bound to this bill, this cashier, this
+    // company and this device; it is consumed here, inside the return's transaction.
+    const approval = await authorizeSaleChange(client, {
+      actor: manager,
+      action: "return",
+      approvalId: req.body.approval_id,
+      sale,
+      companyId: context?.company_id ?? req.auth.companyId,
+      deviceId: context?.device_id ?? req.auth.deviceId,
+    });
+    if (!approval.ok) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        code: approval.code,
+        detail: approval.detail,
+        message: approval.message,
+      });
     }
     // The shop's day, not the server's: the server runs in UTC, which is still yesterday until
     // 05:30 in India. A date the client sends must be a real YYYY-MM-DD, not after today in India
@@ -24347,7 +24392,8 @@ const createSaleReturnHandler = async (req, res) => {
         returnNo, saleId, nullableText(req.body.customer_name) || sale.customer_name,
         nullableText(req.body.customer_mobile) || sale.customer_mobile,
         returnDate.date, refundType, returnReason,
-        branchId || sale.branch_id, createdBy,
+        // The bill's branch, already checked to be this login's; never the branch the client sent.
+        sale.branch_id, createdBy,
         context?.company_id || sale.company_id || null,
         context?.operational_location_id || sale.operational_location_id || null,
       ]
@@ -24446,9 +24492,11 @@ const createSaleReturnHandler = async (req, res) => {
           returnQuantity,
           `Sale return ${returnNo}: ${returnReason}`,
           createdBy,
-          branchId || sale.branch_id,
-          context?.company_id || sale.company_id || null,
-          context?.operational_location_id || sale.operational_location_id || null,
+          // The stock went back into the bill's own batches, so the movement belongs to the bill's
+          // shop and counter, even when the return was typed in somewhere else.
+          sale.branch_id,
+          sale.company_id || context?.company_id || null,
+          sale.operational_location_id || context?.operational_location_id || null,
         ]
       );
       totalReturnAmount = roundCurrency(totalReturnAmount + returnAmount);
@@ -25136,18 +25184,25 @@ const createSaleChangeApprovalHandler = async (req, res) => {
   // permission -- only to be an active user. Anyone the 5% rule already exempts (Owner, Admin,
   // holder of manual_pos_rate_override) is told they need no approval.
   const discountRequest = request.action === "discount";
+  // A return is asked for by whoever may record returns at all (the `billing` key the return route
+  // itself checks); the approval is what a Cashier then needs on top.
+  const returnRequest = request.action === "return";
   const requester = discountRequest
     ? await getManualDiscountActor(requesterId)
-    : await getSalePermissionUser(requesterId, request.action);
+    : returnRequest
+      ? await getPermissionUser(requesterId, "billing", ["Owner", "Admin"])
+      : await getSalePermissionUser(requesterId, request.action);
   if (!requester) {
     await audit(CODES.REQUESTER_NOT_ALLOWED, { stage: "requester_permission" });
     return res.status(403).json({
       code: CODES.REQUESTER_NOT_ALLOWED,
       message: discountRequest
         ? "Your account is not active."
-        : request.action === "cancel"
-          ? "You do not have permission to cancel completed sales."
-          : "You do not have permission to edit completed sales.",
+        : returnRequest
+          ? "You do not have permission to record sale returns."
+          : request.action === "cancel"
+            ? "You do not have permission to cancel completed sales."
+            : "You do not have permission to edit completed sales.",
     });
   }
   if (discountRequest ? discountRules.manualDiscountExempt(requester) : !saleChangeApproval.approvalRequired(requester.role_name)) {
@@ -25156,7 +25211,9 @@ const createSaleChangeApprovalHandler = async (req, res) => {
       code: CODES.NOT_NEEDED,
       message: discountRequest
         ? "You can give this discount without approval."
-        : "Owners and Admins do not need approval to change a bill.",
+        : returnRequest
+          ? "Owners and Admins do not need approval to record a return."
+          : "Owners and Admins do not need approval to change a bill.",
     });
   }
 
@@ -25662,4 +25719,8 @@ module.exports = {
   // Exported so `saleReturns.test.js` can run the reversal against a real Postgres (PGlite) and see
   // that stock a return already put back is not put back again.
   restoreSaleInventory,
+  // Exported so `deviceMachineFingerprint.test.js` can run the device upsert against PGlite and see
+  // that an absent or malformed fingerprint never erases a stored one.
+  readDevicePayload,
+  upsertDeviceRequest,
 };

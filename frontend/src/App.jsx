@@ -70,6 +70,7 @@ import { buildCommandIndex, highlightSegments, searchCommands } from "./local/co
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
 import { WHATSAPP_OPENED, describeChatHandoff, initialWhatsappSelection } from "./local/whatsappHandoff";
 import { buildSaleReturnDraft, filterReturnInvoices, refundPerUnit, saleReturnFingerprint, saleReturnPayload } from "./local/saleReturnDraft";
+import { canRetireDeviceId, normalizeMachineFingerprint, previousIdsNote, retireDeviceConfirmText, waitingIdsNote } from "./local/deviceBoxes";
 import { DASHBOARD_BLOCKS, DEFAULT_DASHBOARD_ORDER, dashboardDropIndex, isDefaultDashboardOrder, moveDashboardBlock, nudgeDashboardBlock, readDashboardOrder, writeDashboardOrder } from "./local/dashboardLayout";
 import { PRICE_LIST_SHARE_ROUTE, PRICE_LIST_SHARE_TIMEOUT_MS, PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, choosePriceListShareRoute, parseWhatsappGroupInvite, priceListCaption, priceListCopySaveOutcome, priceListFileName, priceListGroupLink, priceListGroupOutcome, readLastPreparedOn, readPriceListGroup, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListGroup, writePriceListSchedule } from "./local/dailyPriceList";
 import { buildPosPayments, buildUpiPayload, describePaymentConfirmation, invoiceUpiNote, resolveInvoiceUpiQr } from "./local/posPaymentConfirmation";
@@ -99,7 +100,7 @@ import {
   resolveNotification,
   unreadCount,
 } from "./local/notificationCenter";
-import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
+import { sameIdentityRecord, buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
@@ -1403,6 +1404,10 @@ const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
     device_name: identity.device_name || fallback.device_name,
     device_type: identity.platform || fallback.device_type,
     branch_id: identity.branch_id || fallback.branch_id,
+    // A hash of this computer's Windows id or this phone's ANDROID_ID ("" where there is none), so
+    // the cloud can show one box per machine even if an old install left another device id behind.
+    // Never the raw id.
+    machine_fp: normalizeMachineFingerprint(identity.machine_fp),
   };
 };
 
@@ -3341,6 +3346,7 @@ function App() {
     const payload = {
       device_id: latestDevice.device_id,
       device_name: latestDevice.device_name || "FroozERP Device",
+      machine_fp: normalizeMachineFingerprint(latestDevice.machine_fp),
       platform: DEVICE_PLATFORM,
       app_version: APP_VERSION,
       branch_id: currentUser.branch_id || 1,
@@ -3639,8 +3645,12 @@ function App() {
       cloudIdentity: status.canonicalIdentity,
       deviceInfo: deviceInfoRef.current,
     });
-    userRef.current = canonicalUser;
-    setUser(canonicalUser);
+    // Unchanged after a sync (the usual case): keep the same object, or every screen that reloads
+    // when the user changes reloads every minute -- Branches & Counters jumped back to the top.
+    if (!sameIdentityRecord(userRef.current, canonicalUser)) {
+      userRef.current = canonicalUser;
+      setUser(canonicalUser);
+    }
     mergeCloudIdentityIntoSavedConfig({
       ...status.canonicalIdentity,
       cloud_api_url: CLOUD_API_URL,
@@ -7504,7 +7514,7 @@ function App() {
       return;
     }
     try {
-      const latestDevice = getClientDeviceInfo();
+      const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       const response = await axios.post(`${API_URL}/devices/activate`, {
         ...latestDevice,
         activation_code: activationCode,
@@ -10678,6 +10688,7 @@ function App() {
 
           {activeView === "returns" && (
             <SaleReturnModule
+              approvalRoute={resolveSaleChangeRoute({ user, offlineMode, connectivityMode })}
               onSaved={refreshAfterSaleReturn}
               returns={saleReturns}
               user={user}
@@ -10964,6 +10975,7 @@ function App() {
               <OperationalScopeManagement
                 canManage={settingsData.canManageSettings}
                 canManageDevices={canManageRates}
+                currentDeviceId={deviceInfo.device_id}
                 focusSection={pendingSection}
                 onFocusSectionHandled={() => setPendingSection(null)}
                 onReloadSettings={async () => {
@@ -18219,7 +18231,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
 // list on a counter can hold this computer's local bill ids, which the cloud cannot look up, so a
 // return picked from it failed as "Invalid invoice". What may be sent is worked out in
 // local/saleReturnDraft.js; the server checks it all again.
-function SaleReturnModule({ onSaved, returns, user }) {
+function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
   const [invoiceSearch, setInvoiceSearch] = useState("");
   const [invoiceList, setInvoiceList] = useState({ status: "loading", sales: [], message: "" });
   const [invoiceId, setInvoiceId] = useState("");
@@ -18230,10 +18242,13 @@ function SaleReturnModule({ onSaved, returns, user }) {
   const [quantities, setQuantities] = useState({});
   const [saving, setSaving] = useState(false);
   const [outcome, setOutcome] = useState(null);
+  // A Cashier's return needs the Owner or an Admin to type their own username and password here
+  // (asked for 3 Oct 2026), the same check a bill cancel uses. Owner and Admin see nothing extra.
+  const [approver, setApprover] = useState({ approverUsername: "", approverPassword: "" });
   const optionsRequest = useRef(0);
   // One key per return: a retry of the same return after a lost reply is recognised by the server
   // instead of being booked twice. A changed form gets a new key.
-  const pendingWrite = useRef({ fingerprint: "", operationId: "" });
+  const pendingWrite = useRef({ fingerprint: "", operationId: "", approvalId: "" });
   const today = toDateKey(new Date());
 
   const loadInvoices = async () => {
@@ -18278,8 +18293,14 @@ function SaleReturnModule({ onSaved, returns, user }) {
 
   const draft = buildSaleReturnDraft({ invoiceId, items: returnOptions.items, quantities, reason: returnReason });
   const dateProblem = !returnDate ? "Pick the return date." : (returnDate > today ? "The return date cannot be after today." : "");
-  const blockers = [...draft.problems, ...(dateProblem ? [dateProblem] : [])];
-  const canSave = draft.canSave && !dateProblem && returnOptions.status === "ready";
+  const approvalMode = approvalRoute?.mode || SALE_CHANGE_APPROVAL_MODE.NONE;
+  const approvalProblem = approvalMode === SALE_CHANGE_APPROVAL_MODE.REFUSED
+    ? approvalRoute.message
+    : approvalMode === SALE_CHANGE_APPROVAL_MODE.CLOUD && (!approver.approverUsername.trim() || !approver.approverPassword)
+      ? "The Owner or an Admin must type their username and password to approve this return."
+      : "";
+  const blockers = [...draft.problems, ...(dateProblem ? [dateProblem] : []), ...(approvalProblem ? [approvalProblem] : [])];
+  const canSave = draft.canSave && !dateProblem && !approvalProblem && returnOptions.status === "ready";
 
   const saveReturn = async () => {
     if (saving || !canSave) return;
@@ -18294,21 +18315,45 @@ function SaleReturnModule({ onSaved, returns, user }) {
       draft,
     });
     const fingerprint = saleReturnFingerprint(payload);
-    if (pendingWrite.current.fingerprint !== fingerprint) pendingWrite.current = { fingerprint, operationId: "" };
-    const returnWrite = createOperationalWrite(user, payload, pendingWrite.current.operationId);
-    pendingWrite.current.operationId = returnWrite.operationId;
+    if (pendingWrite.current.fingerprint !== fingerprint) pendingWrite.current = { fingerprint, operationId: "", approvalId: "" };
     setSaving(true);
     setOutcome(null);
+    // The approval is asked for once per return. If the save then fails, the retry reuses it: the
+    // failed save rolled back without spending it.
+    if (approvalMode === SALE_CHANGE_APPROVAL_MODE.CLOUD && !pendingWrite.current.approvalId) {
+      try {
+        pendingWrite.current.approvalId = await requestSaleChangeApproval(user, {
+          action: "return",
+          saleRef: invoiceId,
+          reason: payload.return_reason,
+          approverUsername: approver.approverUsername,
+          approverPassword: approver.approverPassword,
+        });
+      } catch (error) {
+        setSaving(false);
+        setOutcome({ tone: "error", text: describeApprovalError(error) });
+        return;
+      }
+    }
+    const returnWrite = createOperationalWrite(
+      user,
+      pendingWrite.current.approvalId ? { ...payload, approval_id: pendingWrite.current.approvalId } : payload,
+      pendingWrite.current.operationId,
+    );
+    pendingWrite.current.operationId = returnWrite.operationId;
     let saved;
     try {
       const response = await axios.post(`${API_URL}/api/v3/sale-returns`, returnWrite.body, returnWrite.config);
       saved = response.data || {};
     } catch (error) {
+      // A refused or spent approval cannot be reused; the next try asks again.
+      if (String(error?.response?.data?.code || "").includes("APPROVAL")) pendingWrite.current.approvalId = "";
       setSaving(false);
       setOutcome({ tone: "error", text: getErrorMessage(error, "The return was not saved.") });
       return;
     }
-    pendingWrite.current = { fingerprint: "", operationId: "" };
+    pendingWrite.current = { fingerprint: "", operationId: "", approvalId: "" };
+    setApprover({ approverUsername: "", approverPassword: "" });
     optionsRequest.current += 1;
     setInvoiceId("");
     setReturnOptions({ status: "idle", sale: null, items: [], message: "" });
@@ -18402,6 +18447,12 @@ function SaleReturnModule({ onSaved, returns, user }) {
           <SummaryMetric label="Return Value" value={draft.total === null ? "Unknown" : currency.format(draft.total)} featured />
           <SummaryMetric label="Refund Mode" value={labelFor("refundType", refundType)} />
         </div>
+        <SaleChangeApprovalFields
+          disabled={saving}
+          form={approver}
+          onChange={(change) => setApprover((current) => ({ ...current, ...change }))}
+          route={approvalRoute}
+        />
         {invoiceId !== "" && returnOptions.status === "ready" && blockers.length > 0 && (
           <ul className="return-note return-blockers">
             {blockers.map((problem) => <li key={problem}>{problem}</li>)}
@@ -22899,6 +22950,7 @@ function OperationalScopeManagement({
   focusSection = null,
   onFocusSectionHandled,
   onReloadSettings,
+  currentDeviceId = "",
   settingsData = {},
   user,
 }) {
@@ -22920,11 +22972,18 @@ function OperationalScopeManagement({
   const [locationDraft, setLocationDraft] = useState({ branch_id: "", location_code: "", location_name: "", location_type: "STORE", address: "", is_default: false });
   const [staffDraft, setStaffDraft] = useState({ user_id: "", branch_id: "", operational_location_id: "", role_id: "", is_default: true, effective_from: "", effective_to: "" });
   const [approvalDrafts, setApprovalDrafts] = useState({});
+  // Read once when the screen opens, after each save, and when the signed-in session itself changes
+  // -- not whenever the user object is rebuilt. The full-page loading card is for the first read
+  // only: a later reload keeps the page (and where it is scrolled to) and refreshes in place.
+  const [loadedOnce, setLoadedOnce] = useState(false);
+  const scopeUserRef = useRef(user);
+  scopeUserRef.current = user;
+  const sessionKey = `${user?.id ?? ""}|${user?.device_session_token ?? ""}|${user?.branch_id ?? ""}`;
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const response = await axios.get(`${SYNC_API_URL}/api/v3/admin/scope-management`, createOperationalReadConfig(user));
+      const response = await axios.get(`${SYNC_API_URL}/api/v3/admin/scope-management`, createOperationalReadConfig(scopeUserRef.current));
       setData({ ...EMPTY_OPERATIONAL_SCOPE_DATA, ...(response.data || {}) });
       setScopeReadAllowed(true);
     } catch (requestError) {
@@ -22932,9 +22991,10 @@ function OperationalScopeManagement({
       setError(getErrorMessage(requestError, "Unable to load branch and device assignments"));
     } finally {
       setLoading(false);
+      setLoadedOnce(true);
     }
-  }, [user]);
-  useEffect(() => { load(); }, [load]);
+  }, []);
+  useEffect(() => { load(); }, [load, sessionKey]);
   // Same rule as the Settings filter: the licence card is the Owner's, and a phone has no screen
   // lock. The backend refuses either way; this only decides what is drawn.
   const isOwnerAccount = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
@@ -23103,7 +23163,20 @@ function OperationalScopeManagement({
     } catch (requestError) { report("computers", "error", getErrorMessage(requestError, "The computer could not be approved.")); }
   };
 
-  if (loading) return <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters"><p>Loading branches and counters...</p></ModuleCard>;
+  // An id a machine no longer uses (an install from before one-machine-one-id). Kept in the books --
+  // old bills name it -- but no longer drawn as a box. The server refuses this computer's own id.
+  const retireDevice = async (device) => {
+    if (!window.confirm(retireDeviceConfirmText(device))) return;
+    try {
+      await saveWrite("post", `/api/v3/admin/devices/${encodeURIComponent(device.device_id)}/retire`, {
+        reason: "Owner removed an id this machine no longer uses",
+      });
+      report("computers", "ok", `Old id ${device.device_id} removed.`);
+      onReloadSettings?.();
+    } catch (requestError) { report("computers", "error", getErrorMessage(requestError, "The old id could not be removed.")); }
+  };
+
+  if (loading && !loadedOnce) return <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters"><p>Loading branches and counters...</p></ModuleCard>;
   const stepMessage = (step) => {
     const status = stepStatus[step];
     if (!status?.text) return null;
@@ -23180,7 +23253,14 @@ function OperationalScopeManagement({
         {data.pending_devices.map((device) => {
           const draft = approvalDraft(device);
           return <section className="settings-inline-panel" key={device.device_id}>
-            <div><strong>{device.device_name}</strong><small className="cell-note">{device.device_id} - {device.device_type || device.platform || "Other"}</small></div>
+            <div>
+              <strong>{device.device_name}</strong>
+              <small className="cell-note device-id-note">{device.device_id} - {device.device_type || device.platform || "Other"}</small>
+              {previousIdsNote(device) && <small className="cell-note device-id-note">{previousIdsNote(device)}</small>}
+              {canRetireDeviceId({ deviceId: device.device_id, currentDeviceId, isOwner: isOwnerAccount }) && (
+                <button className="table-action" disabled={!canManage} onClick={() => retireDevice(device)} type="button">Retire this id</button>
+              )}
+            </div>
             <div className="form-grid supplier-form-grid">
               <Field label="Branch"><select disabled={!canManage} value={draft.branch_id} onChange={(event) => updateApprovalDraft(device, "branch_id", event.target.value)}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
               <Field label="Counter"><select disabled={!canManage || !draft.branch_id} value={draft.operational_location_id} onChange={(event) => updateApprovalDraft(device, "operational_location_id", event.target.value)}><option value="">{draft.branch_id ? "Select counter" : "Select branch first"}</option>{locationsForBranch(draft.branch_id).map((location) => <option key={location.id} value={location.id}>{location.location_name}</option>)}</select></Field>
@@ -23196,8 +23276,26 @@ function OperationalScopeManagement({
         {data.pending_devices.length === 0 && <p className="scope-empty">Nothing is waiting. A new machine appears here after it presses Send to Shop.</p>}
         {stepMessage("computers")}
         <h3 className="scope-subheading">Approved</h3>
-        <DataTable headers={["Computer", "Branch", "Counter", "Used for", "Status"]}>
-          {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{labelFor("deviceUsage", assignment.intended_usage)}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td></tr>)}
+        <DataTable headers={["Computer", "Branch", "Counter", "Used for", "Status", "Actions"]}>
+          {data.device_assignments.map((assignment) => (
+            <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}>
+              <td className="primary-cell">
+                {assignment.device_name}
+                <small className="cell-note device-id-note">{assignment.device_id}</small>
+                {previousIdsNote(assignment) && <small className="cell-note device-id-note">{previousIdsNote(assignment)}</small>}
+                {waitingIdsNote(assignment) && <small className="cell-note warning-note device-id-note">{waitingIdsNote(assignment)}</small>}
+              </td>
+              <td>{assignment.branch_name}</td>
+              <td>{assignment.location_name}</td>
+              <td>{labelFor("deviceUsage", assignment.intended_usage)}</td>
+              <td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td>
+              <td>
+                {canRetireDeviceId({ deviceId: assignment.device_id, currentDeviceId, isOwner: isOwnerAccount })
+                  ? <button className="table-action" disabled={!canManage} onClick={() => retireDevice(assignment)} type="button">Retire this id</button>
+                  : (canonicalInventoryId(assignment.device_id) === canonicalInventoryId(currentDeviceId) ? <small className="cell-note">This computer</small> : null)}
+              </td>
+            </tr>
+          ))}
         </DataTable>
         {activeCounters.length === 0 && <p className="form-note">Add a counter in Step 2 before approving a computer.</p>}
       </ModuleCard>
@@ -23278,7 +23376,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
       <DataTable headers={["Device", "Type", "Branch / Counter", "Status", "Last Active", "Last Sync", "Actions"]}>
         {devices.map((device) => (
           <tr key={device.device_id}>
-            <td className="primary-cell">{device.device_name}<small className="cell-note">{device.device_id}</small></td>
+            <td className="primary-cell">{device.device_name}<small className="cell-note device-id-note">{device.device_id}</small></td>
             <td>{labelFor("deviceType", device.device_type || "Browser")}</td>
             <td>{device.branch_name || "Main Branch"}<small className="cell-note">{device.counter_name || "No counter assigned"}</small></td>
             <td><span className={statusClass("deviceStatus", device.status)}>{labelFor("deviceStatus", device.status)}</span></td>

@@ -1,0 +1,26 @@
+-- The machine a device identity was first ensured on.
+--
+-- "One computer, one ID, one name." A desktop's `FZDEV-…` id used to be minted afresh whenever
+-- `local_device_identity` was empty — after an uninstall that deleted app data, under a second
+-- Windows user, or after the SQLite file was lost — so one counter could accumulate several
+-- device ids. `src/machine_identity.rs` now derives a fingerprint of the computer itself
+-- (`sha256("froozerp:machine:" + lowercase(MachineGuid))`, lowercase hex) and keeps an anchor
+-- file outside the app-data directory, so a rebuilt profile on the same machine gets its old id
+-- back instead of a new one. This column records that fingerprint on the identity row.
+--
+-- Never the raw MachineGuid: only the hash is stored, and only the hash is ever sent.
+--
+-- NULL means "unknown" — every row that predates this migration, every non-Windows device, and
+-- any machine whose registry could not be read. It is filled when the identity is ensured and only
+-- while it is NULL or empty, so it keeps the machine the identity was first seen on: a profile later
+-- copied to another computer still says where it came from. No id is ever re-keyed from it — the
+-- entitlement binding hashes `device_id`, and sales and outbox rows reference it.
+--
+-- Idempotent across restarts by version-gating in apply_migration(), which skips any version
+-- already recorded APPLIED in local_schema_migrations. SQLite has no ADD COLUMN IF NOT EXISTS, so
+-- this file is not safe to execute twice on its own — the gate is what makes it idempotent, exactly
+-- as for every other ALTER-bearing migration in this directory. Forward-only: never edit this file
+-- once it has been applied anywhere. In SQLite an ADD COLUMN with no default is an O(1) catalogue
+-- change, not a table rebuild.
+
+ALTER TABLE local_device_identity ADD COLUMN machine_fp TEXT;
