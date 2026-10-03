@@ -14854,7 +14854,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
               <SummaryMetric label="Credit Amount" value={currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
               <SummaryMetric label="Balance" value={currency.format(summaries.reduce((sum, row) => sum + Number(row.balance || 0), 0))} />
             </div>
-            <DataTable headers={["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Balance", "Action"]}>
+            <DataTable headers={["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Returned", "Balance", "Action"]}>
               {summaries.map((summary) => (
                 <tr key={summary.key}>
                   <td className="primary-cell">{summary.customer_name}</td>
@@ -14863,6 +14863,8 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
                   <td>{summary.pending_bill_count} bills</td>
                   <td>{currency.format(Number(summary.total_credit_amount || 0))}</td>
                   <td>{currency.format(Number(summary.amount_received || 0))}</td>
+                  {/* Goods returned on a credit note or future adjustment, so Credit - Received - Returned = Balance. */}
+                  <td>{currency.format(Number(summary.amount_returned || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(summary.balance || 0))}</td>
                   <td><button className="table-action" onClick={() => setSelectedCustomerKey(summary.key)}>View</button></td>
                 </tr>
@@ -14873,7 +14875,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
 
           {selectedCustomer && (
             <ModuleCard eyebrow="Customer Drill-Down" title={selectedCustomer.customer_name} subtitle="Receive payment, view invoices and print customer credit statement.">
-              <DataTable headers={["Bill Date", "Invoice Number", "Items / Narration", "Gross Amount", "Discount", "Net Amount", "Received", "Balance", "Due Date", "Status", "Action"]}>
+              <DataTable headers={["Bill Date", "Invoice Number", "Items / Narration", "Gross Amount", "Discount", "Net Amount", "Received", "Returned", "Balance", "Due Date", "Status", "Action"]}>
                 {selectedCustomer.rows.map((invoice) => (
                   <tr key={invoice.id}>
                     <td>{formatDisplayDate(invoice.sale_date)}</td>
@@ -14883,6 +14885,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
                     <td>{currency.format(Number(invoice.item_discount_amount || 0) + Number(invoice.invoice_discount_amount || 0))}</td>
                     <td>{currency.format(Number(invoice.total_amount || 0))}</td>
                     <td>{currency.format(Number(invoice.received_amount || 0))}</td>
+                    <td>{currency.format(Number(invoice.returned_amount || 0))}</td>
                     <td className="balance-cell">{currency.format(Number(invoice.balance_amount || 0))}</td>
                     <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : "-"}</td>
                     <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{labelFor("credit_status", invoice.credit_status)}</span></td>
@@ -18340,7 +18343,7 @@ function SaleReturnModule({ onSaved, returns, user }) {
           </Field>
           <Field label="Select Invoice">
             <select disabled={invoiceList.status !== "ready" || saving} value={invoiceId} onChange={(event) => loadReturnOptions(event.target.value)}>
-              <option value="">{invoiceList.status === "loading" ? "Loading bills..." : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : "No bill matches"}</option>
+              <option value="">{invoiceList.status === "loading" ? "Loading bills..." : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : invoiceSearch.trim() ? "No bill matches" : "No bills yet"}</option>
               {!selectedInvoiceListed && selectedInvoice && (
                 <option value={invoiceId}>{returnInvoiceLabel(selectedInvoice)}</option>
               )}
