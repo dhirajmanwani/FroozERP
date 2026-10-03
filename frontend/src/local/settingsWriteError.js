@@ -142,9 +142,12 @@ export const settingsWriteErrorMessage = (error, fallback, options) =>
  * What a person needs to know here is exactly two things: what you saved is saved, and this screen
  * may be showing yesterday's version of it.
  */
-export const refreshAfterSaveMessage = (error) => {
-  const detail = text(error?.message) || text(error?.code);
+export const refreshAfterSaveMessage = (error, part = "") => {
+  // The desktop app's own commands reject with a bare string, not an Error; on 3 Oct 2026 that
+  // made this message arrive with no detail at all, so nobody could tell which read had failed.
+  const detail = text(error?.message) || text(error?.code) || (typeof error === "string" ? text(error) : "");
+  const what = text(part);
   return "This screen could not refresh itself, so it may be showing old information."
     + " Anything you just saved is saved — reopen Settings to see the latest."
-    + (detail ? ` [${detail}]` : "");
+    + (what || detail ? ` [${[what, detail].filter(Boolean).join(": ")}]` : "");
 };
