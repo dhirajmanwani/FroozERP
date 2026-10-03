@@ -21,6 +21,7 @@ import {
   pushNavigation,
   resolveNavigationTarget,
   resolveShortcutTarget,
+  RESERVED_SHORTCUT_LETTERS,
   SETTINGS_GROUPS,
 } from "./appNavigation.js";
 
@@ -207,14 +208,54 @@ const keyEvent = (overrides = {}) => ({
 
 const digitEvent = (digit, overrides = {}) => keyEvent({ code: `Digit${digit}`, key: String(digit), ...overrides });
 
+// The physical key a shortcut names: `Digit1` for "1", `KeyW` for "W".
+const shortcutEvent = (shortcut, overrides = {}) => keyEvent({
+  code: /^[0-9]$/.test(shortcut) ? `Digit${shortcut}` : `Key${shortcut}`,
+  key: String(shortcut).toLowerCase(),
+  ...overrides,
+});
+
 test("every assigned shortcut reaches its module", () => {
   const assigned = navigationRegistry.filter((item) => item.shortcut !== null);
   assert.ok(assigned.length > 0, "the whole feature is the shortcuts; some must be assigned");
   for (const item of assigned) {
-    const resolved = resolveShortcutTarget(digitEvent(item.shortcut));
+    const resolved = resolveShortcutTarget(shortcutEvent(item.shortcut));
     assert.ok(resolved, `Alt+${item.shortcut} resolved to nothing`);
     assert.equal(resolved.id, item.id, `Alt+${item.shortcut} must open ${item.id}`);
   }
+});
+
+test("every screen in the sidebar has a key (asked for on 2 Oct 2026)", () => {
+  const missing = navigationRegistry.filter((item) => item.shortcut === null || item.shortcut === undefined).map((item) => item.id);
+  assert.deepEqual(missing, []);
+});
+
+test("a shortcut is one digit or one capital letter, and never a key the browser keeps", () => {
+  for (const item of navigationRegistry) {
+    assert.match(item.shortcut, /^[0-9A-Z]$/, `${item.id} has an unusable shortcut "${item.shortcut}"`);
+    assert.ok(!RESERVED_SHORTCUT_LETTERS.includes(item.shortcut), `${item.id} uses Alt+${item.shortcut}, which a browser keeps for itself`);
+  }
+});
+
+test("letters are read from the physical key, whatever the layout types", () => {
+  // A counter typing in Hindi presses the key marked W; `key` is a Devanagari character, `code`
+  // is still KeyW.
+  assert.equal(resolveShortcutTarget(keyEvent({ code: "KeyW", key: "\u0941" })).id, "waste");
+  assert.equal(resolveShortcutTarget(keyEvent({ code: "KeyS", key: "s" })).id, "settings");
+  // No `code` at all: the letter is taken from `key`, in either case.
+  assert.equal(resolveShortcutTarget(keyEvent({ code: undefined, key: "x" })).id, "expenses");
+  assert.equal(resolveShortcutTarget(keyEvent({ code: undefined, key: "B" })).id, "branches");
+});
+
+test("a letter shortcut is muted while typing, exactly like a digit", () => {
+  assert.equal(resolveShortcutTarget(shortcutEvent("W", { target: { tagName: "INPUT" } })), null);
+  assert.equal(resolveShortcutTarget(shortcutEvent("W", { altKey: false })), null);
+  assert.equal(resolveShortcutTarget(shortcutEvent("W", { ctrlKey: true })), null);
+});
+
+test("the chip prints a letter in capitals", () => {
+  assert.equal(formatShortcut("w"), "Alt W");
+  assert.equal(formatShortcut("S"), "Alt S");
 });
 
 test("the till has the most reachable key", () => {
@@ -248,7 +289,7 @@ test("the chip text and the resolver agree about what a shortcut is", () => {
 });
 
 test("an unassigned key does nothing rather than something", () => {
-  // Alt+8 is Sale Returns today; whichever digit is spare must not fall through to a default.
+  // Every digit is taken today; a spare one, and an unassigned letter, must not fall through to a default.
   const spare = "123456789 0".split("").find((digit) => /[0-9]/.test(digit) && !navigationRegistry.some((item) => item.shortcut === digit));
   if (spare) assert.equal(resolveShortcutTarget(digitEvent(spare)), null);
   assert.equal(resolveShortcutTarget(keyEvent({ code: "KeyQ", key: "q" })), null);

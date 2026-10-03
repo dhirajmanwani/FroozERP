@@ -106,8 +106,10 @@
     overflow-x: auto;
   }
 
-  :root[data-app-font-size="large"] table,
-  :root[data-app-font-size="extra-large"] table {
+  /* Not the printed bill: forcing it to 920px made the invoice dialog scroll sideways at the
+     larger text sizes, which also pushed its close button off screen. */
+  :root[data-app-font-size="large"] table:not(.bill-table),
+  :root[data-app-font-size="extra-large"] table:not(.bill-table) {
     min-width: max(100%, 920px);
   }
 
@@ -385,8 +387,14 @@ input[type="number"] {
   margin-left: 252px;
 }
 
+/* Pinned to the top of the window (2 Oct 2026, asked for by the owner): search, back and forward
+   stay one click away however far down a long report or ledger somebody has scrolled. Anything
+   else that sticks while the page scrolls must start below it, at `--topbar-height`. */
 .topbar {
-  min-height: 76px;
+  position: sticky;
+  top: 0;
+  z-index: 18;
+  min-height: var(--topbar-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3104,8 +3112,8 @@ tbody tr:has(> .empty-cell):hover {
 
 .checkout-card {
   position: sticky;
-  top: 18px;
-  max-height: calc(100vh - 104px);
+  top: calc(var(--topbar-height, 0px) + 18px);
+  max-height: calc(100vh - 104px - var(--topbar-height, 0px));
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -3382,7 +3390,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .sticky-report-filters {
   position: sticky;
-  top: 10px;
+  top: calc(var(--topbar-height, 0px) + 10px);
   z-index: 8;
   align-items: end;
   padding: 12px;
@@ -4092,6 +4100,334 @@ tbody tr:has(> .empty-cell):hover {
   gap: 7px;
 }
 
+/* The bill dialog's own header. Scoped by `-bill` modifiers because the plain classes are shared by
+   about twenty other dialogs. It never scrolls sideways: the actions wrap instead of overflowing,
+   and the close button lives in the top row beside the title, where it is always in view. */
+.invoice-modal-bill {
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.invoice-toolbar-bill {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px 14px;
+  border-bottom: 1px solid var(--accent-line);
+  background:
+    linear-gradient(180deg, var(--accent-soft), transparent 70%),
+    var(--card-veil-solid);
+  box-shadow: 0 6px 18px var(--shadow-faint);
+  backdrop-filter: blur(10px);
+}
+
+.invoice-toolbar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.invoice-toolbar-title {
+  min-width: 0;
+}
+
+.invoice-toolbar-bill .invoice-toolbar-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-strong);
+  font-size: 18px;
+  font-weight: 750;
+  letter-spacing: 0.2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.invoice-toolbar-bill .invoice-close {
+  flex: 0 0 auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--card);
+  box-shadow: 0 1px 2px var(--shadow-faint);
+}
+
+.invoice-toolbar-bill .invoice-close:hover,
+.invoice-toolbar-bill .invoice-close:focus-visible {
+  border-color: var(--danger-line);
+  color: var(--danger-ink);
+  background: var(--danger-soft);
+}
+
+.invoice-actions-bill {
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 8px;
+}
+
+.invoice-actions-bill > button {
+  min-height: var(--control-height-sm);
+  border-radius: var(--radius-pill);
+  padding: 0 14px;
+  white-space: nowrap;
+}
+
+.invoice-actions-bill > .secondary-button {
+  border-color: var(--accent-line);
+  background: var(--card);
+}
+
+.invoice-actions-bill > .secondary-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* Today's price list, at the top of the Dashboard. The card inside is what becomes the WhatsApp
+   picture, so it uses fixed paper and brand colours rather than theme tokens that flip in dark. */
+.price-list-panel {
+  display: grid;
+  gap: 14px;
+  margin-bottom: var(--space-4);
+}
+
+.price-list-panel-ready {
+  border-color: var(--success-line);
+  box-shadow: 0 0 0 3px var(--success-soft);
+}
+
+.price-list-heading {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.price-list-ready-note {
+  margin: 4px 0 0;
+  color: var(--success-ink);
+  font-weight: 650;
+}
+
+.price-list-actions {
+  margin: 0;
+}
+
+.price-list-card {
+  overflow: hidden;
+  border: 1px solid var(--price-list-gold);
+  border-radius: 16px;
+  color: var(--paper-ink);
+  background: var(--price-list-cream);
+}
+
+/* Only while the picture is taken: two columns, about a phone screen wide. */
+.price-list-card-capture {
+  width: 560px;
+  max-width: none;
+}
+
+.price-list-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 20px;
+  border-bottom: 3px solid var(--price-list-gold);
+  color: var(--price-list-cream);
+  background: linear-gradient(120deg, var(--price-list-band), var(--price-list-band-2));
+}
+
+.price-list-card-head div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.price-list-card-head strong {
+  font-family: var(--font-display, inherit);
+  font-size: 22px;
+  letter-spacing: 0.3px;
+}
+
+.price-list-card-head span {
+  color: var(--price-list-gold);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+}
+
+.price-list-card-head time {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border: 1px solid var(--price-list-gold);
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.price-list-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 230px), 1fr));
+  gap: 10px;
+  margin: 0;
+  padding: 16px;
+  list-style: none;
+}
+
+.price-list-item {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  grid-template-areas: "photo name" "photo rate";
+  align-items: center;
+  column-gap: 12px;
+  padding: 8px 12px 8px 8px;
+  border: 1px solid var(--paper-line);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.price-list-photo {
+  grid-area: photo;
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  object-fit: cover;
+}
+
+.price-list-initial {
+  display: grid;
+  place-items: center;
+  color: var(--price-list-cream);
+  font-size: 20px;
+  font-weight: 800;
+}
+
+.price-list-name {
+  grid-area: name;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--paper-ink);
+  font-weight: 700;
+}
+
+.price-list-rate {
+  grid-area: rate;
+  color: var(--price-list-band);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-list-card-foot {
+  padding: 10px 20px 14px;
+  color: var(--paper-ink-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.price-list-more {
+  justify-self: start;
+}
+
+.price-list-schedule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+}
+
+.price-list-schedule .check-field {
+  margin: 0;
+}
+
+.price-list-schedule input[type="time"] {
+  width: auto;
+}
+
+/* "Has the customer paid?" — asked after Checkout, before the bill is saved. */
+.pos-paid-modal {
+  width: min(460px, 100%);
+}
+
+.pos-paid-body {
+  display: grid;
+  gap: 14px;
+}
+
+.pos-paid-rows {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pos-paid-rows li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+
+.pos-paid-rows strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.pos-paid-qr {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, var(--accent-soft), transparent 75%), var(--card);
+}
+
+.pos-paid-qr img,
+.pos-paid-qr-wait {
+  flex: 0 0 auto;
+  width: 168px;
+  height: 168px;
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+}
+
+.pos-paid-qr-wait {
+  display: grid;
+  place-items: center;
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.pos-paid-qr > div:last-child {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.pos-paid-qr strong {
+  color: var(--ink-strong);
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pos-paid-qr small {
+  overflow-wrap: anywhere;
+  color: var(--ink-muted);
+}
+
+.invoice-actions-bill > .invoice-cancel-bill {
+  width: auto;
+  margin-left: auto;
+}
+
 .secondary-button,
 .whatsapp-button {
   min-height: var(--control-height);
@@ -4171,6 +4507,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .upi-qr-box {
+  box-sizing: border-box;
   width: min(280px, 100%);
   display: flex;
   align-items: center;
@@ -4194,6 +4531,12 @@ tbody tr:has(> .empty-cell):hover {
 .upi-qr-box small {
   display: block;
   color: #082116;
+}
+
+/* A long bill number wraps inside the box instead of pushing it past the bill's edge. */
+.upi-qr-box > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .upi-qr-box strong {
@@ -5099,13 +5442,13 @@ tbody tr:has(> .empty-cell):hover {
     border-radius: 8px;
   }
 
+  .content-shell {
+    --topbar-height: 68px;
+  }
+
   .topbar {
-    min-height: 68px;
     height: auto;
     padding: 0 19px;
-    position: sticky;
-    top: 0;
-    z-index: 18;
   }
 
   .topbar h1 {
@@ -7754,6 +8097,9 @@ tbody tr:has(> .empty-cell):hover {
 /* The keyboard chip beside a module name. Deliberately quiet: it is a thing to notice once and
    then stop seeing, not a second label competing with the first. */
 .nav-shortcut {
+  /* Every screen has a key now, long labels included: the label may wrap, the chip never does. */
+  flex: 0 0 auto;
+  white-space: nowrap;
   margin-left: auto;
   padding: 1px 6px;
   border-radius: 5px;
@@ -7851,6 +8197,56 @@ tbody tr:has(> .empty-cell):hover {
 
 .command-result-active {
   background: var(--accent-soft);
+}
+
+.shortcut-sheet {
+  width: min(720px, calc(100vw - 28px));
+  overflow-y: auto;
+}
+
+.shortcut-sheet .form-note {
+  margin: 0;
+}
+
+.shortcut-sheet-group {
+  display: grid;
+  gap: 8px;
+}
+
+.shortcut-sheet-rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 210px), 1fr));
+  gap: 6px;
+}
+
+.shortcut-sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink-strong);
+  background: var(--card);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+
+button.shortcut-sheet-row {
+  cursor: pointer;
+}
+
+button.shortcut-sheet-row:hover,
+button.shortcut-sheet-row:focus-visible {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.shortcut-sheet-row kbd {
+  flex: 0 0 auto;
+  font-size: 11px;
 }
 
 .command-palette-notice {

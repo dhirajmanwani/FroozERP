@@ -1591,7 +1591,7 @@ test("indicator: rendered next to the bell whenever the controller says the micr
   assert.match(topbar, /\{frostVoiceIndicator && \(\s*<FrostVoiceIndicator/, "the indicator sits in the topbar, just before the bell");
   assert.doesNotMatch(topbar.slice(0, topbar.indexOf("{frostVoiceIndicator &&")), /frostDrawerOpen &&/, "not gated on the drawer");
   assert.match(appSource, /<FrostVoiceLevel channel=\{level\} \/>/, "with the level");
-  // The launcher is fixed on screen; the topbar scrolls away. It carries the microphone too.
+  // The launcher is fixed on screen and carries the microphone too.
   assert.match(appSource, /micOn=\{frostLiveVoice\.on === true\}/);
   assert.match(appSource, /\{micOn && <i aria-hidden="true" className="frost-launcher-mic">/);
 });

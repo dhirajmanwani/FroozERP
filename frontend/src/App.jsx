@@ -67,6 +67,9 @@ import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./loc
 import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
 import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
+import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
+import { PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, priceListCaption, priceListFileName, readLastPreparedOn, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListSchedule } from "./local/dailyPriceList";
+import { buildPosPayments, buildUpiPayload, describePaymentConfirmation, invoiceUpiNote, resolveInvoiceUpiQr } from "./local/posPaymentConfirmation";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
@@ -1539,6 +1542,43 @@ const showPdfExportOverlay = (message) => {
   document.body.appendChild(overlay);
   return () => overlay.remove();
 };
+// This device's localStorage, or null where reading the property itself throws (a locked-down
+// profile). Callers in local/dailyPriceList.js already treat null as "nothing remembered".
+const deviceStorage = () => {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+};
+
+// A picture of one element, for sharing where a PDF is the wrong thing (WhatsApp shows a picture
+// inline; a PDF is a tap away). Same capture settings as `exportElementToPdf` below.
+const exportElementToPngBlob = async (element) => {
+  if (!element) throw new Error("Nothing to capture.");
+  const canvas = await html2canvas(element, {
+    backgroundColor: null,
+    scale: Math.min(3, Math.max(2, window.devicePixelRatio || 1)),
+    useCORS: true,
+    logging: false,
+  });
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!blob) throw new Error("The picture could not be encoded.");
+  return blob;
+};
+
+// A webview download: lands in Downloads, the same way the Excel export and catalogue are saved.
+const downloadBlob = (blob, fileName) => {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+};
+
 const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", printProfile = "", save = true }) => {
   if (!element) throw new Error("Nothing to export");
   const isThermal = mode === "THERMAL";
@@ -2058,6 +2098,7 @@ function Icon({ name, size = 18 }) {
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
+    keyboard: <><rect x="2" y="6" width="20" height="12" rx="2" /><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8" /></>,
     "arrow-left": <><path d="M19 12H5" /><path d="m12 19-7-7 7-7" /></>,
     "arrow-right": <><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></>,
     truck: <><path d="M3 7h11v9H3z" /><path d="M14 10h4l3 3v3h-7z" /><circle cx="7" cy="18" r="1.6" /><circle cx="17" cy="18" r="1.6" /></>,
@@ -2321,6 +2362,14 @@ function App() {
   const [productPhotos, setProductPhotos] = useState([]);
   const [productPhotosState, setProductPhotosState] = useState({ source: "none", message: "" });
   const productPhotoIndex = useMemo(() => indexProductPhotos(productPhotos), [productPhotos]);
+  // Today's price list (local/dailyPriceList.js): when this device reminds somebody to send it.
+  // Per device, like the update hours, because it is the machine at the counter that is open at 8.
+  const [priceListSchedule, setPriceListSchedule] = useState(() => readPriceListSchedule(deviceStorage()));
+  const [priceListReadyOn, setPriceListReadyOn] = useState("");
+  // The Dashboard's own read of this counter's shelf, for the price list. POS fills `posShelf` only
+  // once it is opened, and a counter that starts on the Dashboard would otherwise list nothing and
+  // say it does not know its shop. Same snapshot, same scope ladder, same filter as POS.
+  const [priceListShelf, setPriceListShelf] = useState({ status: "idle", products: [], inventoryLots: [], scope: null, message: "" });
   // The photo being edited in Product Master: `dataUrl` is what shows, `changed` whether Save must send it.
   const [productPhotoDraft, setProductPhotoDraft] = useState({ dataUrl: null, changed: false });
   const [productPhotoMessage, setProductPhotoMessage] = useState("");
@@ -2547,6 +2596,7 @@ function App() {
   });
   const [frostDrawerOpen, setFrostDrawerOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [shortcutSheetOpen, setShortcutSheetOpen] = useState(false);
   // FROST live voice. The controller (local/frostLiveVoice.js) owns the microphone; this component
   // only hands it the browser objects and the two routes it may use. `frostLiveVoice` is what the
   // switch and the indicator draw; `frostSpeechSetup` is the gateway's word on whether whisper is
@@ -2932,6 +2982,17 @@ function App() {
       if (event.key === "Escape") {
         setFrostDrawerOpen(false);
         setCommandPaletteOpen(false);
+        setShortcutSheetOpen(false);
+      }
+      if (isShortcutSheetChord(event)) {
+        // Works while typing, like Ctrl K: it only opens a list over the screen, so a bill being
+        // built underneath is still there when the list closes.
+        event.preventDefault();
+        if (user) {
+          setCommandPaletteOpen(false);
+          setShortcutSheetOpen((current) => !current);
+        }
+        return;
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         // Deliberately still works while typing, unlike the Alt shortcuts below. That is the whole
@@ -2941,7 +3002,7 @@ function App() {
         event.preventDefault();
         if (user) setCommandPaletteOpen((current) => !current);
       }
-      // Alt + digit jumps straight to a module. `resolveShortcutTarget` returns null while any
+      // Alt + digit or letter jumps straight to a module. `resolveShortcutTarget` returns null while any
       // input, textarea, select or contenteditable has focus, and during IME composition - a
       // cashier types into a search box all day, and a keystroke that changed screens mid-sale
       // would be a defect, not a nuisance. The guard lives in the module because that is where it
@@ -2950,6 +3011,7 @@ function App() {
       if (shortcutTarget && user) {
         event.preventDefault();
         setCommandPaletteOpen(false);
+        setShortcutSheetOpen(false);
         navigateRef.current?.(shortcutTarget.id);
       }
     };
@@ -4615,6 +4677,35 @@ function App() {
     });
   }, [activeView, connectivityMode, deviceInfo.device_id, posRefreshToken, user?.id]);
 
+  // Read-only: unlike the POS refresh it never replaces the app's product or stock lists, so the
+  // Dashboard's other figures stay exactly as they were.
+  useEffect(() => {
+    if (!user?.id || activeView !== "dashboard" || !isTauriRuntime()) return undefined;
+    let cancelled = false;
+    setPriceListShelf((current) => (current.status === "ready" ? current : { ...current, status: "loading" }));
+    loadLocalReferenceSnapshot({ username: user.username, deviceId: deviceInfo.device_id })
+      .then((snapshot) => {
+        if (cancelled) return;
+        if (!snapshot || typeof snapshot !== "object") {
+          // Nothing downloaded yet is its own state, not "this device does not know its shop".
+          setPriceListShelf({ status: "error", products: [], inventoryLots: [], scope: null, message: "This computer has not downloaded its stock yet. Press Sync now, then come back." });
+          return;
+        }
+        const scope = resolveCounterScope(snapshot);
+        const selected = selectLocalPosInventory(snapshot, {}, scope);
+        setCounterScope(scope);
+        setPriceListShelf({ status: "ready", products: selected.products, inventoryLots: selected.inventoryLots, scope, message: "" });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        writeDiagnosticLog("ERROR", "price-list-shelf-load-failed", { message: error?.message || String(error) });
+        setPriceListShelf({ status: "error", products: [], inventoryLots: [], scope: null, message: `This computer's stock could not be read: ${error?.message || "unknown error"}.` });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeView, deviceInfo.device_id, lastReferenceSyncAt, localDbStatus, posRefreshToken, user?.id, user?.username]);
+
   const fetchOnlineReferenceSnapshot = async (currentUser, latestDevice) => {
     const localSnapshot = isTauriRuntime()
       ? await loadLocalReferenceSnapshot({ username: currentUser?.username, deviceId: latestDevice.device_id }).catch(() => null)
@@ -4898,6 +4989,33 @@ function App() {
     const timer = window.setInterval(publish, 60000);
     return () => window.clearInterval(timer);
   }, [ordersState.orders, ordersState.loadState, notify, clearNotice]);
+
+  /**
+   * The morning price list. At or after the set time, once a day, the bell says the list is ready
+   * and the Dashboard panel lights its Share button. Nothing is sent: WhatsApp cannot be posted
+   * into an ordinary group by an app, so the person sends it (owner's choice, 3 Oct 2026). No
+   * network call either, so Local Only is untouched. A missed minute catches up while the app is
+   * open later the same day.
+   */
+  useEffect(() => {
+    if (!user) return undefined;
+    const check = () => {
+      const storage = deviceStorage();
+      const decision = shouldPreparePriceList({ schedule: priceListSchedule, lastPreparedOn: readLastPreparedOn(storage) });
+      if (!decision.due) return;
+      writeLastPreparedOn(storage, decision.today);
+      setPriceListReadyOn(decision.today);
+      notify({
+        title: "Today's price list is ready to send",
+        message: "Open the Dashboard and press Share on WhatsApp, then pick your group.",
+        source: "Price list",
+        dedupeKey: `price-list-${decision.today}`,
+      });
+    };
+    check();
+    const timer = window.setInterval(check, 60000);
+    return () => window.clearInterval(timer);
+  }, [notify, priceListSchedule, user]);
 
   /**
    * Whether this person is shown FROST at all.
@@ -9400,6 +9518,9 @@ function App() {
     devicePending: connectionStatus.devicePending,
   });
 
+  // What the sidebar shows this person, computed once so the shortcut list names the same screens.
+  const visibleNavigationItems = navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates"));
+
   return (
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""} ${sidebarCollapsed ? "sidebar-rail" : ""}`}>
@@ -9411,7 +9532,7 @@ function App() {
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
-          {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => {
+          {visibleNavigationItems.map(([view, label]) => {
             const shortcut = navigationRegistry.find((item) => item.id === view)?.shortcut || null;
             return (
               <button
@@ -9513,6 +9634,16 @@ function App() {
                 type="button"
               >
                 <Icon name="search" />
+              </button>
+              <button
+                aria-label="Keyboard shortcuts"
+                aria-pressed={shortcutSheetOpen}
+                className="chrome-button"
+                onClick={() => setShortcutSheetOpen((current) => !current)}
+                title={`Keyboard shortcuts (${SHORTCUT_SHEET_CHORD})`}
+                type="button"
+              >
+                <Icon name="keyboard" />
               </button>
               <button
                 aria-label="Back"
@@ -9720,6 +9851,25 @@ function App() {
                   <p>{dashboardError}</p>
                 </div>
               )}
+              {/* First thing on the Dashboard, asked for by the owner: the list he sends every morning. */}
+              <DailyPriceListPanel
+                businessSettings={settingsData.businessSettings}
+                branchName={websiteShopDetails.branch}
+                canSchedule={canManageRates}
+                inventoryLots={isTauriRuntime() ? priceListShelf.inventoryLots : inventory}
+                loadError={isTauriRuntime() && priceListShelf.status === "error" ? priceListShelf.message : ""}
+                loading={isTauriRuntime() && (priceListShelf.status === "idle" || priceListShelf.status === "loading")}
+                onScheduleChange={(next) => {
+                  setPriceListSchedule(next);
+                  writePriceListSchedule(deviceStorage(), next);
+                }}
+                photoIndex={productPhotoIndex}
+                products={(isTauriRuntime() ? priceListShelf.products : products).filter((product) => product.active !== false)}
+                readyToday={priceListReadyOn !== ""}
+                schedule={priceListSchedule}
+                // In the browser the cloud has already limited the stock to this login's shop.
+                scope={isTauriRuntime() ? priceListShelf.scope : null}
+              />
               <section className="welcome-banner">
                 <div>
                   <h2>Good to see you, {getUserGreetingName(user)}.</h2>
@@ -11025,6 +11175,13 @@ function App() {
           onClose={() => setCommandPaletteOpen(false)}
         />
       )}
+      {shortcutSheetOpen && (
+        <ShortcutSheet
+          onClose={() => setShortcutSheetOpen(false)}
+          onNavigate={(viewId) => { setShortcutSheetOpen(false); navigate(viewId); }}
+          sheet={buildShortcutSheet({ visibleModuleIds: visibleNavigationItems.map(([view]) => view) })}
+        />
+      )}
       {profileOpen && <UserProfilePanel onClose={() => setProfileOpen(false)} onLogout={() => setUser(null)} user={user} />}
     </main>
   );
@@ -11073,8 +11230,7 @@ function FrostFloatingCopilot({
 }) {
   return (
     <>
-      {/* The launcher is fixed on screen while the topbar scrolls away, so it also shows when the
-          microphone is on. */}
+      {/* The launcher is fixed on screen, so it also shows when the microphone is on. */}
       <button
         aria-label={micOn ? "Open FROST. The microphone is on." : "Open FROST"}
         className={`frost-floating-launcher ${unreadCount ? "frost-floating-launcher-alert" : ""} ${micOn ? "frost-floating-launcher-listening" : ""}`}
@@ -11250,6 +11406,53 @@ function CommandPalette({ index, recentIds = [], onNavigate, onClose }) {
     </div>
   );
 }
+
+/**
+ * Every keyboard shortcut, in one place. The list itself is built and tested in
+ * `local/keyboardShortcuts.js`; this only draws it. A screen row is also a button, so the list
+ * doubles as a way to get somewhere for anybody who would rather click.
+ */
+function ShortcutSheet({ sheet, onClose, onNavigate }) {
+  return (
+    <div className="command-palette-backdrop" onClick={onClose}>
+      {/* Not marked as a dialog on purpose: `isTypingContext` mutes the Alt keys inside dialogs,
+          and somebody reading this list is about to press one of them. */}
+      <section aria-label="Keyboard shortcuts" className="command-palette shortcut-sheet" onClick={(event) => event.stopPropagation()}>
+        <div className="command-palette-header">
+          <span className="eyebrow">Keyboard shortcuts</span>
+          <button aria-label="Close keyboard shortcuts" autoFocus className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
+        </div>
+        <p className="form-note">
+          Alt keys do nothing while the cursor is in a typing box, so a half-made bill is never lost. Click outside the box first.
+        </p>
+        {sheet.groups.map((group) => (
+          <div className="shortcut-sheet-group" key={group.id}>
+            <span className="eyebrow">{group.title}</span>
+            {group.id === "screens" && sheet.status === SHORTCUT_SHEET_STATUS.NO_SCREENS && (
+              <div className="cart-empty">No screen is open to this sign-in, so there is no screen key to list.</div>
+            )}
+            <div className="shortcut-sheet-rows">
+              {group.rows.map((row) => (
+                row.moduleId ? (
+                  <button className="shortcut-sheet-row" key={row.keys} onClick={() => onNavigate?.(row.moduleId)} type="button">
+                    <span>{row.label}</span>
+                    <kbd className="command-result-key">{row.keys}</kbd>
+                  </button>
+                ) : (
+                  <div className="shortcut-sheet-row" key={row.keys}>
+                    <span>{row.label}</span>
+                    <kbd className="command-result-key">{row.keys}</kbd>
+                  </div>
+                )
+              ))}
+            </div>
+          </div>
+        ))}
+      </section>
+    </div>
+  );
+}
+
 const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String(severity).toLowerCase()}`;
 
 function AiBusinessAssistantModule({
@@ -23555,6 +23758,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    * never copied here and never cleared by it.
    */
   const [discountApproval, setDiscountApproval] = useState(null);
+  // The "has the customer paid?" step. Holds the checkout that is waiting for the answer.
+  const [paymentConfirm, setPaymentConfirm] = useState(null);
   // Owner, Admin and anyone who may already set any rate are never asked.
   const discountExempt = discountApprovalExempt({ role: user?.role, canManualRateOverride });
   /**
@@ -24407,14 +24612,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return;
     }
 
-    const payments = paymentMode === "MIXED"
-      ? Object.entries(mixedPayments)
-        .filter(([, amount]) => Number(amount) > 0)
-        .map(([mode, amount]) => ({ mode, amount: Number(amount) }))
-      : [{ mode: paymentMode, amount: totals.total }];
-    const paidAmount = payments.reduce((sum, payment) => sum + Number(payment.amount), 0);
-    if (Math.abs(paidAmount - totals.total) > 0.01) {
-      alert("Payment amounts must match the tax-inclusive invoice total.");
+    const { payments, error: paymentError } = buildPosPayments({ paymentMode, mixedPayments, total: totals.total });
+    if (paymentError) {
+      alert(paymentError);
       return;
     }
 
@@ -24442,6 +24642,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // The bill's own reference: the approval (if any) was issued for it, and it is the sale's
     // idempotency key (browser) or sync operation id (desktop).
     const saleRef = String(confirmations.sale_ref || "").trim() || newSyncId("op");
+
+    // Nothing is saved, printed or sent until the cashier says the customer has paid (3 Oct 2026,
+    // the owner). The dialog shows a UPI QR for exactly the UPI part of the bill. "Paid" comes back
+    // here with every answer already given, and the same `sale_ref`, so nothing is asked twice.
+    if (confirmations.payment_confirmed !== true) {
+      setPaymentConfirm({ printAfterSave, confirmations: { ...carriedConfirmations, sale_ref: saleRef }, payments, paymentMode, total: totals.total });
+      return;
+    }
 
     setSaving(true);
     try {
@@ -24721,6 +24929,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     if (!lotSelectorProduct) return [];
     return [...new Set((lotsByProduct.get(lotSelectorProduct.id) || []).map((lot) => String(lot.unit || lotSelectorProduct.unit || "").trim()).filter(Boolean))].sort();
   }, [lotSelectorProduct, lotsByProduct]);
+
+  const confirmPayment = () => {
+    const draft = paymentConfirm;
+    if (!draft || saving) return;
+    setPaymentConfirm(null);
+    checkout(draft.printAfterSave, { ...draft.confirmations, payment_confirmed: true });
+  };
 
   const handleShortcuts = (event) => {
     if (event.key === "F2") {
@@ -25008,8 +25223,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <Field label="Credit Remarks"><input value={creditInfo.remarks} onChange={(event) => setCreditInfo({ ...creditInfo, remarks: event.target.value })} placeholder="Optional credit note" /></Field>
             </div>
           )}
-          {paymentSettings.enable_upi_qr_on_invoice && paymentSettings.business_upi_id && ["UPI", "MIXED", "BANK_TRANSFER"].includes(paymentMode) && (
-            <p className="form-note">UPI QR will be printed for {paymentSettings.business_upi_id} on this invoice.</p>
+          {paymentSettings.business_upi_id && ["UPI", "MIXED"].includes(paymentMode) && (
+            <p className="form-note">At checkout a UPI QR for {paymentSettings.business_upi_id} is shown for the UPI amount.</p>
           )}
           {paymentMode === "MIXED" && (
             <div className="mixed-payment-panel">
@@ -25082,13 +25297,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         </div>
         <div className="button-row checkout-actions">
           <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(false)}>
-            <Icon name="receipt" /> {saving ? "Saving..." : "Save Bill"}
+            <Icon name="receipt" /> {saving ? "Saving..." : "Checkout"}
           </button>
           <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
             <Icon name="print" /> Print Bill
           </button>
           <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(true)}>
-            <Icon name="print" /> Save & Print
+            <Icon name="print" /> Checkout & Print
           </button>
         </div>
       </aside>
@@ -25199,6 +25414,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           onConfirm={confirmDiscountApproval}
         />
       )}
+      {paymentConfirm && (
+        <PosPaymentConfirmModal
+          draft={paymentConfirm}
+          onClose={() => setPaymentConfirm(null)}
+          onPaid={confirmPayment}
+          paymentSettings={paymentSettings}
+        />
+      )}
     </section>
   );
 }
@@ -25299,6 +25522,88 @@ function DiscountApprovalModal({ draft, onChange, onClose, onConfirm }) {
           <div className="button-row">
             <button className="primary-button" disabled={draft.saving || missingCredentials} type="submit">{draft.saving ? "Checking..." : "Approve and save bill"}</button>
             <button className="secondary-button" disabled={draft.saving} type="button" onClick={onClose}>Change discount</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+/**
+ * "Has the customer paid?", asked after Checkout and before anything is saved. The wording, the
+ * rows and how much the QR asks for come from `local/posPaymentConfirmation.js`; this draws them
+ * and renders the QR locally with the bundled `qrcode` package, so it works offline and in Local
+ * Only with no request at all. Closing it ("Not yet") leaves the cart exactly as it was.
+ */
+function PosPaymentConfirmModal({ draft, onClose, onPaid, paymentSettings = {} }) {
+  const upiId = String(paymentSettings.business_upi_id || "").trim();
+  const view = describePaymentConfirmation({
+    paymentMode: draft.paymentMode,
+    payments: draft.payments,
+    total: draft.total,
+    upiConfigured: upiId !== "",
+  });
+  const payload = view.qrAmount ? buildUpiPayload({ upiId, payeeName: paymentSettings.upi_payee_name, amount: view.qrAmount, note: "FroozERP bill" }) : "";
+  const [qr, setQr] = useState({ payload: "", image: "", error: "" });
+  useEffect(() => {
+    if (!payload) return undefined;
+    let cancelled = false;
+    QRCode.toDataURL(payload, { errorCorrectionLevel: "M", margin: 1, width: 220 })
+      .then((image) => { if (!cancelled) setQr({ payload, image, error: "" }); })
+      .catch(() => { if (!cancelled) setQr({ payload, image: "", error: "The UPI QR could not be drawn. Take the payment by entering the UPI ID instead." }); });
+    return () => { cancelled = true; };
+  }, [payload]);
+  const qrReady = payload !== "" && qr.payload === payload;
+  return (
+    <div className="modal-backdrop">
+      <section
+        aria-label="Payment"
+        aria-modal="true"
+        className="invoice-modal pos-paid-modal"
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.stopPropagation();
+            onClose();
+          }
+        }}
+        role="dialog"
+      >
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">{view.kind === "CREDIT" ? "Credit bill" : "Payment"}</span>
+            <strong>{view.title}</strong>
+          </div>
+          <button aria-label="Close payment" className="remove-button" type="button" onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <form
+          className="sale-edit-body pos-paid-body"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onPaid();
+          }}
+        >
+          <ul className="pos-paid-rows">
+            {view.rows.map((row) => (
+              <li key={row.mode}><span>{row.label}</span><strong>{currency.format(row.amount)}</strong></li>
+            ))}
+          </ul>
+          {view.qrAmount && (
+            <div className="pos-paid-qr">
+              {qrReady && qr.image && <img alt={`UPI QR for ${currency.format(view.qrAmount)}`} src={qr.image} />}
+              {!qrReady && <div className="pos-paid-qr-wait">Drawing QR...</div>}
+              {qrReady && qr.error && <div className="error-banner" role="alert">{qr.error}</div>}
+              <div>
+                <span className="eyebrow">Scan to pay by UPI</span>
+                <strong>{currency.format(view.qrAmount)}</strong>
+                <small>{upiId}</small>
+              </div>
+            </div>
+          )}
+          {view.note && <div className="warning-note">{view.note}</div>}
+          <div className="button-row">
+            {/* Focused on open, so Enter means "Paid" and Esc means "Not yet": the till stays keyboard-only. */}
+            <button autoFocus className="primary-button" type="submit">{view.primaryLabel}</button>
+            <button className="secondary-button" type="button" onClick={onClose}>{view.secondaryLabel}</button>
           </div>
         </form>
       </section>
@@ -26287,24 +26592,26 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const invoiceRef = useRef(null);
   const autoPrintedRef = useRef(false);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
-  const invoicePayments = invoice.payments || [];
-  const hasUpiPayment = invoice.payment_mode === "UPI" || invoice.payment_mode === "MIXED" || invoicePayments.some((payment) => (payment.mode || payment.payment_mode) === "UPI");
   const qrSizeMap = { SMALL: 110, MEDIUM: 145, LARGE: 180 };
   const qrDisplaySize = String(paymentSettings.qr_display_size || "MEDIUM").toUpperCase();
   const qrCodeWidth = activePrintMode === "THERMAL"
     ? Math.min(qrSizeMap[qrDisplaySize] || 145, printSettings.receipt_width === "58MM" ? 118 : 145)
     : (qrSizeMap[qrDisplaySize] || 145);
   const isUpiQrEnabled = paymentSettings.enable_upi_qr_on_invoice === true;
-  const shouldShowUpiQr = isUpiQrEnabled && Boolean(paymentSettings.business_upi_id) && (hasUpiPayment || paymentSettings.show_upi_qr_on_all_bills === true || isUpiQrEnabled);
+  // Which bills carry a QR, and for how much, is decided in local/posPaymentConfirmation.js. The
+  // old inline test ended in `|| isUpiQrEnabled`, so every bill printed a QR, cash ones included,
+  // and a mixed bill's QR asked for the whole total instead of its UPI part.
+  const invoiceUpiQr = resolveInvoiceUpiQr({ paymentSettings, invoice });
+  const shouldShowUpiQr = invoiceUpiQr.show;
   const shouldShowUpiWarning = isUpiQrEnabled && !paymentSettings.business_upi_id;
-  const upiPayload = shouldShowUpiQr ? [
-    "upi://pay?",
-    `pa=${encodeURIComponent(paymentSettings.business_upi_id)}`,
-    `&pn=${encodeURIComponent(paymentSettings.upi_payee_name || "FEEL THE FREAKIN' FROOZ")}`,
-    `&am=${encodeURIComponent(Number(invoice.total_amount || 0).toFixed(2))}`,
-    "&cu=INR",
-    `&tn=${encodeURIComponent(`FroozERP-Invoice-${invoice.invoice_no || invoice.id}`)}`,
-  ].join("") : "";
+  const upiPayload = shouldShowUpiQr
+    ? buildUpiPayload({
+      upiId: paymentSettings.business_upi_id,
+      payeeName: paymentSettings.upi_payee_name,
+      amount: invoiceUpiQr.amount,
+      note: invoiceUpiNote(invoice),
+    })
+    : "";
   useEffect(() => {
     let active = true;
     if (!upiPayload) {
@@ -26383,21 +26690,28 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
 
   return (
     <div className="modal-backdrop">
-      <section className="invoice-modal">
-        <div className="invoice-toolbar">
-          <div>
-            <span className="eyebrow">Invoice Saved</span>
-            <strong>{invoice.invoice_no}</strong>
+      {/* `-bill` modifiers, not the shared classes: about twenty other dialogs use `.invoice-modal`
+          and `.invoice-toolbar`. The toolbar used to be one row of eight buttons that never wrapped,
+          wider than the 820px modal, so the modal scrolled sideways and the close button sat past
+          its right edge (2 Oct 2026). Now the title and the close button share the top row, the
+          actions wrap below them, and the whole bar stays pinned while the bill scrolls. */}
+      <section className="invoice-modal invoice-modal-bill">
+        <div className="invoice-toolbar invoice-toolbar-bill">
+          <div className="invoice-toolbar-head">
+            <div className="invoice-toolbar-title">
+              <span className="eyebrow">Invoice Saved</span>
+              <strong>{invoice.invoice_no}</strong>
+            </div>
+            <button aria-label="Close invoice" className="remove-button invoice-close" onClick={onClose} title="Close" type="button"><Icon name="close" /></button>
           </div>
-          <div className="invoice-actions">
+          <div className="invoice-actions invoice-actions-bill">
             {canEdit && <button className="primary-button" onClick={onEdit}>Edit Bill</button>}
             <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
             <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing..." : "View PDF"}</button>
             <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "Save PDF"}</button>
             <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
-            {canCancel && <button className="remove-button" onClick={onCancel}>Cancel Bill</button>}
-            <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+            {canCancel && <button className="remove-button invoice-cancel-bill" onClick={onCancel}>Cancel Bill</button>}
           </div>
         </div>
         {layout.issues.length > 0 && (
@@ -26416,7 +26730,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
                     <div>
                       <strong>Scan to pay</strong>
                       <span>{paymentSettings.business_upi_id}</span>
-                      <small>{layout.totals.grandTotalText} · {layout.meta.billNo}</small>
+                      <small>{currency.format(invoiceUpiQr.amount)} · {layout.meta.billNo}</small>
                     </div>
                   </section>
                 )}
@@ -26618,6 +26932,176 @@ function DualLineChart({ data, firstKey, firstLabel, secondKey, secondLabel, sub
         <text className="chart-axis-label" x={chartSize.padding} y="20">{formatChartMoney(maxValue)}</text>
       </svg>
     </ChartFrame>
+  );
+}
+
+/**
+ * Today's price list: every product in stock on this counter with its photo and the rate the till
+ * will charge (rows and rules in local/dailyPriceList.js, where stock 0 is left out). "Share on
+ * WhatsApp" turns the card into a picture: the system share sheet where the webview has one,
+ * otherwise copied to the clipboard and saved to Downloads, ready to paste into the group.
+ */
+const PRICE_LIST_PREVIEW_ROWS = 8;
+
+function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedule = false, inventoryLots, loadError = "", loading = false, onScheduleChange, photoIndex, products, readyToday = false, schedule, scope }) {
+  const built = useMemo(
+    () => buildPriceList({ products, inventoryLots, photoIndex, scope }),
+    [inventoryLots, photoIndex, products, scope],
+  );
+  // Until this computer's stock has been read there is no list yet, and that is not "nothing in
+  // stock" or "unknown shop": it says it is reading.
+  const list = loading || loadError
+    ? { ...built, status: loadError ? PRICE_LIST_STATUS.UNAVAILABLE : "loading", rows: [], message: loadError }
+    : built;
+  const header = buildPriceListHeader({ businessSettings, branchName });
+  const cardRef = useRef(null);
+  const [expanded, setExpanded] = useState(false);
+  const [capturing, setCapturing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [outcome, setOutcome] = useState(null);
+  const hiddenCount = Math.max(list.rows.length - PRICE_LIST_PREVIEW_ROWS, 0);
+  const rows = expanded ? list.rows : list.rows.slice(0, PRICE_LIST_PREVIEW_ROWS);
+
+  const share = async () => {
+    if (busy || list.rows.length === 0) return;
+    setBusy(true);
+    setOutcome(null);
+    const wasExpanded = expanded;
+    try {
+      // The picture carries every row, not the dashboard preview, at a phone-shaped width so it
+      // reads in a WhatsApp chat instead of arriving as one long thin strip.
+      flushSync(() => {
+        setExpanded(true);
+        setCapturing(true);
+      });
+      const blob = await exportElementToPngBlob(cardRef.current);
+      const fileName = priceListFileName();
+      const caption = priceListCaption({ header, rows: list.rows });
+      const file = typeof File === "function" ? new File([blob], fileName, { type: "image/png" }) : null;
+      if (file && navigator.canShare?.({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file], text: caption });
+          setOutcome({ tone: "ok", text: "Shared. Choose your WhatsApp group in the share window if it asked." });
+          return;
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            setOutcome({ tone: "note", text: "Sharing was cancelled. Nothing was sent." });
+            return;
+          }
+          // Any other refusal falls through to copy and save.
+        }
+      }
+      let copied = false;
+      try {
+        if (typeof ClipboardItem === "function" && navigator.clipboard?.write) {
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+          copied = true;
+        }
+      } catch {
+        copied = false;
+      }
+      downloadBlob(blob, fileName);
+      setOutcome({
+        tone: "ok",
+        text: copied
+          ? `Picture copied and saved as ${fileName}. Open your WhatsApp group, press Ctrl+V, then Send.`
+          : `Picture saved as ${fileName} in Downloads. Open your WhatsApp group, attach it, then Send.`,
+      });
+    } catch (error) {
+      setOutcome({ tone: "error", text: `The price list picture could not be made: ${error?.message || "unknown error"}. Copy as text still works.` });
+    } finally {
+      setCapturing(false);
+      if (!wasExpanded) setExpanded(false);
+      setBusy(false);
+    }
+  };
+
+  const copyText = async () => {
+    try {
+      await navigator.clipboard.writeText(priceListCaption({ header, rows: list.rows }));
+      setOutcome({ tone: "ok", text: "The list is copied as text. Paste it into your WhatsApp group." });
+    } catch {
+      setOutcome({ tone: "error", text: "The clipboard refused the text, so nothing was copied." });
+    }
+  };
+
+  return (
+    <section className={`content-card price-list-panel ${readyToday ? "price-list-panel-ready" : ""}`}>
+      <div className="card-heading price-list-heading">
+        <div>
+          <span className="eyebrow">Today's price list</span>
+          <h2>{list.status === PRICE_LIST_STATUS.READY ? `${list.rows.length} items in stock` : "Price list"}</h2>
+          {readyToday && <p className="price-list-ready-note">This morning's list is ready. Share it with your group.</p>}
+        </div>
+        <div className="button-row price-list-actions">
+          {/* The device share sheet, not the server send route, so it needs no WhatsApp-send permission. */}
+          <button className="whatsapp-button price-list-share" disabled={busy || list.rows.length === 0} onClick={share} type="button">
+            <Icon name="message" /> {busy ? "Preparing..." : "Share on WhatsApp"}
+          </button>
+          <button className="secondary-button" disabled={list.rows.length === 0} onClick={copyText} type="button">Copy as text</button>
+        </div>
+      </div>
+      {list.status === "loading" && <div className="cart-empty" role="status">Reading today's stock on this computer...</div>}
+      {list.status === PRICE_LIST_STATUS.UNAVAILABLE && <div className="error-banner" role="alert">{list.message || "The price list could not be built."}</div>}
+      {list.status === PRICE_LIST_STATUS.EMPTY && <div className="cart-empty">{list.message || "Nothing is in stock with a rate, so there is no price list today."}</div>}
+      {list.status === PRICE_LIST_STATUS.READY && (
+        <>
+          {/* The card is the picture. Its colours are fixed paper colours, not the theme's, so the
+              image looks the same in a WhatsApp group whether the app was in dark or light mode. */}
+          <div className={capturing ? "price-list-card price-list-card-capture" : "price-list-card"} ref={cardRef}>
+            <header className="price-list-card-head">
+              <div>
+                <strong>{header.title}</strong>
+                <span>{header.subtitle}</span>
+              </div>
+              <time>{header.dateLabel}</time>
+            </header>
+            <ul className="price-list-grid">
+              {rows.map((row) => (
+                <li className="price-list-item" key={row.id}>
+                  {row.photo
+                    ? <img alt="" className="price-list-photo" src={row.photo} />
+                    : <span aria-hidden="true" className="price-list-photo price-list-initial" style={{ background: row.tint }}>{row.initial}</span>}
+                  <span className="price-list-name">{row.name}</span>
+                  <strong className="price-list-rate">{row.rateLabel}</strong>
+                </li>
+              ))}
+            </ul>
+            {(header.phone || header.address) && (
+              <footer className="price-list-card-foot">
+                {[header.phone && `Call / WhatsApp ${header.phone}`, header.address].filter(Boolean).join(" · ")}
+              </footer>
+            )}
+          </div>
+          {list.message && <p className="form-note">{list.message}</p>}
+          {hiddenCount > 0 && (
+            <button className="secondary-button price-list-more" onClick={() => setExpanded((current) => !current)} type="button">
+              {expanded ? "Show fewer" : `Show all ${list.rows.length}`}
+            </button>
+          )}
+        </>
+      )}
+      {outcome && <div className={outcome.tone === "error" ? "error-banner" : "form-note price-list-outcome"} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</div>}
+      {canSchedule && (
+        <div className="price-list-schedule">
+          <label className="check-field">
+            <input
+              checked={schedule.enabled}
+              onChange={(event) => onScheduleChange?.({ ...schedule, enabled: event.target.checked })}
+              type="checkbox"
+            />
+            <span>Remind me every morning on this computer at</span>
+          </label>
+          <input
+            aria-label="Reminder time"
+            disabled={!schedule.enabled}
+            onChange={(event) => event.target.value && onScheduleChange?.({ ...schedule, time: event.target.value })}
+            type="time"
+            value={schedule.time}
+          />
+        </div>
+      )}
+    </section>
   );
 }
 

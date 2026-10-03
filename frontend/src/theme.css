@@ -178,6 +178,11 @@
   --paper-ink: #111111;
   --paper-ink-muted: #2c5d43;
   --paper-line: #c8d8ce;
+  /* The shared price-list picture: fixed brand colours, the same in light and dark mode. */
+  --price-list-band: #0a2d1c;
+  --price-list-band-2: #123623;
+  --price-list-gold: #c29030;
+  --price-list-cream: #f6f3ea;
   --accent-deep: #8a6520;         /* accent text where it must survive a light surface */
   /* The customer bill's saving: success green that reads on white paper (7.1:1), with a wash and
      rule built from it. Paper colours like the rest of this group, so never re-themed. Printed and
@@ -224,6 +229,8 @@
      actions and chips the short one. Scaled with the app's text size setting. */
   --control-height: calc(38px * var(--font-scale, 1));
   --control-height-sm: calc(30px * var(--font-scale, 1));
+  /* The pinned top bar's height; anything else that sticks while the page scrolls starts below it. */
+  --topbar-height: 76px;
 }
 
 /* Block 2: the System state on a machine set to dark.
