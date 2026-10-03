@@ -59,7 +59,7 @@ tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # The phone app's cloud-health and authoritative-time probes (src/mobile_gateway.rs), which the Node
 # desktop gateway makes with `fetch` on Windows. Not a Windows dependency: the Windows build never

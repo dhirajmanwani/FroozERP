@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  PRICE_LIST_GROUP_KEY,
+  parseWhatsappGroupInvite,
+  priceListGroupLink,
+  priceListGroupOutcome,
+  readPriceListGroup,
+  writePriceListGroup,
   PRICE_LIST_SHARE_ROUTE,
   choosePriceListShareRoute,
   priceListCopySaveOutcome,
@@ -389,4 +395,50 @@ test("the share button never waits on a share window without a time limit, and n
   assert.match(body, /Promise\.race\(\[\s*navigator\.share/);
   assert.match(body, /PRICE_LIST_SHARE_TIMEOUT_MS/);
   assert.match(body, /priceListCopySaveOutcome\(\{ copied, saved, fileName \}\)/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// The owner's WhatsApp group: Share opens it on this computer (3 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+const CODE = "FzJ8aQ2kL9mN3pR7sT1uVw";
+
+test("a group invite link is read the way WhatsApp copies it, and nothing else is accepted", () => {
+  assert.deepEqual(parseWhatsappGroupInvite(`https://chat.whatsapp.com/${CODE}`), { ok: true, code: CODE });
+  assert.deepEqual(parseWhatsappGroupInvite(`  chat.whatsapp.com/invite/${CODE}?mode=r_c `), { ok: true, code: CODE });
+  assert.deepEqual(parseWhatsappGroupInvite(""), { ok: true, code: "" });
+  for (const bad of ["https://chat.whatsapp.com/abc", `https://evil.example/${CODE}`, `https://chat.whatsapp.com/${CODE}&calc`, "9876543210"]) {
+    assert.equal(parseWhatsappGroupInvite(bad).ok, false, String(bad));
+  }
+  assert.equal(priceListGroupLink(CODE), `https://chat.whatsapp.com/${CODE}`);
+  assert.equal(priceListGroupLink("bad"), "");
+});
+
+test("the group is kept per computer, and an empty code removes it", () => {
+  const store = new Map();
+  const storage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: (k) => store.delete(k) };
+  assert.equal(readPriceListGroup(storage), "");
+  assert.equal(writePriceListGroup(storage, CODE), true);
+  assert.equal(store.get(PRICE_LIST_GROUP_KEY), CODE);
+  assert.equal(readPriceListGroup(storage), CODE);
+  assert.equal(writePriceListGroup(storage, "not a code!"), false);
+  assert.equal(writePriceListGroup(storage, ""), true);
+  assert.equal(readPriceListGroup(storage), "");
+  assert.equal(writePriceListGroup(null, CODE), false);
+});
+
+test("the open-group message says Ctrl+V only when the picture really is copied", () => {
+  assert.match(priceListGroupOutcome({ copied: true, opened: "app" }).text, /Ctrl\+V, then Enter/);
+  assert.doesNotMatch(priceListGroupOutcome({ copied: false, opened: "app" }).text, /Ctrl\+V/);
+  assert.match(priceListGroupOutcome({ copied: true, opened: "browser" }).text, /browser/);
+  assert.equal(priceListGroupOutcome({ copied: true, opened: "", error: "x" }).tone, "error");
+});
+
+test("Share opens the group only in the Windows app, through the app's own command", () => {
+  const start = appSource.indexOf("const share = async () => {");
+  const body = appSource.slice(start, appSource.indexOf("const copyText = async", start));
+  assert.match(body, /const windowsApp = isDesktopShell\(\) && !MOBILE_SHELL;/);
+  assert.match(body, /if \(windowsApp && groupCode\)/);
+  assert.match(body, /invokeTauriCommand\("open_whatsapp_group", \{ inviteCode: groupCode \}\)/);
+  assert.doesNotMatch(body, /axios|whatsapp\/send/);
 });

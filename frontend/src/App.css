@@ -4359,6 +4359,22 @@ tbody tr:has(> .empty-cell):hover {
   width: auto;
 }
 
+/* The group link sits on its own line under the reminder. */
+.price-list-group {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.price-list-group-field {
+  display: grid;
+  flex: 1 1 320px;
+  gap: 6px;
+  margin: 0;
+}
+
 /* "Has the customer paid?" — asked after Checkout, before the bill is saved. */
 .pos-paid-modal {
   width: min(460px, 100%);
