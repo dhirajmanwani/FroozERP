@@ -89,6 +89,7 @@ const {
   suggestSellingRate,
 } = require("./saleRateUpdate");
 const discountRules = require("./discounts");
+const saleReturnRules = require("./saleReturns");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -4398,6 +4399,36 @@ const assertCompanyBranchLink = async () => {
  * `resolveMoneyScope`. The customer *directory* is company-wide either way: `customers` has no
  * `branch_id`, and every shop serves the same people.
  */
+/**
+ * Which customer a bill belongs to, as `matched.customer_id`: its customer id, else its mobile,
+ * else the walk-in system account, else an exact name. One copy, so the bill and the return made
+ * against it can never be credited to different customers. Needs the bill aliased `s`.
+ */
+const SALE_CUSTOMER_MATCH_LATERAL_SQL = `JOIN LATERAL (
+        SELECT c.id AS customer_id
+        FROM customers c
+        WHERE
+          s.customer_id = c.id
+          OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
+          OR (
+            s.customer_id IS NULL
+            AND c.system_account = TRUE
+            AND (
+              s.customer_name IS NULL
+              OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'
+            )
+          )
+          OR (
+            s.customer_id IS NULL
+            AND c.system_account IS DISTINCT FROM TRUE
+            AND s.customer_mobile IS NULL
+            AND s.customer_name IS NOT NULL
+            AND LOWER(c.customer_name) = LOWER(s.customer_name)
+          )
+        ORDER BY CASE WHEN s.customer_id = c.id THEN 0 WHEN c.mobile_number = s.customer_mobile THEN 1 ELSE 2 END, c.id
+        LIMIT 1
+      ) matched ON TRUE`;
+
 const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, branchId, companyId } = {}) => {
   const scope = resolveMoneyScope({ branchId, companyId });
   if (scope.isCompany) await assertCompanyBranchLink();
@@ -4405,6 +4436,7 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
   const values = [scope.value];
   const saleDateFilter = isDateInput(dateTo) ? `AND s.sale_date <= $${values.push(dateTo)}` : "";
   const customerPaymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
+  const returnDateFilter = isDateInput(dateTo) ? `AND sr.return_date <= $${values.length}` : "";
   if (customerId) {
     values.push(customerId);
     filters.push(`c.id = $${values.length}`);
@@ -4431,30 +4463,7 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
         SUM(CASE WHEN s.sale_status <> 'CANCELLED' THEN COALESCE(pay.total_paid, 0) ELSE 0 END) AS sale_paid,
         SUM(CASE WHEN s.sale_status = 'CANCELLED' THEN s.total_amount ELSE 0 END) AS total_cancelled
       FROM sales s
-      JOIN LATERAL (
-        SELECT c.id AS customer_id
-        FROM customers c
-        WHERE
-          s.customer_id = c.id
-          OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
-          OR (
-            s.customer_id IS NULL
-            AND c.system_account = TRUE
-            AND (
-              s.customer_name IS NULL
-              OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'
-            )
-          )
-          OR (
-            s.customer_id IS NULL
-            AND c.system_account IS DISTINCT FROM TRUE
-            AND s.customer_mobile IS NULL
-            AND s.customer_name IS NOT NULL
-            AND LOWER(c.customer_name) = LOWER(s.customer_name)
-          )
-        ORDER BY CASE WHEN s.customer_id = c.id THEN 0 WHEN c.mobile_number = s.customer_mobile THEN 1 ELSE 2 END, c.id
-        LIMIT 1
-      ) matched ON TRUE
+      ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
       LEFT JOIN (
         SELECT sale_id, SUM(amount) AS total_paid
         FROM sale_payments
@@ -4462,6 +4471,20 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
       ) pay ON pay.sale_id = s.id
       WHERE ${scope.predicate("s.")}
         ${saleDateFilter}
+      GROUP BY matched.customer_id
+    ),
+    -- A credit-note or future-adjustment return leaves the money with the shop as the customer's
+    -- credit, so it reduces what they owe. A cash or UPI refund paid the money back and does not.
+    -- Matched to the customer through the bill, exactly as the bill itself is matched above.
+    return_credit_summary AS (
+      SELECT matched.customer_id, SUM(sr.total_return_amount) AS total_return_credit
+      FROM sale_returns sr
+      JOIN sales s ON s.id = sr.sale_id
+      ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+      WHERE ${scope.predicate("s.")}
+        AND sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL}
+        AND s.sale_status <> 'CANCELLED'
+        ${returnDateFilter}
       GROUP BY matched.customer_id
     ),
     customer_payment_summary AS (
@@ -4477,14 +4500,17 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
       COALESCE(ss.total_sales, 0) AS total_sales,
       COALESCE(ss.sale_paid, 0) + COALESCE(cps.total_customer_paid, 0) AS total_paid,
       COALESCE(ss.total_cancelled, 0) AS total_cancelled,
+      COALESCE(rcs.total_return_credit, 0) AS total_return_credit,
       ROUND((
         COALESCE(c.opening_balance, 0)
         + COALESCE(ss.total_sales, 0)
         - COALESCE(ss.sale_paid, 0)
         - COALESCE(cps.total_customer_paid, 0)
+        - COALESCE(rcs.total_return_credit, 0)
       )::NUMERIC, 2) AS outstanding_balance
     FROM customers c
     LEFT JOIN sale_summary ss ON ss.customer_id = c.id
+    LEFT JOIN return_credit_summary rcs ON rcs.customer_id = c.id
     LEFT JOIN customer_payment_summary cps ON cps.customer_id = c.id
     ${whereClause}
     ORDER BY c.active DESC, c.customer_name
@@ -6206,12 +6232,33 @@ const getSaleSnapshot = async (client, saleId) => {
   };
 };
 
+/**
+ * True when any sale return points at this bill. Edit and cancel are refused for such a bill
+ * (SALE_HAS_RETURNS): cancelling would put the returned stock back a second time and reverse the
+ * refunded money twice, and an edit deletes the sale_items rows the return items reference.
+ * Call it after the bill's row is locked FOR UPDATE -- a return holds FOR SHARE on it -- so a return
+ * committing concurrently is either seen here or waits for this transaction.
+ */
+const saleHasReturns = async (client, saleId) => {
+  const result = await client.query("SELECT 1 FROM sale_returns WHERE sale_id = $1 LIMIT 1", [saleId]);
+  return result.rows.length > 0;
+};
+
+/*
+ * Puts a bill's stock back. Quantity a sale return already put back is skipped, by the same rule
+ * the return used (a line's allocations are consumed in id order -- see saleReturns.js). Edit and
+ * cancel refuse a bill with returns (SALE_HAS_RETURNS) before reaching here, so this is the second
+ * line of defence: any other caller must not add returned stock a second time.
+ */
 const restoreSaleInventory = async (client, saleId, userId, reason, transactionType = "IN") => {
   const allocationsResult = await client.query(
     `
     SELECT
-      sba.inventory_batch_id, sba.quantity, si.product_id, s.invoice_no,
-      s.company_id, s.branch_id, s.operational_location_id
+      sba.id, sba.sale_item_id, sba.inventory_batch_id, sba.quantity, si.product_id, s.invoice_no,
+      s.company_id, s.branch_id, s.operational_location_id,
+      COALESCE((
+        SELECT SUM(sri.return_quantity) FROM sale_return_items sri WHERE sri.sale_item_id = si.id
+      ), 0) AS returned_quantity
     FROM sale_batch_allocations sba
     JOIN sale_items si ON si.id = sba.sale_item_id
     JOIN sales s ON s.id = si.sale_id
@@ -6221,7 +6268,20 @@ const restoreSaleInventory = async (client, saleId, userId, reason, transactionT
     `,
     [saleId]
   );
+  const allocationsByItem = new Map();
   for (const allocation of allocationsResult.rows) {
+    const key = String(allocation.sale_item_id);
+    if (!allocationsByItem.has(key)) allocationsByItem.set(key, []);
+    allocationsByItem.get(key).push(allocation);
+  }
+  const restorable = [];
+  for (const itemAllocations of allocationsByItem.values()) {
+    const remaining = saleReturnRules.remainingAllocations(itemAllocations, itemAllocations[0].returned_quantity);
+    for (const allocation of remaining) {
+      if (allocation.remaining_thousandths > 0) restorable.push({ ...allocation, quantity: allocation.remaining_quantity });
+    }
+  }
+  for (const allocation of restorable) {
     await client.query(
       "UPDATE inventory_batches SET remaining_qty = remaining_qty + $1 WHERE id = $2",
       [allocation.quantity, allocation.inventory_batch_id]
@@ -10729,6 +10789,17 @@ const rejectOperation = (operation, errorCode, message) => ({
   message,
 });
 
+/*
+ * A counter's offline edit or cancel of a bill that has a sale return. Reported as a conflict, the
+ * same status the outbox already shows a person for a bill it cannot apply, with SALE_HAS_RETURNS as
+ * the code: applying it would put returned stock back twice (cancel) or fail on the return items'
+ * foreign key (edit). Nothing is written before this is returned.
+ */
+const rejectSaleHasReturns = (operation) => ({
+  ...rejectOperation(operation, saleReturnRules.SALE_HAS_RETURNS.code, saleReturnRules.SALE_HAS_RETURNS.message),
+  status: "conflict",
+});
+
 const processSyncTestOperation = async (client, operation, context) => {
   const payload = operation.payload || {};
   const value = cleanText(payload.value);
@@ -11377,6 +11448,7 @@ const processPosSaleEditOperation = async (client, operation, context) => {
       result_payload: { sale_id: currentSale.id, invoice_no: currentSale.invoice_no, offline_invoice_ref: offlineInvoiceRef, duplicate: true },
     };
   }
+  if (await saleHasReturns(client, currentSale.id)) return rejectSaleHasReturns(operation);
   const approval = await authorizeSaleChange(client, { actor: editor, action: "edit", approvalId, sale: currentSale, companyId: context.companyId, deviceId: context.deviceId });
   if (!approval.ok) return rejectOperation(operation, "AUTHORIZATION_ERROR", approval.message);
 
@@ -11625,6 +11697,7 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
       result_payload: { sale_id: currentSale.id, invoice_no: currentSale.invoice_no, offline_invoice_ref: offlineInvoiceRef, duplicate: true },
     };
   }
+  if (await saleHasReturns(client, currentSale.id)) return rejectSaleHasReturns(operation);
   const approval = await authorizeSaleChange(client, { actor: canceller, action: "cancel", approvalId, sale: currentSale, companyId: context.companyId, deviceId: context.deviceId });
   if (!approval.ok) return rejectOperation(operation, "AUTHORIZATION_ERROR", approval.message);
   const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
@@ -17833,6 +17906,25 @@ app.get("/accounts/ledger", async (req, res) => {
           FROM customer_payments cp
           WHERE cp.customer_id = $1 AND cp.cancelled = FALSE
             AND cp.branch_id IN (SELECT id FROM branches WHERE company_id = $4)
+          UNION ALL
+          -- Credit-note returns only, matched through the bill as getCustomerSummaryRows matches
+          -- them, so this ledger ends on the balance the account list shows.
+          SELECT sr.return_date AS date, 'Sale Return' AS transaction_type,
+            COALESCE(sr.return_no, 'RET-' || sr.id) AS invoice_no,
+            0::NUMERIC AS sale_amount,
+            sr.refund_type AS payment_mode,
+            0 AS debit,
+            sr.total_return_amount AS credit,
+            -sr.total_return_amount AS delta,
+            'Return ' || COALESCE(sr.return_no, 'RET-' || sr.id) || ' against ' || COALESCE(s.invoice_no, 'Sale #' || s.id) || ' (' || sr.refund_type || ')' AS remarks,
+            sr.created_at
+          FROM sale_returns sr
+          JOIN sales s ON s.id = sr.sale_id
+          ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+          WHERE matched.customer_id = $1
+            AND sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL}
+            AND s.sale_status <> 'CANCELLED'
+            AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $4)
         ) entries
         ORDER BY date, created_at
         `,
@@ -18744,71 +18836,45 @@ app.get("/pending-bills/customer", async (req, res) => {
       GROUP BY s.id, c.customer_name, pay.sale_paid
       ORDER BY s.customer_id NULLS LAST, s.sale_date, s.id
       `,
-      [req.auth.branchId]
+      // The company, not the branch: the predicate is `company_id = $1`. This passed the branch id
+      // until 3 Oct 2026, which only worked where the two happen to be the same number.
+      [req.auth.companyId]
     );
-    const paymentsResult = await pool.query(
-      `
-      SELECT
-        cp.customer_id,
-        SUM(cp.payment_amount) AS total_received
-      FROM customer_payments cp
-      WHERE cp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
-        AND COALESCE(cp.cancelled, FALSE) = FALSE
-      GROUP BY cp.customer_id
-      `,
-      [req.auth.branchId]
+    const [paymentsResult, returnCreditsResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          cp.customer_id,
+          SUM(cp.payment_amount) AS total_received
+        FROM customer_payments cp
+        WHERE cp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
+          AND COALESCE(cp.cancelled, FALSE) = FALSE
+        GROUP BY cp.customer_id
+        `,
+        [req.auth.companyId]
+      ),
+      // Credit-note and future-adjustment returns settle the customer's bills; cash and UPI refunds
+      // paid the money back and settle nothing. Per bill, so a return lands on its own bill first.
+      pool.query(
+        `
+        SELECT sr.sale_id, s.customer_id, SUM(sr.total_return_amount) AS credit_amount
+        FROM sale_returns sr
+        JOIN sales s ON s.id = sr.sale_id
+        WHERE s.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
+          AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+          AND sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL}
+        GROUP BY sr.sale_id, s.customer_id
+        `,
+        [req.auth.companyId]
+      ),
+    ]);
+    const receiptsByCustomer = new Map(
+      paymentsResult.rows.map((row) => [row.customer_id === null || row.customer_id === undefined ? "" : String(row.customer_id), Number(row.total_received || 0)])
     );
-    const paymentByCustomer = new Map(paymentsResult.rows.map((row) => [Number(row.customer_id), Number(row.total_received || 0)]));
-    const invoices = [];
-    const summaries = new Map();
-    for (const row of creditSalesResult.rows) {
-      const customerId = Number(row.customer_id || 0);
-      const key = String(customerId || row.customer_name || "Walk-in Customer");
-      const total = Number(row.total_amount || 0);
-      const salePaid = Number(row.sale_paid || 0);
-      const summary = summaries.get(key) || {
-        key,
-        customer_id: customerId || null,
-        customer_name: row.customer_name || "Walk-in Customer",
-        from: row.sale_date,
-        to: row.sale_date,
-        pending_bill_count: 0,
-        total_credit_amount: 0,
-        amount_received: 0,
-        balance: 0,
-        rows: [],
-        remainingCustomerReceipts: Number(paymentByCustomer.get(customerId) || 0),
-      };
-      const allocatedCustomerPayment = Math.min(summary.remainingCustomerReceipts, Math.max(total - salePaid, 0));
-      summary.remainingCustomerReceipts = roundCurrency(summary.remainingCustomerReceipts - allocatedCustomerPayment);
-      const received = roundCurrency(salePaid + allocatedCustomerPayment);
-      const balance = roundCurrency(Math.max(total - received, 0));
-      const status = balance <= 0.01 ? "Paid" : received > 0 ? "Partially Paid" : "Pending";
-      const invoice = {
-        ...row,
-        customer_id: customerId || null,
-        gross_amount: Number(row.gross_amount || total),
-        item_discount_amount: Number(row.item_discount_amount || 0),
-        invoice_discount_amount: Number(row.invoice_discount_amount || 0),
-        total_amount: total,
-        received_amount: received,
-        balance_amount: balance,
-        credit_status: status,
-      };
-      invoices.push(invoice);
-      if (balance > 0.01) summary.pending_bill_count += 1;
-      summary.from = row.sale_date < summary.from ? row.sale_date : summary.from;
-      summary.to = row.sale_date > summary.to ? row.sale_date : summary.to;
-      summary.total_credit_amount = roundCurrency(summary.total_credit_amount + total);
-      summary.amount_received = roundCurrency(summary.amount_received + received);
-      summary.balance = roundCurrency(summary.balance + balance);
-      summary.rows.push(invoice);
-      summaries.set(key, summary);
-    }
-    const summaryRows = [...summaries.values()]
-      .map(({ remainingCustomerReceipts, ...summary }) => summary)
-      .filter((summary) => summary.balance > 0.01)
-      .sort((left, right) => left.customer_name.localeCompare(right.customer_name));
+    const { summary: summaryRows, invoices } = saleReturnRules.buildCustomerPendingBills(creditSalesResult.rows, {
+      receiptsByCustomer,
+      returnCredits: returnCreditsResult.rows,
+    });
     return res.json({ summary: summaryRows, invoices });
   } catch (error) {
     console.error(error);
@@ -18824,7 +18890,7 @@ app.get("/customer-ledger", async (req, res) => {
     if (customerId && customers.length === 0) return res.status(404).json({ message: "Customer not found" });
     if (customers.length === 0) return res.json({ customers: [], ledger: [] });
     const ids = customers.map((customer) => customer.id);
-    const [salesResult, paymentResult] = await Promise.all([
+    const [salesResult, paymentResult, returnCreditResult] = await Promise.all([
       pool.query(
         `
         SELECT s.*, c.id AS customer_id, COALESCE(pay.total_paid, 0) AS total_paid
@@ -18853,6 +18919,22 @@ app.get("/customer-ledger", async (req, res) => {
           AND cp.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
           AND cp.cancelled = FALSE
         ORDER BY cp.payment_date, cp.created_at, cp.id
+        `,
+        [ids, req.auth.companyId]
+      ),
+      // Credit-note and future-adjustment returns are the customer's credit; cash and UPI refunds
+      // paid the money back and leave the balance alone. Matched as getCustomerSummaryRows does.
+      pool.query(
+        `
+        SELECT sr.*, matched.customer_id, s.invoice_no
+        FROM sale_returns sr
+        JOIN sales s ON s.id = sr.sale_id
+        ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+        WHERE matched.customer_id = ANY($1::INT[])
+          AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
+          AND s.sale_status <> 'CANCELLED'
+          AND sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL}
+        ORDER BY sr.return_date, sr.created_at, sr.id
         `,
         [ids, req.auth.companyId]
       ),
@@ -18925,6 +19007,23 @@ app.get("/customer-ledger", async (req, res) => {
         credit_amount: Number(payment.payment_amount || 0),
         balance_delta: -Number(payment.payment_amount || 0),
         remarks: payment.remarks || payment.reference_number || "Customer payment",
+      });
+    }
+    for (const saleReturn of returnCreditResult.rows) {
+      const amount = Number(saleReturn.total_return_amount || 0);
+      pushEvent({
+        customer_id: saleReturn.customer_id,
+        customer_name: saleReturn.customer_name,
+        transaction_date: toDateKey(saleReturn.return_date),
+        sort_key: `SR-${String(saleReturn.id).padStart(8, "0")}`,
+        transaction_type: "Sale Return",
+        invoice_no: saleReturn.return_no || `RET-${saleReturn.id}`,
+        sale_amount: 0,
+        payment_mode: saleReturn.refund_type || "",
+        debit_amount: 0,
+        credit_amount: amount,
+        balance_delta: -amount,
+        remarks: `Return against ${saleReturn.invoice_no || `Sale #${saleReturn.sale_id}`}: ${saleReturn.return_reason || "Sale return"}`,
       });
     }
     const ledger = [];
@@ -20121,7 +20220,9 @@ app.get("/reports/summary", async (req, res) => {
             COALESCE(sr.return_no, 'RET-' || sr.id) AS voucher_no,
             sr.refund_type AS payment_mode,
             0::NUMERIC AS debit,
-            sr.total_return_amount AS credit,
+            -- Only a credit note or future adjustment is the customer's credit. A cash or UPI refund
+            -- handed the money back, so the customer's account is left where it was.
+            CASE WHEN sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL} THEN sr.total_return_amount ELSE 0 END AS credit,
             'ACTIVE' AS status,
             COALESCE(sr.return_reason, 'Sale return') AS remarks,
             COALESCE(
@@ -20207,7 +20308,11 @@ app.get("/reports/summary", async (req, res) => {
           GROUP BY payment_date
         ),
         returns_by_day AS (
-          SELECT return_date::date AS day, SUM(total_return_amount) AS returns
+          SELECT return_date::date AS day,
+            SUM(total_return_amount) AS returns,
+            SUM(total_return_amount - total_cost_amount) AS return_margin,
+            SUM(CASE WHEN refund_type = 'CASH_REFUND' THEN total_return_amount ELSE 0 END) AS cash_refunds,
+            SUM(CASE WHEN refund_type = 'UPI_REFUND' THEN total_return_amount ELSE 0 END) AS upi_refunds
           FROM sale_returns
           WHERE return_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY return_date
@@ -20225,9 +20330,13 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE(sales_by_day.transactions, 0)::INTEGER AS transactions,
           COALESCE(purchases_by_day.purchases, 0) AS purchases,
           COALESCE(expenses_by_day.expenses, 0) AS expenses,
-          COALESCE(sales_payments_by_day.cash_sales, 0) AS cash_sales,
-          COALESCE(sales_payments_by_day.upi_sales, 0) AS upi_sales,
+          -- Net of the day's refunds paid out of the drawer / by UPI, so the column is the money
+          -- the day actually kept. The refunds themselves are cash_refunds / upi_refunds.
+          COALESCE(sales_payments_by_day.cash_sales, 0) - COALESCE(returns_by_day.cash_refunds, 0) AS cash_sales,
+          COALESCE(sales_payments_by_day.upi_sales, 0) - COALESCE(returns_by_day.upi_refunds, 0) AS upi_sales,
           COALESCE(sales_payments_by_day.bank_card_sales, 0) AS bank_card_sales,
+          COALESCE(returns_by_day.cash_refunds, 0) AS cash_refunds,
+          COALESCE(returns_by_day.upi_refunds, 0) AS upi_refunds,
           COALESCE(customer_receipts_by_day.cash_receipts, 0) AS customer_cash_receipts,
           COALESCE(customer_receipts_by_day.upi_receipts, 0) AS customer_upi_receipts,
           COALESCE(customer_receipts_by_day.bank_card_receipts, 0) AS customer_bank_card_receipts,
@@ -20235,8 +20344,11 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE(supplier_payments_by_day.upi_supplier_payments, 0) AS supplier_upi_payments,
           COALESCE(supplier_payments_by_day.bank_supplier_payments, 0) AS supplier_bank_payments,
           COALESCE(returns_by_day.returns, 0) AS returns,
+          COALESCE(returns_by_day.return_margin, 0) AS return_margin,
           COALESCE(waste_by_day.waste, 0) AS waste,
-          COALESCE(sales_by_day.profit, 0) - COALESCE(expenses_by_day.expenses, 0) - COALESCE(waste_by_day.waste, 0) AS net_profit
+          -- A return takes back the margin the sale made: its refund less the cost of the stock that
+          -- came back. Netted on the return's own date, like every other figure in this row.
+          COALESCE(sales_by_day.profit, 0) - COALESCE(returns_by_day.return_margin, 0) - COALESCE(expenses_by_day.expenses, 0) - COALESCE(waste_by_day.waste, 0) AS net_profit
         FROM days
         LEFT JOIN sales_by_day ON sales_by_day.day = days.day
         LEFT JOIN purchases_by_day ON purchases_by_day.day = days.day
@@ -20499,15 +20611,22 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
-          COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2), 0) AS sales_revenue,
-          COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2), 0) AS purchase_cost,
-          COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS mandi_tax,
-          COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS freight_charges,
-          COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS labour_charges,
-          COALESCE((SELECT SUM(other_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS other_purchase_charges,
-          COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date BETWEEN $1 AND $2), 0) AS expenses,
-          COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0)
-            + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2), 0) AS supplier_rebate_received,
+          -- Every figure is this branch's, as expense_categories below always was. Sales and their
+          -- cost are net of returns, each return on its own return_date: the refund comes off
+          -- revenue and the cost of the stock that came back comes off the cost of goods sold.
+          COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2 AND branch_id = $3), 0)
+            - COALESCE((SELECT SUM(total_return_amount) FROM sale_returns WHERE return_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS sales_revenue,
+          COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2 AND branch_id = $3), 0)
+            - COALESCE((SELECT SUM(total_cost_amount) FROM sale_returns WHERE return_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS purchase_cost,
+          COALESCE((SELECT SUM(total_return_amount) FROM sale_returns WHERE return_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS sales_returns,
+          COALESCE((SELECT SUM(total_cost_amount) FROM sale_returns WHERE return_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS sales_return_cost,
+          COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0) AS mandi_tax,
+          COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0) AS freight_charges,
+          COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0) AS labour_charges,
+          COALESCE((SELECT SUM(other_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0) AS other_purchase_charges,
+          COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS expenses,
+          COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0)
+            + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS supplier_rebate_received,
           COALESCE((
             SELECT JSON_AGG(JSON_BUILD_OBJECT('category', category, 'amount', total_amount) ORDER BY category)
             FROM (
@@ -20625,6 +20744,9 @@ app.get("/reports/summary", async (req, res) => {
         costOfGoodsSold: roundCurrency(costOfGoodsSold),
         expenses: roundCurrency(Number(profitLoss.expenses || 0)),
         expenseCategories: Array.isArray(profitLoss.expense_categories) ? profitLoss.expense_categories : [],
+        // Already taken off salesRevenue and purchaseCost above; reported so the netting is visible.
+        salesReturns: roundCurrency(Number(profitLoss.sales_returns || 0)),
+        salesReturnCost: roundCurrency(Number(profitLoss.sales_return_cost || 0)),
         cashSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && row.payment_mode === "CASH").reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
         upiSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && row.payment_mode === "UPI").reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
         bankCardSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && ["CARD", "BANK_TRANSFER"].includes(row.payment_mode)).reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
@@ -24087,7 +24209,9 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
       // An invoice id is guessable. Without the branch predicate a cashier could type another
       // branch's id and read its customer, total and line items.
       pool.query(
-        "SELECT id, invoice_no, customer_name, customer_mobile, sale_date, total_amount, sale_status FROM sales WHERE id = $1 AND branch_id = $2",
+        `SELECT id, invoice_no, customer_name, customer_mobile, sale_date, total_amount, sale_status,
+                invoice_discount_amount, tax_amount, mandi_tax_basis, other_charges_amount
+         FROM sales WHERE id = $1 AND branch_id = $2`,
         [saleId, req.auth.branchId],
       ),
       pool.query(
@@ -24098,8 +24222,11 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
           p.product_name,
           p.unit,
           si.quantity AS sold_quantity,
+          si.quantity,
+          si.amount,
+          si.discount_amount,
+          si.net_amount AS line_net_amount,
           COALESCE(returned.returned_quantity, 0) AS returned_quantity,
-          si.quantity - COALESCE(returned.returned_quantity, 0) AS returnable_quantity,
           si.selling_rate,
           COALESCE(si.net_amount, si.amount) AS net_amount,
           si.cost_amount
@@ -24109,6 +24236,7 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
         LEFT JOIN (
           SELECT sale_item_id, SUM(return_quantity) AS returned_quantity
           FROM sale_return_items
+          WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)
           GROUP BY sale_item_id
         ) returned ON returned.sale_item_id = si.id
         WHERE si.sale_id = $1
@@ -24119,7 +24247,16 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
     ]);
     const sale = saleResult.rows[0];
     if (!sale) return res.status(404).json({ message: "Invoice not found" });
-    return res.json({ sale, items: itemsResult.rows });
+    // The preview and the save share one rule: refund_per_unit is what POST /sale-returns records
+    // per unit (bill discount and Mandi Tax shared in -- see saleReturns.js), and
+    // returnable_quantity is counted in whole thousandths, as the save checks it.
+    const saleLines = itemsResult.rows.map((row) => ({ ...row, net_amount: row.line_net_amount }));
+    const items = itemsResult.rows.map(({ line_net_amount, quantity, amount, discount_amount, ...row }, index) => ({
+      ...row,
+      returnable_quantity: saleReturnRules.returnableQuantity(row.sold_quantity, row.returned_quantity),
+      refund_per_unit: saleReturnRules.refundPerUnit({ line: saleLines[index], saleLines, sale }),
+    }));
+    return res.json({ sale, items });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Return Options" });
@@ -24137,6 +24274,11 @@ const createSaleReturnHandler = async (req, res) => {
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     if (!saleId || !REFUND_TYPES.has(refundType) || !returnReason || items.length === 0) {
       return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
+    }
+    // One line per sale line. A repeated sale_item_id would be checked against the returnable
+    // quantity and mapped to batches as if the other line did not exist.
+    if (saleReturnRules.findDuplicateSaleItemId(items)) {
+      return res.status(400).json({ message: "Each product can appear only once in a return. Combine the quantities into one line." });
     }
     // `billing`, not `invoice_cancellation`, and the choice is deliberate. A return refunds money and
     // is a partial void of a sale, so the stricter key is arguable — but returns are counter work a
@@ -24173,6 +24315,23 @@ const createSaleReturnHandler = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Select an active invoice for return" });
     }
+    // The shop's day, not the server's: the server runs in UTC, which is still yesterday until
+    // 05:30 in India. A date the client sends must be a real YYYY-MM-DD, not after today in India
+    // and not before the bill.
+    const returnDate = saleReturnRules.resolveReturnDate(req.body.return_date, {
+      today: saleReturnRules.indiaBusinessDateKey(),
+      saleDate: sale.sale_date ? toDateKey(sale.sale_date) : null,
+    });
+    if (returnDate.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: returnDate.error });
+    }
+    // Every line of the bill, for its share of the bill discount and Mandi Tax.
+    const saleLinesResult = await client.query(
+      "SELECT id, quantity, amount, discount_amount, net_amount FROM sale_items WHERE sale_id = $1 ORDER BY id",
+      [saleId]
+    );
+    const saleLines = saleLinesResult.rows;
     const returnNo = `RET-${Date.now()}`;
     const returnResult = await client.query(
       `
@@ -24187,7 +24346,7 @@ const createSaleReturnHandler = async (req, res) => {
       [
         returnNo, saleId, nullableText(req.body.customer_name) || sale.customer_name,
         nullableText(req.body.customer_mobile) || sale.customer_mobile,
-        req.body.return_date || toDateKey(new Date()), refundType, returnReason,
+        returnDate.date, refundType, returnReason,
         branchId || sale.branch_id, createdBy,
         context?.company_id || sale.company_id || null,
         context?.operational_location_id || sale.operational_location_id || null,
@@ -24198,41 +24357,46 @@ const createSaleReturnHandler = async (req, res) => {
     let totalCostAmount = 0;
     for (const requested of items) {
       const saleItemId = parsePositiveInteger(requested.sale_item_id);
-      const returnQuantity = parsePositiveNumber(requested.return_quantity);
-      if (!saleItemId || !returnQuantity) {
+      const requestedQuantity = saleReturnRules.normalizeReturnQuantity(requested.return_quantity);
+      if (!saleItemId || !requestedQuantity) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Enter valid return quantities" });
       }
-      await client.query(
+      const returnQuantity = requestedQuantity.quantity;
+      // Lock the line first, then read what earlier returns took from it: a concurrent return of
+      // the same line waits here and then sees this one's rows.
+      const lockResult = await client.query(
         "SELECT id FROM sale_items WHERE id = $1 AND sale_id = $2 FOR UPDATE",
         [saleItemId, saleId]
       );
-      const itemResult = await client.query(
+      const itemResult = lockResult.rows.length === 0 ? { rows: [] } : await client.query(
         `
         SELECT
           si.*,
           p.product_name,
-          COALESCE(returned.returned_quantity, 0) AS returned_quantity
+          COALESCE((
+            SELECT SUM(sri.return_quantity) FROM sale_return_items sri WHERE sri.sale_item_id = si.id
+          ), 0) AS returned_quantity
         FROM sale_items si
         JOIN products p ON p.id = si.product_id
-        LEFT JOIN (
-          SELECT sale_item_id, SUM(return_quantity) AS returned_quantity
-          FROM sale_return_items
-          GROUP BY sale_item_id
-        ) returned ON returned.sale_item_id = si.id
         WHERE si.id = $1 AND si.sale_id = $2
         `,
         [saleItemId, saleId]
       );
       const saleItem = itemResult.rows[0];
-      const returnable = Number(saleItem?.quantity || 0) - Number(saleItem?.returned_quantity || 0);
-      if (!saleItem || returnQuantity > returnable) {
+      const returnable = saleItem
+        ? saleReturnRules.returnableThousandths(saleItem.quantity, saleItem.returned_quantity)
+        : 0;
+      if (!saleItem || requestedQuantity.thousandths > returnable) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: `${saleItem?.product_name || "Item"} return quantity exceeds returnable quantity` });
       }
-      const returnAmount = roundCurrency((Number(saleItem.net_amount || saleItem.amount || 0) / Number(saleItem.quantity)) * returnQuantity);
-      let quantityToRestore = returnQuantity;
-      let costAmount = 0;
+      const perUnit = saleReturnRules.refundPerUnit({ line: saleItem, saleLines, sale });
+      if (perUnit === null) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: `${saleItem.product_name || "Item"} has no sold quantity to price the return against` });
+      }
+      const returnAmount = saleReturnRules.refundAmountFor(perUnit, returnQuantity);
       const allocations = await client.query(
         `
         SELECT *
@@ -24243,20 +24407,22 @@ const createSaleReturnHandler = async (req, res) => {
         `,
         [saleItemId]
       );
-      for (const allocation of allocations.rows) {
-        if (quantityToRestore <= 0) break;
-        const restoreQuantity = Math.min(quantityToRestore, Number(allocation.quantity));
-        await client.query(
-          "UPDATE inventory_batches SET remaining_qty = remaining_qty + $1, returned_qty = COALESCE(returned_qty, 0) + $1, batch_status = CASE WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status ELSE 'ACTIVE' END WHERE id = $2",
-          [restoreQuantity, allocation.inventory_batch_id]
-        );
-        costAmount += roundCurrency(restoreQuantity * Number(allocation.purchase_rate));
-        quantityToRestore -= restoreQuantity;
-      }
-      if (quantityToRestore > 0.0001) {
+      const restoration = saleReturnRules.planReturnRestoration({
+        allocations: allocations.rows,
+        alreadyReturnedQuantity: saleItem.returned_quantity,
+        returnQuantity,
+      });
+      if (restoration.unmappedThousandths > 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Unable to map return quantity to original inventory batch" });
       }
+      for (const line of restoration.lines) {
+        await client.query(
+          "UPDATE inventory_batches SET remaining_qty = remaining_qty + $1, returned_qty = COALESCE(returned_qty, 0) + $1, batch_status = CASE WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status ELSE 'ACTIVE' END WHERE id = $2",
+          [line.quantity, line.inventory_batch_id]
+        );
+      }
+      const costAmount = restoration.costAmount;
       await client.query(
         `
         INSERT INTO sale_return_items (
@@ -24265,7 +24431,7 @@ const createSaleReturnHandler = async (req, res) => {
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         `,
-        [saleReturn.id, saleItemId, saleItem.product_id, returnQuantity, saleItem.selling_rate, returnAmount, roundCurrency(costAmount)]
+        [saleReturn.id, saleItemId, saleItem.product_id, returnQuantity, saleItem.selling_rate, returnAmount, costAmount]
       );
       await client.query(
         `
@@ -24285,8 +24451,8 @@ const createSaleReturnHandler = async (req, res) => {
           context?.operational_location_id || sale.operational_location_id || null,
         ]
       );
-      totalReturnAmount += returnAmount;
-      totalCostAmount += costAmount;
+      totalReturnAmount = roundCurrency(totalReturnAmount + returnAmount);
+      totalCostAmount = roundCurrency(totalCostAmount + costAmount);
     }
     const updateResult = await client.query(
       `
@@ -24534,6 +24700,10 @@ const updateSaleHandler = async (req, res) => {
     if (currentSale.sale_status === "CANCELLED") {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled invoices cannot be edited" });
+    }
+    if (await saleHasReturns(client, saleId)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ...saleReturnRules.SALE_HAS_RETURNS });
     }
     const approval = await authorizeSaleChange(client, { actor: editor, action: "edit", approvalId: req.body.approval_id, sale: currentSale, companyId: context?.company_id ?? req.auth.companyId, deviceId: context?.device_id ?? req.auth.deviceId });
     if (!approval.ok) return rejectSaleChange(client, res, approval);
@@ -24849,6 +25019,10 @@ const cancelSaleHandler = async (req, res) => {
     if (currentSale.sale_status === "CANCELLED") {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Invoice is already cancelled" });
+    }
+    if (await saleHasReturns(client, saleId)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ...saleReturnRules.SALE_HAS_RETURNS });
     }
     const approval = await authorizeSaleChange(client, { actor: canceller, action: "cancel", approvalId: req.body.approval_id, sale: currentSale, companyId: context?.company_id ?? req.auth.companyId, deviceId: context?.device_id ?? req.auth.deviceId });
     if (!approval.ok) return rejectSaleChange(client, res, approval);
@@ -25485,4 +25659,7 @@ module.exports = {
   // Exported so `discounts.test.js` can drive how a recorded bill (desktop sync, edit) takes its
   // bill discount and its special-price lines, against a scripted client.
   buildSalePayload,
+  // Exported so `saleReturns.test.js` can run the reversal against a real Postgres (PGlite) and see
+  // that stock a return already put back is not put back again.
+  restoreSaleInventory,
 };
