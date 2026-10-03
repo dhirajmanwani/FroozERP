@@ -1404,8 +1404,9 @@ const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
     device_name: identity.device_name || fallback.device_name,
     device_type: identity.platform || fallback.device_type,
     branch_id: identity.branch_id || fallback.branch_id,
-    // A hash of this computer's own Windows id ("" where there is none), so the cloud can show one
-    // box per machine even if an old install left another device id behind. Never the raw id.
+    // A hash of this computer's Windows id or this phone's ANDROID_ID ("" where there is none), so
+    // the cloud can show one box per machine even if an old install left another device id behind.
+    // Never the raw id.
     machine_fp: normalizeMachineFingerprint(identity.machine_fp),
   };
 };

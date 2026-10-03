@@ -5931,7 +5931,18 @@ fn ensure_device_identity_for_machine_at(
                     eprintln!("device identity restored from this machine's anchor: {anchored_id}");
                     (anchored_id, AnchorWritePolicy::IfMissingOrInvalid)
                 }
-                None => (generate_opaque_device_id()?, AnchorWritePolicy::ReplaceForeignMachine),
+                None => match machine_identity::stable_device_id(
+                    &machine.machine_fp,
+                    cfg!(target_os = "android"),
+                ) {
+                    // A phone: the id follows from the phone itself, so a reinstall is the same
+                    // device. There is no anchor on a phone, so the policy is moot.
+                    Some(stable_id) => {
+                        eprintln!("device identity derived from this phone: {stable_id}");
+                        (stable_id, AnchorWritePolicy::IfMissingOrInvalid)
+                    }
+                    None => (generate_opaque_device_id()?, AnchorWritePolicy::ReplaceForeignMachine),
+                },
             }
         }
     };

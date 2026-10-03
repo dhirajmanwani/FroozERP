@@ -967,10 +967,12 @@ name = "froozerp"
 version = "1.0.76"
 dependencies = [
  "ed25519-dalek",
+ "jni 0.21.1",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "tao",
  "tauri",
  "tauri-build",
  "tauri-plugin-process",

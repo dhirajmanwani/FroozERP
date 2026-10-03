@@ -77,11 +77,110 @@ pub fn machine_fp_from_guid(raw_guid: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// This machine's fingerprint, or `""` when it cannot be read (and always `""` off Windows).
+/// This machine's fingerprint, or `""` when it cannot be read. Windows hashes its MachineGuid;
+/// Android hashes its `Settings.Secure.ANDROID_ID`; every other platform is `""`.
+#[cfg(not(target_os = "android"))]
 pub fn current_machine_fp() -> String {
     read_machine_guid()
         .map(|guid| machine_fp_from_guid(&guid))
         .unwrap_or_default()
+}
+
+#[cfg(target_os = "android")]
+pub fn current_machine_fp() -> String {
+    read_android_id()
+        .map(|android_id| android_fp_from_android_id(&android_id))
+        .unwrap_or_default()
+}
+
+/// Domain separation for a phone's fingerprint, so a phone and a computer can never share one.
+const ANDROID_FP_DOMAIN: &str = "froozerp:android:";
+/// Domain separation for the device id a phone derives from its fingerprint.
+const STABLE_DEVICE_ID_DOMAIN: &str = "froozerp:device-id:";
+/// The value a buggy batch of Android 2.2 builds returned for every device. Treated as unknown.
+const SHARED_ANDROID_ID: &str = "9774d56d682e549c";
+
+/// `sha256_hex("froozerp:android:" + lowercase(trim(android_id)))`, or `""` for an empty or
+/// known-shared ANDROID_ID. The raw ANDROID_ID never leaves this module.
+pub fn android_fp_from_android_id(raw_android_id: &str) -> String {
+    use sha2::Digest;
+    let normalized = raw_android_id.trim().to_lowercase();
+    if normalized.is_empty() || normalized == SHARED_ANDROID_ID {
+        return String::new();
+    }
+    let digest = sha2::Sha256::digest(format!("{ANDROID_FP_DOMAIN}{normalized}").as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A phone has no `%ProgramData%` that survives an uninstall, so it cannot keep an anchor file.
+/// What it does keep is ANDROID_ID, which Android holds per device, user and app-signing key and
+/// which survives an uninstall and reinstall. A phone with no identity row therefore derives its
+/// device id from its fingerprint: the same phone, reinstalled, comes back as the same device.
+///
+/// `FZDEV-` + the first 16 bytes of `sha256("froozerp:device-id:" + machine_fp)` in the upper-case
+/// GUID shape every other device id has. `None` off Android or without a fingerprint, where a
+/// random id (and, on Windows, the anchor) applies instead.
+pub fn stable_device_id(machine_fp: &str, is_android: bool) -> Option<String> {
+    use sha2::Digest;
+    let fp = machine_fp.trim();
+    if !is_android || fp.len() != 64 || !fp.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let digest = sha2::Sha256::digest(format!("{STABLE_DEVICE_ID_DOMAIN}{}", fp.to_lowercase()).as_bytes());
+    let hex: String = digest[..16].iter().map(|byte| format!("{byte:02X}")).collect();
+    Some(format!(
+        "FZDEV-{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// `Settings.Secure.getString(context.getContentResolver(), "android_id")` through JNI, on the
+/// calling thread. `None` on any failure; a pending Java exception is cleared, never left behind.
+#[cfg(target_os = "android")]
+fn read_android_id() -> Option<String> {
+    use jni::objects::{JObject, JString, JValue};
+    let context = tao::platform::android::prelude::main_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(context.java_vm.cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let activity = unsafe { JObject::from_raw(context.context_jobject.cast()) };
+    let read = |env: &mut jni::JNIEnv| -> Option<String> {
+        let resolver = env
+            .call_method(&activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let key = env.new_string("android_id").ok()?;
+        let value = env
+            .call_static_method(
+                "android/provider/Settings$Secure",
+                "getString",
+                "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&resolver), JValue::Object(&key)],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        if value.is_null() {
+            return None;
+        }
+        let value = JString::from(value);
+        let text: String = env.get_string(&value).ok()?.into();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    };
+    let result = read(&mut env);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    result
 }
 
 /// `HKLM\SOFTWARE\Microsoft\Cryptography` value `MachineGuid` (REG_SZ), read from the 64-bit view
@@ -138,7 +237,7 @@ fn read_machine_guid() -> Option<String> {
     read(RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY).or_else(|| read(RRF_RT_REG_SZ))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "android")))]
 fn read_machine_guid() -> Option<String> {
     None
 }
@@ -381,6 +480,33 @@ pub fn settle_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phone_fingerprint_is_a_domain_separated_hash_and_never_the_raw_android_id() {
+        let fp = android_fp_from_android_id(" 1A2B3C4D5E6F7A8B ");
+        assert_eq!(fp.len(), 64);
+        assert!(fp.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert_eq!(fp, android_fp_from_android_id("1a2b3c4d5e6f7a8b"));
+        assert!(!fp.contains("1a2b3c4d5e6f7a8b"));
+        assert_ne!(fp, machine_fp_from_guid("1a2b3c4d5e6f7a8b"), "a phone and a computer never share one");
+        assert_eq!(android_fp_from_android_id(""), "");
+        assert_eq!(android_fp_from_android_id("9774D56D682E549C"), "", "the shared emulator-bug value is unknown");
+    }
+
+    #[test]
+    fn a_reinstalled_phone_derives_the_same_device_id_and_a_computer_derives_none() {
+        let fp = android_fp_from_android_id("1a2b3c4d5e6f7a8b");
+        let first = stable_device_id(&fp, true).expect("a phone with a fingerprint has a stable id");
+        assert_eq!(Some(first.clone()), stable_device_id(&fp, true));
+        assert_eq!(Some(first.clone()), stable_device_id(&fp.to_uppercase(), true));
+        assert!(is_well_formed_device_id(&first));
+        let shape: Vec<usize> = first.trim_start_matches("FZDEV-").split('-').map(str::len).collect();
+        assert_eq!(shape, vec![8, 4, 4, 4, 12]);
+        assert_ne!(Some(first), stable_device_id(&android_fp_from_android_id("ffff0000ffff0000"), true));
+        assert_eq!(stable_device_id(&fp, false), None, "a computer keeps its random id and anchor");
+        assert_eq!(stable_device_id("", true), None);
+        assert_eq!(stable_device_id("not-a-fingerprint", true), None);
+    }
 
     fn temp_anchor(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
