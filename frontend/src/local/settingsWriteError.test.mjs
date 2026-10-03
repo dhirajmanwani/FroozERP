@@ -132,6 +132,25 @@ test("a failed refresh says the save is safe, and never says the save failed", (
   assert.match(message, /\[Network Error\]$/);
 });
 
+test("a refresh failure names which read failed, even when the app's own command rejected with a bare string", () => {
+  // 3 Oct 2026: the owner saw this message with nothing in brackets after a Settings save. The
+  // desktop app's commands reject with a string, which has no `.message`.
+  const fromString = refreshAfterSaveMessage("Reference snapshot has no canonical device identity", "purchase rules");
+  assert.match(fromString, /\[purchase rules: Reference snapshot has no canonical device identity\]$/);
+  assert.match(refreshAfterSaveMessage(new Error("Network Error"), "settings"), /\[settings: Network Error\]$/);
+  assert.match(refreshAfterSaveMessage(undefined, "discount rules"), /\[discount rules\]$/);
+  assert.doesNotMatch(refreshAfterSaveMessage(undefined), /\[/);
+});
+
+test("updating this computer's offline copy of the purchase rules can never fail a Settings refresh", () => {
+  const start = appSource.indexOf("const loadPurchaseRules = async () => {");
+  const body = appSource.slice(start, appSource.indexOf("const loadPurchases = async", start));
+  const tryAt = body.indexOf("try {");
+  assert.ok(tryAt > 0 && tryAt < body.indexOf("resolveLocalDeviceInfo("), "the device lookup is inside the try");
+  assert.ok(body.indexOf("cacheLocalReferenceSnapshot(") < body.indexOf("} catch (cacheError) {"));
+  assert.match(body, /writeDiagnosticLog\("WARN", "purchase-rules-local-cache-failed"/);
+});
+
 test("the settings refresh never rejects, and never fails one read because another failed", () => {
   // The fix is in App.jsx because that is where onReload is built. Both halves matter: allSettled
   // so one bad read does not fail the other two, and no rethrow so a write handler awaiting this

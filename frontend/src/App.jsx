@@ -5585,20 +5585,28 @@ function App() {
     );
     setPurchaseRules(response.data);
     if (isTauriRuntime()) {
-      const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
-      const snapshot = await loadLocalReferenceSnapshot({
-        username: user?.username || username,
-        deviceId: latestDevice.device_id,
-      }).catch(() => null);
-      if (snapshot?.reference_ready) {
-        await cacheLocalReferenceSnapshot({
-          ...snapshot,
-          settings_bundle: {
-            ...(snapshot.settings_bundle || {}),
-            mandiTaxRules: response.data?.mandiTaxRules || [],
-            rebateRules: response.data?.rebateRules || [],
-          },
-        });
+      // Copying the fresh rules into this computer's offline copy. The rules on screen are already
+      // the cloud's; a refusal here only means the offline copy keeps the previous rules until the
+      // next sync rewrites the whole snapshot, so it is logged, not raised as a failed refresh
+      // after every Settings save (3 Oct 2026).
+      try {
+        const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
+        const snapshot = await loadLocalReferenceSnapshot({
+          username: user?.username || username,
+          deviceId: latestDevice.device_id,
+        }).catch(() => null);
+        if (snapshot?.reference_ready) {
+          await cacheLocalReferenceSnapshot({
+            ...snapshot,
+            settings_bundle: {
+              ...(snapshot.settings_bundle || {}),
+              mandiTaxRules: response.data?.mandiTaxRules || [],
+              rebateRules: response.data?.rebateRules || [],
+            },
+          });
+        }
+      } catch (cacheError) {
+        writeDiagnosticLog("WARN", "purchase-rules-local-cache-failed", { message: cacheError?.message || String(cacheError) });
       }
     }
     return response.data;
@@ -10790,10 +10798,11 @@ function App() {
                 // charge save. `allSettled` refreshes everything that can be refreshed, and the
                 // failure is reported as what it is — a stale screen, not a lost save.
                 onReload={async () => {
+                  const parts = ["settings", "purchase rules", "discount rules"];
                   const results = await Promise.allSettled([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]);
-                  const failed = results.find((result) => result.status === "rejected");
-                  if (failed) alert(refreshAfterSaveMessage(failed.reason));
-                  return !failed;
+                  const failedIndex = results.findIndex((result) => result.status === "rejected");
+                  if (failedIndex >= 0) alert(refreshAfterSaveMessage(results[failedIndex].reason, parts[failedIndex]));
+                  return failedIndex < 0;
                 }}
                 onRegisterCloudDevice={registerCloudDevice}
                 onRetrySync={retrySyncFailures}
