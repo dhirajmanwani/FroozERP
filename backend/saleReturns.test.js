@@ -207,6 +207,17 @@ const SCHEMA = `
     user_id INTEGER, branch_id INTEGER, company_id INTEGER, operational_location_id INTEGER
   );
 
+  CREATE TABLE roles (id INTEGER PRIMARY KEY, role_name TEXT);
+  CREATE TABLE users (id INTEGER PRIMARY KEY, role_id INTEGER, active BOOLEAN DEFAULT TRUE);
+  CREATE TABLE sale_change_approvals (
+    id TEXT PRIMARY KEY, status VARCHAR(20) NOT NULL, action VARCHAR(20) NOT NULL, sale_ref VARCHAR(180) NOT NULL,
+    requester_id INTEGER NOT NULL, approver_id INTEGER, company_id INTEGER, branch_id INTEGER, device_id VARCHAR(160),
+    reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMPTZ,
+    consumed_at TIMESTAMPTZ, consumed_sale_id INTEGER
+  );
+
+  INSERT INTO roles VALUES (1, 'Owner'), (3, 'Cashier');
+  INSERT INTO users VALUES (7, 1, TRUE), (9, 3, TRUE);
   INSERT INTO branches VALUES (1, 1, TRUE);
   INSERT INTO customers (id, customer_name, mobile_number) VALUES (5, 'Ravi', '9000000001');
   INSERT INTO products VALUES (10, 'Apple', 'KG'), (11, 'Banana', 'KG');
@@ -224,6 +235,13 @@ const SCHEMA = `
     (1, 1000, 501, 1.000, 100, 100),
     (2, 1000, 502, 2.000, 120, 240),
     (3, 1001, 503, 0.300, 500, 150);
+  -- A cash bill made on the shop's OTHER counter (location 2), from before bills carried a company.
+  INSERT INTO sales (id, invoice_no, customer_name, sale_date, total_amount, total_cost, profit, payment_mode, branch_id,
+    company_id, operational_location_id, gross_amount, item_discount_amount, invoice_discount_amount, tax_amount, global_id)
+  VALUES (101, 'FZ-2', 'Walk-in Customer', '2026-01-11', 100, 50, 50, 'CASH', 1, NULL, 2, 100, 0, 0, 0, 'sale-g-101');
+  INSERT INTO sale_items VALUES (1010, 101, 10, 1.000, 100, 100, 0, 100, 50, 50);
+  INSERT INTO inventory_batches VALUES (504, 0, 0, 'ACTIVE', 'L4', NULL);
+  INSERT INTO sale_batch_allocations VALUES (4, 1010, 504, 1.000, 50, 50);
 `;
 
 const PERMISSION_SQL = /FROM\s+users\s+u\s+JOIN\s+roles\s+r/i;
@@ -248,6 +266,9 @@ const scopeAnswer = (sql) => {
   return undefined;
 };
 const OWNER_ROW = { id: OWNER_ID, full_name: "Rig Owner", username: "rig", branch_id: 1, role_name: "Owner", permissions: {}, can_edit_sales: true, can_cancel_sales: true };
+const CASHIER_ROW = { id: 9, full_name: "Rig Cashier", username: "cash", branch_id: 1, role_name: "Cashier", permissions: { billing: true }, can_edit_sales: false, can_cancel_sales: false };
+// Who the database says the signed-in user is. Roles are re-read from the database, never the token.
+let actorRow = OWNER_ROW;
 const NOT_IN_RIG = /sync_processed_operations|sync_conflict_log|sync_change_log|sale_audit_trail/i;
 
 const withDatabase = async (run) => {
@@ -260,7 +281,7 @@ const withDatabase = async (run) => {
     statements.push(sql.replace(/\s+/g, " ").trim());
     const scoped = scopeAnswer(sql);
     if (scoped) return scoped;
-    if (PERMISSION_SQL.test(sql)) return { rows: [OWNER_ROW], rowCount: 1 };
+    if (PERMISSION_SQL.test(sql)) return { rows: [actorRow], rowCount: 1 };
     if (NOT_IN_RIG.test(sql)) return { rows: [], rowCount: 0 };
     const result = await db.query(sql, values || []);
     return { ...result, rowCount: result.affectedRows ?? result.rows.length };
@@ -393,7 +414,7 @@ test("restoreSaleInventory never puts returned stock back a second time", async 
     const created = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 1.5 }] });
     assert.equal(created.status, 201);
     await restoreSaleInventory({ query }, 100, OWNER_ID, "Test reversal", "IN");
-    const batches = (await db.query("SELECT id, remaining_qty FROM inventory_batches ORDER BY id")).rows.map((row) => [row.id, qty(row.remaining_qty)]);
+    const batches = (await db.query("SELECT id, remaining_qty FROM inventory_batches WHERE id IN (501, 502, 503) ORDER BY id")).rows.map((row) => [row.id, qty(row.remaining_qty)]);
     // Sold 1 + 2 (+0.3); 1.5 already back (1 on 501, 0.5 on 502). The reversal adds only what is still out.
     assert.deepEqual(batches, [[501, 1], [502, 2], [503, 0.3]]);
   });
@@ -439,4 +460,69 @@ test("ledger report: only a credit note or future adjustment credits the custome
   const ledger = statements.find((sql) => /'Sale Return' AS voucher_type/.test(sql));
   assert.ok(ledger);
   assert.match(ledger, /CASE WHEN sr\.refund_type IN \('CREDIT_NOTE', 'FUTURE_ADJUSTMENT'\) THEN sr\.total_return_amount ELSE 0 END AS credit/);
+});
+
+test("a bill made on the shop's other counter, with no company recorded, can be returned", async () => {
+  await withDatabase(async ({ db }) => {
+    const response = await postReturn({ sale_id: 101, refund_type: "CASH_REFUND", items: [{ sale_item_id: 1010, return_quantity: 0.5 }] });
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    assert.equal(qty((await one(db, "SELECT remaining_qty FROM inventory_batches WHERE id = 504")).remaining_qty), 0.5);
+    const movement = await one(db, "SELECT branch_id, operational_location_id FROM stock_transactions ORDER BY id DESC LIMIT 1");
+    assert.equal(movement.operational_location_id, 2, "the stock movement belongs to the bill's own counter");
+    const saved = await one(db, "SELECT branch_id FROM sale_returns WHERE id = $1", [response.body.id]);
+    assert.equal(saved.branch_id, 1);
+  });
+});
+
+test("a missing or cancelled bill is named as such, not as an unpicked invoice", async () => {
+  await withDatabase(async ({ db }) => {
+    let response = await postReturn({ sale_id: 999, items: [{ sale_item_id: 1000, return_quantity: 1 }] });
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, "SALE_RETURN_INVOICE_NOT_FOUND");
+    await db.query("UPDATE sales SET sale_status = 'CANCELLED' WHERE id = 101");
+    response = await postReturn({ sale_id: 101, items: [{ sale_item_id: 1010, return_quantity: 1 }] });
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, "SALE_RETURN_INVOICE_CANCELLED");
+  });
+});
+
+test("a Cashier's return needs an Owner or Admin approval for that bill, and spends it once", async () => {
+  actorRow = CASHIER_ROW;
+  try {
+    await withDatabase(async ({ db }) => {
+      const body = { sale_id: 101, refund_type: "CASH_REFUND", items: [{ sale_item_id: 1010, return_quantity: 0.25 }] };
+      let response = await postReturn(body);
+      assert.equal(response.status, 403, JSON.stringify(response.body));
+      assert.equal(response.body.code, "SALE_CHANGE_APPROVAL_REQUIRED");
+      assert.equal((await one(db, "SELECT COUNT(*)::INTEGER AS n FROM sale_returns")).n, 0, "nothing written");
+
+      const insert = (id, action, saleRef) => db.query(
+        `INSERT INTO sale_change_approvals (id, status, action, sale_ref, requester_id, approver_id, company_id, branch_id, device_id, reason, expires_at)
+         VALUES ($1, 'ISSUED', $2, $3, 9, 7, 1, 1, $4, 'Soft fruit', CURRENT_TIMESTAMP + INTERVAL '1 day')`,
+        [id, action, saleRef, DEVICE_ID]
+      );
+      await insert("appr-cancel", "cancel", "101");
+      await insert("appr-other-bill", "return", "100");
+      await insert("appr-ok", "return", "101");
+
+      response = await postReturn({ ...body, approval_id: "appr-cancel" });
+      assert.equal(response.status, 403, "a cancel approval is not a return approval");
+      assert.equal(response.body.detail, "APPROVAL_WRONG_ACTION");
+      response = await postReturn({ ...body, approval_id: "appr-other-bill" });
+      assert.equal(response.status, 403, "another bill's approval does not move");
+      assert.equal(response.body.detail, "APPROVAL_WRONG_SALE");
+
+      response = await postReturn({ ...body, approval_id: "appr-ok" });
+      assert.equal(response.status, 201, JSON.stringify(response.body));
+      const approval = await one(db, "SELECT status, consumed_sale_id FROM sale_change_approvals WHERE id = 'appr-ok'");
+      assert.equal(approval.status, "CONSUMED");
+      assert.equal(approval.consumed_sale_id, 101);
+
+      response = await postReturn({ ...body, approval_id: "appr-ok" });
+      assert.equal(response.status, 403, "an approval is single-use");
+      assert.equal(response.body.detail, "APPROVAL_ALREADY_USED");
+    });
+  } finally {
+    actorRow = OWNER_ROW;
+  }
 });

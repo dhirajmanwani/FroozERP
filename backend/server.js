@@ -24270,7 +24270,6 @@ const createSaleReturnHandler = async (req, res) => {
     const refundType = normalizeRefundType(req.body.refund_type);
     const returnReason = cleanText(req.body.return_reason);
     const createdBy = req.auth.userId;
-    const branchId = parsePositiveInteger(req.body.branch_id);
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     if (!saleId || !REFUND_TYPES.has(refundType) || !returnReason || items.length === 0) {
       return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
@@ -24296,24 +24295,51 @@ const createSaleReturnHandler = async (req, res) => {
     const replay = await beginV3BusinessOperation(client, req, "sale_return");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+    // The bill must be this shop's: the same branch the invoice list and the options read are
+    // scoped to. It used to also demand the bill's own counter (operational location) equal the
+    // one recording the return, so a bill made on one counter -- or any bill when the return was
+    // entered on the Owner's laptop -- was refused as "Select an active invoice for return" even
+    // though it was picked from the list. Older bills with no company recorded still qualify.
     const saleResult = await client.query(
       `SELECT * FROM sales
        WHERE id = $1
-         AND ($2::INTEGER IS NULL OR (
-           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
-         ))
+         AND branch_id = $2
+         AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
        FOR SHARE`,
       [
         saleId,
-        context?.company_id || null,
-        context?.branch_id || null,
-        context?.operational_location_id || null,
+        parsePositiveInteger(context?.branch_id) || parsePositiveInteger(req.auth.branchId),
+        parsePositiveInteger(context?.company_id) || parsePositiveInteger(req.auth.companyId) || null,
       ]
     );
     const sale = saleResult.rows[0];
-    if (!sale || sale.sale_status === "CANCELLED") {
+    if (!sale) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Select an active invoice for return" });
+      return res.status(400).json({ code: "SALE_RETURN_INVOICE_NOT_FOUND", message: "This bill is not in this shop's records. Pick the bill again from the list." });
+    }
+    if (sale.sale_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ code: "SALE_RETURN_INVOICE_CANCELLED", message: "This bill is cancelled, so nothing on it can be returned." });
+    }
+    // A Cashier needs an Owner or Admin to approve the return on the counter (their own username and
+    // password, checked by POST /api/v3/sale-change-approvals with action "return"). Owner and
+    // Admin need nothing. The approval is single-use and bound to this bill, this cashier, this
+    // company and this device; it is consumed here, inside the return's transaction.
+    const approval = await authorizeSaleChange(client, {
+      actor: manager,
+      action: "return",
+      approvalId: req.body.approval_id,
+      sale,
+      companyId: context?.company_id ?? req.auth.companyId,
+      deviceId: context?.device_id ?? req.auth.deviceId,
+    });
+    if (!approval.ok) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        code: approval.code,
+        detail: approval.detail,
+        message: approval.message,
+      });
     }
     // The shop's day, not the server's: the server runs in UTC, which is still yesterday until
     // 05:30 in India. A date the client sends must be a real YYYY-MM-DD, not after today in India
@@ -24347,7 +24373,8 @@ const createSaleReturnHandler = async (req, res) => {
         returnNo, saleId, nullableText(req.body.customer_name) || sale.customer_name,
         nullableText(req.body.customer_mobile) || sale.customer_mobile,
         returnDate.date, refundType, returnReason,
-        branchId || sale.branch_id, createdBy,
+        // The bill's branch, already checked to be this login's; never the branch the client sent.
+        sale.branch_id, createdBy,
         context?.company_id || sale.company_id || null,
         context?.operational_location_id || sale.operational_location_id || null,
       ]
@@ -24446,9 +24473,11 @@ const createSaleReturnHandler = async (req, res) => {
           returnQuantity,
           `Sale return ${returnNo}: ${returnReason}`,
           createdBy,
-          branchId || sale.branch_id,
-          context?.company_id || sale.company_id || null,
-          context?.operational_location_id || sale.operational_location_id || null,
+          // The stock went back into the bill's own batches, so the movement belongs to the bill's
+          // shop and counter, even when the return was typed in somewhere else.
+          sale.branch_id,
+          sale.company_id || context?.company_id || null,
+          sale.operational_location_id || context?.operational_location_id || null,
         ]
       );
       totalReturnAmount = roundCurrency(totalReturnAmount + returnAmount);
@@ -25136,18 +25165,25 @@ const createSaleChangeApprovalHandler = async (req, res) => {
   // permission -- only to be an active user. Anyone the 5% rule already exempts (Owner, Admin,
   // holder of manual_pos_rate_override) is told they need no approval.
   const discountRequest = request.action === "discount";
+  // A return is asked for by whoever may record returns at all (the `billing` key the return route
+  // itself checks); the approval is what a Cashier then needs on top.
+  const returnRequest = request.action === "return";
   const requester = discountRequest
     ? await getManualDiscountActor(requesterId)
-    : await getSalePermissionUser(requesterId, request.action);
+    : returnRequest
+      ? await getPermissionUser(requesterId, "billing", ["Owner", "Admin"])
+      : await getSalePermissionUser(requesterId, request.action);
   if (!requester) {
     await audit(CODES.REQUESTER_NOT_ALLOWED, { stage: "requester_permission" });
     return res.status(403).json({
       code: CODES.REQUESTER_NOT_ALLOWED,
       message: discountRequest
         ? "Your account is not active."
-        : request.action === "cancel"
-          ? "You do not have permission to cancel completed sales."
-          : "You do not have permission to edit completed sales.",
+        : returnRequest
+          ? "You do not have permission to record sale returns."
+          : request.action === "cancel"
+            ? "You do not have permission to cancel completed sales."
+            : "You do not have permission to edit completed sales.",
     });
   }
   if (discountRequest ? discountRules.manualDiscountExempt(requester) : !saleChangeApproval.approvalRequired(requester.role_name)) {
@@ -25156,7 +25192,9 @@ const createSaleChangeApprovalHandler = async (req, res) => {
       code: CODES.NOT_NEEDED,
       message: discountRequest
         ? "You can give this discount without approval."
-        : "Owners and Admins do not need approval to change a bill.",
+        : returnRequest
+          ? "Owners and Admins do not need approval to record a return."
+          : "Owners and Admins do not need approval to change a bill.",
     });
   }
 

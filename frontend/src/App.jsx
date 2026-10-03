@@ -10678,6 +10678,7 @@ function App() {
 
           {activeView === "returns" && (
             <SaleReturnModule
+              approvalRoute={resolveSaleChangeRoute({ user, offlineMode, connectivityMode })}
               onSaved={refreshAfterSaleReturn}
               returns={saleReturns}
               user={user}
@@ -18219,7 +18220,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
 // list on a counter can hold this computer's local bill ids, which the cloud cannot look up, so a
 // return picked from it failed as "Invalid invoice". What may be sent is worked out in
 // local/saleReturnDraft.js; the server checks it all again.
-function SaleReturnModule({ onSaved, returns, user }) {
+function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
   const [invoiceSearch, setInvoiceSearch] = useState("");
   const [invoiceList, setInvoiceList] = useState({ status: "loading", sales: [], message: "" });
   const [invoiceId, setInvoiceId] = useState("");
@@ -18230,10 +18231,13 @@ function SaleReturnModule({ onSaved, returns, user }) {
   const [quantities, setQuantities] = useState({});
   const [saving, setSaving] = useState(false);
   const [outcome, setOutcome] = useState(null);
+  // A Cashier's return needs the Owner or an Admin to type their own username and password here
+  // (asked for 3 Oct 2026), the same check a bill cancel uses. Owner and Admin see nothing extra.
+  const [approver, setApprover] = useState({ approverUsername: "", approverPassword: "" });
   const optionsRequest = useRef(0);
   // One key per return: a retry of the same return after a lost reply is recognised by the server
   // instead of being booked twice. A changed form gets a new key.
-  const pendingWrite = useRef({ fingerprint: "", operationId: "" });
+  const pendingWrite = useRef({ fingerprint: "", operationId: "", approvalId: "" });
   const today = toDateKey(new Date());
 
   const loadInvoices = async () => {
@@ -18278,8 +18282,14 @@ function SaleReturnModule({ onSaved, returns, user }) {
 
   const draft = buildSaleReturnDraft({ invoiceId, items: returnOptions.items, quantities, reason: returnReason });
   const dateProblem = !returnDate ? "Pick the return date." : (returnDate > today ? "The return date cannot be after today." : "");
-  const blockers = [...draft.problems, ...(dateProblem ? [dateProblem] : [])];
-  const canSave = draft.canSave && !dateProblem && returnOptions.status === "ready";
+  const approvalMode = approvalRoute?.mode || SALE_CHANGE_APPROVAL_MODE.NONE;
+  const approvalProblem = approvalMode === SALE_CHANGE_APPROVAL_MODE.REFUSED
+    ? approvalRoute.message
+    : approvalMode === SALE_CHANGE_APPROVAL_MODE.CLOUD && (!approver.approverUsername.trim() || !approver.approverPassword)
+      ? "The Owner or an Admin must type their username and password to approve this return."
+      : "";
+  const blockers = [...draft.problems, ...(dateProblem ? [dateProblem] : []), ...(approvalProblem ? [approvalProblem] : [])];
+  const canSave = draft.canSave && !dateProblem && !approvalProblem && returnOptions.status === "ready";
 
   const saveReturn = async () => {
     if (saving || !canSave) return;
@@ -18294,21 +18304,45 @@ function SaleReturnModule({ onSaved, returns, user }) {
       draft,
     });
     const fingerprint = saleReturnFingerprint(payload);
-    if (pendingWrite.current.fingerprint !== fingerprint) pendingWrite.current = { fingerprint, operationId: "" };
-    const returnWrite = createOperationalWrite(user, payload, pendingWrite.current.operationId);
-    pendingWrite.current.operationId = returnWrite.operationId;
+    if (pendingWrite.current.fingerprint !== fingerprint) pendingWrite.current = { fingerprint, operationId: "", approvalId: "" };
     setSaving(true);
     setOutcome(null);
+    // The approval is asked for once per return. If the save then fails, the retry reuses it: the
+    // failed save rolled back without spending it.
+    if (approvalMode === SALE_CHANGE_APPROVAL_MODE.CLOUD && !pendingWrite.current.approvalId) {
+      try {
+        pendingWrite.current.approvalId = await requestSaleChangeApproval(user, {
+          action: "return",
+          saleRef: invoiceId,
+          reason: payload.return_reason,
+          approverUsername: approver.approverUsername,
+          approverPassword: approver.approverPassword,
+        });
+      } catch (error) {
+        setSaving(false);
+        setOutcome({ tone: "error", text: describeApprovalError(error) });
+        return;
+      }
+    }
+    const returnWrite = createOperationalWrite(
+      user,
+      pendingWrite.current.approvalId ? { ...payload, approval_id: pendingWrite.current.approvalId } : payload,
+      pendingWrite.current.operationId,
+    );
+    pendingWrite.current.operationId = returnWrite.operationId;
     let saved;
     try {
       const response = await axios.post(`${API_URL}/api/v3/sale-returns`, returnWrite.body, returnWrite.config);
       saved = response.data || {};
     } catch (error) {
+      // A refused or spent approval cannot be reused; the next try asks again.
+      if (String(error?.response?.data?.code || "").includes("APPROVAL")) pendingWrite.current.approvalId = "";
       setSaving(false);
       setOutcome({ tone: "error", text: getErrorMessage(error, "The return was not saved.") });
       return;
     }
-    pendingWrite.current = { fingerprint: "", operationId: "" };
+    pendingWrite.current = { fingerprint: "", operationId: "", approvalId: "" };
+    setApprover({ approverUsername: "", approverPassword: "" });
     optionsRequest.current += 1;
     setInvoiceId("");
     setReturnOptions({ status: "idle", sale: null, items: [], message: "" });
@@ -18402,6 +18436,12 @@ function SaleReturnModule({ onSaved, returns, user }) {
           <SummaryMetric label="Return Value" value={draft.total === null ? "Unknown" : currency.format(draft.total)} featured />
           <SummaryMetric label="Refund Mode" value={labelFor("refundType", refundType)} />
         </div>
+        <SaleChangeApprovalFields
+          disabled={saving}
+          form={approver}
+          onChange={(change) => setApprover((current) => ({ ...current, ...change }))}
+          route={approvalRoute}
+        />
         {invoiceId !== "" && returnOptions.status === "ready" && blockers.length > 0 && (
           <ul className="return-note return-blockers">
             {blockers.map((problem) => <li key={problem}>{problem}</li>)}

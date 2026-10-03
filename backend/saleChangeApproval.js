@@ -41,7 +41,10 @@
 /** The roles that may approve, and that need no approval themselves. */
 const APPROVER_ROLES = new Set(["Owner", "Admin"]);
 
-const APPROVAL_ACTIONS = Object.freeze(["cancel", "edit", "discount"]);
+// "return" (3 Oct 2026): a sale return refunds money from a completed bill, so the owner asked that a
+// Cashier cannot record one without an Owner or Admin approving it on the counter, exactly as a
+// cancel. `sale_ref` is the bill being returned against.
+const APPROVAL_ACTIONS = Object.freeze(["cancel", "edit", "discount", "return"]);
 
 /** The reason stored for a discount approval when the counter sent none. */
 const DEFAULT_DISCOUNT_REASON = "Item discount over 5%";
@@ -147,7 +150,7 @@ const normalizeApprovalRequest = (body) => {
   const source = body && typeof body === "object" ? body : {};
   const action = text(source.action).toLowerCase();
   if (!APPROVAL_ACTIONS.includes(action)) {
-    return invalid("Say whether the bill is being cancelled or edited, or a discount approved.");
+    return invalid("Say whether the bill is being cancelled, edited or returned, or a discount approved.");
   }
   const saleRef = idText(source.sale_ref);
   if (!saleRef) return invalid("Say which bill needs approval.");
