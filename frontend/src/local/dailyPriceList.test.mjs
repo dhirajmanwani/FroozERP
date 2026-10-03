@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  PRICE_LIST_SHARE_ROUTE,
+  choosePriceListShareRoute,
+  priceListCopySaveOutcome,
   PRICE_LIST_CAPTION_MAX_ROWS,
   PRICE_LIST_LAST_PREPARED_KEY,
   PRICE_LIST_SCHEDULE_DEFAULTS,
@@ -351,4 +354,39 @@ test("the morning reminder only notifies; it makes no request and sends nothing"
   assert.match(effect, /notify\(\{/);
   assert.match(effect, /writeLastPreparedOn\(storage, decision\.today\)/);
   assert.doesNotMatch(effect, /axios|fetch\(|API_URL|whatsapp\/send/i);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Share route: inside the FroozERP app the browser share window is never used (3 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+test("the app (counter or phone) always copies and saves; only a real browser opens the share window", () => {
+  assert.equal(choosePriceListShareRoute({ appShell: true, canShareFiles: true }), PRICE_LIST_SHARE_ROUTE.COPY_AND_SAVE);
+  assert.equal(choosePriceListShareRoute({ appShell: true, canShareFiles: false }), PRICE_LIST_SHARE_ROUTE.COPY_AND_SAVE);
+  assert.equal(choosePriceListShareRoute({ appShell: false, canShareFiles: true }), PRICE_LIST_SHARE_ROUTE.NATIVE_SHARE);
+  assert.equal(choosePriceListShareRoute({ appShell: false, canShareFiles: false }), PRICE_LIST_SHARE_ROUTE.COPY_AND_SAVE);
+  assert.equal(choosePriceListShareRoute({ appShell: false, canShareFiles: "yes" }), PRICE_LIST_SHARE_ROUTE.COPY_AND_SAVE);
+  assert.equal(choosePriceListShareRoute(), PRICE_LIST_SHARE_ROUTE.COPY_AND_SAVE);
+});
+
+test("the outcome says only what actually happened, and a total failure is an error", () => {
+  const both = priceListCopySaveOutcome({ copied: true, saved: true, fileName: "Frooz_PriceList_2026-10-03.png" });
+  assert.equal(both.tone, "ok");
+  assert.match(both.text, /Ctrl\+V/);
+  assert.match(both.text, /Frooz_PriceList_2026-10-03\.png/);
+  const copiedOnly = priceListCopySaveOutcome({ copied: true, saved: false, fileName: "x.png" });
+  assert.doesNotMatch(copiedOnly.text, /Downloads/);
+  const savedOnly = priceListCopySaveOutcome({ copied: false, saved: true, fileName: "x.png" });
+  assert.doesNotMatch(savedOnly.text, /Ctrl\+V/);
+  assert.match(savedOnly.text, /Downloads/);
+  assert.equal(priceListCopySaveOutcome({ copied: false, saved: false }).tone, "error");
+});
+
+test("the share button never waits on a share window without a time limit, and never uses it in the app", () => {
+  const start = appSource.indexOf("const share = async () => {");
+  const body = appSource.slice(start, appSource.indexOf("const copyText = async", start));
+  assert.match(body, /choosePriceListShareRoute\(\{\s*appShell: isDesktopShell\(\)/);
+  assert.match(body, /Promise\.race\(\[\s*navigator\.share/);
+  assert.match(body, /PRICE_LIST_SHARE_TIMEOUT_MS/);
+  assert.match(body, /priceListCopySaveOutcome\(\{ copied, saved, fileName \}\)/);
 });

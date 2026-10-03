@@ -68,7 +68,7 @@ import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTar
 import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
-import { PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, priceListCaption, priceListFileName, readLastPreparedOn, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListSchedule } from "./local/dailyPriceList";
+import { PRICE_LIST_SHARE_ROUTE, PRICE_LIST_SHARE_TIMEOUT_MS, PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, choosePriceListShareRoute, priceListCaption, priceListCopySaveOutcome, priceListFileName, readLastPreparedOn, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListSchedule } from "./local/dailyPriceList";
 import { buildPosPayments, buildUpiPayload, describePaymentConfirmation, invoiceUpiNote, resolveInvoiceUpiQr } from "./local/posPaymentConfirmation";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
@@ -26978,11 +26978,20 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
       const fileName = priceListFileName();
       const caption = priceListCaption({ header, rows: list.rows });
       const file = typeof File === "function" ? new File([blob], fileName, { type: "image/png" }) : null;
-      if (file && navigator.canShare?.({ files: [file] })) {
+      const route = choosePriceListShareRoute({
+        appShell: isDesktopShell(),
+        canShareFiles: Boolean(file && typeof navigator.share === "function" && navigator.canShare?.({ files: [file] })),
+      });
+      if (route === PRICE_LIST_SHARE_ROUTE.NATIVE_SHARE) {
         try {
-          await navigator.share({ files: [file], text: caption });
-          setOutcome({ tone: "ok", text: "Shared. Choose your WhatsApp group in the share window if it asked." });
-          return;
+          const answered = await Promise.race([
+            navigator.share({ files: [file], text: caption }).then(() => "shared"),
+            new Promise((resolve) => setTimeout(() => resolve("timeout"), PRICE_LIST_SHARE_TIMEOUT_MS)),
+          ]);
+          if (answered === "shared") {
+            setOutcome({ tone: "ok", text: "Shared. Choose your WhatsApp group in the share window if it asked." });
+            return;
+          }
         } catch (error) {
           if (error?.name === "AbortError") {
             setOutcome({ tone: "note", text: "Sharing was cancelled. Nothing was sent." });
@@ -27000,13 +27009,14 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
       } catch {
         copied = false;
       }
-      downloadBlob(blob, fileName);
-      setOutcome({
-        tone: "ok",
-        text: copied
-          ? `Picture copied and saved as ${fileName}. Open your WhatsApp group, press Ctrl+V, then Send.`
-          : `Picture saved as ${fileName} in Downloads. Open your WhatsApp group, attach it, then Send.`,
-      });
+      let saved = false;
+      try {
+        downloadBlob(blob, fileName);
+        saved = true;
+      } catch {
+        saved = false;
+      }
+      setOutcome(priceListCopySaveOutcome({ copied, saved, fileName }));
     } catch (error) {
       setOutcome({ tone: "error", text: `The price list picture could not be made: ${error?.message || "unknown error"}. Copy as text still works.` });
     } finally {
@@ -27041,6 +27051,8 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
           <button className="secondary-button" disabled={list.rows.length === 0} onClick={copyText} type="button">Copy as text</button>
         </div>
       </div>
+      {/* Right under the button that caused it, so what to do next is the first thing read. */}
+      {outcome && <div className={outcome.tone === "error" ? "error-banner" : "form-note price-list-outcome"} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</div>}
       {list.status === "loading" && <div className="cart-empty" role="status">Reading today's stock on this computer...</div>}
       {list.status === PRICE_LIST_STATUS.UNAVAILABLE && <div className="error-banner" role="alert">{list.message || "The price list could not be built."}</div>}
       {list.status === PRICE_LIST_STATUS.EMPTY && <div className="cart-empty">{list.message || "Nothing is in stock with a rate, so there is no price list today."}</div>}
@@ -27081,7 +27093,6 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
           )}
         </>
       )}
-      {outcome && <div className={outcome.tone === "error" ? "error-banner" : "form-note price-list-outcome"} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</div>}
       {canSchedule && (
         <div className="price-list-schedule">
           <label className="check-field">

@@ -354,3 +354,39 @@ export const priceListCaption = ({ header = {}, rows = [] } = {}) => {
 
 /** `Frooz_PriceList_2026-10-03.png`, dated by the device's own day. */
 export const priceListFileName = (now = new Date()) => `Frooz_PriceList_${localDateString(now)}.png`;
+
+/**
+ * How the Share button hands the picture over.
+ *
+ * The browser's share window (`navigator.share`) is only used in a real browser that says it can
+ * share a picture: on a phone that is the share sheet with WhatsApp in it. Inside the FroozERP app
+ * (the Windows counter app, and the phone app) it is never used. Its webview either has no share
+ * window at all or opens one that never answers, and on 3 Oct 2026 the owner's first press of the
+ * button on the counter app did nothing he could see. There the picture is copied and saved instead,
+ * which is a thing the app can finish and say it finished.
+ */
+export const PRICE_LIST_SHARE_ROUTE = Object.freeze({
+  NATIVE_SHARE: "native-share",
+  COPY_AND_SAVE: "copy-and-save",
+});
+
+export const choosePriceListShareRoute = ({ appShell = false, canShareFiles = false } = {}) => (
+  appShell !== true && canShareFiles === true ? PRICE_LIST_SHARE_ROUTE.NATIVE_SHARE : PRICE_LIST_SHARE_ROUTE.COPY_AND_SAVE
+);
+
+/** A browser share window gets this long to answer before the picture is copied and saved instead. */
+export const PRICE_LIST_SHARE_TIMEOUT_MS = 20000;
+
+/** What the owner reads after the picture was copied and/or saved. Says only what actually happened. */
+export const priceListCopySaveOutcome = ({ copied = false, saved = false, fileName = "" } = {}) => {
+  if (copied && saved) {
+    return { tone: "ok", text: `Picture copied. Open WhatsApp, open your group, press Ctrl+V, then Send. A copy is also saved in Downloads as ${fileName}.` };
+  }
+  if (copied) {
+    return { tone: "ok", text: "Picture copied. Open WhatsApp, open your group, press Ctrl+V, then Send." };
+  }
+  if (saved) {
+    return { tone: "ok", text: `Picture saved in Downloads as ${fileName}. Open your WhatsApp group, attach it from Downloads, then Send.` };
+  }
+  return { tone: "error", text: "The picture could neither be copied nor saved on this computer. Copy as text still works." };
+};
