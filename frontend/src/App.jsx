@@ -68,7 +68,8 @@ import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTar
 import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
-import { PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, priceListCaption, priceListFileName, readLastPreparedOn, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListSchedule } from "./local/dailyPriceList";
+import { WHATSAPP_OPENED, describeChatHandoff, initialWhatsappSelection } from "./local/whatsappHandoff";
+import { PRICE_LIST_SHARE_ROUTE, PRICE_LIST_SHARE_TIMEOUT_MS, PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, choosePriceListShareRoute, parseWhatsappGroupInvite, priceListCaption, priceListCopySaveOutcome, priceListFileName, priceListGroupLink, priceListGroupOutcome, readLastPreparedOn, readPriceListGroup, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListGroup, writePriceListSchedule } from "./local/dailyPriceList";
 import { buildPosPayments, buildUpiPayload, describePaymentConfirmation, invoiceUpiNote, resolveInvoiceUpiQr } from "./local/posPaymentConfirmation";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
@@ -2365,6 +2366,7 @@ function App() {
   // Today's price list (local/dailyPriceList.js): when this device reminds somebody to send it.
   // Per device, like the update hours, because it is the machine at the counter that is open at 8.
   const [priceListSchedule, setPriceListSchedule] = useState(() => readPriceListSchedule(deviceStorage()));
+  const [priceListGroup, setPriceListGroup] = useState(() => readPriceListGroup(deviceStorage()));
   const [priceListReadyOn, setPriceListReadyOn] = useState("");
   // The Dashboard's own read of this counter's shelf, for the price list. POS fills `posShelf` only
   // once it is opened, and a counter that starts on the Dashboard would otherwise list nothing and
@@ -9856,6 +9858,12 @@ function App() {
                 businessSettings={settingsData.businessSettings}
                 branchName={websiteShopDetails.branch}
                 canSchedule={canManageRates}
+                groupCode={priceListGroup}
+                onGroupChange={(code) => {
+                  const stored = writePriceListGroup(deviceStorage(), code);
+                  if (stored) setPriceListGroup(code);
+                  return stored;
+                }}
                 inventoryLots={isTauriRuntime() ? priceListShelf.inventoryLots : inventory}
                 loadError={isTauriRuntime() && priceListShelf.status === "error" ? priceListShelf.message : ""}
                 loading={isTauriRuntime() && (priceListShelf.status === "idle" || priceListShelf.status === "loading")}
@@ -13826,11 +13834,12 @@ function WhatsAppSendModal({
   const [search, setSearch] = useState("");
   const [manualNumber, setManualNumber] = useState("");
   const [manualRecipients, setManualRecipients] = useState([]);
-  const [selectedKeys, setSelectedKeys] = useState(() => new Set());
+  const [selectedKeys, setSelectedKeys] = useState(() => initialWhatsappSelection(recipients));
   const [sending, setSending] = useState(false);
   const [status, setStatus] = useState("");
   const [results, setResults] = useState([]);
   const [error, setError] = useState("");
+  const [handoff, setHandoff] = useState(null);
   const allRecipients = useMemo(() => [...recipients, ...manualRecipients], [manualRecipients, recipients]);
   const filteredRecipients = useMemo(() => {
     const text = search.trim().toLowerCase();
@@ -13880,9 +13889,44 @@ function WhatsAppSendModal({
     setManualNumber("");
     setError("");
   };
+  // The counter app, with no WhatsApp Business API (or one that refused): put the PDF on the
+  // clipboard, open WhatsApp on the first chosen number with the message typed, and say what is
+  // left (Ctrl+V, Enter). False when this is not the Windows app, so the old path runs instead.
+  const handOffToWhatsappDesktop = async (pdfResult, fileName) => {
+    if (!isDesktopShell() || MOBILE_SHELL || !pdfResult?.blob) return false;
+    const [first, ...others] = selectedRecipients;
+    const phone = normalizeWhatsappNumber(first?.phoneNumber || first?.whatsappNumber || first?.mobileNumber);
+    if (!phone) return false;
+    let copied = false;
+    try {
+      const bytes = Array.from(new Uint8Array(await pdfResult.blob.arrayBuffer()));
+      await invokeTauriCommand("copy_file_to_clipboard", { fileName, bytes });
+      copied = true;
+    } catch (copyError) {
+      writeDiagnosticLog("WARN", "whatsapp-pdf-clipboard-failed", { message: copyError?.message || String(copyError) });
+      pdfResult.pdf?.save(fileName);
+    }
+    let opened = "";
+    let openError = "";
+    try {
+      opened = await invokeTauriCommand("open_whatsapp_chat", { phone, text: caption || "" });
+    } catch (chatError) {
+      openError = chatError?.message || String(chatError);
+    }
+    setHandoff(describeChatHandoff({
+      opened: opened === WHATSAPP_OPENED.APP || opened === WHATSAPP_OPENED.BROWSER ? opened : "",
+      copied,
+      fileName,
+      name: first?.name,
+      error: openError,
+      others: others.length,
+    }));
+    return true;
+  };
   const send = async () => {
     setError("");
     setResults([]);
+    setHandoff(null);
     if (selectedRecipients.length === 0) {
       setError("Select at least one WhatsApp number or add a manual number.");
       return;
@@ -13918,13 +13962,17 @@ function WhatsAppSendModal({
       const responseResults = response.data?.results || [];
       setResults(responseResults);
       if (response.data?.configured === false) {
-        pdfResult.pdf?.save(fileName);
-        await openWhatsappWebFallback({
-          caption: `${caption}\n\nPDF exported as ${fileName}. Please attach the PDF manually in WhatsApp.`,
-          fileName,
-          numbers: normalizedNumbers.map((entry) => entry.phoneNumber),
-        });
-        setStatus("WhatsApp API not configured. PDF exported for manual sharing.");
+        if (await handOffToWhatsappDesktop(pdfResult, fileName)) {
+          setStatus("");
+        } else {
+          pdfResult.pdf?.save(fileName);
+          await openWhatsappWebFallback({
+            caption: `${caption}\n\nPDF exported as ${fileName}. Please attach the PDF manually in WhatsApp.`,
+            fileName,
+            numbers: normalizedNumbers.map((entry) => entry.phoneNumber),
+          });
+          setStatus("WhatsApp API not configured. PDF exported for manual sharing.");
+        }
       } else if (responseResults.some((item) => item.status !== "sent")) {
         setStatus("Some numbers failed. Check WhatsApp log.");
       } else {
@@ -13933,13 +13981,17 @@ function WhatsAppSendModal({
     } catch (sendError) {
       const message = getErrorMessage(sendError, "Unable to send WhatsApp document");
       if (pdfResult?.pdf) {
-        pdfResult.pdf.save(pdfResult.fileName || documentName);
-        await openWhatsappWebFallback({
-          caption: `${caption}\n\nPDF exported as ${pdfResult.fileName || documentName}. Please attach the PDF manually in WhatsApp.`,
-          fileName: pdfResult.fileName || documentName,
-          numbers: normalizedNumbers.map((entry) => entry.phoneNumber),
-        });
-        setStatus("PDF exported for manual sharing.");
+        if (await handOffToWhatsappDesktop(pdfResult, pdfResult.fileName || documentName)) {
+          setStatus("");
+        } else {
+          pdfResult.pdf.save(pdfResult.fileName || documentName);
+          await openWhatsappWebFallback({
+            caption: `${caption}\n\nPDF exported as ${pdfResult.fileName || documentName}. Please attach the PDF manually in WhatsApp.`,
+            fileName: pdfResult.fileName || documentName,
+            numbers: normalizedNumbers.map((entry) => entry.phoneNumber),
+          });
+          setStatus("PDF exported for manual sharing.");
+        }
       }
       setError(message);
     } finally {
@@ -13990,6 +14042,9 @@ function WhatsAppSendModal({
             })}
             {filteredRecipients.length === 0 && <div className="cart-empty">No matching WhatsApp contacts found.</div>}
           </div>
+          {handoff && (
+            <div className={handoff.tone === "error" ? "error-banner" : handoff.tone === "warning" ? "warning-note" : "form-note price-list-outcome"} role={handoff.tone === "error" ? "alert" : "status"}>{handoff.text}</div>
+          )}
           {(status || error) && (
             <div className={`startup-status-panel ${error ? "startup-status-error" : ""}`}>
               {status && <p>{status}</p>}
@@ -26943,7 +26998,7 @@ function DualLineChart({ data, firstKey, firstLabel, secondKey, secondLabel, sub
  */
 const PRICE_LIST_PREVIEW_ROWS = 8;
 
-function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedule = false, inventoryLots, loadError = "", loading = false, onScheduleChange, photoIndex, products, readyToday = false, schedule, scope }) {
+function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedule = false, groupCode = "", inventoryLots, onGroupChange, loadError = "", loading = false, onScheduleChange, photoIndex, products, readyToday = false, schedule, scope }) {
   const built = useMemo(
     () => buildPriceList({ products, inventoryLots, photoIndex, scope }),
     [inventoryLots, photoIndex, products, scope],
@@ -26957,6 +27012,8 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
   const cardRef = useRef(null);
   const [expanded, setExpanded] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [groupDraft, setGroupDraft] = useState(() => priceListGroupLink(groupCode));
+  const [groupNote, setGroupNote] = useState(null);
   const [busy, setBusy] = useState(false);
   const [outcome, setOutcome] = useState(null);
   const hiddenCount = Math.max(list.rows.length - PRICE_LIST_PREVIEW_ROWS, 0);
@@ -26978,11 +27035,20 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
       const fileName = priceListFileName();
       const caption = priceListCaption({ header, rows: list.rows });
       const file = typeof File === "function" ? new File([blob], fileName, { type: "image/png" }) : null;
-      if (file && navigator.canShare?.({ files: [file] })) {
+      const route = choosePriceListShareRoute({
+        appShell: isDesktopShell(),
+        canShareFiles: Boolean(file && typeof navigator.share === "function" && navigator.canShare?.({ files: [file] })),
+      });
+      if (route === PRICE_LIST_SHARE_ROUTE.NATIVE_SHARE) {
         try {
-          await navigator.share({ files: [file], text: caption });
-          setOutcome({ tone: "ok", text: "Shared. Choose your WhatsApp group in the share window if it asked." });
-          return;
+          const answered = await Promise.race([
+            navigator.share({ files: [file], text: caption }).then(() => "shared"),
+            new Promise((resolve) => setTimeout(() => resolve("timeout"), PRICE_LIST_SHARE_TIMEOUT_MS)),
+          ]);
+          if (answered === "shared") {
+            setOutcome({ tone: "ok", text: "Shared. Choose your WhatsApp group in the share window if it asked." });
+            return;
+          }
         } catch (error) {
           if (error?.name === "AbortError") {
             setOutcome({ tone: "note", text: "Sharing was cancelled. Nothing was sent." });
@@ -27000,13 +27066,37 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
       } catch {
         copied = false;
       }
-      downloadBlob(blob, fileName);
-      setOutcome({
-        tone: "ok",
-        text: copied
-          ? `Picture copied and saved as ${fileName}. Open your WhatsApp group, press Ctrl+V, then Send.`
-          : `Picture saved as ${fileName} in Downloads. Open your WhatsApp group, attach it, then Send.`,
-      });
+      const windowsApp = isDesktopShell() && !MOBILE_SHELL;
+      if (!copied && windowsApp) {
+        // The webview refused the picture; the app puts it on the clipboard as a file instead,
+        // which WhatsApp Desktop also takes with Ctrl+V.
+        try {
+          await invokeTauriCommand("copy_file_to_clipboard", { fileName, bytes: Array.from(new Uint8Array(await blob.arrayBuffer())) });
+          copied = true;
+        } catch {
+          copied = false;
+        }
+      }
+      if (windowsApp && groupCode) {
+        if (!copied) downloadBlob(blob, fileName);
+        let opened = "";
+        let openError = "";
+        try {
+          opened = await invokeTauriCommand("open_whatsapp_group", { inviteCode: groupCode });
+        } catch (groupError) {
+          openError = groupError?.message || String(groupError);
+        }
+        setOutcome(priceListGroupOutcome({ copied, opened: opened === "app" || opened === "browser" ? opened : "", error: openError }));
+        return;
+      }
+      let saved = false;
+      try {
+        downloadBlob(blob, fileName);
+        saved = true;
+      } catch {
+        saved = false;
+      }
+      setOutcome(priceListCopySaveOutcome({ copied, saved, fileName }));
     } catch (error) {
       setOutcome({ tone: "error", text: `The price list picture could not be made: ${error?.message || "unknown error"}. Copy as text still works.` });
     } finally {
@@ -27041,6 +27131,8 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
           <button className="secondary-button" disabled={list.rows.length === 0} onClick={copyText} type="button">Copy as text</button>
         </div>
       </div>
+      {/* Right under the button that caused it, so what to do next is the first thing read. */}
+      {outcome && <div className={outcome.tone === "error" ? "error-banner" : "form-note price-list-outcome"} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</div>}
       {list.status === "loading" && <div className="cart-empty" role="status">Reading today's stock on this computer...</div>}
       {list.status === PRICE_LIST_STATUS.UNAVAILABLE && <div className="error-banner" role="alert">{list.message || "The price list could not be built."}</div>}
       {list.status === PRICE_LIST_STATUS.EMPTY && <div className="cart-empty">{list.message || "Nothing is in stock with a rate, so there is no price list today."}</div>}
@@ -27081,7 +27173,6 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
           )}
         </>
       )}
-      {outcome && <div className={outcome.tone === "error" ? "error-banner" : "form-note price-list-outcome"} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</div>}
       {canSchedule && (
         <div className="price-list-schedule">
           <label className="check-field">
@@ -27099,6 +27190,39 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
             type="time"
             value={schedule.time}
           />
+          {/* The group Share opens on this computer. WhatsApp gives no way to post into a group,
+              so this only saves the owner finding it: Ctrl+V and Enter stay his. */}
+          <form
+            className="price-list-group"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const parsed = parseWhatsappGroupInvite(groupDraft);
+              if (!parsed.ok) {
+                setGroupNote({ tone: "error", text: parsed.message });
+                return;
+              }
+              if (onGroupChange?.(parsed.code) !== true) {
+                setGroupNote({ tone: "error", text: "This computer would not save the group link." });
+                return;
+              }
+              setGroupDraft(priceListGroupLink(parsed.code));
+              setGroupNote({ tone: "ok", text: parsed.code ? "Saved. Share will now open this group." : "Group removed. Share will only copy the picture." });
+            }}
+          >
+            <label className="price-list-group-field">
+              <span>WhatsApp group link (Share opens this group)</span>
+              <input
+                onChange={(event) => {
+                  setGroupDraft(event.target.value);
+                  setGroupNote(null);
+                }}
+                placeholder="https://chat.whatsapp.com/..."
+                value={groupDraft}
+              />
+            </label>
+            <button className="secondary-button" type="submit">Save group</button>
+          </form>
+          {groupNote && <p className={groupNote.tone === "error" ? "form-note stock-low" : "form-note"} role="status">{groupNote.text}</p>}
         </div>
       )}
     </section>

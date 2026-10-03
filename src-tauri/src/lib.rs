@@ -35,7 +35,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, GlobalFree, ERROR_ALREADY_EXISTS};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -46,6 +46,11 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::{
+    DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+    Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT},
+};
 
 static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
@@ -1993,6 +1998,207 @@ fn open_pdf_in_system_viewer_desktop(file_name: String, bytes: Vec<u8>) -> Resul
     Ok(path.to_string_lossy().to_string())
 }
 
+/// The invite code from a `https://chat.whatsapp.com/<code>` link: letters and digits only, so
+/// nothing but a WhatsApp group link can ever be built from it and handed to the shell.
+#[cfg(desktop)]
+fn whatsapp_invite_code_is_valid(code: &str) -> bool {
+    (16..=40).contains(&code.len()) && code.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+/// Opens the owner's WhatsApp group, for the Dashboard price list (3 Oct 2026). WhatsApp lets no
+/// app post into an existing group, so the picture is already on the clipboard and this only puts
+/// the group in front of the owner: Ctrl+V and Enter are his. Returns "app" when WhatsApp Desktop
+/// took the link, "browser" when it went to the browser instead.
+#[tauri::command]
+fn open_whatsapp_group(invite_code: String) -> Result<String, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("Opening a WhatsApp group");
+    #[cfg(desktop)]
+    return open_whatsapp_group_desktop(invite_code.trim());
+}
+
+#[cfg(desktop)]
+fn open_whatsapp_group_desktop(code: &str) -> Result<String, String> {
+    if !whatsapp_invite_code_is_valid(code) {
+        return Err("That is not a WhatsApp group invite link.".to_string());
+    }
+    let web_link = format!("https://chat.whatsapp.com/{}", code);
+    #[cfg(target_os = "windows")]
+    {
+        if open_with_windows_shell(&format!("whatsapp://chat/?code={}", code)).is_ok() {
+            return Ok("app".to_string());
+        }
+        open_with_windows_shell(&web_link)?;
+        return Ok("browser".to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
+            .arg(&web_link)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok("browser".to_string())
+    }
+}
+
+/// Digits only, country code included (what `wa.me` and `whatsapp://send` want).
+#[cfg(desktop)]
+fn whatsapp_phone_is_valid(phone: &str) -> bool {
+    (8..=15).contains(&phone.len()) && phone.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// Percent-encodes a message for a WhatsApp link: everything but unreserved ASCII is escaped.
+#[cfg(desktop)]
+fn encode_whatsapp_text(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
+/// Opens a customer's chat in WhatsApp, with the message typed in, for a bill or a statement
+/// (3 Oct 2026). The document itself is put on the clipboard by `copy_file_to_clipboard`, so the
+/// person sending presses Ctrl+V and Enter. Returns "app" or "browser" like `open_whatsapp_group`.
+#[tauri::command]
+fn open_whatsapp_chat(phone: String, text: String) -> Result<String, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("Opening a WhatsApp chat");
+    #[cfg(desktop)]
+    return open_whatsapp_chat_desktop(phone.trim(), &text);
+}
+
+#[cfg(desktop)]
+fn open_whatsapp_chat_desktop(phone: &str, text: &str) -> Result<String, String> {
+    if !whatsapp_phone_is_valid(phone) {
+        return Err("That is not a WhatsApp number.".to_string());
+    }
+    let message = encode_whatsapp_text(text);
+    let web_link = format!("https://wa.me/{}?text={}", phone, message);
+    #[cfg(target_os = "windows")]
+    {
+        if open_with_windows_shell(&format!("whatsapp://send?phone={}&text={}", phone, message)).is_ok() {
+            return Ok("app".to_string());
+        }
+        open_with_windows_shell(&web_link)?;
+        return Ok("browser".to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
+            .arg(&web_link)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok("browser".to_string())
+    }
+}
+
+/// The header of a CF_HDROP clipboard block (the Win32 `DROPFILES` struct), followed in memory by
+/// a double-null-terminated list of UTF-16 paths.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct DropFilesHeader {
+    files_offset: u32,
+    point_x: i32,
+    point_y: i32,
+    non_client: i32,
+    wide: i32,
+}
+
+/// Puts one file on the Windows clipboard the way Explorer's Copy does, so Ctrl+V in WhatsApp
+/// Desktop attaches it.
+#[cfg(target_os = "windows")]
+fn put_file_on_windows_clipboard(path: &Path) -> Result<(), String> {
+    const CF_HDROP: u32 = 15;
+    let header_size = std::mem::size_of::<DropFilesHeader>();
+    let mut wide_path: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+    wide_path.push(0);
+    wide_path.push(0);
+    let total = header_size + wide_path.len() * 2;
+    let header = DropFilesHeader {
+        files_offset: header_size as u32,
+        point_x: 0,
+        point_y: 0,
+        non_client: 0,
+        wide: 1,
+    };
+    unsafe {
+        let memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total);
+        if memory.is_null() {
+            return Err("The clipboard memory could not be reserved.".to_string());
+        }
+        let target = GlobalLock(memory) as *mut u8;
+        if target.is_null() {
+            GlobalFree(memory);
+            return Err("The clipboard memory could not be locked.".to_string());
+        }
+        std::ptr::copy_nonoverlapping(&header as *const DropFilesHeader as *const u8, target, header_size);
+        std::ptr::copy_nonoverlapping(wide_path.as_ptr() as *const u8, target.add(header_size), wide_path.len() * 2);
+        GlobalUnlock(memory);
+
+        let mut opened = false;
+        for _ in 0..10 {
+            if OpenClipboard(std::ptr::null_mut()) != 0 {
+                opened = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        if !opened {
+            GlobalFree(memory);
+            return Err("Another program is holding the clipboard. Try again.".to_string());
+        }
+        EmptyClipboard();
+        let placed = SetClipboardData(CF_HDROP, memory);
+        CloseClipboard();
+        if placed.is_null() {
+            GlobalFree(memory);
+            return Err("Windows refused to put the file on the clipboard.".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Writes a document (a bill PDF, the price list picture) to the app's share folder and puts that
+/// file on the clipboard. Only the newest file is kept in the folder. Returns the file's path.
+#[tauri::command]
+fn copy_file_to_clipboard(file_name: String, bytes: Vec<u8>) -> Result<String, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("Copying a file for WhatsApp");
+    #[cfg(desktop)]
+    return copy_file_to_clipboard_desktop(&file_name, bytes);
+}
+
+#[cfg(desktop)]
+fn copy_file_to_clipboard_desktop(file_name: &str, bytes: Vec<u8>) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("The file to copy is empty.".to_string());
+    }
+    let share_dir = app_data_dir().join("whatsapp-share");
+    fs::create_dir_all(&share_dir).map_err(|error| error.to_string())?;
+    let path = share_dir.join(sanitize_file_name(file_name));
+    if let Ok(entries) = fs::read_dir(&share_dir) {
+        for entry in entries.flatten() {
+            if entry.path() != path {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    #[cfg(target_os = "windows")]
+    {
+        put_file_on_windows_clipboard(&path)?;
+        return Ok(path.to_string_lossy().to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(format!("Copying a file to the clipboard needs Windows; it was saved at {}.", path.to_string_lossy()))
+    }
+}
+
 #[tauri::command]
 fn open_startup_log() -> Result<String, String> {
     #[cfg(mobile)]
@@ -2033,8 +2239,14 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 #[cfg(target_os = "windows")]
 fn open_path_with_windows_shell(path: &Path) -> Result<(), String> {
+    open_with_windows_shell(&path.to_string_lossy())
+}
+
+/// Hands a path or a URL to the Windows shell, which opens it with whatever is registered for it.
+#[cfg(target_os = "windows")]
+fn open_with_windows_shell(target: &str) -> Result<(), String> {
     let operation = wide_null("open");
-    let file = wide_null(&path.to_string_lossy());
+    let file = wide_null(target);
     let result = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
@@ -3016,6 +3228,9 @@ pub fn run() {
             open_startup_log,
             backend_startup_diagnostics,
             open_pdf_in_system_viewer,
+            open_whatsapp_group,
+            open_whatsapp_chat,
+            copy_file_to_clipboard,
             save_pdf_with_dialog,
             set_kiosk_mode,
             close_froozerp_window,

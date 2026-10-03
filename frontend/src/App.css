@@ -4220,6 +4220,18 @@ tbody tr:has(> .empty-cell):hover {
   background: var(--price-list-cream);
 }
 
+/* What happened after Share, in the success colours, so it cannot be missed. */
+.price-list-outcome {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--success-line);
+  border-left: 4px solid var(--success);
+  border-radius: 12px;
+  color: var(--success-ink);
+  background: var(--success-soft);
+  font-weight: 700;
+}
+
 /* Only while the picture is taken: two columns, about a phone screen wide. */
 .price-list-card-capture {
   width: 560px;
@@ -4345,6 +4357,22 @@ tbody tr:has(> .empty-cell):hover {
 
 .price-list-schedule input[type="time"] {
   width: auto;
+}
+
+/* The group link sits on its own line under the reminder. */
+.price-list-group {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.price-list-group-field {
+  display: grid;
+  flex: 1 1 320px;
+  gap: 6px;
+  margin: 0;
 }
 
 /* "Has the customer paid?" — asked after Checkout, before the bill is saved. */

@@ -279,6 +279,70 @@ export const writePriceListSchedule = (storage, schedule) => {
   }
 };
 
+// ---------------------------------------------------------------------------------------------
+// The owner's WhatsApp group (3 Oct 2026)
+//
+// WhatsApp lets no app post into an existing group. What the app can do is open that group, with
+// the picture already on the clipboard, so Ctrl+V and Enter are all that is left. The group is
+// named by its invite link (group info -> Invite via link -> Copy link), kept on this computer like
+// the reminder time. Only the code is kept: letters and digits, so nothing else can ever be opened.
+// ---------------------------------------------------------------------------------------------
+
+export const PRICE_LIST_GROUP_KEY = "froozerp.priceList.whatsappGroup";
+
+const INVITE_CODE_PATTERN = /^[A-Za-z0-9]{16,40}$/;
+
+/**
+ * `{ ok: true, code }` for a WhatsApp group invite link, or `{ ok: false, message }`. Accepts the
+ * link as WhatsApp copies it (`https://chat.whatsapp.com/<code>`, with or without `https://`,
+ * `invite/`, or a trailing `?...`). An empty box is `{ ok: true, code: "" }`: that clears the group.
+ */
+export const parseWhatsappGroupInvite = (text) => {
+  const raw = typeof text === "string" ? text.trim() : "";
+  if (raw === "") return { ok: true, code: "" };
+  const match = raw.match(/^(?:https?:\/\/)?chat\.whatsapp\.com\/(?:invite\/)?([^/?#\s]+)\/?(?:[?#].*)?$/i);
+  const code = match ? match[1] : "";
+  if (!INVITE_CODE_PATTERN.test(code)) {
+    return { ok: false, message: "Paste the group's invite link, like https://chat.whatsapp.com/AbC123... (WhatsApp: group info, Invite via link, Copy link)." };
+  }
+  return { ok: true, code };
+};
+
+export const priceListGroupLink = (code) => (INVITE_CODE_PATTERN.test(String(code || "")) ? `https://chat.whatsapp.com/${code}` : "");
+
+export const readPriceListGroup = (storage) => {
+  try {
+    const raw = storage?.getItem?.(PRICE_LIST_GROUP_KEY);
+    return typeof raw === "string" && INVITE_CODE_PATTERN.test(raw.trim()) ? raw.trim() : "";
+  } catch {
+    return "";
+  }
+};
+
+/** Returns false when the device would not store it. An empty code removes the group. */
+export const writePriceListGroup = (storage, code) => {
+  try {
+    if (code === "") {
+      if (typeof storage?.removeItem !== "function") return false;
+      storage.removeItem(PRICE_LIST_GROUP_KEY);
+      return true;
+    }
+    if (!INVITE_CODE_PATTERN.test(String(code || "")) || typeof storage?.setItem !== "function") return false;
+    storage.setItem(PRICE_LIST_GROUP_KEY, code);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** What the owner reads after the picture was copied and the app tried to open his group. */
+export const priceListGroupOutcome = ({ copied = false, opened = "", error = "" } = {}) => {
+  const paste = copied ? "press Ctrl+V, then Enter" : "attach the picture from Downloads, then Send";
+  if (opened === "app") return { tone: "ok", text: `WhatsApp is opening your group. ${copied ? "Picture copied: " : ""}${paste}.` };
+  if (opened === "browser") return { tone: "ok", text: `Your group is opening in the browser (WhatsApp Desktop did not take the link). ${paste[0].toUpperCase()}${paste.slice(1)} there.` };
+  return { tone: "error", text: `Your WhatsApp group could not be opened${error ? `: ${error}` : ""}. Open it yourself and ${paste}.` };
+};
+
 /** The device-local day the list was last prepared, "YYYY-MM-DD", or "" when never/unreadable. */
 export const readLastPreparedOn = (storage) => {
   try {
@@ -354,3 +418,39 @@ export const priceListCaption = ({ header = {}, rows = [] } = {}) => {
 
 /** `Frooz_PriceList_2026-10-03.png`, dated by the device's own day. */
 export const priceListFileName = (now = new Date()) => `Frooz_PriceList_${localDateString(now)}.png`;
+
+/**
+ * How the Share button hands the picture over.
+ *
+ * The browser's share window (`navigator.share`) is only used in a real browser that says it can
+ * share a picture: on a phone that is the share sheet with WhatsApp in it. Inside the FroozERP app
+ * (the Windows counter app, and the phone app) it is never used. Its webview either has no share
+ * window at all or opens one that never answers, and on 3 Oct 2026 the owner's first press of the
+ * button on the counter app did nothing he could see. There the picture is copied and saved instead,
+ * which is a thing the app can finish and say it finished.
+ */
+export const PRICE_LIST_SHARE_ROUTE = Object.freeze({
+  NATIVE_SHARE: "native-share",
+  COPY_AND_SAVE: "copy-and-save",
+});
+
+export const choosePriceListShareRoute = ({ appShell = false, canShareFiles = false } = {}) => (
+  appShell !== true && canShareFiles === true ? PRICE_LIST_SHARE_ROUTE.NATIVE_SHARE : PRICE_LIST_SHARE_ROUTE.COPY_AND_SAVE
+);
+
+/** A browser share window gets this long to answer before the picture is copied and saved instead. */
+export const PRICE_LIST_SHARE_TIMEOUT_MS = 20000;
+
+/** What the owner reads after the picture was copied and/or saved. Says only what actually happened. */
+export const priceListCopySaveOutcome = ({ copied = false, saved = false, fileName = "" } = {}) => {
+  if (copied && saved) {
+    return { tone: "ok", text: `Picture copied. Open WhatsApp, open your group, press Ctrl+V, then Send. A copy is also saved in Downloads as ${fileName}.` };
+  }
+  if (copied) {
+    return { tone: "ok", text: "Picture copied. Open WhatsApp, open your group, press Ctrl+V, then Send." };
+  }
+  if (saved) {
+    return { tone: "ok", text: `Picture saved in Downloads as ${fileName}. Open your WhatsApp group, attach it from Downloads, then Send.` };
+  }
+  return { tone: "error", text: "The picture could neither be copied nor saved on this computer. Copy as text still works." };
+};
