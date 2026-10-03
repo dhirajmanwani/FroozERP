@@ -9987,3 +9987,180 @@ button.shortcut-sheet-row:focus-visible {
 .discount-form > div.warning-note {
   margin: 0;
 }
+
+/* Dashboard boxes the owner reorders (3 Oct 2026). Each box carries three dots at its top right:
+   hold and drag them to move the box, or click them for a small move menu. The boxes keep their
+   own look; the wrapper only owns the spacing between them, so a moved box sits the same. */
+.dashboard-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.dash-block {
+  position: relative;
+  min-width: 0;
+}
+
+.dash-block > :not(.dash-handle):not(.dash-menu) {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+/* A small chip on the box's corner, half outside it, so it never covers a box's own title or
+   buttons: a box made of several cards (today's figures, the graphs) has no padding of its own. */
+.dash-handle {
+  position: absolute;
+  top: -9px;
+  right: -9px;
+  z-index: 5;
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-pill);
+  background: var(--card);
+  box-shadow: var(--shadow-faint);
+  color: var(--ink-muted);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dash-handle svg {
+  fill: currentColor;
+}
+
+.dash-handle:hover,
+.dash-handle[aria-expanded="true"] {
+  border-color: var(--line-strong);
+  background: var(--raised);
+  color: var(--ink-strong);
+}
+
+.dash-handle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.dashboard-blocks-dragging,
+.dashboard-blocks-dragging .dash-handle {
+  cursor: grabbing;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dash-block-dragging {
+  z-index: 20;
+  opacity: 0.92;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-deep);
+  pointer-events: none;
+}
+
+.dash-block-dragging .dash-handle {
+  pointer-events: auto;
+}
+
+.dash-drop-line {
+  position: relative;
+  height: 0;
+}
+
+.dash-drop-line::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(var(--space-4) / -2 - 2px);
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+
+/* The drop line is a gap marker, not a box: it must not add the flex gap of a sibling. */
+.dashboard-blocks > .dash-drop-line {
+  margin-bottom: calc(var(--space-4) * -1);
+}
+
+.dash-menu {
+  position: absolute;
+  top: 22px;
+  right: 0;
+  z-index: 30;
+  display: grid;
+  min-width: 190px;
+  padding: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  box-shadow: var(--shadow-strong);
+}
+
+.dash-menu button {
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink-body);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.dash-menu button:hover:not(:disabled),
+.dash-menu button:focus-visible {
+  outline: none;
+  background: var(--hover);
+  color: var(--ink-strong);
+}
+
+.dash-menu button:disabled {
+  color: var(--ink-faint);
+  cursor: default;
+}
+
+.dash-unsaved {
+  margin: 0;
+  color: var(--warning-ink);
+  font-size: var(--font-size-sm);
+}
+
+/* Sale Returns: what stops a save, and what happened after one, said under the form. */
+.return-note {
+  margin: var(--space-3) 0 0;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+}
+
+.return-blockers {
+  padding-left: 18px;
+  color: var(--warning-ink);
+}
+
+.return-note-error {
+  color: var(--danger-ink);
+}
+
+.return-note-warning {
+  color: var(--warning-ink);
+}
+
+.return-note-ok {
+  color: var(--success-ink);
+  font-weight: 650;
+}
+
+.return-line-problem {
+  color: var(--danger-ink);
+}
+
+.return-note + .primary-button,
+.return-blockers + .primary-button {
+  margin-top: var(--space-3);
+}

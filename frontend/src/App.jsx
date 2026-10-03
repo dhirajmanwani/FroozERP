@@ -69,6 +69,8 @@ import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, des
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
 import { WHATSAPP_OPENED, describeChatHandoff, initialWhatsappSelection } from "./local/whatsappHandoff";
+import { buildSaleReturnDraft, filterReturnInvoices, refundPerUnit, saleReturnFingerprint, saleReturnPayload } from "./local/saleReturnDraft";
+import { DASHBOARD_BLOCKS, DEFAULT_DASHBOARD_ORDER, dashboardDropIndex, isDefaultDashboardOrder, moveDashboardBlock, nudgeDashboardBlock, readDashboardOrder, writeDashboardOrder } from "./local/dashboardLayout";
 import { PRICE_LIST_SHARE_ROUTE, PRICE_LIST_SHARE_TIMEOUT_MS, PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, choosePriceListShareRoute, parseWhatsappGroupInvite, priceListCaption, priceListCopySaveOutcome, priceListFileName, priceListGroupLink, priceListGroupOutcome, readLastPreparedOn, readPriceListGroup, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListGroup, writePriceListSchedule } from "./local/dailyPriceList";
 import { buildPosPayments, buildUpiPayload, describePaymentConfirmation, invoiceUpiNote, resolveInvoiceUpiQr } from "./local/posPaymentConfirmation";
 import { buildOrderNotifications } from "./local/orderNotifications";
@@ -2367,6 +2369,17 @@ function App() {
   // Per device, like the update hours, because it is the machine at the counter that is open at 8.
   const [priceListSchedule, setPriceListSchedule] = useState(() => readPriceListSchedule(deviceStorage()));
   const [priceListGroup, setPriceListGroup] = useState(() => readPriceListGroup(deviceStorage()));
+  // The order of the Dashboard boxes, as this login left it on this computer.
+  const [dashboardOrder, setDashboardOrder] = useState(() => [...DEFAULT_DASHBOARD_ORDER]);
+  const [dashboardOrderUnsaved, setDashboardOrderUnsaved] = useState(false);
+  useEffect(() => {
+    setDashboardOrder(readDashboardOrder(deviceStorage(), user?.id));
+    setDashboardOrderUnsaved(false);
+  }, [user?.id]);
+  const changeDashboardOrder = (next) => {
+    setDashboardOrder(next);
+    setDashboardOrderUnsaved(!writeDashboardOrder(deviceStorage(), user?.id, next));
+  };
   const [priceListReadyOn, setPriceListReadyOn] = useState("");
   // The Dashboard's own read of this counter's shelf, for the price list. POS fills `posShelf` only
   // once it is opened, and a counter that starts on the Dashboard would otherwise list nothing and
@@ -8497,6 +8510,32 @@ function App() {
     return response.data;
   };
 
+  // After a saved return. The return put stock back on the cloud's shelf; a counter sells from its
+  // own copy, so that copy is fetched again here and POS rebuilt from it, or the till would go on
+  // showing the old stock until the next sync. Returns a note naming what did not refresh, so the
+  // screen can say the return is saved but a list is behind; it never throws.
+  const refreshAfterSaleReturn = async () => {
+    const parts = [
+      ["return history", loadSaleReturns],
+      ["dashboard", loadDashboardData],
+    ];
+    if (isTauriRuntime() && userRef.current?.id) {
+      parts.push(["this computer's stock", async () => {
+        const latestDevice = await resolveLocalDeviceInfo(deviceInfoRef.current);
+        const snapshot = await fetchOnlineReferenceSnapshot(userRef.current, latestDevice);
+        setLocalDbStatus(await cacheLocalReferenceSnapshot(snapshot));
+      }]);
+    }
+    const results = await Promise.allSettled(parts.map(([, refresh]) => refresh()));
+    setPosRefreshToken((token) => token + 1);
+    const failed = parts.filter((_, index) => results[index].status === "rejected").map(([name]) => name);
+    if (failed.length === 0) return "";
+    results.forEach((result, index) => {
+      if (result.status === "rejected") console.warn(`sale-return-refresh-failed: ${parts[index][0]}`, result.reason);
+    });
+    return `Could not refresh ${failed.join(" and ")} yet; it catches up at the next sync.`;
+  };
+
   const refreshAfterSaleCancellation = async ({ local = false } = {}) => {
     setSelectedInvoice(null);
     setSelectedInvoicePrintMode(null);
@@ -9861,7 +9900,15 @@ function App() {
                   <p>{dashboardError}</p>
                 </div>
               )}
-              {/* First thing on the Dashboard, asked for by the owner: the list he sends every morning. */}
+              {/* The owner moves these boxes with the three dots at their top right; the order is kept
+                  on this computer per login (local/dashboardLayout.js). The price list is first by
+                  default: the list he sends every morning. */}
+              <DashboardBlocks
+                order={dashboardOrder}
+                onOrderChange={changeDashboardOrder}
+                unsaved={dashboardOrderUnsaved}
+                blocks={{
+                  priceList: (
               <DailyPriceListPanel
                 businessSettings={settingsData.businessSettings}
                 branchName={websiteShopDetails.branch}
@@ -9886,6 +9933,8 @@ function App() {
                 // In the browser the cloud has already limited the stock to this login's shop.
                 scope={isTauriRuntime() ? priceListShelf.scope : null}
               />
+                  ),
+                  welcome: (
               <section className="welcome-banner">
                 <div>
                   <h2>Good to see you, {getUserGreetingName(user)}.</h2>
@@ -9895,6 +9944,8 @@ function App() {
                   <Icon name="receipt" /> New POS Bill
                 </button>
               </section>
+                  ),
+                  kpis: (
               <section className="kpi-grid">
                 {kpis.map(([label, value, icon]) => (
                   <article className="kpi-card" key={label}>
@@ -9906,6 +9957,8 @@ function App() {
                   </article>
                 ))}
               </section>
+                  ),
+                  graphs: (
               <DashboardAnalytics
                 analytics={dashboardAnalytics}
                 customRange={dashboardCustomRange}
@@ -9913,8 +9966,23 @@ function App() {
                 onCustomRangeChange={setDashboardCustomRange}
                 onNavigate={navigate}
                 onRangeChange={changeDashboardRange}
+                part="graphs"
                 range={dashboardRange}
               />
+                  ),
+                  highlights: (
+              <DashboardAnalytics
+                analytics={dashboardAnalytics}
+                customRange={dashboardCustomRange}
+                onApplyCustomRange={applyDashboardCustomRange}
+                onCustomRangeChange={setDashboardCustomRange}
+                onNavigate={navigate}
+                onRangeChange={changeDashboardRange}
+                part="highlights"
+                range={dashboardRange}
+              />
+                  ),
+                  quickAccess: (
               <section className="content-card">
                 <div className="card-heading">
                   <div>
@@ -9931,6 +9999,9 @@ function App() {
                   ))}
                 </div>
               </section>
+                  ),
+                }}
+              />
             </>
           )}
 
@@ -10607,11 +10678,8 @@ function App() {
 
           {activeView === "returns" && (
             <SaleReturnModule
-              onReload={async () => {
-                await Promise.all([loadSaleReturns(), loadDashboardData(), loadSalesHistory()]);
-              }}
+              onSaved={refreshAfterSaleReturn}
               returns={saleReturns}
-              salesHistory={salesHistory}
               user={user}
             />
           )}
@@ -18144,73 +18212,143 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   );
 }
 
-function SaleReturnModule({ onReload, returns, salesHistory, user }) {
+// Return Entry. The invoices come from the cloud's own bill list, read here: the app-wide sales
+// list on a counter can hold this computer's local bill ids, which the cloud cannot look up, so a
+// return picked from it failed as "Invalid invoice". What may be sent is worked out in
+// local/saleReturnDraft.js; the server checks it all again.
+function SaleReturnModule({ onSaved, returns, user }) {
+  const [invoiceSearch, setInvoiceSearch] = useState("");
+  const [invoiceList, setInvoiceList] = useState({ status: "loading", sales: [], message: "" });
   const [invoiceId, setInvoiceId] = useState("");
-  const [returnOptions, setReturnOptions] = useState({ sale: null, items: [] });
-  const [returnDate, setReturnDate] = useState(toDateKey(new Date()));
+  const [returnOptions, setReturnOptions] = useState({ status: "idle", sale: null, items: [], message: "" });
+  const [returnDate, setReturnDate] = useState(() => toDateKey(new Date()));
   const [refundType, setRefundType] = useState("CASH_REFUND");
   const [returnReason, setReturnReason] = useState("");
   const [quantities, setQuantities] = useState({});
-  const activeInvoices = salesHistory.filter((sale) => sale.sale_status !== "CANCELLED");
+  const [saving, setSaving] = useState(false);
+  const [outcome, setOutcome] = useState(null);
+  const optionsRequest = useRef(0);
+  // One key per return: a retry of the same return after a lost reply is recognised by the server
+  // instead of being booked twice. A changed form gets a new key.
+  const pendingWrite = useRef({ fingerprint: "", operationId: "" });
+  const today = toDateKey(new Date());
 
-  const loadReturnOptions = async (saleId) => {
-    setInvoiceId(saleId);
-    setQuantities({});
-    if (!saleId) {
-      setReturnOptions({ sale: null, items: [] });
-      return;
+  const loadInvoices = async () => {
+    setInvoiceList((current) => ({ ...current, status: "loading", message: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/sales`);
+      setInvoiceList({ status: "ready", sales: Array.isArray(response.data) ? response.data : [], message: "" });
+    } catch (error) {
+      setInvoiceList({ status: "error", sales: [], message: getErrorMessage(error, "The bill list could not be loaded. Returns need the internet.") });
     }
-    const response = await axios.get(`${API_URL}/sale-returns/options/${saleId}`);
-    setReturnOptions(response.data);
   };
 
-  const selectedItems = returnOptions.items
-    .map((item) => ({ ...item, return_quantity: Number(quantities[item.sale_item_id] || 0) }))
-    .filter((item) => item.return_quantity > 0);
-  const totalReturnValue = selectedItems.reduce((sum, item) => (
-    sum + (Number(item.net_amount || 0) / Number(item.sold_quantity || 1)) * Number(item.return_quantity || 0)
-  ), 0);
+  // Loaded once when the screen opens and again after each saved return.
+  useEffect(() => {
+    loadInvoices();
+  }, []);
+
+  const { invoices, total: invoiceMatches } = filterReturnInvoices(invoiceList.sales, invoiceSearch);
+  const selectedInvoiceListed = invoiceId === "" || invoices.some((sale) => canonicalInventoryId(sale.id) === invoiceId);
+  const selectedInvoice = invoiceList.sales.find((sale) => canonicalInventoryId(sale.id) === invoiceId) || null;
+
+  const loadReturnOptions = async (saleId) => {
+    const requestId = optionsRequest.current + 1;
+    optionsRequest.current = requestId;
+    setInvoiceId(saleId);
+    setQuantities({});
+    setOutcome(null);
+    if (!saleId) {
+      setReturnOptions({ status: "idle", sale: null, items: [], message: "" });
+      return;
+    }
+    setReturnOptions({ status: "loading", sale: null, items: [], message: "" });
+    try {
+      const response = await axios.get(`${API_URL}/sale-returns/options/${encodeURIComponent(saleId)}`);
+      if (optionsRequest.current !== requestId) return;
+      setReturnOptions({ status: "ready", sale: response.data?.sale || null, items: Array.isArray(response.data?.items) ? response.data.items : [], message: "" });
+    } catch (error) {
+      if (optionsRequest.current !== requestId) return;
+      setReturnOptions({ status: "error", sale: null, items: [], message: getErrorMessage(error, "This invoice's items could not be loaded.") });
+    }
+  };
+
+  const draft = buildSaleReturnDraft({ invoiceId, items: returnOptions.items, quantities, reason: returnReason });
+  const dateProblem = !returnDate ? "Pick the return date." : (returnDate > today ? "The return date cannot be after today." : "");
+  const blockers = [...draft.problems, ...(dateProblem ? [dateProblem] : [])];
+  const canSave = draft.canSave && !dateProblem && returnOptions.status === "ready";
 
   const saveReturn = async () => {
+    if (saving || !canSave) return;
+    const payload = saleReturnPayload({
+      invoiceId,
+      sale: returnOptions.sale,
+      returnDate,
+      refundType,
+      reason: returnReason,
+      branchId: user.branch_id,
+      userId: user.id,
+      draft,
+    });
+    const fingerprint = saleReturnFingerprint(payload);
+    if (pendingWrite.current.fingerprint !== fingerprint) pendingWrite.current = { fingerprint, operationId: "" };
+    const returnWrite = createOperationalWrite(user, payload, pendingWrite.current.operationId);
+    pendingWrite.current.operationId = returnWrite.operationId;
+    setSaving(true);
+    setOutcome(null);
+    let saved;
     try {
-      const returnWrite = createOperationalWrite(user, {
-        sale_id: Number(invoiceId),
-        customer_name: returnOptions.sale?.customer_name,
-        customer_mobile: returnOptions.sale?.customer_mobile,
-        return_date: returnDate,
-        refund_type: refundType,
-        return_reason: returnReason,
-        branch_id: user.branch_id,
-        created_by: user.id,
-        items: selectedItems.map((item) => ({
-          sale_item_id: item.sale_item_id,
-          return_quantity: item.return_quantity,
-        })),
-      });
-      await axios.post(`${API_URL}/api/v3/sale-returns`, returnWrite.body, returnWrite.config);
-      setInvoiceId("");
-      setReturnOptions({ sale: null, items: [] });
-      setReturnReason("");
-      setQuantities({});
-      await onReload();
-      alert("Sale return saved and inventory restored");
+      const response = await axios.post(`${API_URL}/api/v3/sale-returns`, returnWrite.body, returnWrite.config);
+      saved = response.data || {};
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save sale return"));
+      setSaving(false);
+      setOutcome({ tone: "error", text: getErrorMessage(error, "The return was not saved.") });
+      return;
     }
+    pendingWrite.current = { fingerprint: "", operationId: "" };
+    optionsRequest.current += 1;
+    setInvoiceId("");
+    setReturnOptions({ status: "idle", sale: null, items: [], message: "" });
+    setReturnReason("");
+    setQuantities({});
+    setReturnDate(toDateKey(new Date()));
+    const amount = Number(saved.total_return_amount);
+    const savedText = `${saved.return_no ? `Return ${saved.return_no}` : "The return"} is saved${Number.isFinite(amount) ? ` for ${currency.format(amount)}` : ""}, and the goods are back in stock.`;
+    // The return is saved whatever happens below; a failed refresh must not read as a failed save.
+    let refreshNote;
+    try {
+      const [note] = await Promise.all([onSaved(), loadInvoices()]);
+      refreshNote = typeof note === "string" ? note : "";
+    } catch (error) {
+      refreshNote = `The lists on this screen could not refresh (${getErrorMessage(error, "unknown error")}). Reopen Sale Returns to see it.`;
+    }
+    setSaving(false);
+    setOutcome({ tone: refreshNote ? "warning" : "ok", text: refreshNote ? `${savedText} ${refreshNote}` : savedText });
   };
 
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Sale Return / Refund" title="Return Entry" subtitle="Create a separate return record without editing the original invoice.">
         <div className="form-grid supplier-form-grid">
+          <Field label="Find Invoice">
+            <input
+              placeholder="Invoice no, customer or mobile"
+              type="search"
+              value={invoiceSearch}
+              onChange={(event) => setInvoiceSearch(event.target.value)}
+            />
+          </Field>
           <Field label="Select Invoice">
-            <select value={invoiceId} onChange={(event) => loadReturnOptions(event.target.value)}>
-              <option value="">Select invoice</option>
-              {activeInvoices.map((sale) => <option key={sale.id} value={sale.id}>{sale.invoice_no || `Invoice #${sale.id}`} - {sale.customer_name || "Walk-in"} - {currency.format(Number(sale.amount || 0))}</option>)}
+            <select disabled={invoiceList.status !== "ready" || saving} value={invoiceId} onChange={(event) => loadReturnOptions(event.target.value)}>
+              <option value="">{invoiceList.status === "loading" ? "Loading bills..." : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : "No bill matches"}</option>
+              {!selectedInvoiceListed && selectedInvoice && (
+                <option value={invoiceId}>{returnInvoiceLabel(selectedInvoice)}</option>
+              )}
+              {invoices.map((sale) => <option key={canonicalInventoryId(sale.id)} value={canonicalInventoryId(sale.id)}>{returnInvoiceLabel(sale)}</option>)}
             </select>
           </Field>
           <Field label="Customer"><input readOnly value={returnOptions.sale?.customer_name || ""} /></Field>
-          <Field label="Return Date"><input type="date" value={returnDate} onChange={(event) => setReturnDate(event.target.value)} /></Field>
+          <Field label="Return Date"><input max={today} type="date" value={returnDate} onChange={(event) => setReturnDate(event.target.value)} /></Field>
           <Field label="Refund Option">
             <select value={refundType} onChange={(event) => setRefundType(event.target.value)}>
               <option value="CASH_REFUND">Cash Refund</option>
@@ -18219,31 +18357,55 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
               <option value="FUTURE_ADJUSTMENT">Adjustment Against Future Sale</option>
             </select>
           </Field>
-          <Field label="Return Reason"><textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} /></Field>
+          <Field label={<RequiredLabel>Return Reason</RequiredLabel>}><textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} /></Field>
         </div>
-        <DataTable headers={["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Rate", "Return Value"]}>
+        {invoiceList.status === "error" && (
+          <p className="return-note return-note-error" role="alert">
+            {invoiceList.message} <button className="table-action" onClick={loadInvoices} type="button">Try again</button>
+          </p>
+        )}
+        {invoiceList.status === "ready" && invoiceMatches > invoices.length && (
+          <p className="return-note">{`Showing the latest ${invoices.length} of ${invoiceMatches} bills. Type the invoice number or customer to find an older one.`}</p>
+        )}
+        {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items...</p>}
+        {returnOptions.status === "error" && <p className="return-note return-note-error" role="alert">{returnOptions.message}</p>}
+        <DataTable headers={["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Refund per unit", "Return Value"]}>
           {returnOptions.items.map((item) => {
-            const quantity = Number(quantities[item.sale_item_id] || 0);
-            const value = (Number(item.net_amount || 0) / Number(item.sold_quantity || 1)) * quantity;
+            const key = canonicalInventoryId(item.sale_item_id);
+            const line = draft.lines.find((entry) => canonicalInventoryId(entry.sale_item_id) === key);
+            const perUnit = refundPerUnit(item);
+            const lineProblem = draft.lineProblems[key];
             return (
-              <tr key={item.sale_item_id}>
+              <tr key={key}>
                 <td className="primary-cell">{item.product_name}<small className="cell-note">{labelFor("unit", item.unit)}</small></td>
-                <td>{Number(item.sold_quantity || 0).toLocaleString("en-IN")}</td>
-                <td>{Number(item.returned_quantity || 0).toLocaleString("en-IN")}</td>
-                <td>{Number(item.returnable_quantity || 0).toLocaleString("en-IN")}</td>
-                <td><input className="table-input" min="0" max={Number(item.returnable_quantity || 0)} step="0.001" type="number" value={quantities[item.sale_item_id] || ""} onChange={(event) => setQuantities({ ...quantities, [item.sale_item_id]: event.target.value })} /></td>
-                <td>{currency.format(Number(item.selling_rate || 0))}</td>
-                <td>{currency.format(value)}</td>
+                <td>{Number(item.sold_quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                <td>{Number(item.returned_quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                <td>{Number(item.returnable_quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                <td>
+                  <input aria-invalid={Boolean(lineProblem)} className="table-input" disabled={saving || Number(item.returnable_quantity) <= 0} inputMode="decimal" min="0" max={Number(item.returnable_quantity || 0)} step="0.001" type="number" value={quantities[key] || ""} onChange={(event) => setQuantities({ ...quantities, [key]: event.target.value })} />
+                  {lineProblem && <small className="cell-note return-line-problem">{lineProblem}</small>}
+                </td>
+                <td>{perUnit === null ? "Unknown" : currency.format(perUnit)}</td>
+                <td>{line ? (line.value === null ? "Unknown" : currency.format(line.value)) : "-"}</td>
               </tr>
             );
           })}
+          {returnOptions.status === "ready" && returnOptions.items.length === 0 && (
+            <tr><td className="empty-cell" colSpan="7">This invoice has no items left to return.</td></tr>
+          )}
         </DataTable>
         <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Selected Items" value={selectedItems.length} />
-          <SummaryMetric label="Return Value" value={currency.format(totalReturnValue)} featured />
+          <SummaryMetric label="Selected Items" value={draft.lines.length} />
+          <SummaryMetric label="Return Value" value={draft.total === null ? "Unknown" : currency.format(draft.total)} featured />
           <SummaryMetric label="Refund Mode" value={labelFor("refundType", refundType)} />
         </div>
-        <button className="primary-button" onClick={saveReturn}>Save Return / Refund</button>
+        {invoiceId !== "" && returnOptions.status === "ready" && blockers.length > 0 && (
+          <ul className="return-note return-blockers">
+            {blockers.map((problem) => <li key={problem}>{problem}</li>)}
+          </ul>
+        )}
+        {outcome && <p className={`return-note return-note-${outcome.tone}`} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</p>}
+        <button className="primary-button" disabled={saving || !canSave} onClick={saveReturn} type="button">{saving ? "Saving..." : "Save Return / Refund"}</button>
       </ModuleCard>
       <ModuleCard eyebrow="Return History" title="Sale Return History" subtitle="Returned goods, refund modes and reasons remain separate from original invoices.">
         <DataTable headers={["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"]}>
@@ -18256,14 +18418,25 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
               <td><span className="tag">{labelFor("refundType", entry.refund_type)}</span></td>
               <td>{currency.format(Number(entry.total_return_amount || 0))}</td>
               <td>{entry.return_reason}</td>
-              <td>{(entry.items || []).map((item) => `${item.product_name} x ${item.return_quantity}`).join(", ")}</td>
+              <td>{(entry.items || []).map((item) => `${item.product_name} x ${Number(item.return_quantity).toLocaleString("en-IN", { maximumFractionDigits: 3 })}`).join(", ")}</td>
             </tr>
           ))}
+          {returns.length === 0 && <tr><td className="empty-cell" colSpan="8">No returns recorded yet.</td></tr>}
         </DataTable>
       </ModuleCard>
     </section>
   );
 }
+
+const returnInvoiceLabel = (sale) => {
+  const amount = Number(sale.amount);
+  return [
+    sale.invoice_no || `Invoice #${sale.id}`,
+    sale.sale_date ? toDateKey(sale.sale_date) : "",
+    sale.customer_name || "Walk-in",
+    Number.isFinite(amount) ? currency.format(amount) : "",
+  ].filter(Boolean).join(" - ");
+};
 
 function WasteManagementModule({ entries, inventory, onReload, products, user }) {
   const [draft, setDraft] = useState({
@@ -27238,11 +27411,207 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
   );
 }
 
-function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCustomRangeChange, onNavigate, onRangeChange, range }) {
+// The Dashboard's boxes in the owner's order. Each carries three dots at its top right: hold them
+// and drag to move the box up or down, or click them for Move up / Move down / Reset. Pointer
+// events, not HTML drag-and-drop: the Windows app's webview takes HTML drags for files, and a
+// phone has no HTML drag at all. The order logic lives in local/dashboardLayout.js.
+const DASHBOARD_BLOCK_LABELS = new Map(DASHBOARD_BLOCKS.map((block) => [block.id, block.label]));
+const DASHBOARD_DRAG_THRESHOLD_PX = 5;
+const DASHBOARD_AUTOSCROLL_EDGE_PX = 70;
+
+const dashboardScrollParent = (element) => {
+  for (let node = element?.parentElement; node; node = node.parentElement) {
+    const style = window.getComputedStyle(node);
+    if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight) return node;
+  }
+  return document.scrollingElement || document.documentElement;
+};
+
+function DashboardBlocks({ blocks, onOrderChange, order, unsaved = false }) {
+  const elements = useRef(new Map());
+  const dragRef = useRef(null);
+  const suppressClick = useRef(false);
+  const [drag, setDrag] = useState(null);
+  const [menuFor, setMenuFor] = useState("");
+  const ids = order.filter((id) => blocks[id]);
+
+  useEffect(() => {
+    if (!menuFor) return undefined;
+    const close = (event) => {
+      if (event.type === "keydown" && event.key !== "Escape") return;
+      if (event.type === "pointerdown" && event.target?.closest?.(".dash-menu, .dash-handle")) return;
+      setMenuFor("");
+    };
+    document.addEventListener("pointerdown", close);
+    document.addEventListener("keydown", close);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      document.removeEventListener("keydown", close);
+    };
+  }, [menuFor]);
+
+  useEffect(() => () => {
+    if (dragRef.current?.frame) cancelAnimationFrame(dragRef.current.frame);
+    dragRef.current = null;
+  }, []);
+
+  const measure = (state) => {
+    const others = ids.filter((id) => id !== state.id);
+    const midpoints = others.map((id) => {
+      const rect = elements.current.get(id)?.getBoundingClientRect();
+      return rect ? rect.top + rect.height / 2 : Number.NaN;
+    });
+    const offset = state.lastY - state.startY + (state.scroller.scrollTop - state.startScroll);
+    state.dropIndex = dashboardDropIndex(midpoints, state.lastY);
+    setDrag({ id: state.id, offset, dropIndex: state.dropIndex });
+  };
+
+  const autoScroll = () => {
+    const state = dragRef.current;
+    if (!state) return;
+    const isPage = state.scroller === document.scrollingElement || state.scroller === document.documentElement;
+    const bounds = isPage ? { top: 0, bottom: window.innerHeight } : state.scroller.getBoundingClientRect();
+    let step = 0;
+    if (state.lastY < bounds.top + DASHBOARD_AUTOSCROLL_EDGE_PX) step = -14;
+    else if (state.lastY > bounds.bottom - DASHBOARD_AUTOSCROLL_EDGE_PX) step = 14;
+    if (step !== 0) {
+      state.scroller.scrollTop += step;
+      measure(state);
+    }
+    state.frame = requestAnimationFrame(autoScroll);
+  };
+
+  const onPointerDown = (event, id) => {
+    if (event.button !== 0 && event.pointerType === "mouse") return;
+    const element = elements.current.get(id);
+    if (!element) return;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    const scroller = dashboardScrollParent(element);
+    dragRef.current = { id, pointerId: event.pointerId, startY: event.clientY, lastY: event.clientY, scroller, startScroll: scroller.scrollTop, moved: false, dropIndex: null, frame: 0 };
+  };
+
+  const onPointerMove = (event) => {
+    const state = dragRef.current;
+    if (!state || event.pointerId !== state.pointerId) return;
+    state.lastY = event.clientY;
+    if (!state.moved) {
+      if (Math.abs(event.clientY - state.startY) < DASHBOARD_DRAG_THRESHOLD_PX) return;
+      state.moved = true;
+      setMenuFor("");
+      state.frame = requestAnimationFrame(autoScroll);
+    }
+    event.preventDefault();
+    measure(state);
+  };
+
+  const finishDrag = (event, commit) => {
+    const state = dragRef.current;
+    if (!state || event.pointerId !== state.pointerId) return;
+    if (state.frame) cancelAnimationFrame(state.frame);
+    dragRef.current = null;
+    setDrag(null);
+    if (!state.moved) return;
+    suppressClick.current = true;
+    if (commit && state.dropIndex !== null) onOrderChange(moveDashboardBlock(order, state.id, state.dropIndex));
+  };
+
+  const onHandleClick = (id) => {
+    if (suppressClick.current) {
+      suppressClick.current = false;
+      return;
+    }
+    setMenuFor((current) => (current === id ? "" : id));
+  };
+
+  const onHandleKeyDown = (event, id) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    onOrderChange(nudgeDashboardBlock(order, id, event.key === "ArrowUp" ? -1 : 1));
+  };
+
+  const choose = (next) => {
+    setMenuFor("");
+    onOrderChange(next);
+  };
+
+  const draggedIndex = drag ? ids.indexOf(drag.id) : -1;
+  const showLine = drag && drag.dropIndex !== null && drag.dropIndex !== draggedIndex;
+  const others = drag ? ids.filter((id) => id !== drag.id) : ids;
+
+  return (
+    <div className={drag ? "dashboard-blocks dashboard-blocks-dragging" : "dashboard-blocks"}>
+      {unsaved && <p className="dash-unsaved" role="status">This computer would not save the new order, so the boxes go back to how they were when the app is closed.</p>}
+      {ids.map((id, index) => {
+        const label = DASHBOARD_BLOCK_LABELS.get(id) || id;
+        const dragged = drag?.id === id;
+        const lineBefore = showLine && !dragged && others.indexOf(id) === drag.dropIndex;
+        return (
+          <React.Fragment key={id}>
+            {lineBefore && <div aria-hidden="true" className="dash-drop-line" />}
+            <div
+              className={dragged ? "dash-block dash-block-dragging" : "dash-block"}
+              data-block={id}
+              ref={(element) => {
+                if (element) elements.current.set(id, element);
+                else elements.current.delete(id);
+              }}
+              style={dragged ? { transform: `translateY(${drag.offset}px)` } : undefined}
+            >
+              {blocks[id]}
+              <button
+                aria-expanded={menuFor === id}
+                aria-haspopup="menu"
+                aria-label={`Move ${label}`}
+                className="dash-handle"
+                onClick={() => onHandleClick(id)}
+                onContextMenu={(event) => event.preventDefault()}
+                onKeyDown={(event) => onHandleKeyDown(event, id)}
+                onPointerCancel={(event) => finishDrag(event, false)}
+                onPointerDown={(event) => onPointerDown(event, id)}
+                onPointerMove={onPointerMove}
+                onPointerUp={(event) => finishDrag(event, true)}
+                title="Hold and drag to move this box. Click for more."
+                type="button"
+              >
+                <svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16">
+                  <circle cx="8" cy="3" r="1.6" />
+                  <circle cx="8" cy="8" r="1.6" />
+                  <circle cx="8" cy="13" r="1.6" />
+                </svg>
+              </button>
+              {menuFor === id && (
+                <div aria-label={`Move ${label}`} className="dash-menu" role="menu">
+                  <button disabled={index === 0} onClick={() => choose(moveDashboardBlock(order, id, 0))} role="menuitem" type="button">Move to top</button>
+                  <button disabled={index === 0} onClick={() => choose(nudgeDashboardBlock(order, id, -1))} role="menuitem" type="button">Move up</button>
+                  <button disabled={index === ids.length - 1} onClick={() => choose(nudgeDashboardBlock(order, id, 1))} role="menuitem" type="button">Move down</button>
+                  <button disabled={index === ids.length - 1} onClick={() => choose(moveDashboardBlock(order, id, ids.length - 1))} role="menuitem" type="button">Move to bottom</button>
+                  <button disabled={isDefaultDashboardOrder(order)} onClick={() => choose([...DEFAULT_DASHBOARD_ORDER])} role="menuitem" type="button">Reset Dashboard order</button>
+                </div>
+              )}
+            </div>
+          </React.Fragment>
+        );
+      })}
+      {showLine && drag.dropIndex === others.length && <div aria-hidden="true" className="dash-drop-line" />}
+    </div>
+  );
+}
+
+// Two Dashboard boxes the owner can move separately: `part="graphs"` is the range buttons with the
+// charts they drive, `part="highlights"` the insights, top products and low stock cards.
+function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCustomRangeChange, onNavigate, onRangeChange, part = "graphs", range }) {
   const data = analytics || emptyDashboardAnalytics;
   const topProducts = data.topSellingProducts || [];
   const lowStockItems = data.lowStockItems || [];
   const insights = data.insights || [];
+
+  if (part === "highlights") {
+    return (
+      <section className="dashboard-analytics">
+        <DashboardHighlights insights={insights} lowStockItems={lowStockItems} onNavigate={onNavigate} topProducts={topProducts} />
+      </section>
+    );
+  }
 
   return (
     <section className="dashboard-analytics">
@@ -27285,60 +27654,64 @@ function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCust
           title="Purchase vs Sales Comparison"
         />
       </section>
+    </section>
+  );
+}
 
-      <section className="dashboard-side-grid">
-        <section className="content-card insight-panel">
-          <div className="card-heading">
-            <div>
-              <span className="eyebrow">Owner Insights</span>
-              <h2>What Changed</h2>
-            </div>
+function DashboardHighlights({ insights, lowStockItems, onNavigate, topProducts }) {
+  return (
+    <section className="dashboard-side-grid">
+      <section className="content-card insight-panel">
+        <div className="card-heading">
+          <div>
+            <span className="eyebrow">Owner Insights</span>
+            <h2>What Changed</h2>
           </div>
-          <div className="insight-list">
-            {insights.length ? insights.map((insight) => <p key={insight}>{insight}</p>) : <p>No insights available yet.</p>}
-          </div>
-        </section>
+        </div>
+        <div className="insight-list">
+          {insights.length ? insights.map((insight) => <p key={insight}>{insight}</p>) : <p>No insights available yet.</p>}
+        </div>
+      </section>
 
-        <section className="content-card">
-          <div className="card-heading">
-            <div>
-              <span className="eyebrow">Products</span>
-              <h2>Top Selling Products</h2>
-            </div>
+      <section className="content-card">
+        <div className="card-heading">
+          <div>
+            <span className="eyebrow">Products</span>
+            <h2>Top Selling Products</h2>
           </div>
-          <div className="top-product-list">
-            {topProducts.length ? topProducts.map((product) => (
-              <article className="top-product-row" key={product.product_id}>
-                <div>
-                  <strong>{product.product_name}</strong>
-                  <span>{Number(product.quantity_sold || 0).toLocaleString("en-IN")} {product.unit || "units"} sold</span>
-                </div>
-                <strong>{currency.format(Number(product.revenue || 0))}</strong>
-              </article>
-            )) : <div className="empty-inline">No product sales in this period.</div>}
-          </div>
-        </section>
+        </div>
+        <div className="top-product-list">
+          {topProducts.length ? topProducts.map((product) => (
+            <article className="top-product-row" key={product.product_id}>
+              <div>
+                <strong>{product.product_name}</strong>
+                <span>{Number(product.quantity_sold || 0).toLocaleString("en-IN")} {product.unit || "units"} sold</span>
+              </div>
+              <strong>{currency.format(Number(product.revenue || 0))}</strong>
+            </article>
+          )) : <div className="empty-inline">No product sales in this period.</div>}
+        </div>
+      </section>
 
-        <section className="content-card">
-          <div className="card-heading">
-            <div>
-              <span className="eyebrow">Inventory</span>
-              <h2>Low Stock Alerts</h2>
-            </div>
-            <button className="secondary-button" onClick={() => onNavigate("reports")} type="button">Open Stock Inventory</button>
+      <section className="content-card">
+        <div className="card-heading">
+          <div>
+            <span className="eyebrow">Inventory</span>
+            <h2>Low Stock Alerts</h2>
           </div>
-          <div className="low-stock-list">
-            {lowStockItems.length ? lowStockItems.map((item) => (
-              <button className="low-stock-row" key={item.product_id} onClick={() => onNavigate("reports")} type="button">
-                <div>
-                  <strong>{item.product_name}</strong>
-                  <span>Minimum {Number(item.minimum_stock || 0).toLocaleString("en-IN")} {item.unit || ""}</span>
-                </div>
-                <strong>{Number(item.current_stock || 0).toLocaleString("en-IN")} left</strong>
-              </button>
-            )) : <div className="empty-inline">No low stock products right now.</div>}
-          </div>
-        </section>
+          <button className="secondary-button" onClick={() => onNavigate("reports")} type="button">Open Stock Inventory</button>
+        </div>
+        <div className="low-stock-list">
+          {lowStockItems.length ? lowStockItems.map((item) => (
+            <button className="low-stock-row" key={item.product_id} onClick={() => onNavigate("reports")} type="button">
+              <div>
+                <strong>{item.product_name}</strong>
+                <span>Minimum {Number(item.minimum_stock || 0).toLocaleString("en-IN")} {item.unit || ""}</span>
+              </div>
+              <strong>{Number(item.current_stock || 0).toLocaleString("en-IN")} left</strong>
+            </button>
+          )) : <div className="empty-inline">No low stock products right now.</div>}
+        </div>
       </section>
     </section>
   );
