@@ -9,6 +9,7 @@
 pub mod entitlement;
 pub mod activation;
 mod local_db;
+mod machine_identity;
 mod mobile_gateway;
 
 use local_db::{

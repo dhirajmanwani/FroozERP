@@ -58,3 +58,32 @@ test("offline identity can claim its canonical user only on the same device", ()
     snapshot,
   }), {});
 });
+
+test("an unchanged identity after a sync is recognised as the same, so screens do not reload", async () => {
+  const { sameIdentityRecord, reconcileCanonicalIdentity: reconcile } = await import("./canonicalIdentity.js");
+  const user = { id: 2, username: "owner", role: "Owner", branch_id: 1, permissions: { billing: true }, list: [1, 2] };
+  assert.equal(sameIdentityRecord(user, { ...user, permissions: { billing: true }, list: [1, 2] }), true);
+  assert.equal(sameIdentityRecord(user, { list: [1, 2], permissions: { billing: true }, branch_id: 1, role: "Owner", username: "owner", id: 2 }), true, "key order ignored");
+  assert.equal(sameIdentityRecord(user, { ...user, branch_id: 2 }), false);
+  assert.equal(sameIdentityRecord(user, { ...user, permissions: { billing: false } }), false);
+  assert.equal(sameIdentityRecord(user, { ...user, extra: "x" }), false);
+  assert.equal(sameIdentityRecord(user, { ...user, extra: undefined }), true);
+  assert.equal(sameIdentityRecord(null, user), false);
+  // A second reconcile of the same cloud answer is the same record.
+  const cloud = { user_id: "2", device_id: "FZDEV-1", company_id: "1", branch_id: "1", role: "Owner", registration_status: "approved" };
+  const first = reconcile({ authenticatedUser: user, cloudIdentity: cloud, deviceInfo: { device_id: "FZDEV-1" } });
+  const second = reconcile({ authenticatedUser: first, cloudIdentity: cloud, deviceInfo: { device_id: "FZDEV-1" } });
+  assert.notEqual(first, second);
+  assert.equal(sameIdentityRecord(first, second), true);
+});
+
+test("Branches & Counters keeps its page on a background reload and reloads only when the session changes", async () => {
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /if \(!sameIdentityRecord\(userRef\.current, canonicalUser\)\) \{\s*userRef\.current = canonicalUser;\s*setUser\(canonicalUser\);/);
+  const start = app.indexOf("function OperationalScopeManagement(");
+  const body = app.slice(start, app.indexOf("\nfunction ", start + 10));
+  assert.match(body, /useEffect\(\(\) => \{ load\(\); \}, \[load, sessionKey\]\);/);
+  assert.match(body, /if \(loading && !loadedOnce\) return/);
+  assert.doesNotMatch(body, /\}, \[user\]\);/);
+});

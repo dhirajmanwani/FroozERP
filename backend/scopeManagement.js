@@ -92,10 +92,131 @@ const locationDeactivationBlockers = async (database, locationId) => {
 
 const hasBlockers = (blockers) => Object.values(blockers).some((value) => Number(value || 0) > 0);
 
+// ---------------------------------------------------------------------------------------------
+// One computer, one box
+// ---------------------------------------------------------------------------------------------
+//
+// A device id is minted per installation, not per machine, so a reinstalled or rebuilt counter
+// registers again under a new id and "Computers & phones" showed the one machine as several boxes:
+// every PENDING row forever, every assignment generation ever made, and devices nobody may use any
+// more. The Windows app now sends `machine_fp` -- a sha256 of the machine identity, 64 lowercase hex,
+// never the raw machine GUID -- and the read below folds a machine's ids with it.
+//
+// Nothing here deletes or rewrites a row. Sales, sync and audit rows reference device ids, so an old
+// id stays in the database for good; it is only kept off the screen.
+
+const MACHINE_FP_PATTERN = /^[a-f0-9]{64}$/;
+
+/** The fingerprint if it is exactly 64 lowercase hex characters, otherwise null (treated as absent). */
+const normalizeMachineFingerprint = (value) =>
+  typeof value === "string" && MACHINE_FP_PATTERN.test(value) ? value : null;
+
+/**
+ * Device statuses that are not a box on the screen. RETIRED is what the Owner's retire action
+ * writes; DISABLED and REJECTED are what the Settings disable/reject actions (and
+ * scripts/retire-devices.mjs) write; REVOKED is the older spelling some rows carry. None of them can
+ * sign in or sync, so listing them as "In use" was the bug.
+ */
+const HIDDEN_DEVICE_STATUSES = Object.freeze(["REVOKED", "RETIRED", "DISABLED", "REJECTED"]);
+const HIDDEN_STATUS_SQL = HIDDEN_DEVICE_STATUSES.map((status) => `'${status}'`).join(",");
+const statusOf = (row) => cleanText(row?.status).toUpperCase();
+
+const timeOf = (value) => {
+  if (value === null || value === undefined || value === "") return 0;
+  const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+/** When a device row was last heard from, as epoch ms (0 when it never was). */
+const lastSeenAt = (row) => Math.max(timeOf(row?.last_active_at), timeOf(row?.updated_at), timeOf(row?.request_time));
+
+/**
+ * One row per device id: its active assignment, or else its latest generation. Older generations
+ * are history, not boxes. Input order is kept, so the query's ORDER BY still decides the screen.
+ */
+const latestAssignmentPerDevice = (rows) => {
+  const chosen = new Map();
+  for (const row of jsonArray(rows)) {
+    const key = cleanText(row.device_id, 160);
+    const current = chosen.get(key);
+    if (!current) { chosen.set(key, row); continue; }
+    const rowActive = row.active !== false;
+    const currentActive = current.active !== false;
+    if (rowActive !== currentActive) {
+      if (rowActive) chosen.set(key, row);
+      continue;
+    }
+    if (Number(row.assignment_generation || 0) > Number(current.assignment_generation || 0)) chosen.set(key, row);
+  }
+  const kept = new Set(chosen.values());
+  return jsonArray(rows).filter((row) => kept.has(row));
+};
+
+/**
+ * Other device ids registered from the same machine, keyed by device id. `machineRows` are
+ * `{ device_id, machine_fp }` for every company-visible device that has a fingerprint, any status.
+ */
+const siblingDeviceIds = (machineRows) => {
+  const byFingerprint = new Map();
+  for (const row of jsonArray(machineRows)) {
+    const fingerprint = normalizeMachineFingerprint(row.machine_fp);
+    if (!fingerprint) continue;
+    if (!byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, []);
+    byFingerprint.get(fingerprint).push(cleanText(row.device_id, 160));
+  }
+  return (deviceId, fingerprint) => {
+    const fp = normalizeMachineFingerprint(fingerprint);
+    if (!fp) return [];
+    return (byFingerprint.get(fp) || []).filter((id) => id !== cleanText(deviceId, 160));
+  };
+};
+
+/**
+ * The "Waiting for approval" list, one entry per machine.
+ *
+ *   - A PENDING row whose machine already has an approved (or actively posted, still usable) device
+ *     is dropped: that machine is approved under the id it kept.
+ *   - Several PENDING rows of one machine collapse into the most recently seen one, which carries the
+ *     folded ids as `previous_device_ids`.
+ *   - A row with no fingerprint is listed exactly as before.
+ */
+const foldPendingDevices = (pendingRows, machineRows) => {
+  const approvedMachines = new Set(
+    jsonArray(machineRows)
+      .filter((row) => !HIDDEN_DEVICE_STATUSES.includes(statusOf(row))
+        && (statusOf(row) === "APPROVED" || row.has_active_assignment === true || row.has_active_assignment === 1))
+      .map((row) => normalizeMachineFingerprint(row.machine_fp))
+      .filter(Boolean)
+  );
+  const pending = jsonArray(pendingRows).filter((row) => statusOf(row) === "PENDING");
+  const newestByMachine = new Map();
+  pending.forEach((row, index) => {
+    const fingerprint = normalizeMachineFingerprint(row.machine_fp);
+    if (!fingerprint || approvedMachines.has(fingerprint)) return;
+    const current = newestByMachine.get(fingerprint);
+    // Ties go to the later row in request order, so the choice never depends on the database.
+    if (!current || lastSeenAt(row) >= lastSeenAt(current.row)) newestByMachine.set(fingerprint, { row, index });
+  });
+  const result = [];
+  for (const row of pending) {
+    const fingerprint = normalizeMachineFingerprint(row.machine_fp);
+    if (!fingerprint) {
+      result.push({ ...row, previous_device_ids: [] });
+      continue;
+    }
+    if (approvedMachines.has(fingerprint) || newestByMachine.get(fingerprint)?.row !== row) continue;
+    const folded = pending
+      .filter((other) => other !== row && normalizeMachineFingerprint(other.machine_fp) === fingerprint)
+      .sort((left, right) => lastSeenAt(right) - lastSeenAt(left))
+      .map((other) => cleanText(other.device_id, 160));
+    result.push({ ...row, previous_device_ids: folded });
+  }
+  return result;
+};
+
 const registerScopeManagementRoutes = ({ use, database, serverTimePayload = () => ({}) }) => {
   use("get", "/api/v3/admin/scope-management", async (_req, res, context) => {
     requireAssignmentOwner(context);
-    const [branches, locations, staffAssignments, deviceAssignments, users, pendingDevices, roles] = await Promise.all([
+    const [branches, locations, staffAssignments, deviceAssignments, users, pendingDevices, roles, machineDevices, hiddenDevices] = await Promise.all([
       database.query("SELECT * FROM branches WHERE company_id = $1 ORDER BY active DESC, branch_name, id", [context.company_id]),
       database.query(`SELECT ol.*, b.branch_name FROM operational_locations ol JOIN branches b ON b.id = ol.branch_id
         WHERE ol.company_id = $1 ORDER BY ol.active DESC, b.branch_name, ol.location_name, ol.id`, [context.company_id]),
@@ -104,10 +225,13 @@ const registerScopeManagementRoutes = ({ use, database, serverTimePayload = () =
         LEFT JOIN roles r ON r.id = sla.role_id JOIN operational_locations ol ON ol.id = sla.operational_location_id
         JOIN branches b ON b.id = sla.branch_id WHERE sla.company_id = $1
         ORDER BY sla.active DESC, u.full_name, sla.is_default DESC, b.branch_name, ol.location_name`, [context.company_id]),
-      database.query(`SELECT da.*, d.device_name, d.status, ol.location_name, b.branch_name
+      // A device that can no longer sign in is not a box. Which generation is shown is decided by
+      // `latestAssignmentPerDevice` below, not here, so this stays plain SQL.
+      database.query(`SELECT da.*, d.device_name, d.status, d.machine_fp, ol.location_name, b.branch_name
         FROM device_assignments da JOIN authorized_devices d ON d.device_id = da.device_id
         JOIN operational_locations ol ON ol.id = da.operational_location_id JOIN branches b ON b.id = da.branch_id
-        WHERE da.company_id = $1 ORDER BY da.active DESC, d.device_name, da.assignment_generation DESC`, [context.company_id]),
+        WHERE da.company_id = $1 AND UPPER(COALESCE(d.status, '')) NOT IN (${HIDDEN_STATUS_SQL})
+        ORDER BY da.active DESC, d.device_name, da.assignment_generation DESC`, [context.company_id]),
       // A-7. Both of these read a company-wide table with no tenancy predicate at all: every
       // company's staff, and every company's pending device requests, in an Owner's assignment
       // screen. `users.company_id` and `authorized_devices.company_id` both exist and are both
@@ -125,22 +249,51 @@ const registerScopeManagementRoutes = ({ use, database, serverTimePayload = () =
           AND (COALESCE(u.company_id, ub.company_id) = $1 OR COALESCE(u.company_id, ub.company_id) IS NULL)
         ORDER BY u.full_name, u.id`, [context.company_id]),
       database.query(`SELECT d.device_id, d.device_name, d.device_type, d.platform, d.status, d.request_time,
-        d.requested_physical_location, d.requested_intended_usage, d.requested_user_id, d.requested_role_id
+        d.requested_physical_location, d.requested_intended_usage, d.requested_user_id, d.requested_role_id,
+        d.machine_fp, d.last_active_at, d.updated_at
         FROM authorized_devices d
         LEFT JOIN branches db ON db.id = d.assigned_branch_id
         WHERE d.status = 'PENDING'
           AND (COALESCE(d.company_id, db.company_id) = $1 OR COALESCE(d.company_id, db.company_id) IS NULL)
         ORDER BY d.request_time, d.id`, [context.company_id]),
       database.query("SELECT id, role_name FROM roles ORDER BY role_name, id"),
+      // Every company-visible device that has a fingerprint, whatever its status: the material for
+      // folding one machine's ids together. Same tenancy predicate as the pending read above.
+      database.query(`SELECT d.device_id, d.machine_fp, d.status,
+        EXISTS (SELECT 1 FROM device_assignments xa WHERE xa.device_id = d.device_id AND xa.active = TRUE) AS has_active_assignment
+        FROM authorized_devices d
+        LEFT JOIN branches db ON db.id = d.assigned_branch_id
+        WHERE d.machine_fp IS NOT NULL AND d.machine_fp <> ''
+          AND (COALESCE(d.company_id, db.company_id) = $1 OR COALESCE(d.company_id, db.company_id) IS NULL)
+        ORDER BY d.device_id`, [context.company_id]),
+      database.query(`SELECT COUNT(*) AS retired_devices
+        FROM authorized_devices d
+        LEFT JOIN branches db ON db.id = d.assigned_branch_id
+        WHERE UPPER(COALESCE(d.status, '')) IN (${HIDDEN_STATUS_SQL})
+          AND (COALESCE(d.company_id, db.company_id) = $1 OR COALESCE(d.company_id, db.company_id) IS NULL)`, [context.company_id]),
     ]);
+    const siblingsOf = siblingDeviceIds(machineDevices.rows);
+    const waitingOf = siblingDeviceIds(machineDevices.rows.filter((row) => statusOf(row) === "PENDING"));
     return res.json({
       branches: branches.rows,
       operational_locations: locations.rows,
       staff_assignments: staffAssignments.rows,
-      device_assignments: deviceAssignments.rows,
+      device_assignments: latestAssignmentPerDevice(deviceAssignments.rows).map((row) => ({
+        ...row,
+        machine_fp: normalizeMachineFingerprint(row.machine_fp),
+        previous_device_ids: siblingsOf(row.device_id, row.machine_fp),
+        // A request from this same machine under another id is folded out of the waiting list
+        // (the machine is already approved), so it is named here instead of vanishing: if the
+        // machine really did change id it cannot sign in, and retiring this box brings the
+        // request back for approval.
+        waiting_device_ids: waitingOf(row.device_id, row.machine_fp),
+      })),
       users: users.rows,
-      pending_devices: pendingDevices.rows,
+      pending_devices: foldPendingDevices(pendingDevices.rows, machineDevices.rows),
       roles: roles.rows,
+      // Devices kept off the screen because they can no longer sign in (retired, disabled,
+      // rejected, revoked). Never deleted; this says how many there are.
+      retired_devices: Number(hiddenDevices.rows?.[0]?.retired_devices || 0),
       ...serverTimePayload(),
     });
   });
@@ -324,10 +477,74 @@ const registerScopeManagementRoutes = ({ use, database, serverTimePayload = () =
     });
     return res.json({ ...approved, ...serverTimePayload() });
   }, { write: true });
+
+  // Tidy an old box off "Computers & phones". Marks the device RETIRED and ends its posting; never
+  // deletes, because sales, sync and audit rows reference the id. A retired id can no longer sign in
+  // or sync (/login answers DEVICE_DISABLED, the sync path requires APPROVED);
+  // scripts/retire-devices.mjs --restore is the maintainer's way back.
+  use("post", "/api/v3/admin/devices/:deviceId/retire", async (req, res, context) => {
+    requireAssignmentOwner(context);
+    const deviceId = cleanText(req.params.deviceId, 160);
+    if (!deviceId) throw managementError(400, "DEVICE_ID_REQUIRED", "Choose the device to retire");
+    // Ids are opaque strings: compared as strings, never as numbers.
+    if (deviceId === cleanText(context.device_id, 160)) {
+      throw managementError(409, "CANNOT_RETIRE_CURRENT_DEVICE",
+        "This is the computer you are using now, so it cannot be retired from here. Retire it from another computer.");
+    }
+    const outcome = await withTransaction(database, async (client) => {
+      const found = await client.query("SELECT * FROM authorized_devices WHERE device_id = $1 FOR UPDATE", [deviceId]);
+      const device = found.rows?.[0];
+      // Same tenancy rule as the list: this company's device, or one nobody can place. Another
+      // company's device answers exactly like an unknown one.
+      let companyId = device?.company_id ?? null;
+      if (device && (companyId === null || companyId === undefined) && device.assigned_branch_id !== null && device.assigned_branch_id !== undefined) {
+        const branch = await client.query("SELECT company_id FROM branches WHERE id = $1", [device.assigned_branch_id]);
+        companyId = branch.rows?.[0]?.company_id ?? null;
+      }
+      if (!device || (companyId !== null && companyId !== undefined && String(companyId) !== String(context.company_id))) {
+        throw managementError(404, "DEVICE_NOT_FOUND", "Device not found");
+      }
+      if (statusOf(device) === "RETIRED") {
+        return { device, deactivated_assignments: [], already_retired: true };
+      }
+      const reason = cleanText(req.body?.reason, 2000) || "Owner retired an old device";
+      const updated = await client.query(
+        `UPDATE authorized_devices SET status = 'RETIRED', updated_at = CURRENT_TIMESTAMP
+         WHERE device_id = $1 RETURNING *`,
+        [deviceId]
+      );
+      const before = await client.query(
+        "SELECT * FROM device_assignments WHERE device_id = $1 AND active = TRUE FOR UPDATE",
+        [deviceId]
+      );
+      const ended = await client.query(
+        `UPDATE device_assignments SET active = FALSE, deactivated_at = CURRENT_TIMESTAMP, deactivated_by = $2,
+           deactivation_reason = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE device_id = $1 AND active = TRUE RETURNING *`,
+        [deviceId, context.user_id, reason]
+      );
+      for (const assignment of jsonArray(ended.rows)) {
+        const previous = jsonArray(before.rows).find((row) => String(row.id) === String(assignment.id)) || null;
+        await client.query(
+          `INSERT INTO device_assignment_history (device_id, assignment_id, action, old_scope, new_scope, reason, changed_by)
+           VALUES ($1,$2,'RETIRE',$3::jsonb,$4::jsonb,$5,$6)`,
+          [deviceId, assignment.id, previous ? JSON.stringify(previous) : null, JSON.stringify(assignment), reason, context.user_id]
+        );
+      }
+      await auditScopeChange(client, context, "device", deviceId, "RETIRE", device, updated.rows[0], reason);
+      return { device: updated.rows[0], deactivated_assignments: jsonArray(ended.rows), already_retired: false };
+    });
+    return res.json({ ...outcome, ...serverTimePayload() });
+  }, { write: true });
 };
 
 module.exports = {
+  HIDDEN_DEVICE_STATUSES,
+  foldPendingDevices,
   hasBlockers,
+  latestAssignmentPerDevice,
+  normalizeMachineFingerprint,
+  siblingDeviceIds,
   locationDeactivationBlockers,
   registerScopeManagementRoutes,
   requireAssignmentOwner,

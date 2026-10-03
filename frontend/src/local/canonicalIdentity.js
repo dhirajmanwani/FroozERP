@@ -60,3 +60,23 @@ export const buildCanonicalAliasLoginClaim = ({ deviceInfo, snapshot, username }
   }
   return { canonical_user_id: canonicalUserId };
 };
+
+/**
+ * Do two user records carry the same values? Plain JSON values compared deeply; key order ignored.
+ *
+ * Every sync used to hand the screen a brand-new user object even when nothing in it changed, and
+ * every screen that reloads "when the user changes" reloaded each minute. Branches & Counters
+ * swapped its whole page for a loading card each time, so the page jumped back to the top while
+ * the owner was scrolling (3 Oct 2026). The caller keeps the old object when this says they match.
+ */
+export const sameIdentityRecord = (left, right) => {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") {
+    return Number.isNaN(left) && Number.isNaN(right);
+  }
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  const leftKeys = Object.keys(left).filter((key) => left[key] !== undefined);
+  const rightKeys = Object.keys(right).filter((key) => right[key] !== undefined);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameIdentityRecord(left[key], right[key]));
+};

@@ -41,6 +41,7 @@ const {
   validateSyncBatchScope,
 } = require("./operationalScope");
 const { registerOperationalV3Routes } = require("./operationalV3");
+const { normalizeMachineFingerprint } = require("./scopeManagement");
 const {
   VIEW_ONLY_TTL_SECONDS,
   issueDeviceSession,
@@ -2875,6 +2876,13 @@ const initializeDatabase = async () => {
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS app_version VARCHAR(40) DEFAULT '1.0.0';
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMP;
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS sync_status VARCHAR(40) DEFAULT 'IDLE';
+    -- One computer, one box. A device id is minted per installation, so a reinstalled counter
+    -- registers under a new id; the machine fingerprint (sha256, 64 lowercase hex, never the raw
+    -- machine GUID) is what lets the Owner's device list fold those ids into one machine. NULL
+    -- when the client did not send one. backend/migrations/cloud/022_device_machine_fingerprint.sql
+    -- carries the same two statements to the hosted database, where this function never runs.
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS machine_fp VARCHAR(80);
+    CREATE INDEX IF NOT EXISTS authorized_devices_machine_fp_idx ON authorized_devices (machine_fp);
 
     CREATE TABLE IF NOT EXISTS activation_codes (
       id SERIAL PRIMARY KEY,
@@ -7139,6 +7147,9 @@ app.post("/api/cloud/device/register", async (req, res) => {
     const payload = {
       device_id: device.device_id,
       device_name: device.device_name,
+      // Forwarded only when well-formed; `undefined` drops out of the JSON body, so a client that
+      // sends none (or garbage) reaches the cloud exactly as before.
+      machine_fp: device.machine_fp || undefined,
       platform: req.body.platform || device.device_type,
       app_version: cleanText(req.body.app_version) || appVersion,
       branch_id: device.assigned_branch_id || req.body.branch_id,
@@ -10458,6 +10469,9 @@ const readDevicePayload = (body = {}, req = {}) => ({
   local_ip: cleanText(body.local_ip || req.ip),
   assigned_branch_id: parsePositiveInteger(body.assigned_branch_id || body.branch_id) || 1,
   assigned_counter_id: parsePositiveInteger(body.assigned_counter_id),
+  // The machine fingerprint (sha256 hex) or null. Anything malformed is treated as absent, and the
+  // upsert below never lets an absent value erase one already stored.
+  machine_fp: normalizeMachineFingerprint(body.machine_fp),
 });
 
 const upsertDeviceRequest = async (device, client = pool) => {
@@ -10466,14 +10480,15 @@ const upsertDeviceRequest = async (device, client = pool) => {
     `
     INSERT INTO authorized_devices (
       device_id, device_name, device_type, user_agent, local_ip,
-      assigned_branch_id, assigned_counter_id, status, request_time, updated_at
+      assigned_branch_id, assigned_counter_id, status, request_time, updated_at, machine_fp
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $8)
     ON CONFLICT (device_id) DO UPDATE
     SET device_name = EXCLUDED.device_name,
         device_type = EXCLUDED.device_type,
         user_agent = EXCLUDED.user_agent,
         local_ip = EXCLUDED.local_ip,
+        machine_fp = COALESCE(EXCLUDED.machine_fp, authorized_devices.machine_fp),
         updated_at = CURRENT_TIMESTAMP
     RETURNING *
     `,
@@ -10485,6 +10500,7 @@ const upsertDeviceRequest = async (device, client = pool) => {
       device.local_ip,
       device.assigned_branch_id,
       device.assigned_counter_id,
+      normalizeMachineFingerprint(device.machine_fp),
     ]
   );
   return result.rows[0];
@@ -14950,7 +14966,10 @@ app.post("/login", async (req, res) => {
     }
     if (device.status !== "APPROVED") {
       const deviceStatus = String(device.status || "").toUpperCase();
-      const code = deviceStatus === "DISABLED"
+      // RETIRED is the Owner tidying an old box off "Computers & phones". It answers as DISABLED so
+      // every shipped client already handles it, rather than as "pending approval" -- a retired id is
+      // never listed for approval again, so that message would be a wait with no end.
+      const code = deviceStatus === "DISABLED" || deviceStatus === "RETIRED"
         ? "DEVICE_DISABLED"
         : deviceStatus === "REVOKED"
           ? "DEVICE_REVOKED"
@@ -25700,4 +25719,8 @@ module.exports = {
   // Exported so `saleReturns.test.js` can run the reversal against a real Postgres (PGlite) and see
   // that stock a return already put back is not put back again.
   restoreSaleInventory,
+  // Exported so `deviceMachineFingerprint.test.js` can run the device upsert against PGlite and see
+  // that an absent or malformed fingerprint never erases a stored one.
+  readDevicePayload,
+  upsertDeviceRequest,
 };

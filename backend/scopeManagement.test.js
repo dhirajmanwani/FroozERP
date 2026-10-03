@@ -53,6 +53,7 @@ test("management routes cover hierarchy, staff scope, and explicit device approv
     "PUT /api/v3/admin/operational-locations/:locationId",
     "PUT /api/v3/admin/staff-assignments/:userId",
     "POST /api/v3/admin/devices/:deviceId/approve",
+    "POST /api/v3/admin/devices/:deviceId/retire",
   ]);
 });
 
@@ -103,8 +104,9 @@ const scopeFixture = () => {
   db.exec(`CREATE TABLE authorized_devices (
     device_id, device_name, device_type, platform, status, request_time,
     requested_physical_location, requested_intended_usage, requested_user_id, requested_role_id,
-    assigned_branch_id, company_id, id
+    assigned_branch_id, company_id, id, machine_fp, last_active_at, updated_at
   )`);
+  db.exec("CREATE TABLE device_assignments (device_id, active)");
   const rows = [
     ["INSERT INTO branches VALUES (?, ?, ?, ?)", [1, "Main Shop", 1, 1]],
     ["INSERT INTO branches VALUES (?, ?, ?, ?)", [2, "Market Yard", 1, 1]],
@@ -117,13 +119,13 @@ const scopeFixture = () => {
     ["INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", [3, "Stranger", "stranger", 1, 2, 3, null]],
     ["INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", [4, "Unplaced", "unplaced", 1, 2, null, null]],
     ["INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", [5, "Retired", "retired", 0, 2, 1, null]],
-    ["INSERT INTO authorized_devices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ["INSERT INTO authorized_devices (device_id, device_name, device_type, platform, status, request_time, requested_physical_location, requested_intended_usage, requested_user_id, requested_role_id, assigned_branch_id, company_id, id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
       ["FZ-OURS", "Counter 1", "Browser", "Windows", "PENDING", "2026-09-01", null, null, null, null, 1, null, 1]],
-    ["INSERT INTO authorized_devices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ["INSERT INTO authorized_devices (device_id, device_name, device_type, platform, status, request_time, requested_physical_location, requested_intended_usage, requested_user_id, requested_role_id, assigned_branch_id, company_id, id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
       ["FZ-THEIRS", "Their counter", "Browser", "Windows", "PENDING", "2026-09-02", null, null, null, null, 3, null, 2]],
-    ["INSERT INTO authorized_devices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ["INSERT INTO authorized_devices (device_id, device_name, device_type, platform, status, request_time, requested_physical_location, requested_intended_usage, requested_user_id, requested_role_id, assigned_branch_id, company_id, id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
       ["FZ-UNPLACED", "Unplaced counter", "Browser", "Windows", "PENDING", "2026-09-03", null, null, null, null, null, null, 3]],
-    ["INSERT INTO authorized_devices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ["INSERT INTO authorized_devices (device_id, device_name, device_type, platform, status, request_time, requested_physical_location, requested_intended_usage, requested_user_id, requested_role_id, assigned_branch_id, company_id, id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
       ["FZ-APPROVED", "Already approved", "Browser", "Windows", "APPROVED", "2026-09-04", null, null, null, null, 1, null, 4]],
   ];
   for (const [sql, values] of rows) db.prepare(sql).run(...values);

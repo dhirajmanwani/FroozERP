@@ -10164,3 +10164,12 @@ button.shortcut-sheet-row:focus-visible {
 .return-blockers + .primary-button {
   margin-top: var(--space-3);
 }
+
+/* A device id is one long unbroken word (FZDEV-XXXXXXXX-XXXX-...). Under a computer's name it must
+   wrap inside its box rather than run out of it (3 Oct 2026). */
+.device-id-note {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
