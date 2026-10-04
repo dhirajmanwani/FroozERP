@@ -2,14 +2,18 @@
 #
 # THIS WORKFLOW MUST NEVER PUBLISH ANYTHING.
 #   - It never creates a GitHub release or a tag, and never writes or uploads latest.json.
-#   - It never uses a secret (no TAURI_SIGNING_*, no GITHUB_TOKEN writes); permissions are read-only.
+#   - It uses exactly one secret, ANDROID_SIGNING_BUNDLE: FroozERP's own Android app-signing key
+#     (scripts/android/signing-key.mjs). It never uses TAURI_SIGNING_* or a GITHUB_TOKEN write;
+#     permissions are read-only. An APK signature cannot publish anything.
 # Desktop counters auto-update, silently and in `quiet` mode, from
 #   https://github.com/dhirajmanwani/FroozERP/releases/latest/download/latest.json
 # so anything that became the "latest" release would be pushed to every shop counter. A mobile
 # build must never be that release. The only output here is a workflow artifact (7-day retention).
 # Releases are cut only by windows-updater-release.yml / release.yml, by hand.
 #
-# The APK is a DEBUG build signed with the runner's throwaway Android debug keystore.
+# The APK is a DEBUG build. It is re-signed with FroozERP's own key when ANDROID_SIGNING_BUNDLE is
+# set, so a new build installs over the old one and a reinstalled phone keeps its device id (its
+# ANDROID_ID is per signing key). Without the secret it gets a throwaway key, and the summary says so.
 # Built without a cloud URL (the default for push runs), the app's built-in cloud target applies,
 # which is the PRODUCTION cloud. Use the `cloud_api_url` input to point a build elsewhere.
 
@@ -144,6 +148,36 @@ jobs:
           fi
           node "${GITHUB_WORKSPACE}/frontend/node_modules/@tauri-apps/cli/tauri.js" android build --ci --debug --apk --target ${targets}
 
+      - name: Sign APKs with FroozERP's key
+        shell: bash
+        env:
+          ANDROID_SIGNING_BUNDLE: ${{ secrets.ANDROID_SIGNING_BUNDLE }}
+        run: |
+          umask 077
+          keys="${RUNNER_TEMP}/froozerp-signing"
+          rm -rf "${keys}"
+          mkdir -p "${keys}"
+          if [ -n "${ANDROID_SIGNING_BUNDLE}" ]; then
+            printf '%s' "${ANDROID_SIGNING_BUNDLE}" > "${keys}/bundle.txt"
+            echo "SIGNING_SOURCE=FroozERP key (ANDROID_SIGNING_BUNDLE)" >> "$GITHUB_ENV"
+          else
+            node scripts/android/signing-key.mjs create --out "${keys}/bundle.txt"
+            echo "SIGNING_SOURCE=THROWAWAY key (ANDROID_SIGNING_BUNDLE not set)" >> "$GITHUB_ENV"
+            echo "::warning::ANDROID_SIGNING_BUNDLE is not set: this APK has a throwaway key. It will not install over an earlier build, and a phone that is uninstalled for it comes back with a new device id."
+          fi
+          node scripts/android/signing-key.mjs unpack "${keys}/bundle.txt" "${keys}" | tee "${keys}/fingerprint.txt"
+          apksigner="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          mapfile -t apks < <(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | sort)
+          if [ "${#apks[@]}" -eq 0 ]; then echo "::error::No APK was produced"; exit 1; fi
+          for apk in "${apks[@]}"; do
+            "${apksigner}" sign --key "${keys}/key.pk8" --cert "${keys}/cert.der" --out "${apk}.signed" "${apk}"
+            mv "${apk}.signed" "${apk}"
+            rm -f "${apk}.signed.idsig" "${apk}.idsig"
+            "${apksigner}" verify --print-certs "${apk}" | grep -E "Signer #1 certificate (DN|SHA-256)"
+          done
+          echo "SIGNING_FINGERPRINT=$(sed -n 's/^Signing certificate SHA-256: //p' "${keys}/fingerprint.txt")" >> "$GITHUB_ENV"
+          rm -f "${keys}/bundle.txt" "${keys}/key.pk8"
+
       - name: Verify the built APK kept the hardening
         shell: bash
         run: |
@@ -183,7 +217,9 @@ jobs:
           {
             echo "### FroozERP Android debug APK (${short_sha})"
             echo
-            echo "Debug build, debug-keystore signed, not for Play. Not a release; no latest.json."
+            echo "Debug build, not for Play. Not a release; no latest.json."
+            echo
+            echo "Signed with: **${SIGNING_SOURCE}**, certificate SHA-256 \`${SIGNING_FINGERPRINT}\`."
             if [ -z "${VITE_CLOUD_API_URL}" ]; then
               echo
               echo "**Cloud target: built-in PRODUCTION cloud** (no cloud_api_url given)."

@@ -103,3 +103,13 @@ test("the Returns screen uses this module, guards double saves and never Number(
   assert.doesNotMatch(body, /Number\(invoiceId\)/);
   assert.doesNotMatch(body, /salesHistory/);
 });
+
+test("a Cashier's return asks the Owner or an Admin first, with the same check a bill cancel uses", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf("function SaleReturnModule(");
+  const body = app.slice(start, app.indexOf("\nfunction ", start + 10));
+  assert.match(body, /<SaleChangeApprovalFields/);
+  assert.match(body, /requestSaleChangeApproval\(user, \{\s*action: "return",\s*saleRef: invoiceId/);
+  assert.match(body, /approval_id: pendingWrite\.current\.approvalId/);
+  assert.match(app, /<SaleReturnModule\s+approvalRoute=\{resolveSaleChangeRoute\(\{ user, offlineMode, connectivityMode \}\)\}/);
+});

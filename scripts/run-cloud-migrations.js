@@ -81,6 +81,12 @@ const migrationFiles = [
   // exists there -- `verifyDeclaredSchema` refuses to start, and every cashier's cancel or edit
   // would 500 on the missing table once it did.
   "backend/migrations/cloud/021_sale_change_approvals.sql",
+  // 022 adds `authorized_devices.machine_fp` and its index: the stable machine fingerprint that
+  // lets the Owner's device list show one box per computer however many installation ids it has
+  // registered under. Declared in `initializeDatabase()`, which never runs on a hosted deployment,
+  // so without this file the column does not exist there -- `verifyDeclaredSchema` refuses to
+  // start, and every device registration would 500 on it once it did.
+  "backend/migrations/cloud/022_device_machine_fingerprint.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

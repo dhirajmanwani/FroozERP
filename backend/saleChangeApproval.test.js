@@ -120,8 +120,8 @@ test("a numeric sale id is kept as the same opaque string, never re-numbered", (
 
 test("each missing or malformed field is refused by name, without echoing the password", () => {
   const cases = [
-    [{ action: "delete" }, /cancelled or edited/],
-    [{ action: undefined }, /cancelled or edited/],
+    [{ action: "delete" }, /cancelled, edited or returned/],
+    [{ action: undefined }, /cancelled, edited or returned/],
     [{ sale_ref: "" }, /which bill/],
     [{ sale_ref: "x".repeat(181) }, /too long/],
     [{ approver_username: "  " }, /username/],
@@ -512,4 +512,10 @@ test("the approval route takes a discount requester from the session and asks th
   assert.match(route, /discountRules\.manualDiscountExempt\(requester\)/);
   const actor = handlerBody("const getManualDiscountActor");
   assert.match(actor, /WHERE u\.id = \$1 AND u\.active = TRUE/);
+});
+
+test("a sale return is an approval action of its own (3 Oct 2026)", () => {
+  const parsed = normalizeApprovalRequest(validBody({ action: "return", reason: "Soft fruit" }));
+  assert.equal(parsed.ok, true, JSON.stringify(parsed));
+  assert.equal(parsed.value.action, "return");
 });

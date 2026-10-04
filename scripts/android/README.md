@@ -44,7 +44,13 @@ The APK lands in
   Check the APK against `SHA256SUMS.txt`.
 - With USB debugging on: `adb install -r FroozERP-<sha>-app-universal-debug.apk`.
 - Or copy the APK to the phone and open it; allow "Install unknown apps" for the file manager.
-- Debug APKs are signed with a throwaway debug key, and every CI run uses a different one, so
-  installing a build from another machine or run over an existing one fails with a signature
-  mismatch. Uninstall first; that deletes the phone's local data (backup is off by design).
+- CI signs every APK with FroozERP's own key when the repository secret `ANDROID_SIGNING_BUNDLE`
+  is set (make it once with `node scripts/android/signing-key.mjs create`, which saves it to
+  `%USERPROFILE%\FroozERP-android-signing-key.txt` and copies it to the clipboard; keep that file
+  safe). Then a new build installs over the old one, keeping the phone's data, and a phone that is
+  uninstalled and installed again gets its old device id back, because the id is derived from the
+  phone's ANDROID_ID, which Android keeps per signing key.
+- Without the secret, a run signs with a throwaway key (the run summary says so). Such a build will
+  not install over another; uninstall first, which deletes the phone's local data (backup is off
+  by design), and the phone comes back as a new device.
 - Use a test phone. Do not put a debug build on a counter device.
