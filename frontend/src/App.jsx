@@ -193,6 +193,7 @@ import {
   preserveVerifiedLocalCollection,
   preserveVerifiedLocalValue,
 } from "./local/cloudAvailability";
+import { groupPurchaseBills, pendingItemRate, purchaseChangeBlock, purchaseItemCounts, purchaseRowNet } from "./local/purchaseRows";
 import {
   describeFrostTransportFailure,
   hasCloudSession,
@@ -4437,6 +4438,7 @@ function App() {
     (!amendmentDate || toDateKey(purchase.purchase_date) === amendmentDate) &&
     (!amendmentSupplierId || String(purchase.supplier_id || "") === amendmentSupplierId)
   ), [amendmentDate, amendmentSupplierId, purchases]);
+  const amendmentItemCounts = useMemo(() => purchaseItemCounts(amendmentPurchases), [amendmentPurchases]);
 
   const purchaseSummary = useMemo(() => {
     const quantity = Number(purchaseQuantity || 0);
@@ -10476,23 +10478,31 @@ function App() {
                     <button className="secondary-button" onClick={resetPurchaseForm}>Exit Amendment</button>
                   </div>
                   <DataTable headers={["Purchase", "Item", "Qty", "Rate", "Status", "Net", "Actions"]}>
-                    {amendmentPurchases.map((purchase) => (
-                      <tr key={purchase.id}>
-                        <td><span className="batch-id">#{purchase.id}</span></td>
+                    {amendmentPurchases.map((purchase, rowIndex) => {
+                      // One row per item; a bill with several items is edited or completed only
+                      // by cancelling it and entering it again (local/purchaseRows.js).
+                      const itemCount = amendmentItemCounts.get(canonicalInventoryId(purchase.id)) || 1;
+                      const changeBlock = purchaseChangeBlock(itemCount);
+                      const rowNet = purchaseRowNet(purchase, itemCount);
+                      return (
+                      <tr key={`${canonicalInventoryId(purchase.id)}-${purchase.inventory_batch_id ?? rowIndex}`}>
+                        <td><span className="batch-id">#{purchase.id}</span>{itemCount > 1 && <small className="cell-note">{itemCount} fruits on this bill</small>}</td>
                         <td className="primary-cell">{purchase.product_name}<small className="cell-note">{purchase.batch_no || "-"}</small></td>
                         <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit ? labelFor("unit", purchase.unit) : ""}</td>
                         <td>{currency.format(Number(purchase.purchase_rate || purchase.expected_purchase_rate || 0))}</td>
                         <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : "Completed Bill"}</span></td>
-                        <td>{currency.format(Number(purchase.net_payable || purchase.total_amount || 0))}</td>
+                        <td>{rowNet === null ? "-" : currency.format(rowNet)}</td>
                         <td>
                           <div className="button-row table-actions-row">
-                            <button className="table-action" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => editPurchase(purchase)}>Edit</button>
-                            {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
+                            <button className="table-action" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => editPurchase(purchase)} title={changeBlock || undefined}>Edit</button>
+                            {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => completePendingPurchase(purchase)} title={changeBlock || undefined}>Complete Bill</button>}
                             <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
                           </div>
+                          {changeBlock && purchase.purchase_status !== "CANCELLED" && <small className="cell-note">{changeBlock}</small>}
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </DataTable>
                   {amendmentDate && amendmentSupplierId && amendmentPurchases.length === 0 && <div className="cart-empty">No purchases found for selected date and supplier.</div>}
                 </ModuleCard>
@@ -14629,10 +14639,10 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
     const product = purchase.product_name || "Item";
     const qty = Number(purchase.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
     const unit = String(purchase.unit || "").toLowerCase();
-    const rate = Number(purchase.expected_purchase_rate || purchase.purchase_rate || 0);
+    const rate = pendingItemRate(purchase);
     return `${product} ${qty}${unit} @ ${receiptCurrency.format(rate)} = ${receiptCurrency.format(Number(purchase.quantity || 0) * rate)}`;
   };
-  const estimatedValue = (purchase) => Number(purchase.quantity || 0) * Number(purchase.expected_purchase_rate || purchase.purchase_rate || 0);
+  const estimatedValue = (purchase) => Number(purchase.quantity || 0) * pendingItemRate(purchase);
   const pendingRows = basePendingRows.filter((purchase) => matchesPendingBillSearch([
     purchase.supplier_name,
     purchase.firm_name,
@@ -14649,7 +14659,10 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
     narration(purchase),
     "Pending Bill",
   ], search));
-  const supplierSummaries = [...pendingRows.reduce((map, purchase) => {
+  // One entry per bill: the rows are one per item (local/purchaseRows.js).
+  const pendingBills = groupPurchaseBills(pendingRows);
+  const supplierSummaries = [...pendingBills.reduce((map, bill) => {
+    const purchase = bill;
     const key = String(purchase.supplier_id || purchase.supplier_name || "UNKNOWN");
     const summary = map.get(key) || {
       key,
@@ -14666,9 +14679,9 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
     summary.from = date < summary.from ? date : summary.from;
     summary.to = date > summary.to ? date : summary.to;
     summary.billCount += 1;
-    summary.itemCount += 1;
-    summary.estimatedValue += estimatedValue(purchase);
-    summary.rows.push(purchase);
+    summary.itemCount += bill.itemCount;
+    summary.estimatedValue += bill.items.reduce((sum, item) => sum + estimatedValue(item), 0);
+    summary.rows.push(bill);
     map.set(key, summary);
     return map;
   }, new Map()).values()].sort((left, right) => left.supplier_name.localeCompare(right.supplier_name));
@@ -14680,7 +14693,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
       <ModuleCard eyebrow="Supplier bills" title="Waiting for a bill, by supplier" subtitle="Stock that has arrived but whose supplier bill is not complete yet.">
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Pending Suppliers" value={supplierSummaries.length} featured />
-          <SummaryMetric label="Pending Bills" value={pendingRows.length} />
+          <SummaryMetric label="Pending Bills" value={pendingBills.length} />
           <SummaryMetric label="Estimated Value" value={currency.format(pendingRows.reduce((sum, row) => sum + estimatedValue(row), 0))} />
         </div>
         <DataTable headers={["Supplier Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Pending Items", "Estimated Value", "Action"]}>
@@ -14702,26 +14715,32 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
       {selectedSupplier && (
         <ModuleCard eyebrow="Supplier Drill-Down" title={selectedSupplier.supplier_name} subtitle="Complete, edit or safely cancel pending bill entries for this supplier.">
           <DataTable headers={["Date", "Items Narration", "Estimated Total", "Status", "Action"]}>
-            {selectedRows.map((purchase) => (
-              <tr className="report-row-clickable" key={purchase.id} onClick={() => onOpenPurchaseAmendment(purchase)}>
+            {selectedRows.map((bill) => {
+              const purchase = bill.items[0];
+              const itemsNarration = bill.items.map(narration).join("; ");
+              const changeBlock = purchaseChangeBlock(bill.itemCount);
+              return (
+              <tr className="report-row-clickable" key={bill.key} onClick={() => onOpenPurchaseAmendment(purchase)}>
                 <td>{formatDisplayDate(purchase.purchase_date)}</td>
                 <td className="primary-cell purchase-items-cell">
-                  <span title={narration(purchase)}>{narration(purchase)}</span>
+                  <span title={itemsNarration}>{itemsNarration}</span>
+                  {changeBlock && <small className="cell-note">{changeBlock}</small>}
                 </td>
-                <td>{currency.format(estimatedValue(purchase))}</td>
+                <td>{currency.format(bill.items.reduce((sum, item) => sum + estimatedValue(item), 0))}</td>
                 <td><span className="origin-rate">Pending Bill</span></td>
                 <td>
                   <div className="button-row table-actions-row">
-                    <button className="primary-button" onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }}>Complete Bill</button>
-                    <button className="table-action" onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }}>Edit Pending Entry</button>
+                    <button className="primary-button" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }} title={changeBlock || undefined}>Complete Bill</button>
+                    <button className="table-action" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }} title={changeBlock || undefined}>Edit Pending Entry</button>
                     <button className="remove-button" onClick={(event) => { event.stopPropagation(); onCancelPurchase(purchase); }}>Cancel Pending Entry</button>
                   </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </DataTable>
           <div className="button-row">
-            <button className="secondary-button" onClick={() => onOpenPurchaseAmendment(selectedRows[0])}>Add Forgotten Item</button>
+            <button className="secondary-button" onClick={() => onOpenPurchaseAmendment(selectedRows[0]?.items[0])}>Add Forgotten Item</button>
             <button className="secondary-button" onClick={() => setSelectedSupplierKey("")}>Back to Supplier Summary</button>
           </div>
         </ModuleCard>
