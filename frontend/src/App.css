@@ -10173,3 +10173,50 @@ button.shortcut-sheet-row:focus-visible {
   max-width: 100%;
   overflow-wrap: anywhere;
 }
+
+/* A password box with its own show/hide eye (PasswordInput in App.jsx). The WebView's own reveal
+   eye is hidden here: it vanished after a refused sign-in and only came back once the whole
+   password was deleted, and two eyes side by side would be worse. */
+.password-field {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+.password-field > input {
+  padding-right: 42px;
+}
+
+.password-field > input::-ms-reveal,
+.password-field > input::-ms-clear {
+  display: none;
+}
+
+.password-field > .password-eye {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--ink-faint);
+  background: transparent;
+  box-shadow: none;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.password-field > .password-eye:hover:not(:disabled),
+.password-field > .password-eye[aria-pressed="true"] {
+  color: var(--ink);
+}
+
+.password-field > .password-eye:disabled {
+  opacity: 0.4;
+}

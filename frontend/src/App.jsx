@@ -2116,6 +2116,8 @@ function Icon({ name, size = 18 }) {
     print: <><path d="M6 9V3h12v6M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v7H6Z" /></>,
     message: <><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.8 8.8 0 0 1-3.8-1L3 20l1.3-4A8.3 8.3 0 1 1 21 11.5Z" /></>,
     close: <><path d="M18 6 6 18M6 6l12 12" /></>,
+    eye: <><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" /></>,
+    eyeOff: <><path d="M3 3l18 18" /><path d="M10.6 5.1A10.6 10.6 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.1" /><path d="M6.6 6.6A17.4 17.4 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 5.4-1.6" /><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" /></>,
     parcel: <><path d="M3 8h18v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 8l2-4h14l2 4" /><path d="M12 4v17" /></>,
     add: <><path d="M12 5v14M5 12h14" /></>,
     refresh: <><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" /></>,
@@ -4313,10 +4315,9 @@ function App() {
         <div className="sale-edit-body">
           <p className="form-note">Enter the Owner exit code to leave fullscreen and close FroozERP. Staff cannot bypass this from the app UI.</p>
           <Field label="Exit Code">
-            <input
+            <PasswordInput
               autoFocus
               inputMode="numeric"
-              type="password"
               value={exitCodeInput}
               onChange={(event) => {
                 setExitCodeInput(event.target.value.replace(/\D/g, ""));
@@ -9173,8 +9174,7 @@ function App() {
           </label>
           <label>
             Password
-            <input
-              type="password"
+            <PasswordInput
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               onKeyDown={(event) => event.key === "Enter" && login()}
@@ -12946,8 +12946,7 @@ function BootstrapOwnerSetup({ deviceInfo, entitlement, onActivated }) {
         <>
           <strong>Confirm the temporary password for {ownerUsername || "the Owner"}.</strong>
           <p>This device was activated with a one-time Owner credential. Enter the temporary password you were given to continue.</p>
-          <input
-            type="password"
+          <PasswordInput
             placeholder="Temporary password"
             value={tempPassword}
             onChange={(event) => setTempPassword(event.target.value)}
@@ -12962,14 +12961,12 @@ function BootstrapOwnerSetup({ deviceInfo, entitlement, onActivated }) {
         <>
           <strong>Choose a new password for {ownerUsername || "the Owner"}.</strong>
           <p>The temporary password cannot be used again. Set a permanent Owner password to finish setting up this device.</p>
-          <input
-            type="password"
+          <PasswordInput
             placeholder="New password"
             value={newPassword}
             onChange={(event) => setNewPassword(event.target.value)}
           />
-          <input
-            type="password"
+          <PasswordInput
             placeholder="Confirm new password"
             value={confirmPassword}
             onChange={(event) => setConfirmPassword(event.target.value)}
@@ -13114,13 +13111,12 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
             placeholder="Username"
             value={enrolUsername}
           />
-          <input
+          <PasswordInput
             aria-label="Password"
             autoComplete="current-password"
             disabled={busy}
             onChange={(event) => setEnrolPassword(event.target.value)}
             placeholder="Password"
-            type="password"
             value={enrolPassword}
           />
           <button className="secondary-button" type="button" disabled={busy} onClick={sendToShop}>
@@ -14471,8 +14467,8 @@ function UserProfilePanel({ onClose, onLogout, user }) {
           </ModuleCard>
           {showPasswordForm && (
             <div className="form-grid settings-add-grid">
-              <Field label="New Password"><input type="password" value={passwordDraft.password} onChange={(event) => setPasswordDraft({ ...passwordDraft, password: event.target.value })} /></Field>
-              <Field label="Confirm Password"><input type="password" value={passwordDraft.confirm_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value })} /></Field>
+              <Field label="New Password"><PasswordInput value={passwordDraft.password} onChange={(event) => setPasswordDraft({ ...passwordDraft, password: event.target.value })} /></Field>
+              <Field label="Confirm Password"><PasswordInput value={passwordDraft.confirm_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value })} /></Field>
             </div>
           )}
           <div className="button-row">
@@ -20709,7 +20705,7 @@ function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }
           <input disabled={!canManage} placeholder="Meta phone number ID" value={draft.phone_number_id || ""} onChange={(event) => updateDraft("phone_number_id", event.target.value)} />
         </Field>
         <Field label="Access Token">
-          <input disabled={!canManage} placeholder={whatsappSettings?.access_token_configured ? whatsappSettings.access_token_masked || "Token configured - enter new token to replace" : "Paste WhatsApp Cloud API access token"} type="password" value={draft.access_token || ""} onChange={(event) => { setTokenTyped(true); updateDraft("access_token", event.target.value); }} />
+          <PasswordInput disabled={!canManage} placeholder={whatsappSettings?.access_token_configured ? whatsappSettings.access_token_masked || "Token configured - enter new token to replace" : "Paste WhatsApp Cloud API access token"} value={draft.access_token || ""} onChange={(event) => { setTokenTyped(true); updateDraft("access_token", event.target.value); }} />
         </Field>
         <Field label="Default Country Code">
           <input disabled={!canManage} placeholder="91" value={draft.default_country_code || "91"} onChange={(event) => updateDraft("default_country_code", event.target.value.replace(/\D/g, "").slice(0, 5))} />
@@ -21440,9 +21436,9 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
           <input checked={draft.require_exit_code_to_close !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("require_exit_code_to_close", event.target.checked)} />
           <span>Require Exit Code to Close App</span>
         </label>
-        <Field label="Current Owner/Admin Password"><input disabled={!canManage} type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Required only when changing exit code" /></Field>
-        <Field label="New Exit Code"><input disabled={!canManage} inputMode="numeric" type="password" value={exitCode} onChange={(event) => setExitCode(event.target.value.replace(/\D/g, ""))} placeholder="Minimum 4 digits, recommended 6" /></Field>
-        <Field label="Confirm Exit Code"><input disabled={!canManage} inputMode="numeric" type="password" value={confirmExitCode} onChange={(event) => setConfirmExitCode(event.target.value.replace(/\D/g, ""))} /></Field>
+        <Field label="Current Owner/Admin Password"><PasswordInput disabled={!canManage} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Required only when changing exit code" /></Field>
+        <Field label="New Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={exitCode} onChange={(event) => setExitCode(event.target.value.replace(/\D/g, ""))} placeholder="Minimum 4 digits, recommended 6" /></Field>
+        <Field label="Confirm Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={confirmExitCode} onChange={(event) => setConfirmExitCode(event.target.value.replace(/\D/g, ""))} /></Field>
       </div>
       <div className="button-row">
         <button className="primary-button" disabled={!canManage} onClick={save}>Save screen lock</button>
@@ -21625,8 +21621,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
           </select>
         </Field>
         <Field label="Joining Date"><input disabled={!canManage} type="date" value={draft.joining_date} onChange={(event) => updateDraft("joining_date", event.target.value)} /></Field>
-        {!editingId && <Field label="Password"><input disabled={!canManage} type="password" value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
-        {!editingId && <Field label="Confirm Password"><input disabled={!canManage} type="password" value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
+        {!editingId && <Field label="Password"><PasswordInput disabled={!canManage} value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
+        {!editingId && <Field label="Confirm Password"><PasswordInput disabled={!canManage} value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
         <label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} /><span>Active user</span></label>
         <label className="check-field"><input checked={draft.recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("recovery_enabled", event.target.checked)} /><span>Recovery enabled</span></label>
         <label className="check-field"><input checked={draft.staff_self_recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("staff_self_recovery_enabled", event.target.checked)} /><span>Allow staff self-recovery</span></label>
@@ -21681,8 +21677,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
             <div className="sale-edit-body">
               {passwordTarget.recoveryAction && <p className="form-note">Leave the fields blank to generate a one-time temporary password. The user will be required to change it at next login.</p>}
               <div className="form-grid settings-add-grid">
-                <Field label={passwordTarget.recoveryAction ? "Temporary Password" : "New Password"}><input type="password" value={passwordTarget.password} onChange={(event) => setPasswordTarget({ ...passwordTarget, password: event.target.value })} /></Field>
-                <Field label="Confirm Password"><input type="password" value={passwordTarget.confirm_password} onChange={(event) => setPasswordTarget({ ...passwordTarget, confirm_password: event.target.value })} /></Field>
+                <Field label={passwordTarget.recoveryAction ? "Temporary Password" : "New Password"}><PasswordInput value={passwordTarget.password} onChange={(event) => setPasswordTarget({ ...passwordTarget, password: event.target.value })} /></Field>
+                <Field label="Confirm Password"><PasswordInput value={passwordTarget.confirm_password} onChange={(event) => setPasswordTarget({ ...passwordTarget, confirm_password: event.target.value })} /></Field>
               </div>
               <button className="primary-button" onClick={changePassword}>{passwordTarget.recoveryAction ? "Reset Staff Access" : "Save Password"}</button>
             </div>
@@ -25994,7 +25990,7 @@ function SaleChangeApprovalFields({ disabled = false, form, onChange, route }) {
           <input autoCapitalize="none" autoComplete="off" disabled={disabled} name="sale-change-approver" spellCheck={false} value={form.approverUsername || ""} onChange={(event) => onChange({ approverUsername: event.target.value })} />
         </Field>
         <Field label="Password">
-          <input autoComplete="new-password" disabled={disabled} name="sale-change-approver-password" type="password" value={form.approverPassword || ""} onChange={(event) => onChange({ approverPassword: event.target.value })} />
+          <PasswordInput autoComplete="new-password" disabled={disabled} name="sale-change-approver-password" value={form.approverPassword || ""} onChange={(event) => onChange({ approverPassword: event.target.value })} />
         </Field>
       </div>
       <p className="form-note">This needs the Owner or an Admin. They type their own username and password here. The password is not kept.</p>
@@ -27825,6 +27821,32 @@ function SummaryMetric({ featured = false, label, positive = false, value }) {
       <span>{label}</span>
       <strong className={positive ? "metric-value profit-cell" : "metric-value"}>{displayValue}</strong>
     </div>
+  );
+}
+
+// A password box with its own show/hide eye (4 Oct 2026). The eye Windows' WebView draws by itself
+// vanishes once the box loses focus or a sign-in is refused, and only comes back after the whole
+// password is deleted -- so the cashier retyped it blind. This eye is always there, keeps what was
+// typed, and is hidden from Tab so Enter still goes from the password straight to sign-in.
+function PasswordInput(props) {
+  const [shown, setShown] = useState(false);
+  return (
+    <span className="password-field">
+      <input {...props} type={shown ? "text" : "password"} />
+      <button
+        aria-label={shown ? "Hide password" : "Show password"}
+        aria-pressed={shown}
+        className="password-eye"
+        disabled={props.disabled}
+        onClick={() => setShown((value) => !value)}
+        onMouseDown={(event) => event.preventDefault()}
+        tabIndex={-1}
+        title={shown ? "Hide password" : "Show password"}
+        type="button"
+      >
+        <Icon name={shown ? "eyeOff" : "eye"} size={18} />
+      </button>
+    </span>
   );
 }
 
