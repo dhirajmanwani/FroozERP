@@ -57,7 +57,7 @@ test("the approver's password is forgotten after every attempt and never autofil
   const editSave = slice("const save = async () => {", "const saveChange = async () => {");
   assert.match(editSave, /finally \{\s*forgetPassword\(\);/);
   const fields = slice("function SaleChangeApprovalFields(", "function SaleCancelModal(");
-  assert.match(fields, /autoComplete="new-password"[^>]*type="password"/);
+  assert.match(fields, /<PasswordInput autoComplete="new-password"/);
   assert.match(fields, /route\.mode === SALE_CHANGE_APPROVAL_MODE\.REFUSED/);
 });
 
