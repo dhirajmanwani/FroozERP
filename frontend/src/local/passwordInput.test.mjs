@@ -27,3 +27,13 @@ test("the eye starts hidden, keeps what was typed, and stays out of the Tab orde
 test("the WebView's own reveal eye is hidden beside ours", () => {
   assert.match(css, /\.password-field > input::-ms-reveal,\s*\.password-field > input::-ms-clear \{\s*display: none;/);
 });
+
+test("a shown password hides itself again after five seconds", () => {
+  assert.match(app, /const PASSWORD_REVEAL_MS = 5000;/);
+  const start = app.indexOf("function PasswordInput(");
+  const body = app.slice(start, app.indexOf("\nfunction ", start + 10));
+  assert.match(body, /if \(!shown\) return undefined;/, "no timer while it is hidden");
+  assert.match(body, /setTimeout\(\(\) => setShown\(false\), PASSWORD_REVEAL_MS\)/);
+  assert.match(body, /return \(\) => clearTimeout\(timer\);/, "pressing it again or leaving the screen cancels the timer");
+  assert.match(body, /\}, \[shown\]\);/);
+});
