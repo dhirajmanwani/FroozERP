@@ -148,7 +148,8 @@ test("the purchase payload carries the actor rather than reading it", () => {
   );
 
   const calls = backendCode.match(/readPurchaseEntryPayload\(/g) || [];
-  assert.equal(calls.length, 5, "a caller was added or removed; each one must pass the session actor");
+  // 7 since 4 Oct 2026: completing a several-fruit pending arrival reads the header and each fruit.
+  assert.equal(calls.length, 7, "a caller was added or removed; each one must pass the session actor");
   assert.equal(
     countOf(/readPurchaseEntryPayload\(req\.body, req\.auth\.userId\)/g)
       + countOf(/\}, req\.auth\.userId\)/g),

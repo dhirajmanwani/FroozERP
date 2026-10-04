@@ -19783,15 +19783,30 @@ app.get("/reports/summary", async (req, res) => {
           pr.category,
           pr.unit,
           pi.quantity,
+          pi.purchase_rate,
           COALESCE(pi.lot_name, p.lot_name, ib.lot_name) AS lot_name,
           COALESCE(pi.lot_size, p.lot_size, ib.lot_size) AS lot_size,
           ib.batch_no,
           ib.stock_source,
           ib.remaining_qty
         FROM purchases p
-        LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+        -- Each item beside its own lot, paired as GET /purchases pairs them. Joining lots on
+        -- purchase_id alone crossed every item with every lot, so a 2-fruit bill was 4 rows here.
+        LEFT JOIN LATERAL (
+          SELECT item.*, ROW_NUMBER() OVER (PARTITION BY item.product_id ORDER BY item.id) AS product_line
+          FROM purchase_items item
+          WHERE item.purchase_id = p.id
+        ) pi ON TRUE
         LEFT JOIN products pr ON pr.id = pi.product_id
-        LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
+        LEFT JOIN LATERAL (
+          SELECT lot.*
+          FROM (
+            SELECT batch.*, ROW_NUMBER() OVER (PARTITION BY batch.product_id ORDER BY batch.id) AS product_line
+            FROM inventory_batches batch
+            WHERE batch.purchase_id = p.id
+          ) lot
+          WHERE lot.product_id = pi.product_id AND lot.product_line = pi.product_line
+        ) ib ON TRUE
         WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED' AND p.branch_id = $3
           AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING'
           AND p.purchase_date BETWEEN $1 AND $2
@@ -19905,6 +19920,11 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE(pi.lot_size, p.lot_size, ib.lot_size) AS lot_size,
           pi.basic_amount AS item_basic_amount,
           pi.net_payable AS item_net_payable,
+          pi.mandi_tax_amount AS item_mandi_tax_amount,
+          pi.freight_charges AS item_freight_charges,
+          pi.labour_charges AS item_labour_charges,
+          pi.other_charges AS item_other_charges,
+          pi.rebate_amount AS item_rebate_amount,
           pi.effective_cost_per_unit,
           pr.product_name,
           pr.category,
@@ -19918,9 +19938,23 @@ app.get("/reports/summary", async (req, res) => {
           ib.batch_status
         FROM purchases p
         LEFT JOIN suppliers s ON s.id = p.supplier_id
-        LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+        -- Each item beside its own lot, paired as GET /purchases pairs them. Joining lots on
+        -- purchase_id alone crossed every item with every lot, so a 2-fruit bill was 4 rows here.
+        LEFT JOIN LATERAL (
+          SELECT item.*, ROW_NUMBER() OVER (PARTITION BY item.product_id ORDER BY item.id) AS product_line
+          FROM purchase_items item
+          WHERE item.purchase_id = p.id
+        ) pi ON TRUE
         LEFT JOIN products pr ON pr.id = pi.product_id
-        LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
+        LEFT JOIN LATERAL (
+          SELECT lot.*
+          FROM (
+            SELECT batch.*, ROW_NUMBER() OVER (PARTITION BY batch.product_id ORDER BY batch.id) AS product_line
+            FROM inventory_batches batch
+            WHERE batch.purchase_id = p.id
+          ) lot
+          WHERE lot.product_id = pi.product_id AND lot.product_line = pi.product_line
+        ) ib ON TRUE
         WHERE p.purchase_date BETWEEN $1 AND $2 AND p.branch_id = $3
           AND (
             COALESCE(p.purchase_status, 'ACTIVE') = 'CANCELLED'
@@ -21809,7 +21843,9 @@ app.get("/purchases", async (req, res) => {
         pi.product_id,
         pi.quantity,
         pi.purchase_rate,
+        pi.id AS purchase_item_id,
         pi.net_payable AS item_net_payable,
+        pi.origin_type AS item_origin_type,
         pi.lot_name AS item_lot_name,
         pi.lot_size AS item_lot_size,
         pr.product_name,
@@ -22860,8 +22896,9 @@ app.put("/api/v3/purchases/:id", rateLimitSyncRequest, v3WriteAdapter(updatePurc
  * one item and one lot per fruit, so editing it rewrote the first fruit (as whichever fruit was
  * clicked) and set the bill's totals to one line's figures, and completing it priced only the
  * first fruit, left the others pending for good and under-stated what the supplier is owed.
- * Until both are rebuilt for several lines, they refuse such a bill and say what to do instead.
- * Cancelling handles every line and stays allowed.
+ * Editing still refuses such a bill and says what to do instead. Completing it now goes through
+ * `completePendingBillLines`, which takes a final rate for every fruit; only a request without
+ * those lines (an app from before that) is refused here. Cancelling handles every line.
  *
  * @returns {Promise<null | {status: number, body: object}>}
  */
@@ -22875,18 +22912,259 @@ const refuseMultiItemPurchaseChange = async (client, purchaseId, action) => {
       code: "PURCHASE_MULTI_ITEM_CHANGE_UNSUPPORTED",
       items,
       message: action === "complete"
-        ? `This arrival has ${items} fruits on one bill. Completing a bill with several fruits is not supported yet, so nothing was changed.`
+        ? `This arrival has ${items} fruits on one bill, and the final rate came for only one of them, so nothing was changed. Update the app, then complete the bill again with a rate for every fruit.`
         : `This bill has ${items} fruits. Editing a bill with several fruits is not supported yet, so nothing was changed. Cancel the bill and enter it again.`,
     },
   };
+};
+
+/**
+ * Completes a pending arrival with a final rate for each of its fruits (4 Oct 2026).
+ *
+ * `lines` is one entry per purchase item: `{ purchase_item_id, purchase_rate, quantity?,
+ * lot_name?, lot_size? }`. Every item of the arrival must be named exactly once, so a bill can
+ * never come out half completed. The money follows the completed path of
+ * `createPurchaseBillHandler`: charges are shared across the fruits by value, each fruit gets its
+ * own mandi tax, rebate and net, and the bill's header is the sum of its fruits.
+ *
+ * Each item is paired with its own lot the way `GET /purchases` pairs them: by product, then by
+ * order within that product. The product of a line cannot change here; a wrong fruit is cancelled
+ * and entered again.
+ *
+ * @returns {Promise<{error: {status: number, body: object}} | {purchase: object, items: object[], lots: object[]}>}
+ */
+const completePendingBillLines = async (client, { req, purchaseId, oldPurchase, manager, context, lines }) => {
+  const refuse = (status, message, code) => ({ error: { status, body: code ? { code, message } : { message } } });
+  const baseEntry = readPurchaseEntryPayload({ ...req.body, purchase_bill_status: "BILL_COMPLETED" }, req.auth.userId);
+  const items = (await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id FOR UPDATE", [purchaseId])).rows;
+  const lots = (await client.query("SELECT * FROM inventory_batches WHERE purchase_id = $1 ORDER BY id FOR UPDATE", [purchaseId])).rows;
+  if (items.length === 0) return refuse(404, "Linked pending inventory batch not found");
+
+  const lotsByProduct = new Map();
+  for (const lot of lots) {
+    const key = String(lot.product_id);
+    if (!lotsByProduct.has(key)) lotsByProduct.set(key, []);
+    lotsByProduct.get(key).push(lot);
+  }
+  const usedPerProduct = new Map();
+  const linesByItem = new Map();
+  for (const line of lines) {
+    const itemId = parsePositiveInteger(line?.purchase_item_id);
+    if (!itemId || linesByItem.has(itemId)) {
+      return refuse(409, "The fruits sent do not match this arrival, so nothing was changed. Reload Pending Bills and try again.", "PURCHASE_COMPLETE_LINES_MISMATCH");
+    }
+    linesByItem.set(itemId, line);
+  }
+  if (linesByItem.size !== items.length || items.some((item) => !linesByItem.has(Number(item.id)))) {
+    return refuse(409, `This arrival has ${items.length} fruits and a final rate is needed for every one of them, so nothing was changed. Reload Pending Bills and try again.`, "PURCHASE_COMPLETE_LINES_MISMATCH");
+  }
+
+  const entries = [];
+  for (const item of items) {
+    const key = String(item.product_id);
+    const position = usedPerProduct.get(key) || 0;
+    usedPerProduct.set(key, position + 1);
+    const lot = (lotsByProduct.get(key) || [])[position];
+    if (!lot) return refuse(404, "Linked pending inventory batch not found");
+    const line = linesByItem.get(Number(item.id));
+    const oldQuantity = Number(lot.purchase_qty || item.quantity || 0);
+    const hasQuantity = line.quantity !== undefined && line.quantity !== null && line.quantity !== "";
+    const entry = readPurchaseEntryPayload({
+      ...req.body,
+      purchase_bill_status: "BILL_COMPLETED",
+      product_id: item.product_id,
+      quantity: hasQuantity ? line.quantity : oldQuantity,
+      purchase_rate: line.purchase_rate,
+      unit: item.unit,
+      origin_type: item.origin_type,
+      lot_name: line.lot_name !== undefined ? line.lot_name : (lot.lot_name || item.lot_name),
+      lot_size: line.lot_size !== undefined ? line.lot_size : (lot.lot_size || item.lot_size),
+      remarks: lot.remarks || baseEntry.remarks,
+    }, req.auth.userId);
+    const validationMessage = validatePurchaseEntry(entry);
+    if (validationMessage) return refuse(400, validationMessage);
+    entries.push({ entry, item, lot, oldQuantity });
+  }
+
+  const itemBasicTotal = entries.reduce((sum, { entry }) => sum + entry.quantity * entry.purchaseRate, 0);
+  if (itemBasicTotal <= 0) return refuse(400, "Completed purchase items require valid purchase rates");
+  const completed = [];
+  let usedFreight = 0;
+  let usedLabour = 0;
+  let usedOther = 0;
+  for (let index = 0; index < entries.length; index += 1) {
+    const { entry, item, lot, oldQuantity } = entries[index];
+    const itemBasic = entry.quantity * entry.purchaseRate;
+    const isLast = index === entries.length - 1;
+    const freight = isLast ? roundCurrency(baseEntry.freightCharges - usedFreight) : roundCurrency(baseEntry.freightCharges * itemBasic / itemBasicTotal);
+    const labour = isLast ? roundCurrency(baseEntry.labourCharges - usedLabour) : roundCurrency(baseEntry.labourCharges * itemBasic / itemBasicTotal);
+    const other = isLast ? roundCurrency(baseEntry.otherCharges - usedOther) : roundCurrency(baseEntry.otherCharges * itemBasic / itemBasicTotal);
+    usedFreight = roundCurrency(usedFreight + freight);
+    usedLabour = roundCurrency(usedLabour + labour);
+    usedOther = roundCurrency(usedOther + other);
+    const itemEntry = { ...entry, freightCharges: freight, labourCharges: labour, otherCharges: other, purchaseType: "CREDIT", paidAmountInput: 0 };
+    const calculation = await buildPurchaseFinancials(client, itemEntry);
+    if (calculation.error) return refuse(calculation.status || 400, calculation.error);
+    const oldRemaining = Number(lot.remaining_qty || 0);
+    const soldQuantity = roundUnitCost(oldQuantity - oldRemaining);
+    if (itemEntry.quantity < soldQuantity) {
+      return refuse(409, `Quantity of ${calculation.product.product_name} cannot be less than already sold quantity (${soldQuantity}).`);
+    }
+    completed.push({
+      ...calculation,
+      entry: itemEntry,
+      item,
+      lot,
+      oldQuantity,
+      nextRemaining: roundUnitCost(oldRemaining + (itemEntry.quantity - oldQuantity)),
+    });
+  }
+
+  const basicTotal = roundCurrency(completed.reduce((sum, line) => sum + Number(line.financials.basicAmount || 0), 0));
+  const mandiTaxTotal = roundCurrency(completed.reduce((sum, line) => sum + Number(line.financials.mandiTaxAmount || 0), 0));
+  const grossTotal = roundCurrency(completed.reduce((sum, line) => sum + Number(line.financials.grossAmount || 0), 0));
+  const rebateTotal = roundCurrency(completed.reduce((sum, line) => sum + Number(line.financials.rebateAmount || 0), 0));
+  const netTotal = roundCurrency(completed.reduce((sum, line) => sum + Number(line.financials.netPayable || 0), 0));
+  const totalQuantity = completed.reduce((sum, line) => sum + Number(line.entry.quantity || 0), 0);
+  const paidAmount = baseEntry.purchaseType === "CASH" ? Number(baseEntry.paidAmountInput || 0) : 0;
+  if (paidAmount > netTotal) return refuse(400, "Paid amount cannot exceed net payable amount");
+  const balanceAmount = roundCurrency(netTotal - paidAmount);
+  const paymentStatus = balanceAmount === 0 ? "PAID" : paidAmount > 0 ? "PARTIAL" : "PENDING";
+  const mandiTaxPercent = basicTotal > 0 ? roundUnitCost(mandiTaxTotal * 100 / basicTotal) : 0;
+  const rebatePercent = grossTotal > 0 ? roundUnitCost(rebateTotal * 100 / grossTotal) : 0;
+  const effectiveCostPerUnit = totalQuantity > 0 ? roundUnitCost(netTotal / totalQuantity) : 0;
+  const { supplier, rebateRule } = completed[0];
+  const singleLine = completed.length === 1 ? completed[0].entry : null;
+
+  const purchaseResult = await client.query(
+    `
+    UPDATE purchases
+    SET supplier_id = $1, supplier_name = $2, total_amount = $3, branch_id = $4,
+        basic_amount = $5, mandi_tax_percent = $6, mandi_tax_amount = $7,
+        other_charges = $8, gross_amount = $9, rebate_percent = $10,
+        rebate_amount = $11, net_payable = $12, paid_amount = $13,
+        balance_amount = $14, payment_timing = $15, effective_cost_per_unit = $16,
+        freight_charges = $17, labour_charges = $18, rebate_rule_id = $19,
+        payment_due_days = $20, payment_status = $21, payment_date = $22,
+        purchase_type = $23, payment_mode = $24, payment_reference_number = $25,
+        remarks = $26, purchase_status = 'ACTIVE', purchase_bill_status = 'BILL_COMPLETED',
+        bill_number = $27, bill_date = $28, edited_by = $29,
+        edited_at = CURRENT_TIMESTAMP, edit_reason = $30,
+        lot_name = $32, lot_size = $33, stock_source = 'PURCHASE'
+    WHERE id = $31
+    RETURNING *
+    `,
+    [
+      supplier.id, supplier.supplier_name, netTotal, baseEntry.branchId,
+      basicTotal, mandiTaxPercent, mandiTaxTotal,
+      baseEntry.otherCharges, grossTotal, rebatePercent,
+      rebateTotal, netTotal, paidAmount,
+      balanceAmount, rebateRule.rule_name, effectiveCostPerUnit,
+      baseEntry.freightCharges, baseEntry.labourCharges, rebateRule.id,
+      rebateRule.pay_within_days, paymentStatus,
+      baseEntry.purchaseType === "CREDIT" ? null : baseEntry.paymentDate,
+      baseEntry.purchaseType, baseEntry.purchaseType === "CASH" ? baseEntry.paymentMode : null,
+      baseEntry.purchaseType === "CASH" ? baseEntry.paymentReferenceNumber : null,
+      baseEntry.remarks, baseEntry.billNumber, baseEntry.billDate, manager.id,
+      cleanText(req.body.reason) || "Pending purchase bill completed", purchaseId,
+      singleLine ? singleLine.lotName : null, singleLine ? singleLine.lotSize : null,
+    ]
+  );
+
+  const updatedItems = [];
+  const updatedLots = [];
+  for (const line of completed) {
+    const { entry, item, lot, financials, oldQuantity, nextRemaining } = line;
+    const itemResult = await client.query(
+      `
+      UPDATE purchase_items
+      SET quantity = $1, purchase_rate = $2, amount = $3,
+          basic_amount = $4, mandi_tax_amount = $5, other_charges = $6,
+          rebate_amount = $7, net_payable = $8, effective_cost_per_unit = $9,
+          freight_charges = $10, labour_charges = $11, lot_name = $13, lot_size = $14
+      WHERE id = $12
+      RETURNING *
+      `,
+      [
+        entry.quantity, entry.purchaseRate, financials.netPayable,
+        financials.basicAmount, financials.mandiTaxAmount, entry.otherCharges,
+        financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
+        entry.freightCharges, entry.labourCharges, item.id, entry.lotName, entry.lotSize,
+      ]
+    );
+    updatedItems.push(itemResult.rows[0]);
+    // Each lot keeps its own branch, as in the single-fruit path above.
+    const lotResult = await client.query(
+      `
+      UPDATE inventory_batches
+      SET purchase_qty = $1, remaining_qty = $2,
+          purchase_rate = $3, effective_cost_per_unit = $4, supplier_id = $5,
+          supplier_name = $6, branch_id = COALESCE(branch_id, $7), mandi_tax_amount = $8,
+          freight_charges = $9, labour_charges = $10, other_charges = $11,
+          gross_amount = $12, rebate_amount = $13, net_payable = $14,
+          payment_timing = $15, balance_amount = $16, purchase_bill_status = 'BILL_COMPLETED',
+          temporary_sale_rate = 0, lot_name = $18, lot_size = $19,
+          stock_source = 'PURCHASE', purchase_date = $20
+      WHERE id = $17
+      RETURNING *
+      `,
+      [
+        entry.quantity, nextRemaining, entry.purchaseRate, financials.effectiveCostPerUnit,
+        supplier.id, supplier.supplier_name, baseEntry.branchId, financials.mandiTaxAmount,
+        entry.freightCharges, entry.labourCharges, entry.otherCharges, financials.grossAmount,
+        financials.rebateAmount, financials.netPayable, rebateRule.rule_name, financials.balanceAmount, lot.id,
+        entry.lotName, entry.lotSize, baseEntry.purchaseDate,
+      ]
+    );
+    updatedLots.push(lotResult.rows[0]);
+    await client.query(
+      "UPDATE sale_batch_allocations SET purchase_rate = $1, cost_amount = ROUND((quantity * $1)::NUMERIC, 2) WHERE inventory_batch_id = $2",
+      [financials.effectiveCostPerUnit, lot.id]
+    );
+    await recalculateSalesForBatch(client, lot.id);
+    if (entry.quantity !== oldQuantity) {
+      const delta = roundUnitCost(entry.quantity - oldQuantity);
+      await client.query(
+        `INSERT INTO stock_transactions (
+           product_id, quantity, transaction_type, remarks, user_id, branch_id,
+           company_id, operational_location_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          item.product_id,
+          Math.abs(delta),
+          delta > 0 ? "IN" : "OUT",
+          `Pending bill #${purchaseId} completed quantity adjustment`,
+          manager.id,
+          lot.branch_id || baseEntry.branchId,
+          context?.company_id || oldPurchase.company_id || null,
+          lot.operational_location_id || context?.operational_location_id || oldPurchase.operational_location_id || null,
+        ]
+      );
+    }
+  }
+
+  await client.query(
+    "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'COMPLETE_BILL', $2::jsonb, $3::jsonb, $4, $5)",
+    [
+      purchaseId,
+      JSON.stringify({ purchase: oldPurchase, items, batches: lots }),
+      JSON.stringify({ purchase: purchaseResult.rows[0], items: updatedItems, batches: updatedLots }),
+      cleanText(req.body.reason) || "Pending purchase bill completed",
+      manager.id,
+    ]
+  );
+  return { purchase: purchaseResult.rows[0], items: updatedItems, lots: updatedLots };
 };
 
 const completePurchaseBillHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const purchaseId = parsePositiveInteger(Number(req.params.id));
+    // A final rate per fruit (`items`) completes every fruit of the arrival together; without it
+    // the body is the one-fruit form, as before.
+    const completionLines = Array.isArray(req.body.items) && req.body.items.length > 0 ? req.body.items : null;
     const entry = readPurchaseEntryPayload({ ...req.body, purchase_bill_status: "BILL_COMPLETED" }, req.auth.userId);
-    const validationMessage = validatePurchaseEntry(entry);
+    const validationMessage = completionLines ? "" : validatePurchaseEntry(entry);
     if (!purchaseId) return res.status(400).json({ message: "Invalid purchase" });
     if (validationMessage) return res.status(400).json({ message: validationMessage });
 
@@ -22925,6 +23203,17 @@ const completePurchaseBillHandler = async (req, res) => {
     if (oldPurchase.purchase_bill_status !== "BILL_PENDING") {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Only pending purchase bills can be completed" });
+    }
+    if (completionLines) {
+      const completion = await completePendingBillLines(client, { req, purchaseId, oldPurchase, manager, context, lines: completionLines });
+      if (completion.error) {
+        await client.query("ROLLBACK");
+        return res.status(completion.error.status).json(completion.error.body);
+      }
+      const linesPayload = { success: true, purchase: completion.purchase, items: completion.items, lots: completion.lots };
+      await completeV3BusinessOperation(client, req, "purchase", purchaseId, linesPayload);
+      await client.query("COMMIT");
+      return res.json(linesPayload);
     }
     const multiItemRefusal = await refuseMultiItemPurchaseChange(client, purchaseId, "complete");
     if (multiItemRefusal) {

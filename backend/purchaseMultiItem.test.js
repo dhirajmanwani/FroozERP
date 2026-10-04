@@ -1,5 +1,5 @@
-// A purchase from the cart holds one item and one lot per fruit (4 Oct 2026). These pin the three
-// places that used to treat a purchase as one item: the list, edit/complete, and cancel.
+// A purchase from the cart holds one item and one lot per fruit (4 Oct 2026). These pin the places
+// that used to treat a purchase as one item: the list, the reports, edit, complete and cancel.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -49,4 +49,38 @@ test("editing or completing a purchase keeps each lot's branch", () => {
   const complete = between("const completePurchaseBillHandler", "\n};\n");
   assert.equal((edit.match(/branch_id = COALESCE\(branch_id, \$\d+\)/g) || []).length, 2);
   assert.equal((complete.match(/branch_id = COALESCE\(branch_id, \$\d+\)/g) || []).length, 1);
+});
+
+test("the purchase reports pair each item with its own lot too", () => {
+  assert.doesNotMatch(source, /LEFT JOIN inventory_batches ib ON ib\.purchase_id = p\.id\s/);
+  assert.match(source, /pi\.item_rebate_amount|pi\.rebate_amount AS item_rebate_amount/);
+  assert.match(source, /pi\.id AS purchase_item_id/);
+});
+
+test("complete-bill takes a final rate for every fruit before the one-fruit path and its guard", () => {
+  const body = between("const completePurchaseBillHandler", "\n};\n");
+  const lines = body.indexOf("completePendingBillLines(client, {");
+  const guard = body.indexOf('refuseMultiItemPurchaseChange(client, purchaseId, "complete")');
+  const manager = body.indexOf("requireRateManager(req.auth.userId, client)");
+  const pendingCheck = body.indexOf('purchase_bill_status !== "BILL_PENDING"');
+  assert.ok(manager > 0 && pendingCheck > manager && lines > pendingCheck, "only an Owner/Admin completes, and only a pending bill");
+  assert.ok(guard > lines, "an old one-fruit request on a several-fruit bill is still refused");
+  assert.match(body, /const validationMessage = completionLines \? "" : validatePurchaseEntry\(entry\)/);
+});
+
+test("completing several fruits names every fruit once, prices each, and keeps each lot's branch", () => {
+  const helper = between("const completePendingBillLines = async", "\n};\n");
+  assert.doesNotMatch(helper, /LIMIT 1/);
+  assert.match(helper, /FROM purchase_items WHERE purchase_id = \$1 ORDER BY id FOR UPDATE/);
+  assert.match(helper, /FROM inventory_batches WHERE purchase_id = \$1 ORDER BY id FOR UPDATE/);
+  assert.match(helper, /PURCHASE_COMPLETE_LINES_MISMATCH/);
+  assert.match(helper, /linesByItem\.size !== items\.length/);
+  assert.match(helper, /const isLast = index === entries\.length - 1/);
+  assert.match(helper, /Paid amount cannot exceed net payable amount/);
+  assert.match(helper, /cannot be less than already sold quantity/);
+  assert.equal((helper.match(/branch_id = COALESCE\(branch_id, \$\d+\)/g) || []).length, 1);
+  assert.match(helper, /recalculateSalesForBatch\(client, lot\.id\)/);
+  assert.match(helper, /purchase_bill_status = 'BILL_COMPLETED'/);
+  assert.match(helper, /'COMPLETE_BILL'/);
+  assert.doesNotMatch(helper, /SET product_id/, "a fruit cannot be swapped for another while completing");
 });

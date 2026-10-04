@@ -193,7 +193,7 @@ import {
   preserveVerifiedLocalCollection,
   preserveVerifiedLocalValue,
 } from "./local/cloudAvailability";
-import { groupPurchaseBills, pendingItemRate, purchaseChangeBlock, purchaseItemCounts, purchaseRowNet } from "./local/purchaseRows";
+import { completionLinesPayload, completionLinesProblem, groupPurchaseBills, pendingCompletionLines, pendingItemRate, purchaseChangeBlock, purchaseHistoryAmounts, purchaseItemCounts, purchaseRowNet } from "./local/purchaseRows";
 import {
   describeFrostTransportFailure,
   hasCloudSession,
@@ -2747,6 +2747,9 @@ function App() {
   const [editingPurchaseItemLineId, setEditingPurchaseItemLineId] = useState(null);
   const [editingPurchaseId, setEditingPurchaseId] = useState(null);
   const [purchaseAmendmentMode, setPurchaseAmendmentMode] = useState(false);
+  // Completing a pending arrival with several fruits: one line per fruit with its final rate
+  // (local/purchaseRows.js). null for every other purchase form.
+  const [completionLines, setCompletionLines] = useState(null);
   const [amendmentDate, setAmendmentDate] = useState("");
   const [amendmentSupplierId, setAmendmentSupplierId] = useState("");
   const [selectedInvoice, setSelectedInvoice] = useState(null);
@@ -4491,7 +4494,12 @@ function App() {
   }, [expectedPurchaseRate, purchaseBillStatus, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
 
   const purchaseCartSummary = useMemo(() => {
-    const items = editingPurchaseId ? [{
+    const items = completionLines ? completionLines.map((line) => ({
+      quantity: Number(line.quantity || 0),
+      purchase_rate: Number(line.purchase_rate || 0),
+      expected_purchase_rate: Number(line.expected_rate || 0),
+      origin_type: line.origin_type || "LOCAL",
+    })) : editingPurchaseId ? [{
       quantity: Number(purchaseQuantity || 0),
       purchase_rate: Number(purchaseRateInput || 0),
       expected_purchase_rate: Number(expectedPurchaseRate || 0),
@@ -4557,7 +4565,7 @@ function App() {
       effectiveCostPerUnit: receivedQuantity > 0 ? netPayable / receivedQuantity : 0,
       paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
-  }, [editingPurchaseId, expectedPurchaseRate, purchaseBillStatus, purchaseCart, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
+  }, [completionLines, editingPurchaseId, expectedPurchaseRate, purchaseBillStatus, purchaseCart, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
 
   const applySettingsBundle = (bundle = {}) => {
     const nextSaleRateSettings = { ...defaultSaleRateSettings, ...(bundle.saleRateSettings || {}) };
@@ -8167,9 +8175,11 @@ function App() {
     setPurchaseAmendmentMode(false);
     setAmendmentDate("");
     setAmendmentSupplierId("");
+    setCompletionLines(null);
   };
 
   const resetPurchaseItemFields = () => {
+    setCompletionLines(null);
     setPurchaseProductId("");
     setPurchaseQuantity("");
     setPurchaseRateInput("");
@@ -8282,6 +8292,13 @@ function App() {
 
   const validatePurchaseBeforeSave = () => {
     if (!purchaseSupplierId) return "Please select supplier";
+    if (editingPurchaseId && completionLines) {
+      const linesProblem = completionLinesProblem(completionLines);
+      if (linesProblem) return linesProblem;
+      if (!purchaseRebateRuleId) return "Please select rebate rule";
+      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
+      return "";
+    }
     if (editingPurchaseId) {
       const productName = selectedPurchaseProduct?.product_name || "selected item";
       if (!purchaseProductId) return "Please select product";
@@ -8401,7 +8418,11 @@ function App() {
         return;
       }
       if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
-        const completionWrite = createOperationalWrite(user, payload);
+        // Several fruits: every fruit's final rate goes together, so the bill is never half done.
+        const completionWrite = createOperationalWrite(
+          user,
+          completionLines ? { ...payload, items: completionLinesPayload(completionLines) } : payload
+        );
         await axios.post(
           `${SYNC_API_URL}/api/v3/purchases/${editingPurchaseId}/complete-bill`,
           completionWrite.body,
@@ -8760,6 +8781,7 @@ function App() {
   };
 
   const editPurchase = (purchase) => {
+    setCompletionLines(null);
     setEditingPurchaseId(purchase.id);
     setPurchaseAmendmentMode(true);
     setAmendmentDate(toDateKey(purchase.purchase_date || new Date()));
@@ -8858,11 +8880,23 @@ function App() {
   };
 
   const completePendingPurchase = (purchase) => {
+    // An arrival with several fruits is completed in one go, with a final rate for each fruit.
+    const billRows = purchases.filter((row) => inventoryIdsEqual(row.id, purchase.id));
+    let lines = null;
+    if (billRows.length > 1) {
+      const prepared = pendingCompletionLines(billRows);
+      if (prepared.error) {
+        alert(prepared.error);
+        return;
+      }
+      lines = prepared.lines;
+    }
     editPurchase({
       ...purchase,
       purchase_bill_status: "BILL_COMPLETED",
       purchase_rate: purchase.expected_purchase_rate || purchase.purchase_rate || "",
     });
+    if (lines) setCompletionLines(lines);
     setPurchaseBillStatus("BILL_COMPLETED");
     setPurchaseType("CREDIT");
     setPurchasePaidAmount("");
@@ -10479,8 +10513,9 @@ function App() {
                   </div>
                   <DataTable headers={["Purchase", "Item", "Qty", "Rate", "Status", "Net", "Actions"]}>
                     {amendmentPurchases.map((purchase, rowIndex) => {
-                      // One row per item; a bill with several items is edited or completed only
-                      // by cancelling it and entering it again (local/purchaseRows.js).
+                      // One row per item. A bill with several items is completed with a rate per
+                      // fruit, and edited only by cancelling it and entering it again
+                      // (local/purchaseRows.js).
                       const itemCount = amendmentItemCounts.get(canonicalInventoryId(purchase.id)) || 1;
                       const changeBlock = purchaseChangeBlock(itemCount);
                       const rowNet = purchaseRowNet(purchase, itemCount);
@@ -10495,7 +10530,7 @@ function App() {
                         <td>
                           <div className="button-row table-actions-row">
                             <button className="table-action" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => editPurchase(purchase)} title={changeBlock || undefined}>Edit</button>
-                            {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => completePendingPurchase(purchase)} title={changeBlock || undefined}>Complete Bill</button>}
+                            {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
                             <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
                           </div>
                           {changeBlock && purchase.purchase_status !== "CANCELLED" && <small className="cell-note">{changeBlock}</small>}
@@ -10510,7 +10545,7 @@ function App() {
               <ModuleCard eyebrow="Procurement" title={editingPurchaseId ? `Add / Edit Purchase #${editingPurchaseId}` : "Purchase Entry"} subtitle={editingPurchaseId ? "Amend one historical purchase item with inventory protection." : "Select supplier once, add multiple fruit items, then save one purchase workflow."}>
                 <div className="form-grid supplier-form-grid">
                   <Field label="Entry Type">
-                    <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(editingPurchaseId && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
+                    <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(completionLines) || Boolean(editingPurchaseId && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
                       <option value="BILL_COMPLETED">Completed Bill</option>
                       <option value="BILL_PENDING">Stock Arrival / Pending Bill</option>
                     </select>
@@ -10552,7 +10587,21 @@ function App() {
                 </div>
               </ModuleCard>
 
-              <ModuleCard eyebrow={editingPurchaseId ? "Purchase Item Amendment" : "Purchase Cart"} title={editingPurchaseId ? "Edit Purchase Item" : "Add Fruit Items"} subtitle={editingPurchaseId ? "Quantity reductions are blocked if stock from this batch has already been sold." : "Add all products from this supplier before saving the bill."}>
+              <ModuleCard eyebrow={completionLines ? "Complete Pending Bill" : editingPurchaseId ? "Purchase Item Amendment" : "Purchase Cart"} title={completionLines ? "Final Rate per Fruit" : editingPurchaseId ? "Edit Purchase Item" : "Add Fruit Items"} subtitle={completionLines ? `This arrival has ${completionLines.length} fruits. Enter the final purchase rate from the supplier's bill for each one.` : editingPurchaseId ? "Quantity reductions are blocked if stock from this batch has already been sold." : "Add all products from this supplier before saving the bill."}>
+                {completionLines && (
+                  <DataTable headers={["Product", "Lot / Size", "Qty", "Arrival Rate", "Final Purchase Rate"]}>
+                    {completionLines.map((line, index) => (
+                      <tr key={canonicalInventoryId(line.purchase_item_id)}>
+                        <td className="primary-cell">{line.product_name}<small className="cell-note">{labelFor("origin", line.origin_type)}</small></td>
+                        <td>{line.lot_name || "-"}{line.lot_size ? ` / ${line.lot_size}` : ""}</td>
+                        <td><input type="number" min="0" step="0.001" aria-label={`Quantity of ${line.product_name}`} value={line.quantity} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, quantity: event.target.value } : entry))} />{line.unit && <small className="cell-note">{labelFor("unit", line.unit)}</small>}</td>
+                        <td>{line.expected_rate > 0 ? currency.format(line.expected_rate) : "-"}</td>
+                        <td><input type="number" min="0" step="0.01" aria-label={`Final purchase rate of ${line.product_name}`} value={line.purchase_rate} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, purchase_rate: event.target.value } : entry))} /></td>
+                      </tr>
+                    ))}
+                  </DataTable>
+                )}
+                {!completionLines && (
                 <div className="form-grid supplier-form-grid">
                   <Field label="Product">
                     <select value={purchaseProductId} onChange={selectPurchaseProduct}>
@@ -10574,6 +10623,7 @@ function App() {
                   <Field label="Origin Type"><input value={selectedPurchaseProduct?.origin_type || "Select product"} readOnly /></Field>
                   <Field label="Item Remarks"><input value={purchaseItemRemarks} onChange={(event) => setPurchaseItemRemarks(event.target.value)} /></Field>
                 </div>
+                )}
                 {!editingPurchaseId && (
                   <div className="button-row">
                     <button className="secondary-button" onClick={addPurchaseCartItem}>{editingPurchaseItemLineId !== null ? "Update Item" : purchaseAmendmentMode ? "Add Forgotten Item" : "Add Item"}</button>
@@ -10640,7 +10690,7 @@ function App() {
                 <Field label="Bill Remarks"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
                 {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
                 {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">Purchase bill pending. Inventory will increase immediately and profit from this stock will be provisional until the bill is completed.</p>}
-                <PurchaseSummary summary={editingPurchaseId ? purchaseSummary : purchaseCartSummary} />
+                <PurchaseSummary summary={editingPurchaseId && !completionLines ? purchaseSummary : purchaseCartSummary} />
                 <div className="button-row">
                   <button className="primary-button" disabled={purchaseSaveBusy} onClick={savePurchase}>
                     {purchaseSaveBusy
@@ -14730,7 +14780,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
                 <td><span className="origin-rate">Pending Bill</span></td>
                 <td>
                   <div className="button-row table-actions-row">
-                    <button className="primary-button" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }} title={changeBlock || undefined}>Complete Bill</button>
+                    <button className="primary-button" onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }}>Complete Bill</button>
                     <button className="table-action" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }} title={changeBlock || undefined}>Edit Pending Entry</button>
                     <button className="remove-button" onClick={(event) => { event.stopPropagation(); onCancelPurchase(purchase); }}>Cancel Pending Entry</button>
                   </div>
@@ -15718,12 +15768,6 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     if (row.purchase_bill_status === "BILL_PENDING") return "Pending Bill";
     return "Completed Bill";
   };
-  const purchaseCharges = (row) => (
-    Number(row.mandi_tax_amount || 0) +
-    Number(row.freight_charges || 0) +
-    Number(row.labour_charges || 0) +
-    Number(row.other_charges || 0)
-  );
   const purchaseItemBasic = (row) => Number(row.item_basic_amount || 0) || Number(row.quantity || 0) * Number(row.purchase_rate || row.expected_purchase_rate || 0);
   const purchaseItemNarration = (row) => {
     const product = row.product_name || "Item";
@@ -15742,21 +15786,28 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     if (purchaseFilters.status === "BILL_COMPLETED") return row.purchase_status !== "CANCELLED" && row.purchase_bill_status === "BILL_COMPLETED";
     return row.purchase_status !== "CANCELLED";
   });
+  // A bill with several fruits sends one row per fruit, each carrying the whole bill's header; its
+  // rows show their own fruit's money so the bill is not counted once per fruit (purchaseRows.js).
+  const purchaseHistoryItemCounts = purchaseItemCounts(purchaseHistoryRawRows);
+  const purchaseRowAmounts = (row) => purchaseHistoryAmounts(row, purchaseHistoryItemCounts.get(canonicalInventoryId(row.id)) || 1);
   const groupedPurchaseHistoryRows = (() => {
-    if (!clubPurchaseItems) return filteredPurchaseHistoryRows.map((row) => ({
-      ...row,
-      display_key: `item-${row.id}-${row.item_id || row.product_id}`,
-      item_summary: purchaseItemNarration(row),
-      item_narration: purchaseItemNarration(row),
-      gross_total: Number(row.gross_amount || 0) || purchaseItemBasic(row) + purchaseCharges(row),
-      charges_total: purchaseCharges(row),
-      rebate_total: Number(row.rebate_amount || 0),
-      net_total: Number(row.net_payable || row.item_net_payable || 0),
-      paid_total: Number(row.paid_amount || 0),
-      balance_total: Number(row.balance_amount || 0),
-      status_label: purchaseStatusLabel(row),
-      source_rows: [row],
-    }));
+    if (!clubPurchaseItems) return filteredPurchaseHistoryRows.map((row) => {
+      const amounts = purchaseRowAmounts(row);
+      return {
+        ...row,
+        display_key: `item-${row.id}-${row.item_id || row.product_id}`,
+        item_summary: purchaseItemNarration(row),
+        item_narration: purchaseItemNarration(row),
+        gross_total: amounts.gross,
+        charges_total: amounts.charges,
+        rebate_total: amounts.rebate,
+        net_total: amounts.net,
+        paid_total: amounts.paid,
+        balance_total: amounts.balance,
+        status_label: purchaseStatusLabel(row),
+        source_rows: [row],
+      };
+    });
     const groups = new Map();
     for (const row of filteredPurchaseHistoryRows) {
       const key = `${toDateKey(row.purchase_date)}-${row.supplier_id || row.supplier_name}`;
@@ -15773,12 +15824,13 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         source_rows: [],
       };
       existing.source_rows.push(row);
-      existing.gross_total += Number(row.gross_amount || 0) || purchaseItemBasic(row) + purchaseCharges(row);
-      existing.charges_total += purchaseCharges(row);
-      existing.rebate_total += Number(row.rebate_amount || 0);
-      existing.net_total += Number(row.net_payable || row.item_net_payable || 0);
-      existing.paid_total += Number(row.paid_amount || 0);
-      existing.balance_total += Number(row.balance_amount || 0);
+      const amounts = purchaseRowAmounts(row);
+      existing.gross_total += amounts.gross;
+      existing.charges_total += amounts.charges;
+      existing.rebate_total += amounts.rebate;
+      existing.net_total += amounts.net;
+      existing.paid_total += amounts.paid;
+      existing.balance_total += amounts.balance;
       groups.set(key, existing);
     }
     return [...groups.values()].map((group) => {
@@ -16523,9 +16575,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     pendingPurchaseBills: {
       title: "Pending Purchase Bills",
       rows: filterRows(data.pendingPurchaseBillsReport),
-      summary: (rows) => [["Pending Bills", rows.length, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
+      summary: (rows) => [["Pending Bills", purchaseItemCounts(rows).size, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
       headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Remarks"],
-      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.id}-${row.batch_no || index}`}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(pendingItemRate(row))}</td><td>{row.remarks || "-"}</td></tr>,
     },
     stockWithoutBill: {
       title: "Stock Received Without Bill",
