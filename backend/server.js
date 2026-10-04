@@ -21809,6 +21809,7 @@ app.get("/purchases", async (req, res) => {
         pi.product_id,
         pi.quantity,
         pi.purchase_rate,
+        pi.net_payable AS item_net_payable,
         pi.lot_name AS item_lot_name,
         pi.lot_size AS item_lot_size,
         pr.product_name,
@@ -21824,11 +21825,28 @@ app.get("/purchases", async (req, res) => {
         ib.remaining_qty AS batch_remaining_qty,
         ib.batch_status
       FROM purchases p
-      LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+      -- One row per purchase item, beside that item's own lot. A bill from the purchase cart holds
+      -- several items and one lot per item, with no column linking the two, so they are paired by
+      -- product and by their order within that product (both are inserted in the same order). The
+      -- old join on purchase_id alone crossed every item with every lot: a 3-fruit bill came back
+      -- as 9 rows, each item shown 3 times beside the wrong lots.
+      LEFT JOIN LATERAL (
+        SELECT item.*, ROW_NUMBER() OVER (PARTITION BY item.product_id ORDER BY item.id) AS product_line
+        FROM purchase_items item
+        WHERE item.purchase_id = p.id
+      ) pi ON TRUE
       LEFT JOIN products pr ON pr.id = pi.product_id
-      LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
+      LEFT JOIN LATERAL (
+        SELECT lot.*
+        FROM (
+          SELECT batch.*, ROW_NUMBER() OVER (PARTITION BY batch.product_id ORDER BY batch.id) AS product_line
+          FROM inventory_batches batch
+          WHERE batch.purchase_id = p.id
+        ) lot
+        WHERE lot.product_id = pi.product_id AND lot.product_line = pi.product_line
+      ) ib ON TRUE
       WHERE p.branch_id = $1
-      ORDER BY p.purchase_date DESC, p.created_at DESC, p.id DESC
+      ORDER BY p.purchase_date DESC, p.created_at DESC, p.id DESC, pi.id
       LIMIT 250
       `,
       [req.auth.branchId]
@@ -22566,6 +22584,11 @@ const updatePurchaseHandler = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled purchase cannot be edited" });
     }
+    const multiItemRefusal = await refuseMultiItemPurchaseChange(client, purchaseId, "edit");
+    if (multiItemRefusal) {
+      await client.query("ROLLBACK");
+      return res.status(multiItemRefusal.status).json(multiItemRefusal.body);
+    }
 
     const oldItemResult = await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id LIMIT 1 FOR UPDATE", [purchaseId]);
     const oldItem = oldItemResult.rows[0];
@@ -22651,7 +22674,7 @@ const updatePurchaseHandler = async (req, res) => {
         UPDATE inventory_batches
         SET product_id = $1, purchase_qty = $2, remaining_qty = $3,
             purchase_rate = $4, effective_cost_per_unit = $4,
-            supplier_id = $5, supplier_name = $6, branch_id = $7,
+            supplier_id = $5, supplier_name = $6, branch_id = COALESCE(branch_id, $7),
             purchase_bill_status = 'BILL_PENDING', temporary_sale_rate = $8,
             lot_name = $10, lot_size = $11, remarks = $12, purchase_date = $13
         WHERE id = $9
@@ -22767,7 +22790,7 @@ const updatePurchaseHandler = async (req, res) => {
       UPDATE inventory_batches
       SET purchase_id = $1, product_id = $2, purchase_qty = $3, remaining_qty = $4,
           purchase_rate = $5, effective_cost_per_unit = $6, supplier_id = $7,
-          supplier_name = $8, branch_id = $9, mandi_tax_amount = $10,
+          supplier_name = $8, branch_id = COALESCE(branch_id, $9), mandi_tax_amount = $10,
           freight_charges = $11, labour_charges = $12, other_charges = $13,
           gross_amount = $14, rebate_amount = $15, net_payable = $16,
           payment_timing = $17, balance_amount = $18, batch_status = 'ACTIVE',
@@ -22829,6 +22852,35 @@ const updatePurchaseHandler = async (req, res) => {
 app.put("/purchase/:id", updatePurchaseHandler);
 app.put("/api/v3/purchases/:id", rateLimitSyncRequest, v3WriteAdapter(updatePurchaseHandler));
 
+/**
+ * Refuses an edit or a bill completion on a purchase that holds more than one item (4 Oct 2026).
+ *
+ * Both handlers were written for one item per purchase: they load the first item and the first lot
+ * and recompute the whole bill's totals from that one line. A bill from the purchase cart holds
+ * one item and one lot per fruit, so editing it rewrote the first fruit (as whichever fruit was
+ * clicked) and set the bill's totals to one line's figures, and completing it priced only the
+ * first fruit, left the others pending for good and under-stated what the supplier is owed.
+ * Until both are rebuilt for several lines, they refuse such a bill and say what to do instead.
+ * Cancelling handles every line and stays allowed.
+ *
+ * @returns {Promise<null | {status: number, body: object}>}
+ */
+const refuseMultiItemPurchaseChange = async (client, purchaseId, action) => {
+  const result = await client.query("SELECT COUNT(*)::INTEGER AS items FROM purchase_items WHERE purchase_id = $1", [purchaseId]);
+  const items = Number(result.rows[0]?.items || 0);
+  if (items <= 1) return null;
+  return {
+    status: 409,
+    body: {
+      code: "PURCHASE_MULTI_ITEM_CHANGE_UNSUPPORTED",
+      items,
+      message: action === "complete"
+        ? `This arrival has ${items} fruits on one bill. Completing a bill with several fruits is not supported yet, so nothing was changed.`
+        : `This bill has ${items} fruits. Editing a bill with several fruits is not supported yet, so nothing was changed. Cancel the bill and enter it again.`,
+    },
+  };
+};
+
 const completePurchaseBillHandler = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -22873,6 +22925,11 @@ const completePurchaseBillHandler = async (req, res) => {
     if (oldPurchase.purchase_bill_status !== "BILL_PENDING") {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Only pending purchase bills can be completed" });
+    }
+    const multiItemRefusal = await refuseMultiItemPurchaseChange(client, purchaseId, "complete");
+    if (multiItemRefusal) {
+      await client.query("ROLLBACK");
+      return res.status(multiItemRefusal.status).json(multiItemRefusal.body);
     }
     const oldItemResult = await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id LIMIT 1 FOR UPDATE", [purchaseId]);
     const oldItem = oldItemResult.rows[0];
@@ -22951,12 +23008,15 @@ const completePurchaseBillHandler = async (req, res) => {
         entry.freightCharges, entry.labourCharges, oldItem.id, entry.lotName, entry.lotSize,
       ]
     );
+    // The lot keeps its own branch (COALESCE below): a lot received at another shop stays there.
+    // Writing the completing counter's branch over it left the lot at one branch's location under
+    // another branch's id, so it showed in neither shop's stock. The edit handler does the same.
     const batchUpdateResult = await client.query(
       `
       UPDATE inventory_batches
       SET product_id = $1, purchase_qty = $2, remaining_qty = $3,
           purchase_rate = $4, effective_cost_per_unit = $5, supplier_id = $6,
-          supplier_name = $7, branch_id = $8, mandi_tax_amount = $9,
+          supplier_name = $7, branch_id = COALESCE(branch_id, $8), mandi_tax_amount = $9,
           freight_charges = $10, labour_charges = $11, other_charges = $12,
           gross_amount = $13, rebate_amount = $14, net_payable = $15,
           payment_timing = $16, balance_amount = $17, purchase_bill_status = 'BILL_COMPLETED',
@@ -23056,28 +23116,37 @@ const cancelPurchaseHandler = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Purchase is already cancelled" });
     }
-    const itemResult = await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id LIMIT 1 FOR UPDATE", [purchaseId]);
-    const item = itemResult.rows[0];
+    // Every item and every lot of the bill (4 Oct 2026). This used to load only the first of each,
+    // so cancelling a bill with several fruits zeroed the first fruit's lot and the whole bill's
+    // balance while the other fruits stayed in stock and on sale with nothing owed for them, and
+    // the "already sold" check looked at the first lot only.
+    const itemResult = await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id FOR UPDATE", [purchaseId]);
+    const items = itemResult.rows;
+    const item = items[0];
     const batchResult = await client.query(
       `
       SELECT *
       FROM inventory_batches
       WHERE purchase_id = $1 OR (purchase_id IS NULL AND batch_no LIKE $2)
       ORDER BY purchase_id NULLS LAST, id
-      LIMIT 1
       FOR UPDATE
       `,
       [purchaseId, `%-${purchaseId}`]
     );
-    const batch = batchResult.rows[0];
+    // A lot written by this bill carries its id. The batch_no match is only for old single-item
+    // purchases whose lot was never given one, and must not sweep in a lot of another purchase.
+    const linkedBatches = batchResult.rows.filter((row) => row.purchase_id !== null && row.purchase_id !== undefined);
+    const batches = linkedBatches.length ? linkedBatches : batchResult.rows.slice(0, 1);
+    const batch = batches[0];
     if (!item || !batch) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Linked purchase inventory not found" });
     }
-    const purchaseQty = Number(batch.purchase_qty || item.quantity || 0);
-    const remainingQty = Number(batch.remaining_qty || 0);
-    const soldQuantity = roundUnitCost(purchaseQty - remainingQty);
-    if (soldQuantity > 0) {
+    const soldLot = batches.find((row) => {
+      const purchaseQty = Number(row.purchase_qty || (batches.length === 1 ? item.quantity : 0) || 0);
+      return roundUnitCost(purchaseQty - Number(row.remaining_qty || 0)) > 0;
+    });
+    if (soldLot) {
       await client.query("ROLLBACK");
       return res.status(409).json({
         message: purchase.purchase_bill_status === "BILL_PENDING"
@@ -23085,7 +23154,7 @@ const cancelPurchaseHandler = async (req, res) => {
           : "This purchase cannot be cancelled because stock from this batch has already been sold.",
       });
     }
-    const oldSnapshot = { purchase, item, batch };
+    const oldSnapshot = { purchase, item, batch, items, batches };
     const updatedPurchase = await client.query(
       `
       UPDATE purchases
@@ -23096,22 +23165,27 @@ const cancelPurchaseHandler = async (req, res) => {
       `,
       [manager.id, reason, purchaseId]
     );
-    const updatedBatch = await client.query(
-      `
-      UPDATE inventory_batches
-      SET remaining_qty = 0, batch_status = 'CANCELLED', purchase_id = $1
-      WHERE id = $2
-      RETURNING *
-      `,
-      [purchaseId, batch.id]
-    );
-    if (remainingQty > 0) {
-      await client.query(
-        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5)",
-        [item.product_id, remainingQty, `Purchase #${purchaseId} cancelled`, manager.id, purchase.branch_id]
+    const updatedBatches = [];
+    for (const lot of batches) {
+      const updatedBatch = await client.query(
+        `
+        UPDATE inventory_batches
+        SET remaining_qty = 0, batch_status = 'CANCELLED', purchase_id = $1
+        WHERE id = $2
+        RETURNING *
+        `,
+        [purchaseId, lot.id]
       );
+      updatedBatches.push(updatedBatch.rows[0]);
+      const remainingQty = Number(lot.remaining_qty || 0);
+      if (remainingQty > 0) {
+        await client.query(
+          "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5)",
+          [lot.product_id || item.product_id, remainingQty, `Purchase #${purchaseId} cancelled`, manager.id, lot.branch_id || purchase.branch_id]
+        );
+      }
     }
-    const newSnapshot = { purchase: updatedPurchase.rows[0], item, batch: updatedBatch.rows[0] };
+    const newSnapshot = { purchase: updatedPurchase.rows[0], item, batch: updatedBatches[0], items, batches: updatedBatches };
     await client.query(
       `
       INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by)
