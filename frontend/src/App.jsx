@@ -191,6 +191,7 @@ import {
   getFrostAvailabilityMessage,
   isCloudUnavailableError,
   preserveVerifiedLocalCollection,
+  preserveVerifiedLocalValue,
 } from "./local/cloudAvailability";
 import {
   describeFrostTransportFailure,
@@ -4764,7 +4765,7 @@ function App() {
           ? { user_id: currentUser?.id, device_id: latestDevice.device_id }
           : path === "/inventory" ? { include_cancelled: true } : undefined,
       }).then((response) => {
-        const value = preserveVerifiedLocalCollection(response.data, fallback);
+        const value = preserveVerifiedLocalValue(response.data, fallback);
         if (value === fallback && response.data !== fallback) {
           writeDiagnosticLog("INFO", "empty-cloud-collection-preserved", { key, url: `${API_URL}${path}`, preservedCount: fallback.length });
         }

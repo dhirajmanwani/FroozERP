@@ -60,3 +60,26 @@ export const preserveVerifiedLocalCollection = (remoteValue, localValue) => {
   }
   return Array.isArray(remoteValue) ? remoteValue : (Array.isArray(localValue) ? localValue : []);
 };
+
+/**
+ * The value to keep from one reference request: a collection, or a single object such as the
+ * `/settings` bundle (4 Oct 2026).
+ *
+ * Every reference request used to go through `preserveVerifiedLocalCollection`, which only knows
+ * arrays, so an object answer came back as `[]`. The whole settings bundle the cloud sent at
+ * sign-in was thrown away, role permissions with it, and a Cashier was left with only the three
+ * screens the app grants by default: Sale Returns and Orders, which the Cashier's `billing`
+ * permission opens, never appeared. Owner and Admin did not notice because they are granted
+ * everything without reading a permission.
+ *
+ * A collection keeps the collection rule. An object answer is taken as sent; when the answer is not
+ * an object, the cached object stays.
+ */
+export const preserveVerifiedLocalValue = (remoteValue, localValue) => {
+  if (Array.isArray(localValue) || Array.isArray(remoteValue)) {
+    return preserveVerifiedLocalCollection(remoteValue, localValue);
+  }
+  const isObject = (value) => value !== null && typeof value === "object";
+  if (isObject(remoteValue)) return remoteValue;
+  return isObject(localValue) ? localValue : {};
+};
