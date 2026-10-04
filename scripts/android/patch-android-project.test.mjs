@@ -183,3 +183,40 @@ test("BuildTask: an unexpected shape is refused, not guessed", async () => {
     /unexpected arguments/,
   );
 });
+
+test("launcher icon: FroozERP's icon replaces the placeholder, stray ic_launcher files go, a second run changes nothing", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { syncLauncherIcons, launcherIconSourceDir } = await import("./patch-android-project.mjs");
+  const resDir = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-res-"));
+  fs.mkdirSync(path.join(resDir, "mipmap-hdpi"), { recursive: true });
+  fs.writeFileSync(path.join(resDir, "mipmap-hdpi", "ic_launcher.png"), "tauri placeholder");
+  fs.writeFileSync(path.join(resDir, "mipmap-hdpi", "ic_launcher.webp"), "duplicate");
+  fs.mkdirSync(path.join(resDir, "values"), { recursive: true });
+  fs.writeFileSync(path.join(resDir, "values", "strings.xml"), "<resources/>");
+  const first = syncLauncherIcons({ resDir });
+  assert.ok(first.length > 0);
+  assert.ok(!fs.existsSync(path.join(resDir, "mipmap-hdpi", "ic_launcher.webp")), "a second hdpi ic_launcher would be a duplicate resource");
+  assert.ok(fs.readFileSync(path.join(resDir, "mipmap-hdpi", "ic_launcher.png"))
+    .equals(fs.readFileSync(path.join(launcherIconSourceDir, "mipmap-hdpi", "ic_launcher.png"))));
+  assert.equal(fs.readFileSync(path.join(resDir, "values", "strings.xml"), "utf8"), "<resources/>", "other resources are left alone");
+  assert.match(fs.readFileSync(path.join(resDir, "values", "ic_launcher_background.xml"), "utf8"), /#0a2d1c/);
+  assert.deepEqual(syncLauncherIcons({ resDir }), []);
+  fs.rmSync(resDir, { recursive: true, force: true });
+});
+
+test("launcher icon: every density has the square, round and adaptive foreground icon at the right size", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { launcherIconSourceDir } = await import("./patch-android-project.mjs");
+  for (const [density, factor] of [["mdpi", 1], ["hdpi", 1.5], ["xhdpi", 2], ["xxhdpi", 3], ["xxxhdpi", 4]]) {
+    for (const [name, dp] of [["ic_launcher.png", 48], ["ic_launcher_round.png", 48], ["ic_launcher_foreground.png", 108]]) {
+      const png = fs.readFileSync(path.join(launcherIconSourceDir, `mipmap-${density}`, name));
+      assert.equal(png.readUInt32BE(16), Math.round(dp * factor), `${density}/${name}`);
+    }
+  }
+  const adaptive = fs.readFileSync(path.join(launcherIconSourceDir, "mipmap-anydpi-v26", "ic_launcher_round.xml"), "utf8");
+  assert.match(adaptive, /@mipmap\/ic_launcher_foreground/);
+  assert.match(adaptive, /@color\/ic_launcher_background/);
+});

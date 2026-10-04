@@ -184,6 +184,48 @@ export function findBuildTask(projectDir = androidProjectDir) {
   throw new PatchError(`BuildTask.kt not found under ${path.relative(repoRoot, root)}. Run \`tauri android init --ci\` first.`);
 }
 
+// 3. FroozERP's launcher icon, not Tauri's placeholder.
+//    `tauri android init` writes Tauri's own icon into res/, and the project is regenerated on every
+//    CI run, so the phone showed a different icon from the desktop app. The resources rendered by
+//    tools/build-android-icons.mjs live in src-tauri/icons/android/ and are copied over the
+//    placeholders here. Any other ic_launcher* file left in a mipmap folder (a .webp from a newer
+//    template, say) is removed, or Android's resource merger would see the same icon twice.
+export const launcherIconSourceDir = path.join(repoRoot, "src-tauri", "icons", "android");
+export const androidResDir = path.join(androidProjectDir, "app", "src", "main", "res");
+
+const listFiles = (dir, prefix = "") => {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory()
+    ? listFiles(path.join(dir, entry.name), path.join(prefix, entry.name))
+    : [path.join(prefix, entry.name)]));
+};
+
+/** Copies the committed launcher icon into a res/ folder. Returns the files it wrote or removed. */
+export function syncLauncherIcons({ sourceDir = launcherIconSourceDir, resDir = androidResDir } = {}) {
+  const wanted = listFiles(sourceDir);
+  if (!wanted.some((file) => file.endsWith(path.join("mipmap-anydpi-v26", "ic_launcher.xml")))) {
+    throw new PatchError(`launcher icon resources are missing from ${sourceDir}; run node tools/build-android-icons.mjs`);
+  }
+  const wantedSet = new Set(wanted);
+  const changed = [];
+  for (const file of listFiles(resDir)) {
+    const [folder, name] = [path.dirname(file), path.basename(file)];
+    if (folder.startsWith("mipmap") && /^ic_launcher/.test(name) && !wantedSet.has(file)) {
+      fs.rmSync(path.join(resDir, file));
+      changed.push(path.join(resDir, file));
+    }
+  }
+  for (const file of wanted) {
+    const from = fs.readFileSync(path.join(sourceDir, file));
+    const to = path.join(resDir, file);
+    if (fs.existsSync(to) && fs.readFileSync(to).equals(from)) continue;
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.writeFileSync(to, from);
+    changed.push(to);
+  }
+  return changed;
+}
+
 function readRequired(file, what) {
   if (!fs.existsSync(file)) {
     throw new PatchError(
@@ -226,6 +268,7 @@ export function patchProject({ allowDevCleartext = false, log = console.log } = 
     fs.writeFileSync(buildTaskPath, nextBuildTask);
     changed.push(buildTaskPath);
   }
+  changed.push(...syncLauncherIcons());
 
   // Post-conditions, re-read from disk.
   const finalManifest = fs.readFileSync(manifestPath, "utf8");
@@ -245,6 +288,7 @@ export function patchProject({ allowDevCleartext = false, log = console.log } = 
   } else {
     log("Android project already patched; nothing to do.");
   }
+  log(`launcher icon: FroozERP (src-tauri/icons/android)`);
   log(`backup + device transfer: disabled; debug cleartext: ${allowDevCleartext ? "ALLOWED (dev only)" : "blocked"}; release cleartext: blocked`);
   return changed;
 }
