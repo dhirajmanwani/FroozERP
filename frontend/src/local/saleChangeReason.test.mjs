@@ -151,8 +151,14 @@ test("every contract error code has its own plain line that says nothing was sav
 });
 
 test("unknown errors and network failures still say nothing was saved", () => {
-  assert.equal(describeApprovalError(axiosError(500, { code: "SOMETHING_ELSE", message: "boom" })), SALE_CHANGE_APPROVAL_GENERIC_MESSAGE);
-  assert.equal(describeApprovalError({ code: "APPROVAL_NOT_NEEDED" }), SALE_CHANGE_APPROVAL_GENERIC_MESSAGE);
+  assert.equal(
+    describeApprovalError(axiosError(500, { code: "SOMETHING_ELSE", message: "boom" })),
+    "The approval could not be completed. The server said: boom. (SOMETHING_ELSE, HTTP 500) Nothing was saved.",
+  );
+  assert.equal(
+    describeApprovalError({ code: "APPROVAL_NOT_NEEDED" }),
+    "The approval could not be completed. (APPROVAL_NOT_NEEDED) Nothing was saved.",
+  );
   assert.equal(describeApprovalError(null), SALE_CHANGE_APPROVAL_GENERIC_MESSAGE);
   assert.equal(describeApprovalError("oops"), SALE_CHANGE_APPROVAL_GENERIC_MESSAGE);
   assert.equal(describeApprovalError(new Error("x")), SALE_CHANGE_APPROVAL_GENERIC_MESSAGE);
@@ -169,4 +175,20 @@ test("the error code is read from axios or plain shapes", () => {
   assert.equal(approvalErrorCode({ code: "PASSWORD_RESET_REQUIRED" }), "PASSWORD_RESET_REQUIRED");
   assert.equal(approvalErrorCode(undefined), "");
   assert.equal(approvalErrorCode(axiosError(400, "not json")), "");
+});
+
+test("an unknown refusal says what the server said, so the counter can report it (4 Oct 2026)", () => {
+  // An older server that does not know the "return" action answers this.
+  const line = describeApprovalError(axiosError(400, {
+    code: "APPROVAL_REQUEST_INVALID",
+    message: "Say whether the bill is being cancelled, edited or returned, or a discount approved.",
+  }));
+  assert.match(line, /^The approval could not be completed\. The server said: Say whether .* approved\. \(APPROVAL_REQUEST_INVALID, HTTP 400\) Nothing was saved\.$/);
+  assert.doesNotMatch(line, /\.\./);
+  // A message that names a repository script is still turned into plain words.
+  const scoped = describeApprovalError(axiosError(403, { code: "X", message: "Run scripts/bootstrap-first-counter.mjs first." }));
+  assert.match(scoped, /Ask the maintainer to set up the first counter/);
+  assert.doesNotMatch(scoped, /scripts\//);
+  // No code and no words: the bare line, as before.
+  assert.equal(describeApprovalError(axiosError(500, {})), "The approval could not be completed. (HTTP 500) Nothing was saved.");
 });

@@ -22,6 +22,8 @@
  *    that went through.
  */
 
+import { plainServerMessage } from "./plainServerMessage.js";
+
 export const SALE_CHANGE_REASON_CODE = Object.freeze({
   WRONG_ITEM_OR_RATE: "WRONG_ITEM_OR_RATE",
   CUSTOMER_REFUSED: "CUSTOMER_REFUSED",
@@ -145,13 +147,26 @@ export const approvalErrorCode = (error) => {
 /**
  * One plain line for a failed approval or a refused cancel/edit. Always ends by saying nothing was
  * saved. Known server codes get their own sentence; a request that never reached the server says
- * so; anything else gets a generic line. The server's own wording is not shown for known codes, so
- * a stray technical message cannot reach the counter screen.
+ * so. The server's own wording is not shown for known codes, so a stray technical message cannot
+ * reach the counter screen.
+ *
+ * Anything else used to get the bare generic line, which told nobody what went wrong: on 4 Oct 2026
+ * a Cashier's return with the Owner's correct password said only "The approval could not be
+ * completed", and the cause could not be read from the screen. An unknown refusal now carries the
+ * server's own reason and code after the generic line, so the counter can report it.
  */
 export const describeApprovalError = (error) => {
   const code = approvalErrorCode(error);
   if (code && Object.prototype.hasOwnProperty.call(APPROVAL_ERROR_MESSAGES, code)) return APPROVAL_ERROR_MESSAGES[code];
   const isAxiosLike = error && typeof error === "object" && ("isAxiosError" in error || "request" in error);
   if (isAxiosLike && !error.response) return SALE_CHANGE_APPROVAL_UNREACHABLE_MESSAGE;
-  return SALE_CHANGE_APPROVAL_GENERIC_MESSAGE;
+  const status = error && typeof error === "object" ? Number(error.response?.status) : Number.NaN;
+  const serverMessage = error && typeof error === "object"
+    ? text(plainServerMessage(text(error.response?.data?.message) || text(error.data?.message)))
+    : "";
+  const detail = [
+    serverMessage ? `The server said: ${serverMessage.replace(/[.!?]+$/, "")}.` : "",
+    code || Number.isFinite(status) ? `(${[code, Number.isFinite(status) ? `HTTP ${status}` : ""].filter(Boolean).join(", ")})` : "",
+  ].filter(Boolean).join(" ");
+  return detail ? `The approval could not be completed. ${detail} ${NOT_SAVED}` : SALE_CHANGE_APPROVAL_GENERIC_MESSAGE;
 };
