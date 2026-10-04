@@ -6,7 +6,9 @@ import {
   getFrostAvailabilityMessage,
   isCloudUnavailableError,
   preserveVerifiedLocalCollection,
+  preserveVerifiedLocalValue,
 } from "./cloudAvailability.js";
+import { readFileSync } from "node:fs";
 
 test("local backend and cloud connectivity remain independent", () => {
   assert.deepEqual(deriveRuntimeConnectivity({
@@ -55,4 +57,32 @@ test("empty optional cloud collections never replace verified local business dat
   assert.equal(preserveVerifiedLocalCollection(undefined, localProducts), localProducts);
   assert.deepEqual(preserveVerifiedLocalCollection([{ id: 2 }], localProducts), [{ id: 2 }]);
   assert.deepEqual(preserveVerifiedLocalCollection([], []), []);
+});
+
+test("an object answer such as the settings bundle is kept, not turned into []", () => {
+  const cloudSettings = { roles: [{ role_name: "Cashier", permissions: { billing: true } }], businessSettings: { shop_name: "A" } };
+  assert.equal(preserveVerifiedLocalValue(cloudSettings, {}), cloudSettings);
+  assert.equal(preserveVerifiedLocalValue(cloudSettings, { roles: [] }), cloudSettings);
+  const cached = { roles: [{ role_name: "Cashier" }] };
+  assert.equal(preserveVerifiedLocalValue(undefined, cached), cached, "no usable answer keeps the cached object");
+  assert.equal(preserveVerifiedLocalValue("", cached), cached);
+  assert.deepEqual(preserveVerifiedLocalValue(null, undefined), {});
+});
+
+test("collections keep the collection rule", () => {
+  const local = [{ id: 1 }];
+  assert.equal(preserveVerifiedLocalValue([], local), local);
+  assert.equal(preserveVerifiedLocalValue({ message: "x" }, local), local);
+  assert.deepEqual(preserveVerifiedLocalValue([{ id: 2 }], local), [{ id: 2 }]);
+  assert.deepEqual(preserveVerifiedLocalValue([{ id: 2 }], {}), [{ id: 2 }]);
+});
+
+test("the sign-in reference requests use the object-aware rule, so role permissions arrive", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf("const fetchOnlineReferenceSnapshot = async");
+  const body = app.slice(start, app.indexOf("const settingsPayload = values.settings", start));
+  assert.ok(start > 0 && body.length > 0);
+  assert.match(body, /\["settings", "\/settings", localBundle\]/);
+  assert.match(body, /preserveVerifiedLocalValue\(response\.data, fallback\)/);
+  assert.doesNotMatch(body, /preserveVerifiedLocalCollection\(response\.data/);
 });
