@@ -27828,8 +27828,17 @@ function SummaryMetric({ featured = false, label, positive = false, value }) {
 // vanishes once the box loses focus or a sign-in is refused, and only comes back after the whole
 // password is deleted -- so the cashier retyped it blind. This eye is always there, keeps what was
 // typed, and is hidden from Tab so Enter still goes from the password straight to sign-in.
+// Pressing it shows the password for PASSWORD_REVEAL_MS only, then it hides itself again, so a
+// password is never left readable on a counter screen.
+const PASSWORD_REVEAL_MS = 5000;
+
 function PasswordInput(props) {
   const [shown, setShown] = useState(false);
+  useEffect(() => {
+    if (!shown) return undefined;
+    const timer = setTimeout(() => setShown(false), PASSWORD_REVEAL_MS);
+    return () => clearTimeout(timer);
+  }, [shown]);
   return (
     <span className="password-field">
       <input {...props} type={shown ? "text" : "password"} />
