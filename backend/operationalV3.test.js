@@ -7,8 +7,10 @@ const {
   canManageAssignments,
   canUseConsolidatedReports,
   nextTransferStatus,
+  positiveId,
   readSupplierMasterPayload,
   registerOperationalV3Routes,
+  resolveEntityReference,
   supplierReferencePayload,
   validateAssignmentPreview,
   validatePaymentAllocation,
@@ -490,4 +492,333 @@ test("assignment preview separates target scope from authenticated caller scope"
   );
   assert.equal(preview.subject.device_id, "DEVICE-2");
   assert.equal(preview.reassignment_allowed, true);
+});
+
+test("an APPROVED_RESERVED consignment can be cancelled, and nothing past dispatch can", () => {
+  // Sales and waste do not consult reservations, so held crates can be sold before dispatch. Without
+  // this transition the consignment would refuse dispatch (TRANSFER_STOCK_CHANGED) forever.
+  assert.equal(nextTransferStatus("APPROVED_RESERVED", "cancel"), "CANCELLED");
+  assert.equal(nextTransferStatus("DRAFT", "cancel"), "CANCELLED");
+  for (const status of ["DISPATCHED_IN_TRANSIT", "PARTIALLY_RECEIVED", "RECEIVED", "RETURN_IN_TRANSIT"]) {
+    assert.equal(nextTransferStatus(status, "cancel"), null, `${status} must not be cancellable`);
+  }
+});
+
+test("positiveId accepts only a plain number, never the leading digits of something else", () => {
+  assert.equal(positiveId(7), 7);
+  assert.equal(positiveId("7"), 7);
+  assert.equal(positiveId(" 42 "), 42);
+  // The bug: parseInt read `7e1c...` as 7, and a transfer action landed on transfer #7.
+  assert.equal(positiveId("7e1c2a90-5b1d-4c3e-9f00-1a2b3c4d5e6f"), null);
+  assert.equal(positiveId("12abc"), null);
+  assert.equal(positiveId("12.5"), null);
+  assert.equal(positiveId(12.5), null);
+  assert.equal(positiveId("1e3"), null);
+  // Leading zeros are an opaque id, not a number: "004" and 4 are different entities.
+  assert.equal(positiveId("004"), null);
+  assert.equal(positiveId("product-12"), null);
+  assert.equal(positiveId(0), null);
+  assert.equal(positiveId("-3"), null);
+  assert.equal(positiveId(""), null);
+  assert.equal(positiveId(null), null);
+});
+
+test("a product or lot reference resolves by global id, then by its alias, within the company", async () => {
+  const calls = [];
+  const client = {
+    query: async (sql, params) => {
+      calls.push({ sql: sql.replace(/\s+/g, " ").trim(), params });
+      if (sql.includes("WHERE global_id = $1")) {
+        return { rows: params[0] === "4d0c-uuid" && params[1] === 1 ? [{ id: 42 }] : [] };
+      }
+      if (sql.includes("global_id IS NULL")) return { rows: params[0] === 12 && params[1] === 1 ? [{ id: 12 }] : [] };
+      return { rows: [] };
+    },
+  };
+  assert.equal(await resolveEntityReference(client, "lot", 70, 1), 70);
+  assert.equal(calls.length, 0, "a plain numeric id needs no lookup");
+  assert.equal(await resolveEntityReference(client, "lot", "4d0c-uuid", 1), 42);
+  assert.equal(await resolveEntityReference(client, "lot", "4d0c-uuid", 2), null, "another company's lot is not found");
+  assert.equal(await resolveEntityReference(client, "product", "product-12", 1), 12);
+  // The alias of one table does not resolve against the other.
+  assert.equal(await resolveEntityReference(client, "lot", "product-12", 1), null);
+  assert.equal(await resolveEntityReference(client, "product", "", 1), null);
+  assert.ok(calls.every((entry) => entry.params[1] === 1 || entry.params[1] === 2), "every lookup is company-scoped");
+  assert.ok(calls.some((entry) => entry.sql.startsWith("SELECT id FROM inventory_batches WHERE global_id")));
+  assert.ok(calls.some((entry) => entry.sql.startsWith("SELECT id FROM products WHERE id = $1 AND company_id = $2 AND global_id IS NULL")));
+});
+
+/**
+ * The transfer routes over a stub client that knows one transfer and answers by id or global id.
+ */
+const transferRouteHarness = ({ transfers = [], context = ownerContext, extra = () => null } = {}) => {
+  const routes = [];
+  const app = {};
+  for (const method of ["get", "post", "put", "delete"]) {
+    app[method] = (path, ...handlers) => routes.push({ method, path, handler: handlers.at(-1) });
+  }
+  const calls = [];
+  const client = {
+    query: async (text, params = []) => {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      calls.push({ sql, params });
+      const answer = extra(sql, params);
+      if (answer) return answer;
+      if (sql.includes("FROM inventory_transfer_events")) return { rows: [] };
+      if (sql.startsWith("SELECT * FROM inventory_transfers WHERE global_id")) {
+        return { rows: transfers.filter((row) => row.global_id === params[0] && row.company_id === params[1]) };
+      }
+      if (sql.startsWith("SELECT * FROM inventory_transfers WHERE id")) {
+        return { rows: transfers.filter((row) => row.id === params[0] && row.company_id === params[1]) };
+      }
+      if (sql.startsWith("UPDATE inventory_transfers")) {
+        const row = transfers.find((entry) => entry.id === params[0]);
+        return { rows: row ? [{ ...row, status: params[1] }] : [] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  registerOperationalV3Routes({
+    app,
+    database: { connect: async () => client, query: async (sql, params) => client.query(sql, params) },
+    resolveContext: async () => ({ context }),
+    sendScopeError: () => {
+      throw new Error("unexpected");
+    },
+    authorizePermission: async () => ({ id: 1, role_name: "Owner" }),
+  });
+  const find = (method, path) => routes.find((entry) => entry.method === method && entry.path === path);
+  return {
+    calls,
+    async act(transferId, action, body = {}) {
+      const route = find("post", "/api/v3/transfers/:transferId/actions/:action");
+      const res = fakeResponse();
+      await route.handler({
+        method: "POST",
+        path: route.path,
+        params: { transferId, action },
+        query: {},
+        body: { idempotency_key: `act-${transferId}-${action}`, ...body },
+      }, res);
+      return res;
+    },
+    async create(body) {
+      const route = find("post", "/api/v3/transfers");
+      const res = fakeResponse();
+      await route.handler({ method: "POST", path: route.path, query: {}, body }, res);
+      return res;
+    },
+  };
+};
+
+const transferRow = (overrides = {}) => ({
+  id: 55,
+  global_id: "7e1c2a90-5b1d-4c3e-9f00-1a2b3c4d5e6f",
+  company_id: 1,
+  source_branch_id: 1,
+  source_operational_location_id: 10,
+  destination_branch_id: 2,
+  destination_operational_location_id: 20,
+  status: "DRAFT",
+  state_version: 1,
+  transfer_number: "TR-55",
+  ...overrides,
+});
+
+const quietly = async (work) => {
+  const consoleError = console.error;
+  console.error = () => {};
+  try {
+    return await work();
+  } finally {
+    console.error = consoleError;
+  }
+};
+
+test("a transfer action addressed by a uuid starting with a digit acts on that transfer, not transfer #7", async () => {
+  const target = transferRow();
+  const bystander = transferRow({ id: 7, global_id: "other-transfer", transfer_number: "TR-7" });
+  const harness = transferRouteHarness({ transfers: [target, bystander] });
+
+  const res = await harness.act(target.global_id, "cancel");
+  assert.equal(res.statusCode, 200, JSON.stringify(res.payload));
+  assert.equal(res.payload.transfer.id, 55);
+  assert.equal(res.payload.transfer.status, "CANCELLED");
+
+  const lookup = harness.calls.find((entry) => entry.sql.includes("FROM inventory_transfers WHERE"));
+  assert.match(lookup.sql, /WHERE global_id = \$1 AND company_id = \$2/);
+  assert.deepEqual(lookup.params, [target.global_id, 1]);
+  assert.equal(
+    harness.calls.some((entry) => entry.params.includes(7)),
+    false,
+    "nothing may be addressed to transfer #7",
+  );
+  const update = harness.calls.find((entry) => entry.sql.startsWith("UPDATE inventory_transfers"));
+  assert.equal(update.params[0], 55);
+  const event = harness.calls.find((entry) => entry.sql.startsWith("INSERT INTO inventory_transfer_events"));
+  assert.equal(event.params[0], 55);
+});
+
+test("an unknown uuid is not found, even when a transfer with its leading digits exists", async () => {
+  const harness = transferRouteHarness({ transfers: [transferRow({ id: 7, global_id: "other-transfer" })] });
+  const res = await quietly(() => harness.act("7e1c0000-0000-4000-8000-000000000000", "cancel"));
+  assert.equal(res.statusCode, 404);
+  assert.equal(res.payload.code, "TRANSFER_NOT_FOUND");
+  assert.equal(harness.calls.some((entry) => entry.sql.startsWith("UPDATE")), false);
+});
+
+test("a plain numeric transfer id still addresses the transfer by id, within the company", async () => {
+  const harness = transferRouteHarness({ transfers: [transferRow()] });
+  const res = await harness.act("55", "submit");
+  assert.equal(res.statusCode, 200, JSON.stringify(res.payload));
+  const lookup = harness.calls.find((entry) => entry.sql.includes("FROM inventory_transfers WHERE"));
+  assert.match(lookup.sql, /WHERE id = \$1 AND company_id = \$2/);
+  assert.deepEqual(lookup.params, [55, 1]);
+});
+
+test("the sending counter may cancel a draft, and the receiving counter may not", async () => {
+  const source = transferRouteHarness({ transfers: [transferRow()] });
+  const allowed = await source.act("55", "cancel");
+  assert.equal(allowed.statusCode, 200, JSON.stringify(allowed.payload));
+  assert.equal(allowed.payload.transfer.status, "CANCELLED");
+
+  const destination = transferRouteHarness({
+    transfers: [transferRow()],
+    context: { ...ownerContext, operational_location_id: 20 },
+  });
+  const refused = await quietly(() => destination.act("55", "cancel"));
+  assert.equal(refused.statusCode, 403);
+  assert.equal(refused.payload.code, "TRANSFER_ACTION_SCOPE_REJECTED");
+});
+
+test("cancelling an approved consignment releases the stock approval held", async () => {
+  const harness = transferRouteHarness({ transfers: [transferRow({ status: "APPROVED_RESERVED" })] });
+  const res = await harness.act("55", "cancel");
+  assert.equal(res.statusCode, 200, JSON.stringify(res.payload));
+  assert.equal(res.payload.transfer.status, "CANCELLED");
+  const release = harness.calls.find((entry) => entry.sql.startsWith("UPDATE stock_reservations"));
+  assert.ok(release, "the reservations must be released");
+  assert.match(release.sql, /SET status = 'RELEASED'/);
+  assert.match(release.sql, /ti\.transfer_id = \$1 AND sr\.status = 'ACTIVE'/);
+  assert.deepEqual(release.params, [55]);
+  // Releasing must happen before the status moves, inside the same transaction.
+  const order = harness.calls.map((entry) => entry.sql);
+  assert.ok(order.findIndex((sql) => sql.startsWith("UPDATE stock_reservations")) <
+    order.findIndex((sql) => sql.startsWith("UPDATE inventory_transfers")));
+  assert.ok(order.includes("COMMIT"));
+});
+
+test("a dispatched consignment cannot be cancelled", async () => {
+  const harness = transferRouteHarness({ transfers: [transferRow({ status: "DISPATCHED_IN_TRANSIT" })] });
+  const res = await quietly(() => harness.act("55", "cancel"));
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.payload.code, "INVALID_TRANSFER_TRANSITION");
+  assert.equal(harness.calls.some((entry) => entry.sql.startsWith("UPDATE stock_reservations")), false);
+});
+
+test("creating a consignment resolves the desktop's snapshot ids for product and lot", async () => {
+  const lotUuid = "4d0c9e1a-0000-4000-8000-000000000042";
+  const harness = transferRouteHarness({
+    extra: (sql, params) => {
+      if (sql.includes("FROM operational_locations")) return { rows: [{ id: 20, branch_id: 2, active: true }] };
+      if (sql.startsWith("INSERT INTO inventory_transfers")) return { rows: [{ id: 60 }] };
+      if (sql.startsWith("SELECT id FROM products WHERE global_id")) return { rows: [] };
+      if (sql.startsWith("SELECT id FROM products WHERE id")) {
+        return { rows: params[0] === 12 && params[1] === 1 ? [{ id: 12 }] : [] };
+      }
+      if (sql.startsWith("SELECT id FROM inventory_batches WHERE global_id")) {
+        return { rows: params[0] === lotUuid && params[1] === 1 ? [{ id: 42 }] : [] };
+      }
+      if (sql.includes("FROM inventory_batches ib")) return { rows: [{ id: 42, product_id: 12, available: "5" }] };
+      return null;
+    },
+  });
+  const res = await harness.create({
+    idempotency_key: "create-snapshot-ids",
+    initiation_mode: "SOURCE_INITIATED",
+    destination_branch_id: 2,
+    destination_operational_location_id: 20,
+    items: [{ product_id: "product-12", source_lot_id: lotUuid, requested_quantity: 3 }],
+  });
+  assert.equal(res.statusCode, 201, JSON.stringify(res.payload));
+  const availability = harness.calls.find((entry) => entry.sql.includes("FROM inventory_batches ib"));
+  assert.deepEqual(availability.params, [42, 12, 1, 1, 10]);
+  const line = harness.calls.find((entry) => entry.sql.startsWith("INSERT INTO inventory_transfer_items"));
+  assert.deepEqual(line.params, [60, 12, 42, 3]);
+});
+
+test("a consignment line naming an unknown product or lot is refused, not guessed", async () => {
+  const unknownEverything = (sql) => {
+    if (sql.includes("FROM operational_locations")) return { rows: [{ id: 20, branch_id: 2, active: true }] };
+    if (sql.startsWith("INSERT INTO inventory_transfers")) return { rows: [{ id: 60 }] };
+    if (sql.startsWith("SELECT id FROM")) return { rows: [] };
+    return null;
+  };
+  const base = {
+    initiation_mode: "SOURCE_INITIATED",
+    destination_branch_id: 2,
+    destination_operational_location_id: 20,
+  };
+
+  const badProduct = transferRouteHarness({ extra: unknownEverything });
+  const productRes = await quietly(() => badProduct.create({
+    ...base,
+    idempotency_key: "create-bad-product",
+    items: [{ product_id: "12-not-a-product", source_lot_id: 42, requested_quantity: 1 }],
+  }));
+  assert.equal(productRes.statusCode, 400);
+  assert.equal(productRes.payload.code, "INVALID_TRANSFER_ITEM");
+  assert.equal(
+    badProduct.calls.some((entry) => entry.sql.startsWith("SELECT id FROM products WHERE id")),
+    false,
+    "a reference that is not the product-<n> alias is never parsed for digits",
+  );
+
+  const badLot = transferRouteHarness({
+    extra: (sql, params) => (sql.startsWith("SELECT id FROM products WHERE global_id")
+      ? { rows: [{ id: 12 }] }
+      : unknownEverything(sql, params)),
+  });
+  const lotRes = await quietly(() => badLot.create({
+    ...base,
+    idempotency_key: "create-bad-lot",
+    items: [{ product_id: "product-uuid", source_lot_id: "9f-gone", requested_quantity: 1 }],
+  }));
+  assert.equal(lotRes.statusCode, 409);
+  assert.equal(lotRes.payload.code, "TRANSFER_STOCK_UNAVAILABLE");
+  assert.equal(badLot.calls.some((entry) => entry.sql.startsWith("INSERT INTO inventory_transfer_items")), false);
+  assert.ok(badLot.calls.some((entry) => entry.sql === "ROLLBACK"));
+});
+
+test("receiving compares quantities at three decimals, not on raw floats", async () => {
+  // 0.3 dispatched, 0.1 already in: 0.3 - 0.1 is 0.19999999999999998 in floating point, which made a
+  // receipt of the remaining 0.2 read as "more than is in transit".
+  const statements = [];
+  const client = {
+    query: async (text, params) => {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      statements.push({ sql, params });
+      if (sql.includes("COUNT(*)") && sql.includes("source_lot_id IS NULL")) return { rows: [{ pending: 0 }] };
+      if (sql.includes("FROM inventory_transfer_items ti")) {
+        return {
+          rows: [{
+            id: 50, source_lot_id: 70, product_id: 276, requested_quantity: "0.3",
+            dispatched_quantity: "0.3", received_quantity: "0.1", rejected_quantity: "0",
+            damaged_quantity: "0", short_quantity: "0", destination_lot_id: 81,
+          }],
+        };
+      }
+      return { rows: [{ id: 1 }] };
+    },
+  };
+  await applyTransferStockEffect(
+    client,
+    transferRow({ status: "PARTIALLY_RECEIVED" }),
+    "receive",
+    { items: [{ item_id: 50, received_quantity: 0.2 }] },
+    ownerContext,
+    "receive-float",
+  );
+  assert.ok(statements.some((entry) => entry.sql.includes("received_quantity = received_quantity + $2")));
 });

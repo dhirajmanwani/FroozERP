@@ -1939,7 +1939,9 @@ so it is recorded here next to `/login`.
   `APPROVAL_REQUEST_INVALID` 400, `APPROVAL_NOT_NEEDED` 400, `APPROVER_CREDENTIALS_INVALID` 401,
   `PASSWORD_RESET_REQUIRED` 401, `APPROVER_NOT_ALLOWED` 403, `REQUESTER_NOT_ALLOWED` 403,
   `APPROVAL_ATTEMPTS_LOCKED` 429.
-- **`sale_change_approvals`** holds one row per attempt: ISSUED (7-day expiry), CONSUMED, or FAILED.
+- **`sale_change_approvals`** holds one row per attempt: ISSUED (15-minute expiry for cancel/edit/return
+  since 2026-10-07, 7 days from the grant for a cancel/edit arriving by sync push, 7 days for a
+  discount -- see the record at the end), CONSUMED, or FAILED.
   The id is a random UUID made in Node.
 - **`authorizeSaleChange`** is the one enforcement helper, called by all four bill-change paths
   (`updateSaleHandler`, `cancelSaleHandler`, `processPosSaleEditOperation`,
@@ -2097,3 +2099,96 @@ Still open:
   as the cashier's (`impliedManualBillDiscount`). Still unchecked by design: a *desktop* bill synced
   without the field (an older desktop build) -- its bill discount is recorded as billed with the
   per-line check only, since the device could not have had a bill-discount box.
+
+## Who manages whom, and the permission keys nobody read (2026-10-07)
+
+A review found that "Owner or Admin" had been treated as one role on every account-management
+route, that several role-screen toggles gated nothing, and that four smaller holes sat beside them.
+All fixed in `backend/server.js`, `backend/authMiddleware.js` and `backend/saleChangeApproval.js`.
+No schema change.
+
+### Admin could take the business over (critical)
+
+`PUT /users/:id/password` checked only Owner-or-Admin; `POST /users` and `PUT /users/:id` took the
+role from the body; deactivate, reactivate, delete and `recovery-action` checked role alone. An Admin
+could create an Owner, promote themselves, reset the Owner's password or deactivate the Owner, in any
+shop. Now one rule, `userManagementRefusal`, is applied by every user-management write (and by the
+manager half of `requireSelfOrRateManager`, which the recovery-contact routes use):
+
+- an account that **is** Owner/Admin, or **would become** one, is managed by the Owner only
+  (403 `OWNER_REQUIRED_FOR_PRIVILEGED_ACCOUNT`) -- so an Admin cannot edit their own row either;
+- anyone else manages only users whose `branch_id` is the session's branch (403
+  `USER_NOT_IN_YOUR_BRANCH`). The actor's role is re-read from the database; the branch is
+  `req.auth.branchId`.
+
+`PUT /settings/role-permissions/:roleName` for Owner or Admin (compared normalised) is Owner-only
+(403 `OWNER_REQUIRED_FOR_PRIVILEGED_ROLE`).
+
+**Changing your own password now needs `current_password`** (`PUT /users/:id/password`, self path,
+manager or not): 400 `CURRENT_PASSWORD_REQUIRED`, 403 `CURRENT_PASSWORD_INVALID` (403, not 401, so
+the client does not read it as signed out), 423 `USER_LOCKED`. A wrong one counts towards the same
+`failed_login_attempts` / `locked_until` as `/login`, so it is not a second unlimited guessing place.
+Resetting someone else's password is unchanged apart from the rule above.
+
+### Permission keys now read
+
+`getStaffPermissionUser(userId, key)` is `getPermissionUser` with Owner **and Admin** always passing
+(the client treats both as all-modules). Used for:
+
+| Route | Key |
+| --- | --- |
+| `createSaleHandler` (`POST /api/v3/sales`, browser checkout) | `billing` -- 403 `BILLING_PERMISSION_REQUIRED`. Sync (`processPosSaleFoundationOperation`) is untouched and never refuses. |
+| `createPurchaseBillHandler` (`POST /api/v3/purchase-bills`) | `purchases` -- 403 `PURCHASE_PERMISSION_REQUIRED` |
+| `GET /reports/summary`, `/balance-sheet`, `/balance-sheet/details/:lineKey`, `/cash-book`, `/day-book`, `/sales-report/changes` | `reports` -- 403 `REPORTS_PERMISSION_REQUIRED` |
+| `PUT /settings/devices/:deviceId` | `device_management`; below the Owner, own shop's devices only, and no moving one to another shop |
+| `POST /settings/counters` | `branch_settings`; branch must be in the session's company (the `|| 1` fallback is gone) |
+| `PUT /settings/backup`, `POST /settings/backup-now`, `POST /settings/safe-shutdown` | `backup_restore` |
+| `GET /settings/system-info` | `system_info` |
+
+### Devices and activation
+
+- `POST /settings/activation-codes` answers **426** -- issuing one-time codes is retired (its screen
+  was not mounted; devices are approved through protocol-v3 approval or an Owner-issued activation
+  file). Revoke is Owner-only and limited to codes for this company's shops.
+- `POST /devices/activate` honours an outstanding code only if its creator is an active Owner today
+  and its branch belongs to a company.
+- `approveDevice` never approves a RETIRED, DISABLED or REVOKED device (one physical device = one id
+  forever). It returns the row unchanged, so `/login` answers DEVICE_DISABLED / DEVICE_REVOKED,
+  `/devices/activate` rolls back with 403 `DEVICE_DISABLED` without spending the code, and the
+  first-owner bootstrap answers 403.
+- `POST /settings/branches` is Owner-only and writes `company_id` from the session (it inserted NULL).
+- `getSettingsBundle` returns devices, activation codes, branches, counters and exit attempts for
+  `req.auth.companyId` only. A device is placed by `COALESCE(device.company_id, assigned branch's
+  company_id)` because registration does not write `company_id`; a PENDING device with neither is
+  no longer listed to anyone.
+
+### Smaller ones
+
+- **View-only gate:** `requireAuth` lets exactly `POST /api/owner/view-branch` through a view-only
+  session (`VIEW_ONLY_ALLOWED_WRITES`, exact match). Without it the Owner could not switch back.
+- **Approval lifetime:** online, cancel/edit/return approvals expire 15 minutes after issue
+  (`BILL_CHANGE_APPROVAL_TTL_MS`); discount keeps 7 days. **Through the desktop's sync push**
+  (`processPosSaleEditOperation`, `processPosSaleCancelOperation`, which pass `viaSync: true`) a
+  cancel/edit approval is accepted up to 7 days (`SYNC_APPROVAL_WINDOW_MS`) after it was granted, so
+  a bill the counter already changed offline does not end up disagreeing with the server. The window
+  is judged by server timestamps only -- the row's server-written `created_at` against the server's
+  `Date.now()` -- never a device-supplied time; a missing, unreadable or future `created_at` is
+  refused. Everything else still binds on that path: single use, action, bill, requester, company,
+  device, and now the branch (`APPROVAL_WRONG_BRANCH`, the sync session's branch against the
+  approval's). Returns have no offline path, so they keep 15 minutes everywhere. The approval is
+  still not bound to the change's content.
+- **Exit code:** 5 wrong codes per 15 minutes per device or user (from the session) answer 429
+  `EXIT_CODE_ATTEMPTS_LOCKED`, counted from `device_exit_attempt_logs`. The code is still unsalted
+  SHA-256 -- changing that needs the stored hash re-set, so it is left open.
+
+### Tests
+
+`authorizationActor.test.js` (driven: the user-management rule, role permissions, current password,
+report / device / backup gates, activation retirement, device revival, exit-code limit, bundle
+scoping; rate-manager count 65 -> 57 with the reason), `viewBranchSession.test.js`,
+`saleChangeApproval.test.js` (both windows, server-time only, bindings kept), `saleReturns.test.js`
+(driven on Postgres: a 30-minute-old cancel approval refused online and accepted from the outbox; 8
+days, another shop, or the wrong action refused from the outbox), `discounts.test.js` (billing refusal; fixtures now answer the billing
+lookup), `otherCharges.test.js` and `moneyScope.test.js` (fixtures), `masterDataAuthorization.test.js`
+(guard list gains `getStaffPermissionUser` and `getOwnerUser`).
+

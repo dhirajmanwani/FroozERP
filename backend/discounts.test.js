@@ -341,6 +341,11 @@ const saleClient = ({ lotDiscounts = [], slabs = [TEN_PERCENT], slabsOn = true }
       }
       if (/FROM sale_rate_settings/i.test(sql)) return { rows: [{ bill_level_slab_discount_enabled: slabsOn }] };
       if (/FROM sale_discount_rules/i.test(sql)) return { rows: slabs };
+      // The `billing` permission check at the top of checkout (7 Oct 2026): a cashier holding billing
+      // and nothing else, so every other permission the bill asks about answers exactly as before.
+      if (/^SELECT u\.id, u\.full_name, u\.username, u\.branch_id, r\.role_name, COALESCE\(rps\.permissions/.test(sql)) {
+        return { rows: [{ id: 7, full_name: "Counter", username: "counter", branch_id: 2, role_name: "Cashier", permissions: { billing: true } }] };
+      }
       return { rows: [], rowCount: 0 };
     },
   };
@@ -923,6 +928,21 @@ const discountStore = ({ role = "Cashier", permissions = {}, approval = null } =
 // 10 kg at ₹100 = ₹1,000; 5% = ₹50.
 const plainLine = (discount) => ({ product_id: PRODUCT_ID, inventory_batch_id: LOT_ID, quantity: 10, discount_amount: discount });
 const paid = (amount) => [{ mode: "CASH", amount }];
+
+test("checkout: someone without the billing permission is refused before anything is opened", async () => {
+  // 7 Oct 2026. Browser checkout asks `billing` first (Owner and Admin always hold it). The desktop
+  // path is sync, which never refuses a bill the customer already has, and is not this handler.
+  const noBilling = (sql) => (/^SELECT u\.id, u\.full_name, u\.username, u\.branch_id, r\.role_name, COALESCE\(rps\.permissions/.test(sql)
+    ? rows([{ id: 7, full_name: "Stock", username: "stock", branch_id: 2, role_name: "Inventory Manager", permissions: { billing: false } }])
+    : /^SELECT u\.id, u\.full_name, u\.username, u\.branch_id, r\.role_name FROM users/.test(sql)
+      ? rows([{ id: 7, full_name: "Stock", username: "stock", branch_id: 2, role_name: "Inventory Manager" }])
+      : undefined);
+  const { response, statements } = await checkout({ items: [plainLine(0)], payments: paid(1000) }, {}, noBilling);
+  assert.equal(response.status, 403);
+  assert.equal(response.body.code, "BILLING_PERMISSION_REQUIRED");
+  assert.equal(find(statements, /^BEGIN$/).length, 0, "refused before the transaction opens");
+  assert.equal(find(statements, /^INSERT INTO sales/).length, 0);
+});
 
 test("checkout: a cashier's 5.00% discount bills without asking anyone", async () => {
   const { response, statements } = await checkout({ items: [plainLine(50)], payments: paid(950) }, {}, discountStore());

@@ -25,7 +25,12 @@
  *
  * - **Reused.** CONSUMED is terminal; a second change needs a second approval.
  * - **Moved.** A different bill, action, cashier, company or device refuses it.
- * - **Kept forever.** It expires after seven days, so a forgotten one cannot be found later.
+ * - **Kept for later.** A cancel, edit or return approval expires fifteen minutes after it is
+ *   given: the approver is standing at the counter, and the change follows at once. (It was seven
+ *   days, which let a cashier hold an approval for a bill and spend it on whatever change they
+ *   liked later in the week.) A discount approval keeps seven days -- see `approvalTtlMs`. A cancel or
+ *   edit that arrives through the desktop's sync push may spend one up to seven days after the server
+ *   granted it (`SYNC_APPROVAL_WINDOW_MS`), judged by server timestamps only.
  * - **Trusted from the client.** The desktop only carries the id; every property is re-read here.
  *
  * ## The same machinery for a discount over 5% (30 Sep 2026)
@@ -55,8 +60,38 @@ const APPROVAL_STATUS = Object.freeze({
   FAILED: "FAILED",
 });
 
-/** How long an issued approval stays usable. Long enough to cover a counter that goes offline. */
+/**
+ * How long an issued discount approval stays usable. Long enough to cover a counter that goes
+ * offline: a desktop bill carrying one is never refused at sync, and an expired one only leaves a
+ * DISCOUNT_UNAPPROVED trace, so a short life here would mislabel bills rather than protect any.
+ */
 const APPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * How long a cancel, edit or return approval stays usable (7 Oct 2026). These change money already
+ * recorded, the approver is at the counter when they are given, and the approval is not bound to
+ * the content of the change -- so the window it can be spent in is kept short.
+ */
+const BILL_CHANGE_APPROVAL_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * How long after it was granted a cancel or edit approval may still be spent by a change arriving
+ * through the desktop's sync push. A counter that took the approval online and then lost its
+ * connection has already cancelled or edited the bill on its own database; refusing the change at
+ * sync after fifteen minutes would leave device and server disagreeing about that bill. So the sync
+ * path keeps the old seven days, measured from `created_at` -- written by the server when the
+ * approval was granted -- against the server's own clock. No device-supplied time is consulted.
+ * Every other binding (single use, action, bill, requester, company, branch, device) is unchanged.
+ */
+const SYNC_APPROVAL_WINDOW_MS = APPROVAL_TTL_MS;
+const SHORT_LIVED_ACTIONS = Object.freeze(["cancel", "edit", "return"]);
+
+/**
+ * The life of an approval for `action`. Anything that is not exactly "discount" gets the short
+ * life, so an unknown or missing action fails towards the stricter window.
+ */
+const approvalTtlMs = (action) =>
+  (text(action).toLowerCase() === "discount" ? APPROVAL_TTL_MS : BILL_CHANGE_APPROVAL_TTL_MS);
 
 /**
  * Failed approver-password attempts, counted per requester.
@@ -105,6 +140,7 @@ const BINDING_DETAILS = Object.freeze({
   WRONG_SALE: "APPROVAL_WRONG_SALE",
   WRONG_REQUESTER: "APPROVAL_WRONG_REQUESTER",
   WRONG_COMPANY: "APPROVAL_WRONG_COMPANY",
+  WRONG_BRANCH: "APPROVAL_WRONG_BRANCH",
   WRONG_DEVICE: "APPROVAL_WRONG_DEVICE",
   APPROVER_NO_LONGER_ALLOWED: "APPROVER_NO_LONGER_ALLOWED",
 });
@@ -196,7 +232,23 @@ const APPROVAL_NEEDED_MESSAGE = "Cancelling or editing this bill needs Owner or 
  *
  * @returns {{ok: true} | {ok: false, code: string, detail: string, message: string}}
  */
-const checkApprovalBinding = (row, { action, saleRefs, requesterId, companyId, deviceId, nowMs } = {}) => {
+const approvalStillLive = (row, nowMs, viaSync) => {
+  const now = Number.isFinite(nowMs) ? nowMs : Number.NaN;
+  if (!Number.isFinite(now)) return false;
+  if (viaSync === true) {
+    const grantedAt = timeMs(row.created_at);
+    return Number.isFinite(grantedAt) && now >= grantedAt && now - grantedAt < SYNC_APPROVAL_WINDOW_MS;
+  }
+  const expiresAt = timeMs(row.expires_at);
+  return Number.isFinite(expiresAt) && expiresAt > now;
+};
+
+/**
+ * `viaSync` is true only for the desktop's sync push (`processPosSaleEditOperation`,
+ * `processPosSaleCancelOperation`); it swaps the expiry for `SYNC_APPROVAL_WINDOW_MS` from the
+ * server-written `created_at`. `branchId`, when the caller knows it, must equal the approval's.
+ */
+const checkApprovalBinding = (row, { action, saleRefs, requesterId, companyId, branchId, deviceId, nowMs, viaSync = false } = {}) => {
   if (!row) return refuse(BINDING_DETAILS.NOT_FOUND, `${APPROVAL_NEEDED_MESSAGE} The approval sent with it was not found.`);
   if (row.status === APPROVAL_STATUS.CONSUMED) {
     return refuse(BINDING_DETAILS.ALREADY_USED, `${APPROVAL_NEEDED_MESSAGE} That approval has already been used; ask again.`);
@@ -204,9 +256,7 @@ const checkApprovalBinding = (row, { action, saleRefs, requesterId, companyId, d
   if (row.status !== APPROVAL_STATUS.ISSUED) {
     return refuse(BINDING_DETAILS.NOT_ISSUED, `${APPROVAL_NEEDED_MESSAGE} That approval was never granted.`);
   }
-  const expiresAt = timeMs(row.expires_at);
-  const now = Number.isFinite(nowMs) ? nowMs : Number.NaN;
-  if (!Number.isFinite(expiresAt) || !Number.isFinite(now) || expiresAt <= now) {
+  if (!approvalStillLive(row, nowMs, viaSync)) {
     return refuse(BINDING_DETAILS.EXPIRED, `${APPROVAL_NEEDED_MESSAGE} That approval has expired; ask again.`);
   }
   if (text(row.action).toLowerCase() !== text(action).toLowerCase() || !APPROVAL_ACTIONS.includes(text(action).toLowerCase())) {
@@ -221,6 +271,9 @@ const checkApprovalBinding = (row, { action, saleRefs, requesterId, companyId, d
   }
   if (!sameId(row.company_id, companyId)) {
     return refuse(BINDING_DETAILS.WRONG_COMPANY, `${APPROVAL_NEEDED_MESSAGE} That approval belongs to a different company.`);
+  }
+  if (idText(branchId) && !sameId(row.branch_id, branchId)) {
+    return refuse(BINDING_DETAILS.WRONG_BRANCH, `${APPROVAL_NEEDED_MESSAGE} That approval belongs to a different shop.`);
   }
   if (idText(deviceId) && !sameId(row.device_id, deviceId)) {
     return refuse(BINDING_DETAILS.WRONG_DEVICE, `${APPROVAL_NEEDED_MESSAGE} That approval was given on a different counter.`);
@@ -290,7 +343,7 @@ const approvalAttemptsLockedForTheDay = (dailyFailures) => {
   return Number.isFinite(daily) && daily >= DAILY_FAILURE_LIMIT;
 };
 
-const expiresAtFrom = (nowMs) => new Date(nowMs + APPROVAL_TTL_MS);
+const expiresAtFrom = (nowMs, action) => new Date(nowMs + approvalTtlMs(action));
 
 /** Every reference a client might use for this bill: the row id, its global id, its offline ref. */
 const saleRefsOf = (sale) => (sale ? [sale.id, sale.global_id, sale.offline_invoice_ref].map(idText).filter(Boolean) : []);
@@ -300,6 +353,10 @@ module.exports = {
   APPROVAL_STATUS,
   APPROVAL_TTL_MS,
   APPROVER_ROLES,
+  BILL_CHANGE_APPROVAL_TTL_MS,
+  SYNC_APPROVAL_WINDOW_MS,
+  SHORT_LIVED_ACTIONS,
+  approvalTtlMs,
   BINDING_DETAILS,
   CODES,
   DEFAULT_DISCOUNT_REASON,

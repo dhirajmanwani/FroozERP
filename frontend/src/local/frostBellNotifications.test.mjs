@@ -147,10 +147,13 @@ test("a reminder due next week does not ring, and one due now does", () => {
 
   const dueNow = build({ reminders: [reminder({ due_at: isoAt(NOW) })] });
   assert.deepEqual(kinds(dueNow), [FROST_BELL_KIND.REMINDER]);
-  assert.match(dueNow.items[0].message, /due now/i);
+  assert.match(dueNow.items[0].timing, /due now/i);
 
   const overdue = build({ reminders: [reminder({ due_at: isoAt(NOW - (3 * DAY)) })] });
-  assert.match(overdue.items[0].message, /3 days ago/, "the owner should be told how late it is");
+  assert.match(overdue.items[0].timing, /3 days ago/, "the owner should be told how late it is");
+  // NOW - 3 days is 2026-09-19 06:00 UTC, which is 11:30 in the shop.
+  assert.match(overdue.items[0].message, /It was due on 19 Sep 2026 at 11:30\./, "and when it fell due, in shop time");
+  assert.doesNotMatch(overdue.items[0].message, /ago/, "relative time would change the message on every poll");
 });
 
 test("a reminder with no due date rings, because that is every reminder the owner dictates to FROST", () => {
@@ -356,9 +359,10 @@ test("every row this module produces is accepted by the real createNotification,
 test("timestamps arrive as ISO text, as numbers and as Date objects, and all three read the same", () => {
   // `pg` hands timestamps back as Date objects; the same rows, once through JSON, arrive as strings.
   const due = NOW - (2 * HOUR);
-  const messages = [isoAt(due), due, new Date(due)].map((due_at) => build({ reminders: [reminder({ due_at })] }).items[0].message);
-  assert.equal(new Set(messages).size, 1, "one moment, three spellings, one sentence");
-  assert.match(messages[0], /2 hours ago/);
+  const items = [isoAt(due), due, new Date(due)].map((due_at) => build({ reminders: [reminder({ due_at })] }).items[0]);
+  assert.equal(new Set(items.map((item) => item.message)).size, 1, "one moment, three spellings, one sentence");
+  assert.equal(new Set(items.map((item) => item.timing)).size, 1);
+  assert.match(items[0].timing, /2 hours ago/);
 });
 
 test("the bell row is written for a shop owner, not for a programmer", () => {

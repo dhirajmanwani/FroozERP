@@ -1074,6 +1074,69 @@ pub fn list_local_pos_sales(app: &AppHandle) -> Result<Vec<serde_json::Value>, S
         .collect()
 }
 
+/// Every local bill dated `from_date..=to_date` (inclusive, `YYYY-MM-DD`), newest first.
+///
+/// `list_local_pos_sales` stops at the newest 200 bills, and the dashboard's trend, today's figures
+/// and the LOCAL_ONLY sales history were all built from it - so a busy week quietly lost its
+/// oldest days and the totals read low with nothing to say why. A caller that needs a period asks
+/// for that period. Bounds that are not dates are refused rather than read as an empty range.
+pub fn list_local_pos_sales_between(
+    app: &AppHandle,
+    from_date: &str,
+    to_date: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let path = database_path(app)?;
+    list_local_pos_sales_between_at(&path, from_date, to_date)
+}
+
+fn is_iso_calendar_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
+fn list_local_pos_sales_between_at(
+    path: &Path,
+    from_date: &str,
+    to_date: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let from_date = from_date.trim();
+    let to_date = to_date.trim();
+    if !is_iso_calendar_date(from_date) || !is_iso_calendar_date(to_date) {
+        return Err(format!(
+            "Local sales range needs YYYY-MM-DD dates (got from={from_date:?}, to={to_date:?})"
+        ));
+    }
+    if from_date > to_date {
+        return Err(format!("Local sales range starts after it ends ({from_date} > {to_date})"));
+    }
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    // `substr(..., 1, 10)`: a bill copied down from the cloud can carry a full timestamp in
+    // `bill_date`, which compares above its own day's `YYYY-MM-DD` and fell off the last day.
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM local_pos_invoices
+             WHERE substr(bill_date, 1, 10) BETWEEN ?1 AND ?2
+             ORDER BY bill_datetime DESC, created_at DESC",
+        )
+        .map_err(to_error)?;
+    let ids = stmt
+        .query_map(params![from_date, to_date], |row| row.get::<_, String>(0))
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    drop(stmt);
+    ids.into_iter()
+        .map(|id| load_invoice_snapshot(&conn, &id))
+        .collect()
+}
+
 pub fn queue_local_purchase(app: &AppHandle, purchase: serde_json::Value) -> Result<LocalPurchaseIntentResult, String> {
     let path = database_path(app)?;
     queue_local_purchase_at(&path, purchase)
@@ -3578,6 +3641,50 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "023_customer_order_transfer", MIGRATION_023)?;
     apply_migration(&mut conn, "024_other_charges", MIGRATION_024)?;
     apply_migration(&mut conn, "025_device_machine_fingerprint", MIGRATION_025)?;
+    if first_open_in_this_process(path) {
+        release_interrupted_syncing_at(&conn)?;
+    }
+    Ok(())
+}
+
+/// Database paths this process has already opened through `initialize_at`.
+static OPENED_DATABASES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// True exactly once per database path per process: the first `initialize_at` of a run.
+///
+/// Every command calls `initialize_at`, including the ones a sync cycle makes while its own
+/// operations are legitimately `syncing`. Releasing on every call would pull an in-flight batch out
+/// from under the push that owns it. The first call of a run is different: nothing in this process
+/// can have marked anything `syncing` yet, so anything still in that state was left there by a run
+/// that ended mid-push.
+fn first_open_in_this_process(path: &Path) -> bool {
+    let set = OPENED_DATABASES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut opened = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    opened.insert(path.to_path_buf())
+}
+
+/// Puts operations a previous run left `syncing` back in the queue.
+///
+/// `syncing` is set just before a push and cleared by its acknowledgement or by the JS `catch`
+/// releasing it. A run that ends in between - the app closed, Windows restarting, a crash mid-push -
+/// does neither, and `pending_outbox_at` only selects `pending`, so the operation was never sent
+/// again: a bill that stayed on this computer for good while the badge counted it as in flight.
+/// Resending is safe because the server is idempotent per `operation_id`; if the first attempt did
+/// land, the resend comes back `duplicate` and is marked synced like any other acknowledgement.
+fn release_interrupted_syncing_at(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sync_outbox SET status = 'pending' WHERE LOWER(status) = 'syncing'",
+        [],
+    )
+    .map_err(to_error)?;
+    conn.execute(
+        "UPDATE local_purchase_intents
+         SET state = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE state = 'syncing'",
+        [],
+    )
+    .map_err(to_error)?;
     Ok(())
 }
 
@@ -3668,6 +3775,139 @@ fn status_at(path: &Path) -> Result<LocalDbStatus, String> {
         last_push_result: single_optional_string(&conn, "SELECT last_push_result FROM sync_state WHERE device_id <> 'default' ORDER BY updated_at DESC LIMIT 1", &[])?,
         error: None,
     })
+}
+
+/// SQL predicate over a `local_inventory_lots` row: the lot carries work this device has not
+/// delivered to the cloud yet.
+///
+/// Two kinds. A sale (or its edit or cancel) whose `pos_sale` operation is not yet `synced` -
+/// `local_stock_movements.sync_status` is never advanced by an acknowledgement, so the outbox row
+/// is the only record of whether the cloud has seen it. And a provisional lot booked by an offline
+/// purchase whose intent has not completed, which the cloud does not have at all.
+///
+/// A cloud copy of such a lot is behind this device by exactly that work, so writing the cloud's
+/// quantities over it would quietly undo sales the counter really made (or wipe a GRN that exists
+/// only here). `conflict` and `failed` count as undelivered: the fruit left the shop either way.
+const LOT_HOLDS_UNDELIVERED_LOCAL_WORK: &str = "(
+    EXISTS (
+        SELECT 1 FROM local_stock_movements m
+        JOIN sync_outbox o ON o.entity_type = 'pos_sale' AND o.entity_id = m.invoice_id
+        WHERE m.lot_id = local_inventory_lots.id
+          AND LOWER(COALESCE(o.status, 'pending')) <> 'synced'
+    )
+    OR EXISTS (
+        SELECT 1 FROM local_purchase_intent_lines pl
+        JOIN local_purchase_intents pi ON pi.id = pl.intent_id
+        WHERE pl.provisional_lot_id = local_inventory_lots.id
+          AND pi.state <> 'completed'
+    )
+)";
+
+fn lot_holds_undelivered_local_work(conn: &Connection, lot_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM local_inventory_lots WHERE id = ?1 AND {LOT_HOLDS_UNDELIVERED_LOCAL_WORK})"
+        ),
+        [lot_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|found| found == 1)
+    .map_err(to_error)
+}
+
+/// Every spelling under which one cloud lot may already be stored on this device.
+///
+/// The sign-in cache keyed lots by `global_id`, else the bare cloud `id` (`"5"`), and GET
+/// /inventory sent no `global_id`; the pull feed stores `entity_id`, which is the `global_id`
+/// (`"inventory-lot-5"`). The same fruit ended up on the shelf twice. These are the cloud's own two
+/// names for one row - the server mints `global_id` as `'inventory-lot-' || id` and resolves the
+/// alias the same way - so they are matched as text, never as numbers: `"004"` stays `"004"`.
+fn cloud_lot_identity_keys(primary: &str, payload: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut push = |key: String| {
+        if !key.is_empty() && !keys.contains(&key) {
+            keys.push(key);
+        }
+    };
+    let names = [
+        Some(primary.trim().to_string()),
+        optional_text(payload, "global_id"),
+        optional_text(payload, "id"),
+    ];
+    for name in names.into_iter().flatten() {
+        push(name.clone());
+        if let Some(digits) = name.strip_prefix("inventory-lot-") {
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                push(digits.to_string());
+            }
+        } else if name.chars().all(|c| c.is_ascii_digit()) {
+            push(format!("inventory-lot-{name}"));
+        }
+    }
+    keys
+}
+
+/// Local lot rows already holding any of `keys`, by `id` or `cloud_id`, in a stable order.
+fn local_lot_ids_for_keys(conn: &Connection, keys: &[String]) -> Result<Vec<String>, String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut statement = conn
+        .prepare("SELECT id FROM local_inventory_lots WHERE id = ?1 OR cloud_id = ?1 ORDER BY id")
+        .map_err(to_error)?;
+    for key in keys {
+        let ids = statement
+            .query_map([key], |row| row.get::<_, String>(0))
+            .map_err(to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_error)?;
+        for id in ids {
+            if !found.contains(&id) {
+                found.push(id);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The row a cloud lot is written into: the one already stored under the cloud's own key if there
+/// is one, else whichever spelling this device already has, else a new row under the cloud's key.
+/// Keeping an existing id keeps every sale line and stock movement that points at it valid.
+fn surviving_lot_id(primary: &str, existing: &[String]) -> String {
+    if existing.iter().any(|id| id == primary) {
+        primary.to_string()
+    } else {
+        existing.first().cloned().unwrap_or_else(|| primary.to_string())
+    }
+}
+
+/// Retires the other spellings of a lot once its surviving row is written.
+///
+/// Soft-deleted, not removed and not re-pointed: sale lines, movements and order lines that name
+/// the old spelling keep naming a row that exists, and only the shelf (every reader filters
+/// `deleted_at IS NULL`) stops counting the fruit twice. Skipped entirely while any spelling still
+/// holds undelivered local work - which copy's quantity is right cannot be known until that work
+/// reaches the cloud, and the next pull of the lot after it does collapses them then.
+fn retire_duplicate_lot_rows(conn: &Connection, survivor: &str, existing: &[String]) -> Result<(), String> {
+    let duplicates: Vec<&String> = existing.iter().filter(|id| id.as_str() != survivor).collect();
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+    for id in existing {
+        if lot_holds_undelivered_local_work(conn, id)? {
+            return Ok(());
+        }
+    }
+    for id in duplicates {
+        conn.execute(
+            "UPDATE local_inventory_lots
+             SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 sync_status = 'synced'
+             WHERE id = ?1 AND deleted_at IS NULL",
+            [id],
+        )
+        .map_err(to_error)?;
+    }
+    Ok(())
 }
 
 fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Result<(), String> {
@@ -3839,12 +4079,39 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
         .optional()
         .map_err(to_error)?;
 
-    tx.execute("DELETE FROM local_inventory_lots WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
-        .map_err(to_error)?;
-    tx.execute("DELETE FROM local_products WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
-        .map_err(to_error)?;
-    tx.execute("DELETE FROM local_categories WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
-        .map_err(to_error)?;
+    // A refresh, but not of the lots this device is ahead of the cloud on. Deleting every lot of
+    // the branch and re-inserting the cloud's copy put back stock the counter had sold offline
+    // (the sale not yet pushed) and dropped provisional lots booked by an offline GRN the cloud has
+    // never seen. Those rows are kept, and below they take the cloud's descriptive fields but keep
+    // their own quantities.
+    tx.execute(
+        &format!(
+            "DELETE FROM local_inventory_lots
+             WHERE COALESCE(branch_id, '1') = ?1
+               AND NOT {LOT_HOLDS_UNDELIVERED_LOCAL_WORK}"
+        ),
+        [branch_id.as_str()],
+    )
+    .map_err(to_error)?;
+    // Products and categories a kept lot or an offline GRN line still points at stay too:
+    // foreign keys are enforced on this connection (the bundled SQLite defaults them on), and
+    // `local_purchase_intent_lines.product_id` is ON DELETE RESTRICT. They are refreshed in place
+    // below by the same upserts that insert the rest.
+    tx.execute(
+        "DELETE FROM local_products
+         WHERE COALESCE(branch_id, '1') = ?1
+           AND NOT EXISTS (SELECT 1 FROM local_inventory_lots l WHERE l.product_id = local_products.id)
+           AND NOT EXISTS (SELECT 1 FROM local_purchase_intent_lines pl WHERE pl.product_id = local_products.id)",
+        [branch_id.as_str()],
+    )
+    .map_err(to_error)?;
+    tx.execute(
+        "DELETE FROM local_categories
+         WHERE COALESCE(branch_id, '1') = ?1
+           AND NOT EXISTS (SELECT 1 FROM local_products p WHERE p.category_id = local_categories.id)",
+        [branch_id.as_str()],
+    )
+    .map_err(to_error)?;
     tx.execute("DELETE FROM local_customers WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
         .map_err(to_error)?;
     tx.execute("DELETE FROM local_settings WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
@@ -3874,7 +4141,15 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
             tx.execute(
                 "INSERT INTO local_categories (
                     id, cloud_id, branch_id, name, active, created_at, updated_at, version, sync_status, deleted_at
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, COALESCE(?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?7, 'synced', ?8)",
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, COALESCE(?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?7, 'synced', ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    branch_id = excluded.branch_id,
+                    name = excluded.name,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at,
+                    version = excluded.version,
+                    sync_status = 'synced',
+                    deleted_at = excluded.deleted_at",
                 params![
                     category_id,
                     branch_id,
@@ -3923,7 +4198,23 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit, barcode,
                     sale_rate, minimum_stock, active, remarks, created_at, updated_at, version, sync_status,
                     deleted_at, company_id
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', ?15, ?16)",
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', ?15, ?16)
+                 ON CONFLICT(id) DO UPDATE SET
+                    branch_id = excluded.branch_id,
+                    product_name = excluded.product_name,
+                    category_id = excluded.category_id,
+                    category_name = excluded.category_name,
+                    unit = excluded.unit,
+                    barcode = excluded.barcode,
+                    sale_rate = excluded.sale_rate,
+                    minimum_stock = excluded.minimum_stock,
+                    active = excluded.active,
+                    remarks = excluded.remarks,
+                    updated_at = excluded.updated_at,
+                    version = excluded.version,
+                    sync_status = 'synced',
+                    deleted_at = excluded.deleted_at,
+                    company_id = excluded.company_id",
                 params![
                     product_id,
                     branch_id,
@@ -3961,6 +4252,11 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
             if product_id.is_empty() {
                 continue;
             }
+            // The same lot may already be here under its other spelling (a kept row, or one from
+            // another branch's cache): write into that row rather than adding a second copy.
+            let existing_ids = local_lot_ids_for_keys(&tx, &cloud_lot_identity_keys(&lot_id, lot))?;
+            let lot_id = surviving_lot_id(&lot_id, &existing_ids);
+            let keep_local_quantities = lot_holds_undelivered_local_work(&tx, &lot_id)?;
             tx.execute(
                 "INSERT INTO local_inventory_lots (
                     id, cloud_id, branch_id, product_id, product_name, supplier_id, supplier_name,
@@ -3972,7 +4268,35 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                     ?20, ?21, COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?23, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?24, 'synced', ?25,
                     ?26, ?27
-                 )",
+                 )
+                 ON CONFLICT(id) DO UPDATE SET
+                    branch_id = excluded.branch_id,
+                    product_id = excluded.product_id,
+                    product_name = excluded.product_name,
+                    supplier_id = excluded.supplier_id,
+                    supplier_name = excluded.supplier_name,
+                    lot_no = excluded.lot_no,
+                    size_grade = excluded.size_grade,
+                    opening_date = excluded.opening_date,
+                    opening_qty = CASE WHEN ?28 THEN local_inventory_lots.opening_qty ELSE excluded.opening_qty END,
+                    purchased_qty = CASE WHEN ?28 THEN local_inventory_lots.purchased_qty ELSE excluded.purchased_qty END,
+                    sold_qty = CASE WHEN ?28 THEN local_inventory_lots.sold_qty ELSE excluded.sold_qty END,
+                    returned_qty = CASE WHEN ?28 THEN local_inventory_lots.returned_qty ELSE excluded.returned_qty END,
+                    waste_qty = CASE WHEN ?28 THEN local_inventory_lots.waste_qty ELSE excluded.waste_qty END,
+                    adjusted_qty = CASE WHEN ?28 THEN local_inventory_lots.adjusted_qty ELSE excluded.adjusted_qty END,
+                    transfer_in_qty = CASE WHEN ?28 THEN local_inventory_lots.transfer_in_qty ELSE excluded.transfer_in_qty END,
+                    transfer_out_qty = CASE WHEN ?28 THEN local_inventory_lots.transfer_out_qty ELSE excluded.transfer_out_qty END,
+                    balance_qty = CASE WHEN ?28 THEN local_inventory_lots.balance_qty ELSE excluded.balance_qty END,
+                    cost_rate = excluded.cost_rate,
+                    sale_rate = excluded.sale_rate,
+                    status = excluded.status,
+                    remarks = excluded.remarks,
+                    updated_at = excluded.updated_at,
+                    version = excluded.version,
+                    sync_status = CASE WHEN ?28 THEN local_inventory_lots.sync_status ELSE 'synced' END,
+                    deleted_at = excluded.deleted_at,
+                    company_id = excluded.company_id,
+                    operational_location_id = excluded.operational_location_id",
                 params![
                     lot_id,
                     branch_id,
@@ -4007,9 +4331,11 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                         .or_else(|| canonical_scope.as_ref().map(|scope| scope.0.clone())),
                     optional_text(lot, "operational_location_id")
                         .or_else(|| canonical_scope.as_ref().map(|scope| scope.1.clone())),
+                    keep_local_quantities,
                 ],
             )
             .map_err(to_error)?;
+            retire_duplicate_lot_rows(&tx, &lot_id, &existing_ids)?;
         }
     }
 
@@ -4118,7 +4444,17 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     cancelled_at = COALESCE(local_pos_invoices.cancelled_at, excluded.cancelled_at),
                     cancelled_by = COALESCE(local_pos_invoices.cancelled_by, excluded.cancelled_by),
-                    cancellation_reason = COALESCE(local_pos_invoices.cancellation_reason, excluded.cancellation_reason)",
+                    cancellation_reason = COALESCE(local_pos_invoices.cancellation_reason, excluded.cancellation_reason)
+                 -- A bill with an operation still on its way to the cloud is newer here than in the
+                 -- cloud's list: an offline edit or cancel not yet pushed. Overwriting it with the
+                 -- cloud's totals and calling it synced reverted the edit on screen and hid that it
+                 -- had never left the counter. It is left alone until its own acknowledgement lands.
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM sync_outbox o
+                    WHERE o.entity_type = 'pos_sale'
+                      AND o.entity_id = local_pos_invoices.id
+                      AND LOWER(COALESCE(o.status, 'pending')) <> 'synced'
+                 )",
                 params![
                     sale_id,
                     offline_ref,
@@ -4601,13 +4937,15 @@ fn load_reference_snapshot_at(
                 // instead hide rows from a caller that never asked, and would leave the product
                 // aggregate below counting a different universe than this list — the exact
                 // summary-vs-detail split CLAUDE.md warns about.
-                "SELECT id, product_id, product_name, supplier_id, supplier_name, lot_no, size_grade,
-                        opening_date, opening_qty, sold_qty, adjusted_qty, balance_qty, cost_rate, sale_rate,
-                        status, remarks, created_at, updated_at, purchase_bill_status,
-                        branch_id, company_id, operational_location_id
-                 FROM local_inventory_lots
-                 WHERE deleted_at IS NULL
-                 ORDER BY product_name, opening_date, id",
+                "SELECT l.id, l.product_id, l.product_name, l.supplier_id, l.supplier_name, l.lot_no, l.size_grade,
+                        l.opening_date, l.opening_qty, l.sold_qty, l.adjusted_qty, l.balance_qty, l.cost_rate, l.sale_rate,
+                        l.status, l.remarks, l.created_at, l.updated_at, l.purchase_bill_status,
+                        l.branch_id, l.company_id, l.operational_location_id,
+                        p.minimum_stock
+                 FROM local_inventory_lots l
+                 LEFT JOIN local_products p ON p.id = l.product_id
+                 WHERE l.deleted_at IS NULL
+                 ORDER BY l.product_name, l.opening_date, l.id",
             )
             .map_err(to_error)?;
         let rows = statement
@@ -4654,6 +4992,10 @@ fn load_reference_snapshot_at(
                     "branch_id": row.get::<_, Option<String>>(19)?,
                     "company_id": row.get::<_, Option<String>>(20)?,
                     "operational_location_id": row.get::<_, Option<String>>(21)?,
+                    // The product's own reorder level, carried on each of its lots so the local
+                    // dashboard stops applying a flat 5 to every product. Option on purpose: a
+                    // product with no minimum set is `null`, not 0 and not 5.
+                    "minimum_stock": row.get::<_, Option<f64>>(22)?,
                 }))
             })
             .map_err(to_error)?;
@@ -6012,6 +6354,13 @@ fn json_number(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// The automatic push queue: `pending` only.
+///
+/// `failed` used to be selected here too. A failure is a verdict the server already gave, so
+/// resending it every cycle changed nothing - but the rows were picked oldest-first under the
+/// LIMIT, and a handful of old rejected operations filled every batch while the shop's new bills
+/// waited behind them. A failed operation now moves only through `retry_failed_operations`, the
+/// explicit retry, which puts it back to `pending`.
 fn pending_outbox_at(conn: &Connection, limit: i64) -> Result<Vec<PendingSyncOperation>, String> {
     let mut statement = conn
         .prepare(
@@ -6020,7 +6369,7 @@ fn pending_outbox_at(conn: &Connection, limit: i64) -> Result<Vec<PendingSyncOpe
                     COALESCE(payload_json, payload), created_at, retry_count,
                     COALESCE(status, 'pending'), last_error
              FROM sync_outbox
-             WHERE LOWER(status) IN ('pending', 'failed')
+             WHERE LOWER(status) = 'pending'
              ORDER BY created_at, id
              LIMIT ?1",
         )
@@ -7063,13 +7412,34 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             }
         }
         "inventory_lot" => {
+            // One cloud lot, however many spellings this device stored it under.
+            let identity_keys = cloud_lot_identity_keys(&change.entity_id, &change.payload);
+            let existing_ids = local_lot_ids_for_keys(tx, &identity_keys)?;
             if operation == "DELETE" {
-                tx.execute(
-                    "UPDATE local_inventory_lots SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), sync_status = 'synced' WHERE id = ?1",
-                    params![change.entity_id, change.updated_at],
-                )
-                .map_err(to_error)?;
+                let mut targets = existing_ids.clone();
+                if !targets.contains(&change.entity_id) {
+                    targets.push(change.entity_id.clone());
+                }
+                for target in targets {
+                    tx.execute(
+                        "UPDATE local_inventory_lots SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), sync_status = 'synced' WHERE id = ?1",
+                        params![target, change.updated_at],
+                    )
+                    .map_err(to_error)?;
+                }
             } else {
+                let lot_id = surviving_lot_id(&change.entity_id, &existing_ids);
+                // The cloud's quantities describe the lot *without* this device's undelivered
+                // sales. Applying them while such sales exist undid them on the shelf: stock sold
+                // offline came back as sellable the moment a pull arrived. The local quantities
+                // are kept instead - they are the cloud's earlier figure less exactly those sales.
+                // Subtracting the pending movements from the new cloud figure was the alternative,
+                // and it is wrong twice over: a push whose acknowledgement was lost is already in
+                // the cloud figure and would be taken off again, and an edited bill's movements
+                // (reversal plus the new line) do not say how much of the bill the cloud has seen.
+                // The cloud republishes the lot when the pushed sale lands, so the next pull after
+                // delivery writes the cloud figure back over this one.
+                let keep_local_quantities = lot_holds_undelivered_local_work(tx, &lot_id)?;
                 let product_id = optional_text(&change.payload, "product_global_id")
                     .or_else(|| optional_text(&change.payload, "product_id"))
                     .unwrap_or_default();
@@ -7099,15 +7469,15 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                         lot_no = excluded.lot_no,
                         size_grade = excluded.size_grade,
                         opening_date = excluded.opening_date,
-                        opening_qty = excluded.opening_qty,
-                        purchased_qty = excluded.purchased_qty,
-                        sold_qty = excluded.sold_qty,
-                        returned_qty = excluded.returned_qty,
-                        waste_qty = excluded.waste_qty,
-                        adjusted_qty = excluded.adjusted_qty,
-                        transfer_in_qty = excluded.transfer_in_qty,
-                        transfer_out_qty = excluded.transfer_out_qty,
-                        balance_qty = excluded.balance_qty,
+                        opening_qty = CASE WHEN ?26 THEN local_inventory_lots.opening_qty ELSE excluded.opening_qty END,
+                        purchased_qty = CASE WHEN ?26 THEN local_inventory_lots.purchased_qty ELSE excluded.purchased_qty END,
+                        sold_qty = CASE WHEN ?26 THEN local_inventory_lots.sold_qty ELSE excluded.sold_qty END,
+                        returned_qty = CASE WHEN ?26 THEN local_inventory_lots.returned_qty ELSE excluded.returned_qty END,
+                        waste_qty = CASE WHEN ?26 THEN local_inventory_lots.waste_qty ELSE excluded.waste_qty END,
+                        adjusted_qty = CASE WHEN ?26 THEN local_inventory_lots.adjusted_qty ELSE excluded.adjusted_qty END,
+                        transfer_in_qty = CASE WHEN ?26 THEN local_inventory_lots.transfer_in_qty ELSE excluded.transfer_in_qty END,
+                        transfer_out_qty = CASE WHEN ?26 THEN local_inventory_lots.transfer_out_qty ELSE excluded.transfer_out_qty END,
+                        balance_qty = CASE WHEN ?26 THEN local_inventory_lots.balance_qty ELSE excluded.balance_qty END,
                         cost_rate = excluded.cost_rate,
                         sale_rate = excluded.sale_rate,
                         status = excluded.status,
@@ -7115,10 +7485,10 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                         remarks = excluded.remarks,
                         updated_at = excluded.updated_at,
                         version = excluded.version,
-                        sync_status = 'synced',
+                        sync_status = CASE WHEN ?26 THEN local_inventory_lots.sync_status ELSE 'synced' END,
                         deleted_at = NULL",
                     params![
-                        change.entity_id,
+                        lot_id,
                         optional_text(&change.payload, "branch_id")
                             .or_else(|| change.branch_id.map(|value| value.to_string()))
                             .unwrap_or_else(|| "unassigned".to_string()),
@@ -7149,6 +7519,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                         optional_text(&change.payload, "created_at"),
                         change.updated_at.clone(),
                         change.version.unwrap_or(1),
+                        keep_local_quantities,
                     ],
                 )
                 .map_err(to_error)?;
@@ -7157,12 +7528,13 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                      SET company_id = ?2, operational_location_id = ?3
                      WHERE id = ?1",
                     params![
-                        change.entity_id,
+                        lot_id,
                         optional_text(&change.payload, "company_id"),
                         optional_text(&change.payload, "operational_location_id"),
                     ],
                 )
                 .map_err(to_error)?;
+                retire_duplicate_lot_rows(tx, &lot_id, &existing_ids)?;
             }
         }
         // The charges are read before the sale is touched, so that a bill whose charges cannot be
@@ -13458,5 +13830,449 @@ mod tests {
         assert_eq!(identity_count(&db), 1);
         assert_eq!(identity_status(&db, device).expect("row").1, "6");
         let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    // ---- Sync-safety fixes: interrupted pushes, failed rows, sign-in cache, pulls, lot identity ----
+
+    fn sync_fix_path(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-syncfix-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    /// Makes the next `initialize_at` of `path` behave as the first of a new run.
+    fn simulate_restart(path: &Path) {
+        if let Some(set) = OPENED_DATABASES.get() {
+            set.lock().unwrap().remove(path);
+        }
+    }
+
+    fn outbox_status(path: &Path, operation_id: &str) -> String {
+        Connection::open(path)
+            .expect("open outbox")
+            .query_row("SELECT status FROM sync_outbox WHERE operation_id = ?1", [operation_id], |row| row.get(0))
+            .expect("outbox status")
+    }
+
+    fn queue_test_operation(path: &Path, operation_id: &str) {
+        let conn = Connection::open(path).expect("open outbox");
+        enqueue_sync_operation_with_conn(
+            &conn,
+            &SyncOperation {
+                id: operation_id.to_string(),
+                operation_id: Some(operation_id.to_string()),
+                entity_type: "sync_test".to_string(),
+                entity_id: operation_id.to_string(),
+                operation_type: "UPSERT".to_string(),
+                payload: serde_json::json!({}),
+                branch_id: Some("1".to_string()),
+                device_id: Some("device-test".to_string()),
+                user_id: Some("1".to_string()),
+                version: Some(1),
+                created_at: None,
+            },
+        )
+        .expect("queue operation");
+    }
+
+    fn sale_on_lot(invoice: &str, lot_id: &str, product_id: &str, quantity: f64, bill_date: &str) -> serde_json::Value {
+        let mut sale = test_sale_payload(invoice, &format!("op-{invoice}"), quantity, quantity * 10.0);
+        sale["offline_invoice_ref"] = serde_json::json!(format!("OFF-{invoice}"));
+        sale["bill_date"] = serde_json::json!(bill_date);
+        sale["bill_datetime"] = serde_json::json!(format!("{bill_date}T10:00"));
+        sale["items"][0]["item_global_id"] = serde_json::json!(format!("line-{invoice}"));
+        sale["items"][0]["stock_movement_id"] = serde_json::json!(format!("stock-{invoice}"));
+        sale["items"][0]["lot_id"] = serde_json::json!(lot_id);
+        sale["items"][0]["product_id"] = serde_json::json!(product_id);
+        sale["payments"][0]["posting_id"] = serde_json::json!(format!("posting-{invoice}"));
+        sale
+    }
+
+    fn accept(path: &Path, operation_id: &str) {
+        apply_push_acks_at(
+            path,
+            &[SyncAck {
+                operation_id: operation_id.to_string(),
+                status: "accepted".to_string(),
+                server_entity_version: Some(1),
+                server_updated_at: None,
+                error_code: None,
+                message: None,
+                result_payload: Some(serde_json::json!({})),
+            }],
+            Some("device-test".to_string()),
+            Some("2026-10-01T10:00:00.000Z".to_string()),
+        )
+        .expect("apply acknowledgement");
+    }
+
+    fn pulled_lot(entity_id: &str, cloud_id: Option<i64>, product: &str, purchase: f64, remaining: f64) -> PulledChange {
+        let mut payload = serde_json::json!({
+            "branch_id": 1,
+            "global_id": entity_id,
+            "product_global_id": product,
+            "product_name": "Apples",
+            "batch_no": "LOT-A",
+            "purchase_qty": purchase,
+            "remaining_qty": remaining,
+            "purchase_rate": 10,
+            "batch_status": "ACTIVE"
+        });
+        if let Some(id) = cloud_id {
+            payload["id"] = serde_json::json!(id);
+        }
+        PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(1),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: entity_id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload,
+            updated_at: Some("2026-10-01T09:00:00.000Z".to_string()),
+        }
+    }
+
+    fn pull(path: &Path, change: &PulledChange) {
+        let mut conn = Connection::open(path).expect("open pull");
+        let tx = conn.transaction().expect("pull tx");
+        apply_change_with_tx(&tx, change).expect("apply pulled change");
+        tx.commit().expect("commit pull");
+    }
+
+    fn live_lots(path: &Path, product: &str) -> Vec<(String, f64)> {
+        let conn = Connection::open(path).expect("open lots");
+        let mut stmt = conn
+            .prepare("SELECT id, balance_qty FROM local_inventory_lots WHERE product_id = ?1 AND deleted_at IS NULL ORDER BY id")
+            .expect("prepare lots");
+        let rows = stmt
+            .query_map([product], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query lots")
+            .collect::<Result<Vec<(String, f64)>, _>>()
+            .expect("collect lots");
+        rows
+    }
+
+    #[test]
+    fn an_operation_left_syncing_by_a_previous_run_is_queued_again_but_not_mid_run() {
+        let path = sync_fix_path("syncing-restart");
+        initialize_at(&path).expect("initialize");
+        queue_test_operation(&path, "op-interrupted");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute(
+                "INSERT INTO local_purchase_intents (
+                    id, operation_id, provisional_reference, supplier_id, purchase_date,
+                    purchase_bill_status, purchase_type, intent_checksum, payload_json, state
+                 ) VALUES ('intent-1', 'op-purchase', 'OFF-GRN-1', 'supplier-1', '2026-10-01',
+                           'BILL_COMPLETED', 'CASH', 'x', '{}', 'pending')",
+                [],
+            )
+            .expect("seed purchase intent");
+        }
+        queue_test_operation(&path, "op-purchase");
+        mark_outbox_syncing_at(&path, &["op-interrupted".to_string(), "op-purchase".to_string()])
+            .expect("mark syncing");
+
+        // Same run: the push that owns these is still in flight; nothing may release them.
+        initialize_at(&path).expect("initialize mid-run");
+        assert_eq!(outbox_status(&path, "op-interrupted"), "syncing");
+        assert!(pending_outbox_at(&Connection::open(&path).unwrap(), 50).unwrap().is_empty());
+
+        // The run ends mid-push; the next one starts.
+        simulate_restart(&path);
+        initialize_at(&path).expect("initialize after restart");
+        assert_eq!(outbox_status(&path, "op-interrupted"), "pending");
+        assert_eq!(outbox_status(&path, "op-purchase"), "pending");
+        let state: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT state FROM local_purchase_intents WHERE id = 'intent-1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "pending");
+        let resent = pending_outbox_at(&Connection::open(&path).unwrap(), 50).unwrap();
+        assert_eq!(resent.len(), 2);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_operations_leave_the_automatic_queue_until_explicitly_retried() {
+        let path = sync_fix_path("failed-queue");
+        initialize_at(&path).expect("initialize");
+        for index in 0..3 {
+            queue_test_operation(&path, &format!("op-old-{index}"));
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE sync_outbox SET status = 'failed' WHERE operation_id LIKE 'op-old-%'", [])
+            .unwrap();
+        queue_test_operation(&path, "op-new-bill");
+
+        let picked = pending_outbox_at(&Connection::open(&path).unwrap(), 2).unwrap();
+        assert_eq!(
+            picked.iter().map(|op| op.operation_id.as_str()).collect::<Vec<_>>(),
+            vec!["op-new-bill"],
+            "old failures must not fill the batch ahead of a new bill"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE sync_outbox SET status = 'pending' WHERE status IN ('failed', 'conflict')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(pending_outbox_at(&conn, 50).unwrap().len(), 4);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sign_in_cache_keeps_unpushed_sales_on_the_shelf_and_on_the_bill() {
+        let path = sync_fix_path("cache-keeps-local");
+        initialize_at(&path).expect("initialize");
+        // Sold 2 of 5 offline; not pushed yet.
+        complete_local_pos_sale_at(&path, sale_on_lot("inv-offline-1", "lot-test", "product-test", 2.0, "2026-10-01"))
+            .expect("offline sale");
+        let snapshot = |remaining: f64| {
+            serde_json::json!({
+                "branch_context": { "branch_id": "1" },
+                "device_identity": { "device_id": "device-test" },
+                "categories": [],
+                "products": [{ "global_id": "product-test", "product_name": "Test Product" }],
+                "inventory_lots": [{
+                    "global_id": "lot-test",
+                    "product_global_id": "product-test",
+                    "batch_no": "Test Lot",
+                    "purchase_qty": 5,
+                    "remaining_qty": remaining,
+                    "purchase_rate": 10,
+                    "selling_rate": 12
+                }],
+                "customers": [],
+                "sales_history": [{
+                    "id": 900,
+                    "global_id": "inv-offline-1",
+                    "offline_invoice_ref": "OFF-inv-offline-1",
+                    "invoice_no": "FZ-900",
+                    "sale_date": "2026-10-01",
+                    "payment_mode": "CASH",
+                    "amount": 999
+                }],
+                "settings_bundle": {}
+            })
+        };
+
+        cache_reference_snapshot_at(&path, &snapshot(5.0)).expect("cache while sale unpushed");
+        assert_eq!(live_lots(&path, "product-test"), vec![("lot-test".to_string(), 3.0)]);
+        let (net, sync_status): (f64, String) = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT net_total, sync_status FROM local_pos_invoices WHERE id = 'inv-offline-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(net, 20.0, "an unpushed bill keeps its own total");
+        assert_eq!(sync_status, "pending", "an unpushed bill must not be reported synced");
+        let rate: f64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT sale_rate FROM local_inventory_lots WHERE id = 'lot-test'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rate, 12.0, "descriptive fields still come from the cloud");
+
+        // Once the sale is delivered the cloud is authoritative again.
+        accept(&path, "op-inv-offline-1");
+        cache_reference_snapshot_at(&path, &snapshot(3.0)).expect("cache after push");
+        assert_eq!(live_lots(&path, "product-test"), vec![("lot-test".to_string(), 3.0)]);
+        let net: f64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT net_total FROM local_pos_invoices WHERE id = 'inv-offline-1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(net, 999.0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pull_does_not_undo_an_unpushed_sale_and_resumes_after_delivery() {
+        let path = sync_fix_path("pull-keeps-local");
+        initialize_at(&path).expect("initialize");
+        Connection::open(&path)
+            .unwrap()
+            .execute("INSERT INTO local_products (id, product_name) VALUES ('product-pull', 'Apples')", [])
+            .unwrap();
+        pull(&path, &pulled_lot("inventory-lot-41", Some(41), "product-pull", 10.0, 10.0));
+        complete_local_pos_sale_at(&path, sale_on_lot("inv-pull-1", "inventory-lot-41", "product-pull", 2.0, "2026-10-01"))
+            .expect("offline sale");
+        assert_eq!(live_lots(&path, "product-pull"), vec![("inventory-lot-41".to_string(), 8.0)]);
+
+        // Another counter's change to the lot arrives before this sale is pushed.
+        pull(&path, &pulled_lot("inventory-lot-41", Some(41), "product-pull", 10.0, 10.0));
+        assert_eq!(live_lots(&path, "product-pull"), vec![("inventory-lot-41".to_string(), 8.0)]);
+
+        accept(&path, "op-inv-pull-1");
+        pull(&path, &pulled_lot("inventory-lot-41", Some(41), "product-pull", 10.0, 7.0));
+        assert_eq!(live_lots(&path, "product-pull"), vec![("inventory-lot-41".to_string(), 7.0)]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn one_cloud_lot_is_one_local_lot_whichever_id_it_arrived_under() {
+        assert_eq!(
+            cloud_lot_identity_keys("inventory-lot-41", &serde_json::json!({ "id": 41 })),
+            vec!["inventory-lot-41".to_string(), "41".to_string()]
+        );
+        assert_eq!(
+            cloud_lot_identity_keys("004", &serde_json::json!({})),
+            vec!["004".to_string(), "inventory-lot-004".to_string()],
+            "ids are matched as text; 004 is never read as 4"
+        );
+
+        let path = sync_fix_path("lot-identity");
+        initialize_at(&path).expect("initialize");
+        Connection::open(&path)
+            .unwrap()
+            .execute("INSERT INTO local_products (id, product_name) VALUES ('product-dup', 'Apples')", [])
+            .unwrap();
+        // Old sign-in cache: no global_id, so the lot was stored as "41".
+        let snapshot = serde_json::json!({
+            "branch_context": { "branch_id": "1" },
+            "device_identity": { "device_id": "device-test" },
+            "categories": [],
+            "products": [{ "global_id": "product-dup", "product_name": "Apples" }],
+            "inventory_lots": [{ "id": 41, "product_global_id": "product-dup", "purchase_qty": 10, "remaining_qty": 10 }],
+            "customers": [],
+            "settings_bundle": {}
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("old-style cache");
+        pull(&path, &pulled_lot("inventory-lot-41", Some(41), "product-dup", 10.0, 6.0));
+        assert_eq!(live_lots(&path, "product-dup"), vec![("41".to_string(), 6.0)]);
+
+        // A device that already holds both spellings collapses to one on the next pull.
+        {
+            let conn = Connection::open(&path).unwrap();
+            for id in ["42", "inventory-lot-42"] {
+                conn.execute(
+                    "INSERT INTO local_inventory_lots (id, cloud_id, branch_id, product_id, opening_qty, balance_qty)
+                     VALUES (?1, ?1, '1', 'product-dup', 9, 9)",
+                    [id],
+                )
+                .unwrap();
+            }
+        }
+        pull(&path, &pulled_lot("inventory-lot-42", Some(42), "product-dup", 9.0, 4.0));
+        assert_eq!(
+            live_lots(&path, "product-dup"),
+            vec![("41".to_string(), 6.0), ("inventory-lot-42".to_string(), 4.0)]
+        );
+        let kept: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM local_inventory_lots WHERE id = '42'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "the retired spelling is soft-deleted, never removed");
+
+        // A newer sign-in cache that sends global_id lands in the same row too.
+        let snapshot = serde_json::json!({
+            "branch_context": { "branch_id": "1" },
+            "device_identity": { "device_id": "device-test" },
+            "categories": [],
+            "products": [{ "global_id": "product-dup", "product_name": "Apples" }],
+            "inventory_lots": [
+                { "id": 41, "global_id": "inventory-lot-41", "product_global_id": "product-dup", "purchase_qty": 10, "remaining_qty": 5 },
+                { "id": 42, "global_id": "inventory-lot-42", "product_global_id": "product-dup", "purchase_qty": 9, "remaining_qty": 4 }
+            ],
+            "customers": [],
+            "settings_bundle": {}
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("new-style cache");
+        assert_eq!(
+            live_lots(&path, "product-dup"),
+            vec![("inventory-lot-41".to_string(), 5.0), ("inventory-lot-42".to_string(), 4.0)]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_sales_can_be_listed_by_date_range_past_the_200_cap() {
+        let path = sync_fix_path("sales-range");
+        initialize_at(&path).expect("initialize");
+        for (invoice, day) in [("inv-r1", "2026-09-30"), ("inv-r2", "2026-10-01"), ("inv-r3", "2026-10-02")] {
+            let mut sale = sale_on_lot(invoice, &format!("lot-{invoice}"), "product-test", 1.0, day);
+            sale["items"][0]["available_qty"] = serde_json::json!(5.0);
+            complete_local_pos_sale_at(&path, sale).expect("sale");
+        }
+        let ids = |from: &str, to: &str| {
+            list_local_pos_sales_between_at(&path, from, to)
+                .expect("range")
+                .iter()
+                .map(|sale| sale["id"].as_str().or(sale["invoice_global_id"].as_str()).unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("2026-10-01", "2026-10-02").len(), 2);
+        assert_eq!(ids("2026-10-01", "2026-10-01").len(), 1);
+        assert_eq!(ids("2026-09-01", "2026-12-31").len(), 3);
+        assert!(list_local_pos_sales_between_at(&path, "01/10/2026", "2026-10-02").is_err());
+        assert!(list_local_pos_sales_between_at(&path, "2026-10-02", "2026-10-01").is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_lots_carry_their_products_minimum_stock() {
+        let path = activation_temp_path("lot-minimum-stock");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-MIN-STOCK-1";
+        seed_device_assignment(&path, device, "1", "3", "loc-a");
+        {
+            let conn = Connection::open(&path).expect("open");
+            seed_scoped_product(&conn, "product-min", "Mango");
+            seed_scoped_product(&conn, "product-unset", "Kiwi");
+            conn.execute("UPDATE local_products SET minimum_stock = 12.5 WHERE id = 'product-min'", []).unwrap();
+            seed_scoped_lot(&conn, "lot-min", "product-min", "3", "1", "loc-a", 4.0, "ACTIVE", false);
+            seed_scoped_lot(&conn, "lot-unset", "product-unset", "3", "1", "loc-a", 4.0, "ACTIVE", false);
+        }
+        let snapshot = load_reference_snapshot_at(&path, None, Some(device)).expect("snapshot");
+        let lots = snapshot["inventory_lots"].as_array().expect("lots");
+        let by_id = |id: &str| lots.iter().find(|lot| lot["id"] == id).expect("lot").clone();
+        assert_eq!(by_id("lot-min")["minimum_stock"], serde_json::json!(12.5));
+        assert!(by_id("lot-unset")["minimum_stock"].is_null(), "no minimum set is null, not 0 or 5");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sign_in_cache_keeps_a_pending_offline_grn_and_its_product() {
+        let path = sync_fix_path("cache-keeps-grn");
+        initialize_at(&path).expect("initialize");
+        apply_reference_bootstrap_at(
+            &path,
+            &test_reference_bootstrap("device-bootstrap", 1001),
+            "device-bootstrap",
+            Some("2026-07-28T08:00:00.000Z".to_string()),
+        )
+        .expect("bootstrap");
+        queue_local_purchase_at(&path, test_offline_purchase_payload("op-grn-kept")).expect("queue GRN");
+        let snapshot = serde_json::json!({
+            "branch_context": { "branch_id": "1" },
+            "device_identity": { "device_id": "device-bootstrap" },
+            "categories": [],
+            "products": [],
+            "inventory_lots": [],
+            "customers": [],
+            "settings_bundle": {}
+        });
+        // Used to fail outright on the RESTRICT key from the GRN line to its product, or - with
+        // that out of the way - to drop the provisional lots the cloud has never seen.
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache with a pending GRN");
+        let conn = Connection::open(&path).unwrap();
+        let (lots, stock): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(balance_qty), 0) FROM local_inventory_lots
+                 WHERE id LIKE 'offline-lot-op-grn-kept-%' AND deleted_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((lots, stock), (2, 5.5));
+        let _ = fs::remove_file(&path);
     }
 }

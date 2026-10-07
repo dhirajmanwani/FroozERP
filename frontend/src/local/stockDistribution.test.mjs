@@ -82,8 +82,8 @@ test("the warehouse dispatches and the shop receives, and neither does the other
   const approved = consignment({ status: "APPROVED_RESERVED" });
   assert.deepEqual(
     availableTransferActions(approved, WAREHOUSE).map((entry) => entry.action),
-    ["dispatch"],
-    "dispatch is the sender's move",
+    ["dispatch", "cancel"],
+    "dispatch is the sender's move, and so is cancelling to release the held stock",
   );
   assert.deepEqual(
     availableTransferActions(approved, RATANADA),
@@ -470,4 +470,42 @@ test("a line dispatched as nothing is not offered for receipt", () => {
   );
   // And an empty result says so rather than firing a request that will be refused.
   assert.match(source, /onNothingToReceive\?\.\(\)/);
+});
+
+test("the source-side action list matches the server's, exactly", async () => {
+  // Same reasoning as the transition table: a button offered to the wrong side is refused by the
+  // server with TRANSFER_ACTION_SCOPE_REJECTED, so the two lists must not drift.
+  const { TRANSFER_SOURCE_ACTIONS } = await import("./stockDistribution.js");
+  const backend = fs.readFileSync(new URL("../../../backend/operationalV3.js", import.meta.url), "utf8");
+  const match = backend.match(/const sourceActions = \[([^\]]*)\]/);
+  assert.ok(match, "could not find sourceActions in operationalV3.js");
+  const server = [...match[1].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]).sort();
+  assert.ok(server.length > 0, "could not parse the server's sourceActions");
+  assert.deepEqual([...TRANSFER_SOURCE_ACTIONS].sort(), server);
+});
+
+test("a described consignment carries the server's row id for posting actions", () => {
+  const described = describeTransfer(consignment({ id: 5, global_id: "3f2a9c1e-uuid" }), WAREHOUSE);
+  assert.equal(described.id, "3f2a9c1e-uuid", "the key stays the global id");
+  assert.equal(described.serverId, "5", "actions go to the server's own id, never the uuid");
+  const legacy = describeTransfer(consignment({ id: "004", global_id: undefined }), WAREHOUSE);
+  assert.equal(legacy.serverId, "004", "opaque ids are kept as given, never coerced");
+});
+
+test("allocation totals compare at 3 dp, not as raw floats", async () => {
+  const { validateAllocation } = await import("./stockDistribution.js");
+  const result = validateAllocation({
+    requested: 0.3,
+    allocations: [
+      { source_lot_id: "a", quantity: 0.1, available_quantity: 1 },
+      { source_lot_id: "b", quantity: 0.2, available_quantity: 1 },
+    ],
+  });
+  assert.deepEqual(result.problems, []);
+  assert.equal(result.total, 0.3);
+  const over = validateAllocation({
+    requested: 0.3,
+    allocations: [{ source_lot_id: "a", quantity: 0.301, available_quantity: 1 }],
+  });
+  assert.equal(over.ok, false, "a real excess of one gram is still refused");
 });

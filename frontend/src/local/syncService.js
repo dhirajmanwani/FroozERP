@@ -7,6 +7,7 @@ import { isTauriRuntime } from "./localDatabase";
 import { currentDevicePlatform } from "./mobileGateway.js";
 import { repositories } from "./repositories";
 import { classifySyncError } from "./syncClassification";
+import { purchaseReplayBody, runPushCycle, runPushThenPull } from "./syncPushCycle.js";
 import { canonicalizeCloudApiUrl, isHostedCloudOrigin } from "./cloudOrigins.js";
 import {
   authoritativeUtcNowIso,
@@ -38,6 +39,8 @@ let lastStatus = {
   syncProgressDone: 0,
   syncProgressTotal: 0,
   canonicalIdentity: null,
+  // Whether the last `syncNow` cycle finished its pull. Read it from that call's result.
+  pullCompleted: false,
   timeDiagnostics: getTimeDiagnostics(),
 };
 
@@ -112,6 +115,7 @@ const simulatedOfflineStatus = async (apiUrl, stage = "sync") => {
     lastFailureKind: "APP_LOCAL_ONLY",
     lastHttpStatus: null,
     syncStage: stage,
+    pullCompleted: false,
     lastError: "Local Only mode selected - cloud sync paused.",
   };
   return lastStatus;
@@ -239,11 +243,9 @@ const replayOfflinePurchase = async ({ apiUrl, operation, context }) => {
   try {
     const response = await axios.post(
       endpointUrl(apiUrl, "/api/v3/purchase-bills"),
-      {
-        ...(operation.payload || {}),
-        idempotency_key: operation.operation_id,
-        operation_id: operation.operation_id,
-      },
+      // Without the queuing user's identity fields: the server takes identity from the session, and
+      // a stale `user_id` here was refused as a session substitution. See syncPushCycle.js.
+      purchaseReplayBody(operation),
       {
         ...withTimeout(20000),
         headers: {
@@ -330,11 +332,12 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
     syncProgressDone: 0,
     syncProgressTotal: operations.length,
   };
-  try {
-    const acknowledgements = [];
-    let serverTime = "";
-    const regularOperations = operations.filter((operation) => operation.entity_type !== "purchase_grn");
-    if (regularOperations.length > 0) {
+  // Acks are applied as each answer arrives and a failure releases only what is still unsettled;
+  // see `runPushCycle` for why the order matters.
+  const result = await runPushCycle({
+    operations,
+    now: authoritativeUtcNowIso,
+    pushRegular: async (regularOperations) => {
       const pushStartedAt = Date.now();
       const response = await axios.post(endpointUrl(apiUrl, "/api/sync/push"), {
         user_id: context.userId,
@@ -357,48 +360,41 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
         ...withTimeout(15000),
         headers: optionalSessionAuthHeaders(context.deviceSessionToken),
       });
-      serverTime = response.data?.server_time || serverTime;
+      const serverTime = response.data?.server_time || "";
       observeServerTime({
         serverTime,
         requestStartedAt: pushStartedAt,
         responseReceivedAt: Date.now(),
       });
-      acknowledgements.push(...(response.data?.acknowledgements || []));
-    }
-    for (const operation of operations.filter((item) => item.entity_type === "purchase_grn")) {
-      const result = await replayOfflinePurchase({ apiUrl, operation, context });
-      acknowledgements.push(result.acknowledgement);
-      serverTime = result.serverTime || serverTime;
-    }
-    writeSyncLog("INFO", "push-result", {
-      apiUrl: normalizeApiUrl(apiUrl),
-      endpoint: endpointUrl(apiUrl, "/api/sync/push"),
-      status: 200,
-      operationCount: operations.length,
-      acknowledgementCount: acknowledgements.length,
-    });
-    const status = await repositories.outbox.applyAcks(
+      return { acknowledgements: response.data?.acknowledgements || [], serverTime };
+    },
+    replayPurchase: (operation) => replayOfflinePurchase({ apiUrl, operation, context }),
+    applyAcks: (acknowledgements, serverTime) => repositories.outbox.applyAcks(
       acknowledgements,
       context.deviceId,
-      serverTime || authoritativeUtcNowIso(),
-    );
-    lastStatus = {
-      ...normalizeLocalStatus(status),
-      online: true,
-      lastError: "",
-      apiUrl: normalizeApiUrl(apiUrl),
-      syncStage: "push",
-      syncProgressDone: operations.length,
-      syncProgressTotal: operations.length,
-    };
-    return lastStatus;
-  } catch (error) {
-    await repositories.outbox.release(
-      operationIds,
-      error?.message || "Network interruption; purchase remains queued",
-    );
-    throw error;
-  }
+      serverTime,
+    ),
+    release: (ids, message) => repositories.outbox.release(ids, message),
+  });
+  writeSyncLog("INFO", "push-result", {
+    apiUrl: normalizeApiUrl(apiUrl),
+    endpoint: endpointUrl(apiUrl, "/api/sync/push"),
+    status: 200,
+    operationCount: operations.length,
+    acknowledgementCount: result.acknowledgementCount,
+    unacknowledgedCount: result.unacknowledged.length,
+  });
+  const status = result.status || await repositories.status.get();
+  lastStatus = {
+    ...normalizeLocalStatus(status),
+    online: true,
+    lastError: "",
+    apiUrl: normalizeApiUrl(apiUrl),
+    syncStage: "push",
+    syncProgressDone: operations.length,
+    syncProgressTotal: operations.length,
+  };
+  return lastStatus;
 }
 
 export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) {
@@ -487,7 +483,10 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
   }
   if (runningSync) return runningSync;
   runningSync = (async () => {
-    lastStatus = { ...lastStatus, syncing: true, lastError: "", apiUrl: normalizeApiUrl(apiUrl), syncStage: "starting" };
+    lastStatus = { ...lastStatus, syncing: true, lastError: "", apiUrl: normalizeApiUrl(apiUrl), syncStage: "starting", pullCompleted: false };
+    // True once this cycle's pull loop finished, even if the push failed: the caller refreshes POS
+    // and business data on it, because new lots arrived either way.
+    let pullCompleted = false;
     try {
       await initialiseSync({ apiUrl, user, deviceInfo, branchId });
       if (!lastStatus.online) {
@@ -495,10 +494,17 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
         offlineError.froozConnectivity = true;
         throw offlineError;
       }
-      const pushStatus = await pushPendingOperations({ apiUrl, user, deviceInfo, branchId });
-      let pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
-      while (pullStatus.hasMore) {
-        pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
+      // A push that failed while the cloud is reachable (one stuck purchase replay, a 403) must not
+      // stop the pull -- that is what kept a saved Stock Arrival from ever reaching POS.
+      const { pushStatus, pushError, pullStatus } = await runPushThenPull({
+        push: () => pushPendingOperations({ apiUrl, user, deviceInfo, branchId }),
+        pullOnce: () => pullServerChanges({ apiUrl, user, deviceInfo, branchId }),
+        pullAfterPushFailure: (error) => !error?.froozConnectivity && classifySyncError(error, apiUrl).online,
+      });
+      pullCompleted = true;
+      if (pushError) {
+        lastStatus = { ...lastStatus, syncStage: "push" };
+        throw pushError;
       }
       const completed = await repositories.cycle.complete(
         syncContext({ user, deviceInfo, branchId }).deviceId,
@@ -507,7 +513,7 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
       );
       lastStatus = { ...lastStatus, ...normalizeLocalStatus(completed) };
       resetBackoff();
-      lastStatus = { ...lastStatus, syncing: false, online: true, lastError: "", syncStage: "idle", syncProgressDone: 0, syncProgressTotal: 0 };
+      lastStatus = { ...lastStatus, syncing: false, online: true, lastError: "", syncStage: "idle", syncProgressDone: 0, syncProgressTotal: 0, pullCompleted };
       return lastStatus;
     } catch (error) {
       clampBackoff();
@@ -532,6 +538,7 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
         apiUrl: normalizeApiUrl(apiUrl),
         backendUrl: endpointUrl(apiUrl, "/api/health"),
         syncStage: "failed",
+        pullCompleted,
       };
       return lastStatus;
     } finally {

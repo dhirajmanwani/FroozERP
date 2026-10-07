@@ -2923,6 +2923,15 @@ fn pos_sale_list_local(app: AppHandle) -> Result<Vec<serde_json::Value>, String>
 }
 
 #[tauri::command]
+fn pos_sale_list_local_range(
+    app: AppHandle,
+    from_date: String,
+    to_date: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    local_db::list_local_pos_sales_between(&app, &from_date, &to_date)
+}
+
+#[tauri::command]
 fn purchase_queue_local(
     app: AppHandle,
     purchase: serde_json::Value,
@@ -3275,6 +3284,7 @@ pub fn run() {
             pos_sale_cancel_local,
             pos_sale_load_local,
             pos_sale_list_local,
+            pos_sale_list_local_range,
             purchase_queue_local,
             purchase_list_local,
             runtime_profile,

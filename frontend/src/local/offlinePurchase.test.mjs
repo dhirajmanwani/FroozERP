@@ -40,10 +40,16 @@ test("offline replay is signed, idempotent, and recovers after interruption", ()
   // `Authorization: Bearer` and the legacy header. The property is unchanged — replay is signed.
   assert.match(syncSource, /optionalSessionAuthHeaders\(context\.deviceSessionToken\)/);
   assert.match(syncSource, /x-idempotency-key/);
-  assert.match(syncSource, /operation\.entity_type !== "purchase_grn"/);
+  // The purchase/regular split lives in syncPushCycle.js since the ack-ordering fix.
+  assert.match(
+    fs.readFileSync(path.join(here, "syncPushCycle.js"), "utf8"),
+    /operation\?\.entity_type === "purchase_grn"/,
+  );
   assert.match(syncSource, /replayOfflinePurchase/);
   assert.match(syncSource, /markSyncing\(operationIds\)/);
-  assert.match(syncSource, /release\(\s*operationIds/);
+  // The release-on-interruption moved into syncPushCycle.js, which now releases only what is still
+  // unsettled; its behaviour is tested in syncPushCycle.test.mjs.
+  assert.match(syncSource, /release: \(ids, message\) => repositories\.outbox\.release\(ids, message\)/);
   assert.match(rustSource, /state = 'syncing'/);
   assert.match(rustSource, /state = 'pending', last_error/);
   assert.match(rustSource, /server_purchase_ids_json/);

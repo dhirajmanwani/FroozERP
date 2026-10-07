@@ -236,7 +236,10 @@ const collectWriteRegistrations = () => {
   // exactly as `requireRateManager` does and then admits one role instead of two. It guards the
   // activation routes, where an Admin able to mint a device entitlement could authorise a machine
   // nobody approved.
-  const GUARDS = /getPermissionUser\(|requireRateManager\(|getSalePermissionUser\(|requireSelfOrRateManager\(|requireSyncContext\(|requireOrderRouter\(|requireOwnerOnly\(/;
+  // `getStaffPermissionUser` (7 Oct 2026) is `getPermissionUser` with Owner and Admin always let
+  // through; `getOwnerUser` re-reads the role from the database like `requireOwnerOnly` and admits the
+  // Owner alone. Both now guard settings writes that used `requireRateManager` before.
+  const GUARDS = /getPermissionUser\(|getStaffPermissionUser\(|getOwnerUser\(|requireRateManager\(|getSalePermissionUser\(|requireSelfOrRateManager\(|requireSyncContext\(|requireOrderRouter\(|requireOwnerOnly\(/;
   const registrations = [];
   codeLines.forEach((line, index) => {
     const match = /^app\.(post|put|patch|delete)\("([^"]+)"/.exec(line);

@@ -303,6 +303,16 @@ import {
 } from "./local/serverTime";
 import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
 import { describeInitialPullFailure } from "./local/freshDeviceOnboarding";
+import { plainRefusalMessage } from "./local/refusalMessages";
+import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
+import { findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation } from "./local/accountsPresentation";
+import { productStockKeyResolver, wasteEntryProductId } from "./local/wasteStock";
+import { UNDRAWN_TRANSFER_ACTION_NOTE, crateAllocationsForApproval, drawableTransferActions, transferActionId, transferItemsForSend } from "./local/distributionWrites";
+import { buildLocalOnlyReportsData, resolveReportAvailability } from "./local/reportCenterOffline";
+import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, pickDashboardMetric, unavailableBriefingNote } from "./local/figurePresentation";
+import { UPI_BANK_PAYMENT_MODES, dayBookVoucherLabel, paymentReportTotals, saleGrossAmount, salesHistoryMoneyTotals } from "./local/salesReportTotals";
+import { checkoutFingerprint, resolveCheckoutRef } from "./local/checkoutRetry";
+import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 // The phone app is a Tauri runtime too, so `isDesktopShell()` is true there as well. What differs on
@@ -1301,6 +1311,10 @@ const frostDiagnosticsSummary = (diagnostics = []) => {
   return "FROST data could not be loaded. Local FroozERP modules remain available.";
 };
 const getAuthErrorMessage = (error, fallback) => {
+  // The auth-hardening refusals (current password, locks, Owner-only accounts and roles, own-shop
+  // staff) in plain words (local/refusalMessages.js).
+  const refusal = plainRefusalMessage(error);
+  if (refusal) return refusal;
   const code = error.response?.data?.code;
   const message = error.response?.data?.message;
   if (code === "INVALID_CREDENTIALS") return "Invalid username or password.";
@@ -2454,6 +2468,8 @@ function App() {
   const [discountRules, setDiscountRules] = useState([]);
   const [lotDiscounts, setLotDiscounts] = useState([]);
   const [customerPendingBills, setCustomerPendingBills] = useState({ summary: [], invoices: [] });
+  // Kept so a failed read is shown as a failure on Pending Bills, not as an empty credit list.
+  const [customerPendingBillsError, setCustomerPendingBillsError] = useState("");
   const [saleRates, setSaleRates] = useState([]);
   const [saleRateHistory, setSaleRateHistory] = useState([]);
   const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
@@ -2474,12 +2490,10 @@ function App() {
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
   const [accountPayments, setAccountPayments] = useState([]);
-  const [accountOutstanding, setAccountOutstanding] = useState({
-    customerOutstanding: [],
-    supplierOutstanding: [],
-    totalReceivable: 0,
-    totalPayable: 0,
-  });
+  // null until a load has answered, and the error kept beside it: zeros here were shown as "nobody
+  // owes anything" whenever the read failed (local/accountsPresentation.js).
+  const [accountOutstanding, setAccountOutstanding] = useState(null);
+  const [accountOutstandingError, setAccountOutstandingError] = useState("");
   const [reportsData, setReportsData] = useState({
     salesReport: [],
     purchaseReport: [],
@@ -3701,7 +3715,10 @@ function App() {
     });
     setSyncStatus(status);
     applyCanonicalIdentityFromSync(status);
-    if (!status.lastError) await refreshBusinessDataAfterSync();
+    // A cycle whose push failed may still have pulled new lots into SQLite (`pullCompleted`, read
+    // from this call's own result). Redraw from them: a stuck local change must not hide a Stock
+    // Arrival saved on another machine (local/syncRefreshPolicy.js).
+    if (shouldRefreshAfterSync(status)) await refreshBusinessDataAfterSync();
     const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user, localServiceState: localServiceStartupStateRef.current });
     setSyncMessage(nextStatus.syncSummary);
     return status;
@@ -4220,19 +4237,13 @@ function App() {
     // screen that shows every shop's money. The backend refuses non-Owners regardless; this keeps
     // the door from appearing in the first place.
     if (view === "all-shops") return String(roleName || "").toUpperCase() === "OWNER";
-    if (view === "dashboard") {
-      if (roleName === "Owner") return true;
-      if (permissions && Object.prototype.hasOwnProperty.call(permissions, "dashboard")) return Boolean(permissions.dashboard);
-      return roleName === "Admin";
-    }
+    // Everything else: Owner always; then the role's stored map, key by key; the built-in
+    // defaults (`defaultPermissions.all` for Admin, the per-screen ones for the other seeded roles)
+    // only answer a key the stored map leaves undefined. Defaults used to be read first, so
+    // unticking a screen in Settings -> Role Permissions changed nothing. Branches & Counters opens
+    // for Owner and Admin; an Admin sees only its Counter screen lock (local/rolePermissions.js).
     const defaultPermissions = defaultRolePermissions[roleName] || {};
-    if (defaultPermissions.all || defaultPermissions[view]) return true;
-    const permissionKey = modulePermissionMap[view];
-    if (view === "accounts" && permissions) {
-      return Boolean(permissions.customer_payments || permissions.supplier_payments || permissions.supplier_accounts);
-    }
-    if (!permissions || !permissionKey) return false;
-    return Boolean(permissions[permissionKey]);
+    return resolveModuleAccess({ view, role: roleName, permissions, defaultPermissions, modulePermissionMap });
   };
 
   // FROST is drawn only for someone the server would let use it (see `mayUseFrost`).
@@ -4293,10 +4304,13 @@ function App() {
       setExitAttemptCount((count) => count + 1);
       if (!error?.response) {
         setExitCodeError("Local backend is unavailable, so FroozERP cannot verify the Owner exit code. Start/reconnect the local backend, then try again.");
+      } else if (plainRefusalMessage(error)) {
+        // EXIT_CODE_ATTEMPTS_LOCKED (429): too many wrong codes. Not "invalid exit code".
+        setExitCodeError(plainRefusalMessage(error));
       } else if (error.response?.status === 409) {
-        setExitCodeError(getErrorMessage(error, "No Owner exit code is configured. Open Branches & Counters > Counter screen lock and set a new code with the Owner/Admin password."));
+        setExitCodeError(getErrorMessage(error, "No Owner exit code is configured. The Owner or an Admin can set one in Branches & Counters > Counter screen lock."));
       } else if (error.response?.status === 403) {
-        setExitCodeError("Invalid exit code. Owner/Admin can reset it in Branches & Counters > Counter screen lock using the current account password.");
+        setExitCodeError("Invalid exit code. The Owner or an Admin can reset it in Branches & Counters > Counter screen lock.");
       } else {
         setExitCodeError(getErrorMessage(error, "Unable to verify Owner exit code."));
       }
@@ -4388,32 +4402,39 @@ function App() {
       stockValue: supplierDashboard.stockValue ?? stockValue,
       lowStockItems: supplierDashboard.lowStockItems ?? lowStockItems,
       transactions: supplierDashboard.transactions ?? todaysSales.length,
-      supplierOutstanding: supplierDashboard.supplierOutstanding ?? supplierDashboard.total_supplier_outstanding ?? 0,
-      customerOutstanding: analyticsSummary.customerOutstanding ?? supplierDashboard.customerOutstanding ?? 0,
-      todayExpenses: analyticsSummary.todayExpenses ?? supplierDashboard.todayExpenses ?? 0,
-      todayReturns: analyticsSummary.todayReturns ?? supplierDashboard.todayReturns ?? 0,
-      monthlyReturns: analyticsSummary.monthlyReturns ?? supplierDashboard.monthlyReturns ?? 0,
-      todayWaste: analyticsSummary.todayWaste ?? supplierDashboard.todayWaste ?? 0,
-      monthlyWaste: analyticsSummary.monthlyWaste ?? supplierDashboard.monthlyWaste ?? 0,
-      wastePercentage: analyticsSummary.wastePercentage ?? supplierDashboard.wastePercentage ?? 0,
-      totalRebateReceived: supplierDashboard.totalRebateReceived ?? supplierDashboard.total_rebate_received ?? 0,
-      todaySupplierPayments: supplierDashboard.todaySupplierPayments ?? supplierDashboard.todays_supplier_payments ?? 0,
+      // Not worked out by the local dashboard, which says so with `null` (LOCAL_UNCOMPUTED_METRICS in
+      // local/dashboardSnapshot.js). `null` stays unknown and prints "—"; `?? 0` and `Number(x || 0)`
+      // used to turn it into ₹0.00 (local/figurePresentation.js).
+      supplierOutstanding: pickDashboardMetric(supplierDashboard.supplierOutstanding, supplierDashboard.total_supplier_outstanding),
+      customerOutstanding: pickDashboardMetric(analyticsSummary.customerOutstanding, supplierDashboard.customerOutstanding),
+      todayExpenses: pickDashboardMetric(analyticsSummary.todayExpenses, supplierDashboard.todayExpenses),
+      todayReturns: pickDashboardMetric(analyticsSummary.todayReturns, supplierDashboard.todayReturns),
+      monthlyReturns: pickDashboardMetric(analyticsSummary.monthlyReturns, supplierDashboard.monthlyReturns),
+      todayWaste: pickDashboardMetric(analyticsSummary.todayWaste, supplierDashboard.todayWaste),
+      monthlyWaste: pickDashboardMetric(analyticsSummary.monthlyWaste, supplierDashboard.monthlyWaste),
+      wastePercentage: pickDashboardMetric(analyticsSummary.wastePercentage, supplierDashboard.wastePercentage),
+      totalRebateReceived: pickDashboardMetric(supplierDashboard.totalRebateReceived, supplierDashboard.total_rebate_received),
+      todaySupplierPayments: pickDashboardMetric(supplierDashboard.todaySupplierPayments, supplierDashboard.todays_supplier_payments),
     };
+    const rupees = (value) => formatKnownFigure(value, (number) => currency.format(number));
+    // [label, value, icon, note]. The note is printed under the figure: the caveat on a profit that
+    // includes provisional costs, the stock still waiting for a bill, or why a tile is blank.
+    const unknownNote = (value) => (value === null ? "Not available offline" : "");
 
     return [
       ["Today's Sales", currency.format(Number(metrics.todaySales || 0)), "rupee"],
-      ["Today's Profit", currency.format(Number(metrics.todayProfit || 0)), "trend"],
-      ["Stock Value", currency.format(Number(metrics.stockValue || 0)), "layers"],
-      ["Supplier Outstanding", currency.format(Number(metrics.supplierOutstanding || 0)), "wallet"],
-      ["Customer Outstanding", currency.format(Number(metrics.customerOutstanding || 0)), "users"],
-      ["Today's Expenses", currency.format(Number(metrics.todayExpenses || 0)), "wallet"],
-      ["Total Rebate Received", currency.format(Number(metrics.totalRebateReceived || 0)), "trend"],
-      ["Today's Supplier Payments", currency.format(Number(metrics.todaySupplierPayments || 0)), "rupee"],
-      ["Today's Returns", currency.format(Number(metrics.todayReturns || 0)), "history"],
-      ["Monthly Returns", currency.format(Number(metrics.monthlyReturns || 0)), "history"],
-      ["Today's Waste", currency.format(Number(metrics.todayWaste || 0)), "alert"],
-      ["Monthly Waste", currency.format(Number(metrics.monthlyWaste || 0)), "alert"],
-      ["Waste Percentage", `${Number(metrics.wastePercentage || 0).toFixed(2)}%`, "chart"],
+      ["Today's Profit", currency.format(Number(metrics.todayProfit || 0)), "trend", String(supplierDashboard.profitNote || "")],
+      ["Stock Value", currency.format(Number(metrics.stockValue || 0)), "layers", String(supplierDashboard.stockValueNote || "")],
+      ["Supplier Outstanding", rupees(metrics.supplierOutstanding), "wallet", unknownNote(metrics.supplierOutstanding)],
+      ["Customer Outstanding", rupees(metrics.customerOutstanding), "users", unknownNote(metrics.customerOutstanding)],
+      ["Today's Expenses", rupees(metrics.todayExpenses), "wallet", unknownNote(metrics.todayExpenses)],
+      ["Total Rebate Received", rupees(metrics.totalRebateReceived), "trend", unknownNote(metrics.totalRebateReceived)],
+      ["Today's Supplier Payments", rupees(metrics.todaySupplierPayments), "rupee", unknownNote(metrics.todaySupplierPayments)],
+      ["Today's Returns", rupees(metrics.todayReturns), "history", unknownNote(metrics.todayReturns)],
+      ["Monthly Returns", rupees(metrics.monthlyReturns), "history", unknownNote(metrics.monthlyReturns)],
+      ["Today's Waste", rupees(metrics.todayWaste), "alert", unknownNote(metrics.todayWaste)],
+      ["Monthly Waste", rupees(metrics.monthlyWaste), "alert", unknownNote(metrics.monthlyWaste)],
+      ["Waste Percentage", formatKnownFigure(metrics.wastePercentage, (number) => `${number.toFixed(2)}%`), "chart", unknownNote(metrics.wastePercentage)],
       ["Low Stock Items", Number(metrics.lowStockItems || 0), "alert"],
       ["Transactions", Number(metrics.transactions || 0), "receipt"],
     ];
@@ -4617,7 +4638,7 @@ function App() {
     setPurchases(snapshot?.offline_purchases || bundle.offlinePurchases || []);
     setSuppliers(bundle.offlineSuppliers || []);
     setAccounts(bundle.offlineAccounts || []);
-    setAccountOutstanding(bundle.offlineAccountOutstanding || {});
+    setAccountOutstanding(bundle.offlineAccountOutstanding || null);
     setExpenses(bundle.offlineExpenses || []);
     setSaleReturns(bundle.offlineSaleReturns || []);
     setWasteEntries(bundle.offlineWasteEntries || []);
@@ -4760,7 +4781,7 @@ function App() {
       ["purchases", "/purchases", localBundle.offlinePurchases || purchases],
       ["suppliers", "/suppliers", localBundle.offlineSuppliers || suppliers],
       ["accounts", "/accounts", localBundle.offlineAccounts || accounts],
-      ["accountOutstanding", "/accounts/outstanding", localBundle.offlineAccountOutstanding || accountOutstanding],
+      ["accountOutstanding", "/accounts/outstanding", localBundle.offlineAccountOutstanding || accountOutstanding || {}],
       ["expenses", "/expenses", localBundle.offlineExpenses || expenses],
       ["saleReturns", "/sale-returns", localBundle.offlineSaleReturns || saleReturns],
       ["wasteEntries", "/waste-entries", localBundle.offlineWasteEntries || wasteEntries],
@@ -5725,8 +5746,14 @@ function App() {
   };
 
   const loadCustomerPendingBills = async () => {
-    const response = await axios.get(`${API_URL}/pending-bills/customer`);
-    setCustomerPendingBills(response.data || { summary: [], invoices: [] });
+    try {
+      const response = await axios.get(`${API_URL}/pending-bills/customer`);
+      setCustomerPendingBills(response.data || { summary: [], invoices: [] });
+      setCustomerPendingBillsError("");
+    } catch (error) {
+      setCustomerPendingBillsError(getErrorMessage(error, "no answer from the server"));
+      throw error;
+    }
   };
 
   const loadAiAssistant = async (range = aiRange) => {
@@ -6670,8 +6697,14 @@ function App() {
   };
 
   const loadAccountOutstanding = async () => {
-    const response = await axios.get(`${API_URL}/accounts/outstanding`);
-    setAccountOutstanding(response.data);
+    try {
+      const response = await axios.get(`${API_URL}/accounts/outstanding`);
+      setAccountOutstanding(response.data);
+      setAccountOutstandingError("");
+    } catch (error) {
+      setAccountOutstandingError(getErrorMessage(error, "no answer from the server"));
+      throw error;
+    }
   };
 
   const loadAccountPayments = async (accountKey = "") => {
@@ -6682,6 +6715,11 @@ function App() {
   };
 
   const loadReports = async (params = {}) => {
+    // Not asked for at all without the Reports permission: the reads answer 403, and this runs after
+    // every sale and on opening POS (local/rolePermissions.js, `mayReadReports`).
+    if (user && !mayReadReports({ role: user.role, permissions: rolePermissionMap.get(user.role) })) {
+      return { params: reportLoadParams(params, reportParamsRef.current), source: "SKIPPED_NO_PERMISSION", failures: [], skipped: true };
+    }
     const requestGeneration = reportRequestGateRef.current.begin();
     const requestedParams = reportLoadParams(params, reportParamsRef.current);
     const normalizedParams = { ...requestedParams, ...resolveReportDateRange(requestedParams) };
@@ -6714,29 +6752,39 @@ function App() {
     if (tauriRuntime && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
       try {
         if (localInventoryFailure) throw Object.assign(new Error(localInventoryFailure.message), { code: "INVENTORY_RESPONSE_CONTRACT" });
-        const localRows = await listLocalPosSales().catch(() => []);
-        const salesRows = filterRowsForReportRange(localRows.map(localSnapshotToInvoice), normalizedParams);
+        // A failed read of this computer's sales is an error on Sales History, not an empty list
+        // that reads as "no sales" (local/reportCenterOffline.js).
+        let localRows = [];
+        let salesError = "";
+        try {
+          localRows = await listLocalPosSales();
+        } catch (salesReadError) {
+          salesError = getErrorMessage(salesReadError, salesReadError?.message || "the local sales could not be read");
+          writeDiagnosticLog("ERROR", "local-sales-report-load-failed", { message: salesError });
+        }
+        const salesRows = filterRowsForReportRange((Array.isArray(localRows) ? localRows : []).map(localSnapshotToInvoice), normalizedParams);
         if (!reportRequestGateRef.current.isCurrent(requestGeneration)) {
           return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [], stale: true };
         }
+        // Every report the server works out is blanked and marked unavailable offline. Spreading
+        // `...current` here kept the last cloud figures under the newly chosen period. The cash book
+        // went the same way: a partial one (POS receipts only, no payments, no openings) in a shape
+        // the screen does not read is worse than saying it needs the server.
         setReportsData((current) => ({
-          ...current,
-          salesHistoryReport: salesRows,
-          stockReport: localInventorySnapshot.products,
-          stockLotReport: localInventorySnapshot.lots,
+          ...buildLocalOnlyReportsData(current, {
+            salesRows,
+            salesError,
+            stockReport: localInventorySnapshot.products,
+            stockLotReport: localInventorySnapshot.lots,
+            dateFrom: normalizedParams.date_from,
+            dateTo: normalizedParams.date_to,
+          }),
           inventoryLoadState: "ready",
           inventoryLoadError: "",
-          cashBookReport: salesRows.flatMap((sale) => (sale.payments || []).map((payment) => ({
-            transaction_date: sale.sale_date,
-            source: "LOCAL_POS",
-            party_name: sale.customer_name || "Walk-in Customer",
-            payment_mode: payment.mode || payment.payment_mode || sale.payment_mode,
-            total_amount: Number(payment.amount || sale.total_amount || 0),
-            transaction_count: 1,
-          }))),
-          dateFrom: normalizedParams.date_from,
-          dateTo: normalizedParams.date_to,
         }));
+        if (salesError) {
+          return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [{ key: "sales", message: salesError }] };
+        }
         return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [] };
       } catch (error) {
         const message = sanitizedInventoryLoadError(error);
@@ -6781,6 +6829,9 @@ function App() {
     setReportsData((current) => ({
       ...current,
       ...(summaryFailed ? {} : (values.summary || {})),
+      // Back on the server's figures: nothing is marked offline-only any more.
+      ...(summaryFailed ? {} : { offlineUnavailable: false }),
+      salesHistoryLoadError: "",
       stockReport: inventoryFailure ? current.stockReport : nextStockReport,
       stockLotReport: inventoryFailure ? current.stockLotReport : nextStockLots,
       inventoryLoadState: inventoryFailure ? "error" : "ready",
@@ -6818,8 +6869,9 @@ function App() {
         initiation_mode: "DESTINATION_REQUESTED",
         source_branch_id: draft.sourceBranchId,
         source_operational_location_id: draft.sourceLocationId,
+        // Snapshot ids sent as given (opaque, never Number()); the server resolves them.
         items: draft.lines.map((line) => ({
-          product_id: line.product_id,
+          product_id: canonicalInventoryId(line.product_id),
           requested_quantity: line.requested_quantity,
         })),
       });
@@ -6931,11 +6983,9 @@ function App() {
         initiation_mode: "SOURCE_INITIATED",
         destination_branch_id: draft.destinationBranchId,
         destination_operational_location_id: draft.destinationLocationId,
-        items: draft.lines.map((line) => ({
-          product_id: line.product_id,
-          source_lot_id: line.source_lot_id,
-          requested_quantity: line.requested_quantity,
-        })),
+        // This counter's own lots, named by their snapshot ids ("product-12", a lot's global id) as
+        // opaque strings; the server resolves each within the company (local/distributionWrites.js).
+        items: transferItemsForSend(draft.lines),
       });
       await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
       await loadDistribution();
@@ -7268,6 +7318,8 @@ function App() {
       const localSales = localRows.map(localSnapshotToInvoice);
       const localDashboard = buildLocalDashboardSnapshot({
         inventoryLots: snapshot?.inventory_lots || [],
+        // Each product's own minimum stock, for the low-stock count.
+        products: snapshot?.products,
         sales: localSales,
         range,
         customRange,
@@ -8468,9 +8520,18 @@ function App() {
           postSaveRefreshFailures.map((result) => getErrorMessage(result.reason, "Refresh failed"))
         );
       }
+      // The new or changed lots are in the cloud; POS on this desktop reads SQLite, which would learn
+      // of them only at the next background cycle (up to a minute). Pull them now. Not awaited and
+      // never allowed to fail the save; LOCAL_ONLY is refused inside runSyncNow before any request
+      // (local/syncRefreshPolicy.js). Covers completing a pending bill, which saves through here.
+      if (shouldSyncAfterPurchaseSave({ tauriRuntime: isTauriRuntime(), queuedOffline: false })) {
+        runSyncNow({ force: true }).catch((syncError) => {
+          writeDiagnosticLog("WARN", "post-purchase-sync-failed", { message: getErrorMessage(syncError, "Sync after purchase save failed") });
+        });
+      }
       alert(purchaseBillStatus === "BILL_PENDING" ? "Stock Arrival Saved - Bill Pending" : wasEditing ? "Purchase Updated" : "Purchase Saved");
     } catch (error) {
-      alert(getErrorMessage(error, "Purchase Error"));
+      alert(plainRefusalMessage(error) || getErrorMessage(error, "Purchase Error"));
     } finally {
       purchaseSaveInFlightRef.current = false;
       setPurchaseSaveBusy(false);
@@ -8941,16 +9002,10 @@ function App() {
       customerRows = response.data;
       setCustomers(response.data);
     }
-    const saleCustomerId = Number(sale.customer_id || 0);
-    const saleMobile = String(sale.customer_mobile || "").trim();
-    const saleName = String(sale.customer_name || "").trim().toLowerCase();
-    const customer = customerRows.find((item) => {
-      if (saleCustomerId && Number(item.id) === saleCustomerId) return true;
-      const mobileMatches = saleMobile && String(item.mobile_number || "").trim() === saleMobile;
-      const nameMatches = saleName && String(item.customer_name || "").trim().toLowerCase() === saleName;
-      const walkInMatches = saleName.includes("walk-in") && item.system_account === true;
-      return mobileMatches || nameMatches || walkInMatches;
-    });
+    // The same id first (canonical, never Number()), then mobile, then name, each over the whole
+    // list: a one-pass "id OR mobile OR name" let a namesake earlier in the list win over the
+    // customer the sale actually names (local/accountsPresentation.js).
+    const customer = findSaleCustomer(customerRows, sale);
     if (!customer?.id) {
       alert("Customer account is not linked to this sale.");
       return;
@@ -9994,12 +10049,13 @@ function App() {
                   ),
                   kpis: (
               <section className="kpi-grid">
-                {kpis.map(([label, value, icon]) => (
+                {kpis.map(([label, value, icon, note]) => (
                   <article className="kpi-card" key={label}>
                     <div className="kpi-icon"><Icon name={icon} size={20} /></div>
                     <div>
                       <span>{label}</span>
-                      <strong>{value}</strong>
+                      <strong title={value === UNKNOWN_FIGURE ? note || undefined : undefined}>{value}</strong>
+                      {note && <small className="cell-note">{note}</small>}
                     </div>
                   </article>
                 ))}
@@ -10528,11 +10584,14 @@ function App() {
                         <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : "Completed Bill"}</span></td>
                         <td>{rowNet === null ? "-" : currency.format(rowNet)}</td>
                         <td>
-                          <div className="button-row table-actions-row">
-                            <button className="table-action" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => editPurchase(purchase)} title={changeBlock || undefined}>Edit</button>
-                            {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
-                            <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
-                          </div>
+                          {/* Edit, complete and cancel are Owner/Admin on the server (requireRateManager). */}
+                          {canManagePendingPurchaseBills(user.role) ? (
+                            <div className="button-row table-actions-row">
+                              <button className="table-action" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => editPurchase(purchase)} title={changeBlock || undefined}>Edit</button>
+                              {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
+                              <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
+                            </div>
+                          ) : <small className="cell-note">Only the Owner or an Admin can edit, complete or cancel a purchase.</small>}
                           {changeBlock && purchase.purchase_status !== "CANCELLED" && <small className="cell-note">{changeBlock}</small>}
                         </td>
                       </tr>
@@ -10708,7 +10767,11 @@ function App() {
 
           {activeView === "pending-bills" && (
             <PendingBillsModule
+              canManagePending={canManagePendingPurchaseBills(user.role)}
+              // Customer Payments from the role's permission map (Owner always), not a list of names.
+              canReceivePayment={resolveAccountPermissions({ role: user.role, permissions: rolePermissionMap.get(user.role) }).customerPayments}
               customerPendingBills={customerPendingBills}
+              customerPendingBillsError={customerPendingBillsError}
               customers={customers}
               onCancelPurchase={cancelPurchase}
               onCompletePurchase={completePendingPurchase}
@@ -10731,6 +10794,9 @@ function App() {
               accountLedger={accountLedger}
               accountPayments={accountPayments}
               accountOutstanding={accountOutstanding}
+              accountOutstandingError={accountOutstandingError}
+              // The role's own permission map decides payments and the account master, not its name.
+              accountPermissions={resolveAccountPermissions({ role: user.role, permissions: rolePermissionMap.get(user.role) })}
               ledgerFocusKey={accountLedgerFocusKey}
               onLedgerLoad={loadAccountLedger}
               onPaymentsLoad={loadAccountPayments}
@@ -11664,8 +11730,13 @@ function AiBusinessAssistantModule({
   // and the unreadable-clock fallback live in local/frostGreeting.js, with the tests.
   const frostGreeting = resolveFrostGreeting({ now: new Date(), name: getUserGreetingName(user) });
   const periodLabel = data.period?.label || briefing.period?.label || "Current data";
-  const cardValue = (section, key, fallback = 0) => cards[section]?.[key] ?? fallback;
-  const money = (value) => currency.format(Number(value || 0));
+  // A card the server could not fill arrives as `{ unavailable: true }`; its figures are unknown and
+  // print "—", never ₹0 (local/figurePresentation.js).
+  const cardValue = (section, key) => briefingCardFigure(cards, section, key);
+  const money = (value) => formatKnownFigure(value, (number) => currency.format(number));
+  const count = (value) => formatKnownFigure(value);
+  // "Overdue" only when the server sends an overdue total; the card carries total outstanding.
+  const customerDue = customerDueCard(cards);
   const surface = resolveFrostSurface({
     activeSection,
     // Passed through exactly as computed above. This module narrows what is shown; it is never the
@@ -11962,11 +12033,12 @@ function AiBusinessAssistantModule({
       {activeSection === "today" && <div className="ai-brief-grid">
         <SummaryMetric featured label="Sales" value={money(cardValue("sales", "totalSales"))} />
         <SummaryMetric label="Gross Profit" positive value={money(cardValue("sales", "estimatedGrossProfit"))} />
-        <SummaryMetric label="Customer Overdue" value={money(cardValue("customerOutstanding", "totalOutstanding"))} />
+        <SummaryMetric label={customerDue.label} value={money(customerDue.value)} />
         <SummaryMetric label="Supplier Due" value={money(cardValue("supplierOutstanding", "totalOutstanding"))} />
-        <SummaryMetric label="Pending Bills" value={cardValue("pendingPurchases", "count")} />
-        <SummaryMetric label="Low Stock" value={cardValue("lowStock", "count")} />
+        <SummaryMetric label="Pending Bills" value={count(cardValue("pendingPurchases", "count"))} />
+        <SummaryMetric label="Low Stock" value={count(cardValue("lowStock", "count"))} />
       </div>}
+      {activeSection === "today" && unavailableBriefingNote(cards) && <p className="form-note" role="status">{unavailableBriefingNote(cards)}</p>}
 
       {activeSection === "today" && <div className="ai-collection-strip">
         <span>Cash {money(cardValue("collections", "cash"))}</span>
@@ -14377,7 +14449,9 @@ function ReportToolbar({ canWhatsappSend = false, exporting = false, onExcelExpo
 }
 
 function UserProfilePanel({ onClose, onLogout, user }) {
-  const [passwordDraft, setPasswordDraft] = useState({ password: "", confirm_password: "" });
+  // `current_password`: changing one's own password needs the present one (auth hardening), so a
+  // session left open on a counter cannot be used to lock its owner out.
+  const [passwordDraft, setPasswordDraft] = useState({ current_password: "", password: "", confirm_password: "" });
   const [showPasswordForm, setShowPasswordForm] = useState(false);
   const [profile, setProfile] = useState(null);
   const [recoveryDraft, setRecoveryDraft] = useState({ email: "", mobile: "" });
@@ -14407,14 +14481,16 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   const savePassword = async () => {
     try {
       await axios.put(`${API_URL}/users/${user.id}/password`, {
-        ...passwordDraft,
+        current_password: passwordDraft.current_password,
+        password: passwordDraft.password,
+        confirm_password: passwordDraft.confirm_password,
         updated_by: user.id,
       });
-      setPasswordDraft({ password: "", confirm_password: "" });
+      setPasswordDraft({ current_password: "", password: "", confirm_password: "" });
       setShowPasswordForm(false);
       alert("Password changed");
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to change password"));
+      alert(getAuthErrorMessage(error, "Unable to change password"));
     }
   };
   const requestContactOtp = async (type) => {
@@ -14528,6 +14604,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
           </ModuleCard>
           {showPasswordForm && (
             <div className="form-grid settings-add-grid">
+              <Field label="Current Password"><PasswordInput autoComplete="current-password" value={passwordDraft.current_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, current_password: event.target.value })} /></Field>
               <Field label="New Password"><PasswordInput value={passwordDraft.password} onChange={(event) => setPasswordDraft({ ...passwordDraft, password: event.target.value })} /></Field>
               <Field label="Confirm Password"><PasswordInput value={passwordDraft.confirm_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value })} /></Field>
             </div>
@@ -14679,7 +14756,7 @@ const matchesPendingBillSearch = (values, search) => {
   return values.some((value) => String(value ?? "").toLowerCase().includes(text));
 };
 
-function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, purchases, search = "" }) {
+function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, purchases, search = "" }) {
   const [selectedSupplierKey, setSelectedSupplierKey] = useState("");
   const basePendingRows = purchases.filter((purchase) =>
     purchase.purchase_status !== "CANCELLED" &&
@@ -14779,11 +14856,15 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
                 <td>{currency.format(bill.items.reduce((sum, item) => sum + estimatedValue(item), 0))}</td>
                 <td><span className="origin-rate">Pending Bill</span></td>
                 <td>
-                  <div className="button-row table-actions-row">
-                    <button className="primary-button" onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }}>Complete Bill</button>
-                    <button className="table-action" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }} title={changeBlock || undefined}>Edit Pending Entry</button>
-                    <button className="remove-button" onClick={(event) => { event.stopPropagation(); onCancelPurchase(purchase); }}>Cancel Pending Entry</button>
-                  </div>
+                  {/* The server lets only Owner and Admin complete, edit or cancel a pending bill
+                      (requireRateManager). Anyone else got three buttons that could only fail. */}
+                  {canManagePending ? (
+                    <div className="button-row table-actions-row">
+                      <button className="primary-button" onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }}>Complete Bill</button>
+                      <button className="table-action" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }} title={changeBlock || undefined}>Edit Pending Entry</button>
+                      <button className="remove-button" onClick={(event) => { event.stopPropagation(); onCancelPurchase(purchase); }}>Cancel Pending Entry</button>
+                    </div>
+                  ) : <small className="cell-note">{PENDING_BILL_MANAGER_NOTE}</small>}
                 </td>
               </tr>
               );
@@ -14799,7 +14880,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
   );
 }
 
-function PendingBillsModule({ customerPendingBills = { summary: [], invoices: [] }, customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchases, user }) {
+function PendingBillsModule({ canManagePending = false, canReceivePayment = false, customerPendingBills = { summary: [], invoices: [] }, customerPendingBillsError = "", customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchases, user }) {
   const [activeTab, setActiveTab] = useState("purchase");
   const [selectedCustomerKey, setSelectedCustomerKey] = useState("");
   const [pendingSearch, setPendingSearch] = useState("");
@@ -14855,7 +14936,6 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
       summary.balance,
     ], pendingSearch) || summary.rows.length > 0);
   const selectedCustomer = summaries.find((summary) => summary.key === selectedCustomerKey);
-  const canReceivePayment = ["Owner", "Admin", "Cashier"].includes(user.role);
 
   const openReceivePayment = (summary, invoice = null) => {
     if (!summary?.customer_id) {
@@ -14915,6 +14995,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
 
       {activeTab === "purchase" && (
         <PendingPurchaseBillsModule
+          canManagePending={canManagePending}
           onCancelPurchase={onCancelPurchase}
           onCompletePurchase={onCompletePurchase}
           onEditPurchase={onEditPurchase}
@@ -14927,10 +15008,12 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
       {activeTab === "customer" && (
         <>
           <ModuleCard eyebrow="Customer Credit" title="Customer-Wise Pending Bills" subtitle="Credit POS bills stay here until customer receipts are entered.">
+            {/* A failed read is said, not shown as "no customers owe anything". */}
+            {customerPendingBillsError && <div className="error-banner" role="alert">{`Customer pending bills could not be loaded: ${customerPendingBillsError}. What is shown may be out of date.`}</div>}
             <div className="purchase-summary-grid supplier-payment-preview">
-              <SummaryMetric label="Customers Pending" value={summaries.length} featured />
-              <SummaryMetric label="Credit Amount" value={currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
-              <SummaryMetric label="Balance" value={currency.format(summaries.reduce((sum, row) => sum + Number(row.balance || 0), 0))} />
+              <SummaryMetric label="Customers Pending" value={customerPendingBillsError ? UNKNOWN_FIGURE : summaries.length} featured />
+              <SummaryMetric label="Credit Amount" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
+              <SummaryMetric label="Balance" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.balance || 0), 0))} />
             </div>
             <DataTable headers={["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Returned", "Balance", "Action"]}>
               {summaries.map((summary) => (
@@ -15637,21 +15720,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   const stockRows = filterRows(data.stockReport);
   const lowStockRows = stockRows.filter((row) => Number(row.current_stock || 0) <= Number(row.minimum_stock || 0));
   const ledgerRows = filterRows(data.ledgerReport);
-  const dayBookVoucherType = (row) => {
-    const raw = String(row.transaction_type || row.voucher_type || "").toLowerCase();
-    if (raw.includes("sale return")) return "Sale Return";
-    if (raw.includes("customer sale") || raw === "sale" || raw.includes("pos sale")) return "POS Sale";
-    if (raw.includes("supplier purchase") || raw === "purchase") return "Purchase";
-    if (raw.includes("supplier payment")) return "Supplier Payment";
-    if (raw.includes("customer payment") || raw.includes("customer receipt") || raw === "receipt") return "Customer Receipt";
-    if (raw.includes("expense")) return "Expense";
-    if (raw.includes("waste")) return "Waste";
-    if (raw.includes("opening")) return "Opening Stock";
-    if (raw.includes("adjust")) return "Stock Adjustment";
-    if (raw.includes("capital")) return "Owner Capital";
-    if (raw.includes("drawing")) return "Drawings";
-    return row.transaction_type || row.voucher_type || "-";
-  };
+  // "Customer Sale Cancellation" holds "customer sale"; a cancellation is tested first now, so it is
+  // no longer labelled a POS Sale (local/salesReportTotals.js).
+  const dayBookVoucherType = (row) => dayBookVoucherLabel(row);
   const accountNames = [...new Set(ledgerRows.map((row) => row.party_name).filter(Boolean))].sort();
   const voucherTypes = [
     "POS Sale",
@@ -16115,10 +16186,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         };
         group.invoices.add(row.id);
         group.item_lines += itemRows.length;
-        group.gross_total += Number(row.gross_total || row.total_amount || 0);
+        group.gross_total += saleGrossAmount(row);
         group.net_total += Number(row.net_total || row.total_amount || 0);
         group.cash_total += salePaymentAmount(row, new Set(["CASH"]));
-        group.upi_bank_total += salePaymentAmount(row, new Set(["UPI", "BANK", "BANK_TRANSFER"]));
+        group.upi_bank_total += salePaymentAmount(row, new Set(UPI_BANK_PAYMENT_MODES));
         if (String(row.payment_mode || "").toUpperCase() === "CREDIT") {
           group.credit_total += Number(row.net_total || row.total_amount || 0);
         }
@@ -16365,9 +16436,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         const activeInvoices = filteredSalesHistoryRows.filter((row) => saleStatusLabel(row) !== "Cancelled");
         const invoiceCount = new Set(activeInvoices.map((row) => row.id)).size;
         const itemLineCount = activeRows.reduce((sum, row) => sum + (row.item_rows?.length || 1), 0);
-        const totalCash = activeInvoices.reduce((sum, row) => sum + salePaymentAmount(row, new Set(["CASH"])), 0);
-        const totalUpiBank = activeInvoices.reduce((sum, row) => sum + salePaymentAmount(row, new Set(["UPI", "BANK", "BANK_TRANSFER"])), 0);
-        const grossTotal = activeInvoices.reduce((sum, row) => sum + Number(row.gross_total || row.total_amount || 0), 0);
+        // Card counts as bank money, a mixed bill is split by its own `payments`, and Gross reads
+        // `gross_amount` (it read the net figure) -- over the invoices on screen, and for one shown
+        // only in part, over the items shown (local/salesReportTotals.js).
+        const { cash: totalCash, upiBank: totalUpiBank, gross: grossTotal } = salesHistoryMoneyTotals(activeInvoices, { itemGross: saleItemGross });
         return [
           ["Total Quantity", combineSaleQuantityGroups(activeRows), true],
           ["Invoices", invoiceCount],
@@ -16610,7 +16682,11 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     paymentReport: {
       title: "Payment Report",
       rows: filterRows(data.paymentReport),
-      summary: (rows) => [["Payments", money(totalOf(rows, "payment_amount")), true], ["Rebates", money(totalOf(rows, "rebate_amount"))], ["Entries", rows.length]],
+      // Cancelled payments are not money paid; counted apart, as the Expense Report does.
+      summary: (rows) => {
+        const totals = paymentReportTotals(rows);
+        return [["Payments", money(totals.payments), true], ["Rebates", money(totals.rebates)], ["Cancelled", money(totals.cancelled)], ["Entries", totals.entries]];
+      },
       headers: ["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"],
       render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{labelFor("transactionType", row.payment_type)}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
     },
@@ -16818,6 +16894,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);
   const currentReport = reports[selectedReport];
+  const reportAvailability = resolveReportAvailability(selectedReport, data, { selfContained: Object.values(ORDER_REPORT) });
   const profitLossLine = (label, value, options = {}) => {
     const numericValue = Number(value || 0);
     const amountClass = numericValue < 0 ? "pl-negative" : options.positive ? "pl-positive" : "";
@@ -17567,6 +17644,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                   {reportFilterSummary.map((item) => <span key={item}>{item}</span>)}
                 </div>
               )}
+              {/* Offline, a report the server works out is said to be unavailable, in place of its
+                  tiles and table; a failed local sales read is an error, not "no records". */}
+              {!reportAvailability.available ? (
+                <div className={reportAvailability.tone === "error" ? "error-banner" : "warning-note"} role={reportAvailability.tone === "error" ? "alert" : "status"} data-report-note="">
+                  {reportAvailability.message}
+                </div>
+              ) : (
+              <>
               <div className="purchase-summary-grid supplier-payment-preview">
                 {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
               </div>
@@ -17599,6 +17684,8 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                     </div>
                   )}
                 </>
+              )}
+              </>
               )}
             </PrintableReport>
           </ModuleCard>
@@ -17884,7 +17971,9 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
     addUnitValue(groups, lot.unit, lotBalance(lot));
     return groups;
   }, new Map());
-  const totalStockValue = filteredLots.filter((lot) => lotStatus(lot) === "Active").reduce((sum, lot) => sum + lotBalance(lot) * lotCost(lot), 0);
+  // The table's own figures, summed: the tile used to count only "Active" lots while the rows under
+  // it valued Low Stock lots too, so the two disagreed whenever anything ran low. One source now.
+  const totalStockValue = filteredProductRows.reduce((sum, product) => sum + product.filtered_stock_value, 0);
   const lowStockItems = filteredLots.filter((lot) => lotStatus(lot) === "Low Stock").length;
   const adjustmentCount = auditRows.filter((row) => row.action === "INVENTORY_LOT_ADJUST").length;
 
@@ -18570,11 +18659,15 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
   });
   // Keyed and read with the canonical id on both sides. It used to be `Number()` on both, which
   // folds "004" into 4 and turns a non-numeric id into NaN, so a product could show another's stock
-  // or none at all.
+  // or none at all. A lot may name its product by the other form of id ("12" against the snapshot's
+  // "product-12"), so each lot is filed under the id of the product row it belongs to, matched
+  // through every identity that row has (local/wasteStock.js).
+  const productKeyForLot = productStockKeyResolver(products);
   const stockByProduct = inventory.reduce((stock, item) => {
     const key = canonicalInventoryId(item.product_id);
     if (key === "") return stock;
-    stock.set(key, (stock.get(key) || 0) + Number(item.remaining_qty || 0));
+    const productKey = productKeyForLot(item) || key;
+    stock.set(productKey, (stock.get(productKey) || 0) + Number(item.remaining_qty || 0));
     return stock;
   }, new Map());
   const mostWasted = [...entries].reduce((map, entry) => {
@@ -18589,7 +18682,9 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
     try {
       const wasteWrite = createOperationalWrite(user, {
         ...draft,
-        product_id: Number(draft.product_id),
+        // The id exactly as picked: the snapshot's "product-12" was NaN under Number(). The server
+        // resolves a global id or alias to its row.
+        product_id: wasteEntryProductId(draft.product_id),
         quantity: Number(draft.quantity || 0),
         branch_id: user.branch_id,
         created_by: user.id,
@@ -18806,19 +18901,17 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       onNothingToReceive?.();
       return;
     }
-    await onAction?.(entry.id, "receive", { items: lines });
+    await onAction?.(transferActionId(entry), "receive", { items: lines });
   };
 
   /** Approve a request, naming the crates it will be sent from. */
   const approveWithCrates = async (entry, lines) => {
     const items = lines.map((line) => ({
       item_id: line.id,
-      allocations: allocationFor(line).checked.allocations.map((choice) => ({
-        source_lot_id: choice.source_lot_id,
-        quantity: Number(choice.quantity),
-      })),
+      allocations: crateAllocationsForApproval(allocationFor(line).checked.allocations),
     }));
-    await onAction?.(entry.id, "approve", { items });
+    // The server's own row id: `entry.id` prefers the global id (local/distributionWrites.js).
+    await onAction?.(transferActionId(entry), "approve", { items });
     setAllocations({});
   };
 
@@ -18946,6 +19039,9 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
               ) || null;
               const toAllocate = pendingAllocationLines(raw, scope);
               const canApprove = entry.actions.some((option) => option.action === "approve");
+              // "Receive part" and "Take back in" need a quantity per line that this screen has no
+              // box for; drawn, they could only come back 422 (local/distributionWrites.js).
+              const { drawn: drawnActions, heldBack } = drawableTransferActions(entry.actions);
               return (
               <tr key={entry.id}>
                 <td className="primary-cell">
@@ -18957,7 +19053,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                 <td><span className={entry.tone === "done" ? "stock-ok" : "stock-low"}>{entry.label}</span></td>
                 <td>
                   <div className="table-actions">
-                    {entry.actions.map((option) => (
+                    {drawnActions.map((option) => (
                       // Approving a request means choosing the crates, so that button is drawn by
                       // the form below instead. Drawing it here as well would give two buttons that
                       // do different things under one word.
@@ -18969,7 +19065,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                           title={option.detail}
                           onClick={() => (option.action === "receive"
                             ? receiveInFull(entry, raw)
-                            : onAction?.(entry.id, option.action))}
+                            : onAction?.(transferActionId(entry), option.action))}
                         >
                           {option.label}
                         </button>
@@ -18978,6 +19074,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                     {/* Not blank. "Nothing for you to do here" and "this screen forgot to draw the
                         buttons" look identical when the cell is empty. */}
                     {entry.actions.length === 0 && <small className="cell-note">Nothing for you to do</small>}
+                    {heldBack && <small className="cell-note">{UNDRAWN_TRANSFER_ACTION_NOTE}</small>}
                   </div>
 
                   {canApprove && toAllocate.length > 0 && (
@@ -19709,10 +19806,13 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
   );
 }
 
-function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, canCancel = false, canWhatsappSend = false, ledgerFocusKey, onLedgerLoad, onPaymentsLoad, onReload, user }) {
+function AccountsModule({ accounts, accountLedger, accountOutstanding = null, accountOutstandingError = "", accountPayments, canCancel = false, canWhatsappSend = false, accountPermissions = {}, ledgerFocusKey, onLedgerLoad, onPaymentsLoad, onReload, user }) {
+  // A role without Customer Accounts starts on a supplier, is offered only the types it may save,
+  // and cannot open a customer row for editing (local/rolePermissions.js; the server refuses anyway).
+  const masterTypeOptions = accountMasterTypeOptions(accountTypes, accountPermissions);
   const emptyAccount = {
     account_name: "",
-    account_type: "CUSTOMER",
+    account_type: defaultAccountMasterType(accountTypes, accountPermissions),
     firm_name: "",
     mobile_number: "",
     whatsapp_number: "",
@@ -19737,7 +19837,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   const [ledgerAccountKey, setLedgerAccountKey] = useState("");
   const [ledgerDateRange, setLedgerDateRange] = useState({ date_from: "", date_to: "" });
   const [payment, setPayment] = useState({
-    payment_action: user.role === "Purchase Manager" ? "PAY_SUPPLIER" : "RECEIVE_CUSTOMER",
+    payment_action: accountPermissions.customerPayments ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER",
     account_key: "",
     payment_date: toDateKey(new Date()),
     amount: "",
@@ -19753,8 +19853,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   const [ledgerWhatsappOpen, setLedgerWhatsappOpen] = useState(false);
   const ledgerPrintRef = useRef(null);
   const canManageAllAccounts = ["Owner", "Admin"].includes(user.role);
-  const canUseSupplierPayments = canManageAllAccounts || user.role === "Purchase Manager";
-  const canUseCustomerPayments = canManageAllAccounts || user.role === "Cashier";
+  // From the role's permission map (Owner always), as the server decides them -- a Cashier whose
+  // Customer Payments box is unticked no longer gets a form that can only be refused.
+  const canUseSupplierPayments = accountPermissions.supplierPayments === true;
+  const canUseCustomerPayments = accountPermissions.customerPayments === true;
   const accountTabs = [
     ...(canManageAllAccounts || user.role === "Purchase Manager" ? [["master", "Account Master"]] : []),
     ["ledger", "Ledger"],
@@ -19779,13 +19881,17 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
       : ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type)
   );
   const selectedPaymentAccount = accounts.find((account) => account.account_key === payment.account_key);
+  const outstandingView = resolveOutstandingPresentation(accountOutstanding, accountOutstandingError);
   const isSupplierPayment = payment.payment_action !== "RECEIVE_CUSTOMER";
   const paymentAmount = Number(payment.amount || 0);
   const rebateAmount = isSupplierPayment ? Number(payment.rebate_amount || 0) : 0;
   const outstandingBefore = selectedPaymentAccount
     ? Number(isSupplierPayment ? selectedPaymentAccount.payable_balance : selectedPaymentAccount.receivable_balance)
     : 0;
-  const outstandingAfter = Math.max(0, roundUi(outstandingBefore - paymentAmount - rebateAmount));
+  // Signed: paying more than is owed shows the advance it creates, with a warning, not ₹0.00.
+  const balancePreview = paymentBalancePreview({ outstandingBefore, payment: paymentAmount, rebate: rebateAmount });
+  const outstandingAfter = balancePreview.after;
+  const overpaymentNote = overpaymentWarning(balancePreview, { supplier: isSupplierPayment });
   const selectedCustomerSummary = selectedPaymentAccount && selectedPaymentAccount.account_type === "CUSTOMER"
     ? {
       totalSales: Number(selectedPaymentAccount.total_sales || 0),
@@ -20016,7 +20122,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
               <div className="form-grid supplier-form-grid">
                 <Field label="Account Type">
                   <select value={draft.account_type} onChange={(event) => setDraft({ ...draft, account_type: event.target.value })}>
-                    {accountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                    {masterTypeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                   </select>
                 </Field>
                 <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
@@ -20070,7 +20176,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                   <td>{currency.format(Number(account.payable_balance || 0))}</td>
                   <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
-                  <td><button className="table-action" disabled={account.system_account === true} onClick={() => editAccount(account)}>{account.system_account ? "Protected" : "Edit"}</button></td>
+                  <td><button className="table-action" disabled={!canEditAccountRow(account, accountPermissions)} onClick={() => editAccount(account)} title={!account.system_account && !canEditAccountRow(account, accountPermissions) ? "Your role cannot change this type of account." : undefined}>{account.system_account ? "Protected" : "Edit"}</button></td>
                 </tr>
               ))}
             </DataTable>
@@ -20198,11 +20304,12 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <SummaryMetric label={isSupplierPayment ? "Outstanding Payable Before" : "Outstanding Receivable Before"} value={currency.format(outstandingBefore)} />
             <SummaryMetric label="Payment Amount" value={currency.format(paymentAmount)} />
             {isSupplierPayment && <SummaryMetric label="Rebate Received" value={currency.format(rebateAmount)} positive />}
-            <SummaryMetric label="Balance After Payment" value={currency.format(outstandingAfter)} featured />
+            <SummaryMetric label={balancePreview.overpaid ? "Balance After Payment (advance)" : "Balance After Payment"} value={currency.format(outstandingAfter)} featured />
           </div>
+          {overpaymentNote && <div className="warning-note" role="status">{overpaymentNote}</div>}
           <div className="button-row">
             <button className="primary-button" onClick={savePayment}>{editingPaymentKey ? "Update Payment" : "Save Payment"}</button>
-            {editingPaymentKey && <button className="secondary-button" onClick={() => { setEditingPaymentKey(""); setPayment({ payment_action: "RECEIVE_CUSTOMER", account_key: "", payment_date: toDateKey(new Date()), amount: "", rebate_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" }); }}>Cancel Edit</button>}
+            {editingPaymentKey && <button className="secondary-button" onClick={() => { setEditingPaymentKey(""); setPayment({ payment_action: canUseCustomerPayments ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER", account_key: "", payment_date: toDateKey(new Date()), amount: "", rebate_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" }); }}>Cancel Edit</button>}
           </div>
           <div className="ledger-toolbar">
             <button className="secondary-button" onClick={() => onPaymentsLoad(payment.account_key)}>Refresh Payment History</button>
@@ -20234,23 +20341,29 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
 
       {tab === "outstanding" && (
         <ModuleCard eyebrow="Outstanding" title="Receivable and Payable Summary" subtitle="Customer outstanding and supplier outstanding in one place.">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Total Receivable" value={currency.format(Number(accountOutstanding.totalReceivable || 0))} featured />
-            <SummaryMetric label="Total Payable" value={currency.format(Number(accountOutstanding.totalPayable || 0))} featured />
-            <SummaryMetric label="Customer Accounts" value={(accountOutstanding.customerOutstanding || []).length} />
-            <SummaryMetric label="Supplier Accounts" value={(accountOutstanding.supplierOutstanding || []).length} />
-          </div>
-          <DataTable headers={["Account", "Type", "Receivable", "Payable", "Status"]}>
-            {[...(accountOutstanding.customerOutstanding || []), ...(accountOutstanding.supplierOutstanding || [])].map((account) => (
-              <tr key={account.account_key}>
-                <td className="primary-cell">{account.account_name}</td>
-                <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
-                <td>{currency.format(Number(account.receivable_balance || 0))}</td>
-                <td>{currency.format(Number(account.payable_balance || 0))}</td>
-                <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
-              </tr>
-            ))}
-          </DataTable>
+          {outstandingView.kind !== "ready" ? (
+            <div className={outstandingView.kind === "error" ? "error-banner" : "cart-empty"} role={outstandingView.kind === "error" ? "alert" : "status"}>{outstandingView.message}</div>
+          ) : (
+            <>
+              <div className="purchase-summary-grid supplier-payment-preview">
+                <SummaryMetric label="Total Receivable" value={currency.format(outstandingView.totalReceivable)} featured />
+                <SummaryMetric label="Total Payable" value={currency.format(outstandingView.totalPayable)} featured />
+                <SummaryMetric label="Customer Accounts" value={outstandingView.customerOutstanding.length} />
+                <SummaryMetric label="Supplier Accounts" value={outstandingView.supplierOutstanding.length} />
+              </div>
+              <DataTable headers={["Account", "Type", "Receivable", "Payable", "Status"]}>
+                {[...outstandingView.customerOutstanding, ...outstandingView.supplierOutstanding].map((account) => (
+                  <tr key={account.account_key}>
+                    <td className="primary-cell">{account.account_name}</td>
+                    <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
+                    <td>{currency.format(Number(account.receivable_balance || 0))}</td>
+                    <td>{currency.format(Number(account.payable_balance || 0))}</td>
+                    <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
+                  </tr>
+                ))}
+              </DataTable>
+            </>
+          )}
         </ModuleCard>
       )}
       {receiptPayment && <PaymentReceiptModal canWhatsappSend={canWhatsappSend} payment={receiptPayment} onClose={() => setReceiptPayment(null)} user={user} />}
@@ -21301,6 +21414,12 @@ function DiscountSettings({ canManage, onChanged, saleRateSettings = {}, unavail
                 <Field label="Name on the bill (optional)">
                   <input maxLength={80} placeholder={slabDisplayName({ ...buildSlabPayload(draft), rule_name: "" })} value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} />
                 </Field>
+                {/* Saved with the slab (`active` in saveSlab). Without a box here a slab could be
+                    removed but never switched off for a while, nor a switched-off one back on. */}
+                <label className="check-field">
+                  <input checked={draft.active !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} />
+                  <span>Give this discount at POS (active)</span>
+                </label>
               </div>
               {refusals.length > 0 && (
                 <div className="inline-error" role="alert">
@@ -21444,7 +21563,7 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
       await onReload();
       alert("Role permissions updated");
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update role permissions"));
+      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to update role permissions"));
     }
   };
   return (
@@ -21611,7 +21730,7 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
       await onReload();
       alert(editingId ? "User updated" : "User added");
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save user"));
+      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to save user"));
     }
   };
   const changePassword = async () => {
@@ -21632,7 +21751,10 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
           ? `Temporary password generated. Share it securely once: ${response.data.temporary_password}`
           : "Temporary password set. The user must change it at next login.");
       } else {
+        // Changing one's own password, even from here, needs the present one (auth hardening).
+        const ownRow = inventoryIdsEqual(passwordTarget.id, user.id);
         await axios.put(`${API_URL}/users/${passwordTarget.id}/password`, {
+          ...(ownRow ? { current_password: passwordTarget.current_password || "" } : {}),
           password: passwordTarget.password,
           confirm_password: passwordTarget.confirm_password,
           updated_by: user.id,
@@ -21667,7 +21789,7 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
       }
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update user status"));
+      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to update user status"));
     }
   };
   return (
@@ -21749,6 +21871,9 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
             <div className="sale-edit-body">
               {passwordTarget.recoveryAction && <p className="form-note">Leave the fields blank to generate a one-time temporary password. The user will be required to change it at next login.</p>}
               <div className="form-grid settings-add-grid">
+                {!passwordTarget.recoveryAction && inventoryIdsEqual(passwordTarget.id, user.id) && (
+                  <Field label="Current Password"><PasswordInput autoComplete="current-password" value={passwordTarget.current_password || ""} onChange={(event) => setPasswordTarget({ ...passwordTarget, current_password: event.target.value })} /></Field>
+                )}
                 <Field label={passwordTarget.recoveryAction ? "Temporary Password" : "New Password"}><PasswordInput value={passwordTarget.password} onChange={(event) => setPasswordTarget({ ...passwordTarget, password: event.target.value })} /></Field>
                 <Field label="Confirm Password"><PasswordInput value={passwordTarget.confirm_password} onChange={(event) => setPasswordTarget({ ...passwordTarget, confirm_password: event.target.value })} /></Field>
               </div>
@@ -23048,6 +23173,14 @@ function OperationalScopeManagement({
   scopeUserRef.current = user;
   const sessionKey = `${user?.id ?? ""}|${user?.device_session_token ?? ""}|${user?.branch_id ?? ""}`;
   const load = useCallback(async () => {
+    // Only the Owner may read branches, counters, staff and machines (`requireAssignmentOwner`).
+    // An Admin is here for the Counter screen lock alone, and asking would only earn a 403 banner.
+    if (!branchesScreenPlan(scopeUserRef.current?.role || scopeUserRef.current?.role_name).readsScope) {
+      setScopeReadAllowed(false);
+      setLoading(false);
+      setLoadedOnce(true);
+      return;
+    }
     setLoading(true);
     setError("");
     try {
@@ -23065,9 +23198,11 @@ function OperationalScopeManagement({
   useEffect(() => { load(); }, [load, sessionKey]);
   // Same rule as the Settings filter: the licence card is the Owner's, and a phone has no screen
   // lock. The backend refuses either way; this only decides what is drawn.
+  // Owner: every section. Admin: the Counter screen lock only (local/rolePermissions.js).
+  const scopePlan = branchesScreenPlan(user?.role || user?.role_name);
   const isOwnerAccount = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
   const visibleSections = (navigationRegistry.find((item) => item.id === "branches")?.sections || [])
-    .filter((section) => (!section.ownerOnly || isOwnerAccount) && shellShowsSettingsSection(section.id, SHELL_CAPABILITIES));
+    .filter((section) => (!section.ownerOnly || isOwnerAccount) && scopePlan.showsSection(section.id) && shellShowsSettingsSection(section.id, SHELL_CAPABILITIES));
   const showsSection = (sectionId) => visibleSections.some((section) => section.id === sectionId);
   const scrollToSection = (sectionId) => document.getElementById(scopeSectionDomId(sectionId))
     ?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -23256,7 +23391,8 @@ function OperationalScopeManagement({
     <div className="scope-page">
       <ModuleCard eyebrow="Setup" title="Branches & Counters" subtitle="Your shops, their counters, who works where, and which computers and phones may bill. Set them up in this order.">
         {error && <div className="startup-status-error" role="alert"><p>{error}</p></div>}
-        {!canManage && !error && <p className="scope-locked-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
+        {!scopePlan.readsScope && <p className="scope-locked-note">Branches, counters, staff and computers are the Owner's. As an Admin you can manage the Counter screen lock below.</p>}
+        {scopePlan.readsScope && !canManage && !error && <p className="scope-locked-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
         <nav className="scope-jump" aria-label="Sections on this page">
           {visibleSections.map((section) => (
             <a
@@ -23271,6 +23407,8 @@ function OperationalScopeManagement({
         </nav>
       </ModuleCard>
 
+      {scopePlan.readsScope && (
+      <>
       <ModuleCard id={scopeSectionDomId("branches/shops")} eyebrow="Step 1" title="Branches" subtitle="A branch is one shop. Reports are totalled branch by branch.">
         <div className="form-grid supplier-form-grid">
           <Field label="Branch name"><input disabled={!canManage} placeholder="e.g. Jodhpur Main" value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
@@ -23367,6 +23505,8 @@ function OperationalScopeManagement({
         </DataTable>
         {activeCounters.length === 0 && <p className="form-note">Add a counter in Step 2 before approving a computer.</p>}
       </ModuleCard>
+      </>
+      )}
 
       {showsSection("branches/activation-licences") && (
         <div className="scope-anchor" id={scopeSectionDomId("branches/activation-licences")}>
@@ -24155,6 +24295,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const billDateKey = billDateTime ? billDateTime.slice(0, 10) : toDateKey(new Date());
   // Said when discounts changed under an open cart (a sync, or checkout refused by the server).
   const [discountNotice, setDiscountNotice] = useState("");
+  // The browser checkout's key across a retry: a lost reply followed by a second press of an
+  // unchanged cart must reach the server under the same key, or it is billed twice
+  // (local/checkoutRetry.js; SaleReturnModule.pendingWrite keeps the same rule).
+  const pendingCheckoutRef = useRef(null);
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
   /**
@@ -25047,7 +25191,21 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }
     // The bill's own reference: the approval (if any) was issued for it, and it is the sale's
     // idempotency key (browser) or sync operation id (desktop).
-    const saleRef = String(confirmations.sale_ref || "").trim() || newSyncId("op");
+    let saleRef = String(confirmations.sale_ref || "").trim();
+    if (!saleRef && !isTauriRuntime()) {
+      const resolvedRef = resolveCheckoutRef(pendingCheckoutRef.current, checkoutFingerprint({
+        cart,
+        customer,
+        payments,
+        billDate: selectedBillDate,
+        billDateTime,
+        charges: totals.chargeLines || [],
+        billDiscount: billDiscountInput,
+      }), newSyncId("op"));
+      pendingCheckoutRef.current = resolvedRef.pending;
+      saleRef = resolvedRef.ref;
+    }
+    if (!saleRef) saleRef = newSyncId("op");
 
     // Nothing is saved, printed or sent until the cashier says the customer has paid (3 Oct 2026,
     // the owner). The dialog shows a UPI QR for exactly the UPI part of the bill. "Paid" comes back
@@ -25179,6 +25337,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         ...(discountApprovalId ? { discount_approval_id: discountApprovalId } : {}),
       }, saleRef);
       const response = await axios.post(`${API_URL}/api/v3/sales`, saleWrite.body, saleWrite.config);
+      // Confirmed: the next checkout is a new bill with a new key.
+      pendingCheckoutRef.current = null;
       setCart([]);
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
       setPaymentMode("CASH");
@@ -25261,7 +25421,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           return;
         }
       }
-      alert(getErrorMessage(error, "Unable to complete checkout"));
+      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to complete checkout"));
     } finally {
       setSaving(false);
     }
@@ -27810,7 +27970,8 @@ function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCust
 
       <section className="chart-grid">
         <LineChart color="#f59e0b" data={data.salesTrend} subtitle="Revenue" title="Daily Sales Trend" valueKey="sales" />
-        <LineChart color="#22c55e" data={data.profitTrend} subtitle="At purchase cost" title="Daily Profit Trend" valueKey="grossProfit" />
+        {/* The range's caveat (lots still at an estimated cost), from local/dashboardSnapshot.js. */}
+        <LineChart color="#22c55e" data={data.profitTrend} subtitle={data.profitNote ? `At purchase cost. ${data.profitNote}` : "At purchase cost"} title="Daily Profit Trend" valueKey="grossProfit" />
         <BarChart color="#fb7185" data={data.expenseTrend} subtitle="Operating Cost" title="Daily Expense Trend" valueKey="expenses" />
         <LineChart color="#a78bfa" data={data.netProfitTrend} subtitle="Profit After Expenses" title="Net Profit Trend" valueKey="netProfit" />
         <DualLineChart

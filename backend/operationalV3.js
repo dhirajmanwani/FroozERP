@@ -6,7 +6,10 @@ const { registerScopeManagementRoutes } = require("./scopeManagement");
 const TRANSFER_TRANSITIONS = Object.freeze({
   DRAFT: Object.freeze({ submit: "APPROVAL_PENDING", cancel: "CANCELLED" }),
   APPROVAL_PENDING: Object.freeze({ approve: "APPROVED_RESERVED", reject: "REJECTED" }),
-  APPROVED_RESERVED: Object.freeze({ dispatch: "DISPATCHED_IN_TRANSIT" }),
+  // `cancel` here releases the reservation. Sales and waste do not consult stock_reservations, so
+  // the held crates can be sold before dispatch, and without a way out the consignment would sit
+  // refusing dispatch with TRANSFER_STOCK_CHANGED forever.
+  APPROVED_RESERVED: Object.freeze({ dispatch: "DISPATCHED_IN_TRANSIT", cancel: "CANCELLED" }),
   DISPATCHED_IN_TRANSIT: Object.freeze({
     receive: "RECEIVED",
     partial_receive: "PARTIALLY_RECEIVED",
@@ -25,9 +28,63 @@ const TRANSFER_TRANSITIONS = Object.freeze({
 });
 
 const cleanText = (value, max = 220) => String(value ?? "").trim().slice(0, max);
+/**
+ * A numeric row id, or `null`.
+ *
+ * Strict on purpose: only a whole positive number, or a string of digits with no leading zero, is
+ * an id. `parseInt` read the leading digits of anything, so a transfer's uuid global id such as
+ * `7e1c...` became transfer #7 and the action landed on somebody else's consignment. Anything that
+ * is not plainly a number is an opaque reference and is resolved by global id, never parsed.
+ */
 const positiveId = (value) => {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  if (typeof value === "number") return Number.isSafeInteger(value) && value > 0 ? value : null;
+  const text = String(value ?? "").trim();
+  if (!/^[1-9]\d*$/.test(text)) return null;
+  const parsed = Number.parseInt(text, 10);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+};
+
+/** Quantities carry three decimals; compare them there, not on raw floats (0.1 + 0.2 > 0.3). */
+const roundQuantity = (value) => Math.round(Number(value) * 1000) / 1000;
+
+/**
+ * Where a desktop's reference to a product or lot can be found.
+ *
+ * The desktop names rows by their snapshot id: the cloud `global_id` when the row has one, or
+ * `product-<id>` / `inventory-lot-<id>` when it did not (syncReferenceBootstrap's COALESCE). The
+ * alias therefore only ever names a row whose `global_id` is still NULL, and is matched that way.
+ */
+const ENTITY_REFERENCES = Object.freeze({
+  product: Object.freeze({ table: "products", alias: /^product-([1-9]\d*)$/ }),
+  lot: Object.freeze({ table: "inventory_batches", alias: /^inventory-lot-([1-9]\d*)$/ }),
+});
+
+/**
+ * Resolve a product or lot reference to its numeric row id within one company, or `null`.
+ *
+ * A plain number is taken as the row id. Anything else is looked up by `global_id`, then by the
+ * alias above -- never by reading digits out of it.
+ */
+const resolveEntityReference = async (client, kind, value, companyId) => {
+  const numeric = positiveId(value);
+  if (numeric) return numeric;
+  const reference = cleanText(value);
+  if (!reference) return null;
+  const { table, alias } = ENTITY_REFERENCES[kind];
+  const byGlobalId = await client.query(
+    `SELECT id FROM ${table} WHERE global_id = $1 AND company_id = $2 LIMIT 2`,
+    [reference, companyId]
+  );
+  // Two rows answering one global id is not a reference we can act on; refuse rather than pick.
+  if ((byGlobalId.rows || []).length > 1) return null;
+  if (byGlobalId.rows?.[0]) return positiveId(byGlobalId.rows[0].id);
+  const aliased = alias.exec(reference);
+  if (!aliased) return null;
+  const byAlias = await client.query(
+    `SELECT id FROM ${table} WHERE id = $1 AND company_id = $2 AND global_id IS NULL`,
+    [positiveId(aliased[1]), companyId]
+  );
+  return byAlias.rows?.[0] ? positiveId(byAlias.rows[0].id) : null;
 };
 const positiveNumber = (value) => {
   const parsed = Number(value);
@@ -372,12 +429,18 @@ const transferActionItems = (body) => new Map(
  * belonging to somewhere else, and against what is genuinely free after existing reservations.
  */
 const allocateRequestedTransferItem = async (client, transfer, item, allocations) => {
-  const rows = (Array.isArray(allocations) ? allocations : [])
-    .map((entry) => ({
-      lotId: positiveId(entry?.source_lot_id),
-      quantity: positiveNumber(entry?.quantity),
-    }))
-    .filter((entry) => entry.lotId && entry.quantity);
+  const rows = [];
+  for (const entry of Array.isArray(allocations) ? allocations : []) {
+    const quantity = positiveNumber(entry?.quantity);
+    if (!cleanText(entry?.source_lot_id) || !quantity) continue;
+    // The approver picks crates from its own snapshot, which names them by global id. A crate that
+    // names a lot we cannot find is refused by name: dropping it would approve less than was chosen.
+    const lotId = await resolveEntityReference(client, "lot", entry.source_lot_id, transfer.company_id);
+    if (!lotId) {
+      throw routeError(422, "TRANSFER_ALLOCATION_INVALID", "That lot is not available at this location");
+    }
+    rows.push({ lotId, quantity });
+  }
 
   if (rows.length === 0) {
     throw routeError(
@@ -387,8 +450,8 @@ const allocateRequestedTransferItem = async (client, transfer, item, allocations
     );
   }
 
-  const total = rows.reduce((sum, entry) => sum + entry.quantity, 0);
-  const requested = Number(item.requested_quantity);
+  const total = roundQuantity(rows.reduce((sum, entry) => sum + entry.quantity, 0));
+  const requested = roundQuantity(item.requested_quantity);
   if (total > requested) {
     throw routeError(
       422,
@@ -449,6 +512,18 @@ const allocateRequestedTransferItem = async (client, transfer, item, allocations
 };
 
 const applyTransferStockEffect = async (client, transfer, action, body, context, idempotencyKey) => {
+  // Cancelling gives back whatever approval held. A DRAFT has no reservations, so this is a no-op
+  // there; from APPROVED_RESERVED it is what frees the crates for sale again.
+  if (action === "cancel") {
+    await client.query(
+      `UPDATE stock_reservations sr
+       SET status = 'RELEASED', released_at = CURRENT_TIMESTAMP
+       FROM inventory_transfer_items ti
+       WHERE ti.id = sr.transfer_item_id AND ti.transfer_id = $1 AND sr.status = 'ACTIVE'`,
+      [transfer.id]
+    );
+    return;
+  }
   if (!["approve", "dispatch", "receive", "partial_receive", "source_receive"].includes(action)) return;
   const supplied = transferActionItems(body);
 
@@ -515,8 +590,8 @@ const applyTransferStockEffect = async (client, transfer, action, body, context,
          WHERE inventory_batch_id = $1 AND status = 'ACTIVE'`,
         [item.source_lot_id]
       );
-      const available = Number(item.remaining_qty) - Number(reservations.rows[0]?.reserved || 0);
-      if (available < approved) {
+      const available = roundQuantity(Number(item.remaining_qty) - Number(reservations.rows[0]?.reserved || 0));
+      if (available < roundQuantity(approved)) {
         throw routeError(409, "TRANSFER_STOCK_UNAVAILABLE", "Source stock is no longer available for approval");
       }
       await client.query(
@@ -554,7 +629,9 @@ const applyTransferStockEffect = async (client, transfer, action, body, context,
          RETURNING id`,
         [item.source_lot_id, quantity]
       );
-      if (!reduced.rows?.[0]) throw routeError(409, "TRANSFER_STOCK_CHANGED", "Source stock changed after approval");
+      if (!reduced.rows?.[0]) {
+        throw routeError(409, "TRANSFER_STOCK_CHANGED", "Source stock changed after approval. Cancel this consignment to release the held stock");
+      }
       await client.query(
         `UPDATE inventory_transfer_items SET dispatched_quantity = $2 WHERE id = $1`,
         [item.id, quantity]
@@ -587,12 +664,12 @@ const applyTransferStockEffect = async (client, transfer, action, body, context,
       if (!receivedNow) {
         throw routeError(422, "RECEIVED_QUANTITY_REQUIRED", "Every received transfer item needs a positive received quantity");
       }
-      const remainingInTransit = Number(item.dispatched_quantity) -
+      const remainingInTransit = roundQuantity(Number(item.dispatched_quantity) -
         Number(item.received_quantity) -
         Number(item.rejected_quantity) -
         Number(item.damaged_quantity) -
-        Number(item.short_quantity);
-      if (receivedNow > remainingInTransit) {
+        Number(item.short_quantity));
+      if (roundQuantity(receivedNow) > remainingInTransit) {
         throw routeError(422, "TRANSFER_RECEIPT_EXCEEDS_TRANSIT", "Received quantity exceeds unresolved in-transit stock");
       }
       let destinationLotId = positiveId(item.destination_lot_id);
@@ -648,7 +725,7 @@ const applyTransferStockEffect = async (client, transfer, action, body, context,
           transfer.destination_operational_location_id,
         ]
       );
-      if (action === "receive" && receivedNow !== remainingInTransit) {
+      if (action === "receive" && roundQuantity(receivedNow) !== remainingInTransit) {
         throw routeError(422, "FULL_RECEIPT_REQUIRED", "Use partial receipt when unresolved in-transit quantity remains");
       }
       continue;
@@ -657,8 +734,8 @@ const applyTransferStockEffect = async (client, transfer, action, body, context,
     if (action === "source_receive") {
       const returnedNow = positiveNumber(supplied.get(Number(item.id))?.returned_quantity);
       if (!returnedNow) throw routeError(422, "RETURNED_QUANTITY_REQUIRED", "Returned quantity is required");
-      const unresolved = Number(item.dispatched_quantity) - Number(item.received_quantity);
-      if (returnedNow > unresolved) throw routeError(422, "RETURN_EXCEEDS_UNRESOLVED", "Returned quantity exceeds unresolved transfer stock");
+      const unresolved = roundQuantity(Number(item.dispatched_quantity) - Number(item.received_quantity));
+      if (roundQuantity(returnedNow) > unresolved) throw routeError(422, "RETURN_EXCEEDS_UNRESOLVED", "Returned quantity exceeds unresolved transfer stock");
       await client.query(
         "UPDATE inventory_batches SET remaining_qty = remaining_qty + $2 WHERE id = $1",
         [item.source_lot_id, returnedNow]
@@ -1294,10 +1371,20 @@ const registerOperationalV3Routes = ({
       );
       for (const item of items) {
         const quantity = positiveNumber(item.requested_quantity);
-        const productId = positiveId(item.product_id);
-        const lotId = positiveId(item.source_lot_id);
+        // The desktop names products and lots by their snapshot ids (`product-12`, a uuid global
+        // id, `inventory-lot-42`), so these are resolved within the company, never parsed.
+        const productId = await resolveEntityReference(client, "product", item.product_id, context.company_id);
+        const lotNamed = cleanText(item.source_lot_id) !== "";
+        const lotId = lotNamed
+          ? await resolveEntityReference(client, "lot", item.source_lot_id, context.company_id)
+          : null;
         if (!quantity || !productId) {
           throw routeError(400, "INVALID_TRANSFER_ITEM", "Transfer items require a product and a positive quantity");
+        }
+        // A lot that was named but cannot be found is not "no lot": reading it as a request would
+        // turn a consignment of named crates into one the other side has to choose for.
+        if (lotNamed && !lotId) {
+          throw routeError(409, "TRANSFER_STOCK_UNAVAILABLE", "Requested source stock is not available");
         }
 
         // A branch asking another branch for stock names the product and the quantity, and not the
@@ -1352,10 +1439,14 @@ const registerOperationalV3Routes = ({
   }, { write: true, permission: "inventory" });
 
   use("post", "/api/v3/transfers/:transferId/actions/:action", async (req, res, context) => {
-    const transferId = positiveId(req.params.transferId);
+    // The desktop posts the transfer's global id (a uuid); older callers post the numeric id. Only
+    // a plain number is an id -- anything else is looked up by global id, so `7e1c...` can never be
+    // read as transfer #7.
+    const transferReference = cleanText(req.params.transferId);
+    const transferId = positiveId(transferReference);
     const action = cleanText(req.params.action).toLowerCase();
     const key = requiredIdempotencyKey(req.body);
-    if (!transferId) throw routeError(400, "TRANSFER_REQUIRED", "A transfer is required");
+    if (!transferReference) throw routeError(400, "TRANSFER_REQUIRED", "A transfer is required");
     const saved = await withTransaction(database, async (client) => {
       const existingEvent = await client.query(
         "SELECT transfer_id FROM inventory_transfer_events WHERE idempotency_key = $1",
@@ -1365,12 +1456,22 @@ const registerOperationalV3Routes = ({
         const existing = await client.query("SELECT * FROM inventory_transfers WHERE id = $1", [existingEvent.rows[0].transfer_id]);
         return existing.rows[0];
       }
-      const locked = await client.query("SELECT * FROM inventory_transfers WHERE id = $1 FOR UPDATE", [transferId]);
-      const transfer = locked.rows?.[0];
+      const locked = transferId
+        ? await client.query(
+          "SELECT * FROM inventory_transfers WHERE id = $1 AND company_id = $2 FOR UPDATE",
+          [transferId, context.company_id]
+        )
+        : await client.query(
+          "SELECT * FROM inventory_transfers WHERE global_id = $1 AND company_id = $2 FOR UPDATE",
+          [transferReference, context.company_id]
+        );
+      const transfer = locked.rows?.length === 1 ? locked.rows[0] : null;
       if (!transfer || Number(transfer.company_id) !== context.company_id) {
         throw routeError(404, "TRANSFER_NOT_FOUND", "Transfer was not found");
       }
-      const sourceActions = ["submit", "approve", "reject", "dispatch", "return", "source_receive", "close"];
+      // Mirrored by SOURCE_ACTIONS in frontend/src/local/stockDistribution.js. `cancel` is the
+      // sender's: it drops a draft, or releases what approval held before anything has left.
+      const sourceActions = ["submit", "approve", "reject", "dispatch", "return", "source_receive", "close", "cancel"];
       const requiredLocation = sourceActions.includes(action)
         ? Number(transfer.source_operational_location_id)
         : Number(transfer.destination_operational_location_id);
@@ -1387,7 +1488,7 @@ const registerOperationalV3Routes = ({
            approved_by = CASE WHEN $3 = 'approve' THEN $4 ELSE approved_by END,
            updated_at = CURRENT_TIMESTAMP
          WHERE id = $1 AND state_version = $5 RETURNING *`,
-        [transferId, nextStatus, action, context.user_id, transfer.state_version]
+        [transfer.id, nextStatus, action, context.user_id, transfer.state_version]
       );
       if (!updated.rows?.[0]) throw routeError(409, "STALE_TRANSFER_STATE", "Transfer state changed; refresh before retrying");
       await client.query(
@@ -1396,7 +1497,7 @@ const registerOperationalV3Routes = ({
            user_id, device_id, idempotency_key)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
         [
-          transferId,
+          transfer.id,
           action.toUpperCase(),
           transfer.status,
           nextStatus,
@@ -1576,7 +1677,9 @@ module.exports = {
   nextTransferStatus,
   applyTransferStockEffect,
   paymentAllocationPermissions,
+  positiveId,
   readSupplierMasterPayload,
+  resolveEntityReference,
   registerOperationalV3Routes,
   supplierReferencePayload,
   validateAssignmentPreview,

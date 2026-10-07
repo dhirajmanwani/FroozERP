@@ -68,6 +68,29 @@ test("sync is blocked too, deliberately, with no allowlist for read-shaped POSTs
   assert.equal(response.code, "VIEW_ONLY_SESSION");
 });
 
+test("a view-only session may switch shops, which is the only way back to its own", async () => {
+  // 7 Oct 2026. The switch writes nothing -- it re-reads the Owner and mints a token -- and refusing
+  // it left the Owner stuck viewing another shop until the token expired. It reaches the handler,
+  // which then does its own Owner check (no database row here, so OWNER_ONLY).
+  const response = await call("POST", "/api/owner/view-branch", token({ viewOnly: true }), { view_branch_id: 1 });
+  assert.notEqual(response.code, "VIEW_ONLY_SESSION");
+  assert.equal(response.code, "OWNER_ONLY");
+  const trailing = await call("POST", "/api/owner/view-branch/", token({ viewOnly: true }), { view_branch_id: 1 });
+  assert.notEqual(trailing.code, "VIEW_ONLY_SESSION");
+});
+
+test("the exception is that one route and nothing that merely resembles it", async () => {
+  for (const [method, url] of [
+    ["PUT", "/api/owner/view-branch"],
+    ["POST", "/api/owner/view-branches"],
+    ["POST", "/api/owner/view-branch/extra"],
+    ["POST", "/owner/view-branch"],
+  ]) {
+    const response = await call(method, url, token({ viewOnly: true }));
+    assert.equal(response.code, "VIEW_ONLY_SESSION", `${method} ${url}`);
+  }
+});
+
 test("a view-only session can still read", async () => {
   // The control. A gate that refused everything would pass every assertion above while making the
   // feature useless. There is no database here, so a read reaches the handler and hangs rather than

@@ -25,9 +25,19 @@ const assert = require("node:assert/strict");
 const {
   loadServerApp,
   probe,
+  setQueryResponder,
+  clearQueryResponder,
   startQueryRecording,
   stopQueryRecording,
 } = require("./routeAuthCoverage");
+
+/**
+ * The caller's permission lookup, answered as the Owner. Report reads check the `reports`
+ * permission before their first money query (7 Oct 2026); with every query answered by empty rows
+ * that check refuses, and the route would run no money SQL for this file to inspect.
+ */
+const PERMISSION_USER_SQL = /FROM\s+users\s+u\s+JOIN\s+roles\s+r/i;
+const OWNER_ROW = { rows: [{ id: 7, full_name: "Probe Owner", username: "probe", branch_id: 1, role_name: "Owner", permissions: {} }], rowCount: 1 };
 const { issueDeviceSession } = require("./deviceSession");
 
 /** Must match the throwaway key `routeAuthCoverage` pins into the environment before loading. */
@@ -53,10 +63,15 @@ const run = async (path) => {
     });
   }
   startQueryRecording();
-  await probe(app, "GET", path, {
-    authorization: `Bearer ${token}`,
-    "content-type": "application/json",
-  });
+  setQueryResponder((sql) => (PERMISSION_USER_SQL.test(sql) ? OWNER_ROW : undefined));
+  try {
+    await probe(app, "GET", path, {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    });
+  } finally {
+    clearQueryResponder();
+  }
   return stopQueryRecording();
 };
 

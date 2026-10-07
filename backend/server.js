@@ -1631,8 +1631,13 @@ const getSupportContacts = async ({ staffOnly = false } = {}) => {
  * Removing the `||` fallback would not have fixed it — an attacker simply sends `updated_by` too.
  * The only fix is that the actor is a *proven* identity, which is why every caller now sits behind
  * `requireAuth`.
+ *
+ * The manager half follows `userManagementRefusal`: only the Owner may act on an Owner or Admin
+ * account, and anyone else only on their own shop's staff. `actorBranchId` is `req.auth.branchId`.
+ * (The substitution check already refuses a body or query `user_id` that is not the caller's own, so
+ * today this half is reached only through a future caller; it is closed anyway, not left to that.)
  */
-const requireSelfOrRateManager = async (targetUserId, actorUserId, client = pool) => {
+const requireSelfOrRateManager = async (targetUserId, actorUserId, client = pool, actorBranchId = null) => {
   const parsedTarget = parsePositiveInteger(targetUserId);
   const parsedActor = parsePositiveInteger(actorUserId);
   if (!parsedTarget || !parsedActor) return null;
@@ -1648,7 +1653,10 @@ const requireSelfOrRateManager = async (targetUserId, actorUserId, client = pool
     );
     return result.rows[0] || null;
   }
-  return requireRateManager(parsedActor, client);
+  const manager = await requireRateManager(parsedActor, client);
+  if (!manager) return null;
+  const refusal = await refuseUserManagement({ actor: manager, auth: { branchId: actorBranchId }, targetUserId: parsedTarget }, client);
+  return refusal ? null : manager;
 };
 
 const createOtpRequest = async ({ client = pool, user, purpose, method, contact, req, deviceId = "" }) => {
@@ -1777,6 +1785,116 @@ const getOwnerUser = async (userId, client = pool) => {
   );
   const user = result.rows[0];
   return user && isOwnerRole(user.role_name) ? user : null;
+};
+
+/**
+ * `getPermissionUser`, except that Owner and Admin always pass.
+ *
+ * For the module keys the client already treats as open to both (`billing`, `purchases`, `reports`
+ * and the settings keys): an Admin whose stored row had a box unticked would otherwise see the
+ * screen and be refused by the server. Everyone else is decided by their stored row, or by the
+ * Owner/Admin default when the row does not mention the key. `userId` must be `req.auth.userId`.
+ */
+const getStaffPermissionUser = async (userId, permissionKey, client = pool) => {
+  const permitted = await getPermissionUser(userId, permissionKey, ["Owner", "Admin"], client);
+  if (permitted) return permitted;
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId || !PERMISSION_KEYS.includes(permissionKey)) return null;
+  const result = await client.query(
+    `
+    SELECT u.id, u.full_name, u.username, u.branch_id, r.role_name
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  const user = result.rows[0];
+  return user && roleMatches(user.role_name, ["Admin"]) ? user : null;
+};
+
+/**
+ * Who may manage whose account. One rule, used by every route that writes another user's row.
+ *
+ * Before this, every `/users/:id` write checked only that the caller was Owner *or Admin*, and took
+ * the role from the body. An Admin could therefore create an Owner, promote themselves, reset the
+ * Owner's password, deactivate or delete the Owner, and do all of it to any shop's staff. Admin is
+ * a shop manager, not the business's owner, so:
+ *
+ * - an account that is Owner or Admin now, or would become one, is managed by the Owner only;
+ * - anyone else who manages users manages their own shop's staff (`req.auth.branchId`) and nobody
+ *   else's. A user with no branch is outside every shop, so only the Owner can manage them.
+ *
+ * `actorRole` must be the role the database reports for the caller, never the token claim, and
+ * `actorBranchId` the verified session's branch. Returns a refusal `{status, code, message}` or null.
+ */
+const PRIVILEGED_ACCOUNT_ROLES = Object.freeze(["Owner", "Admin"]);
+
+const userManagementRefusal = ({ actorRole, actorBranchId, targetRole = "", targetBranchId = null, requestedRole = "" } = {}) => {
+  if (isOwnerRole(actorRole)) return null;
+  if (roleMatches(targetRole, PRIVILEGED_ACCOUNT_ROLES) || roleMatches(requestedRole, PRIVILEGED_ACCOUNT_ROLES)) {
+    return {
+      status: 403,
+      code: "OWNER_REQUIRED_FOR_PRIVILEGED_ACCOUNT",
+      message: "Only the Owner can add, change or remove an Owner or Admin account.",
+    };
+  }
+  const ownBranchId = parsePositiveInteger(actorBranchId);
+  if (!ownBranchId || parsePositiveInteger(targetBranchId) !== ownBranchId) {
+    return {
+      status: 403,
+      code: "USER_NOT_IN_YOUR_BRANCH",
+      message: "You can only manage the staff of your own shop.",
+    };
+  }
+  return null;
+};
+
+/** The target of a user-management write, as the database has it now. */
+const loadManagedUser = async (userId, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return null;
+  const result = await client.query(
+    `
+    SELECT u.id, u.username, u.branch_id, u.active, r.role_name
+    FROM users u
+    LEFT JOIN roles r ON r.id = u.role_id
+    WHERE u.id = $1
+    `,
+    [parsedUserId]
+  );
+  return result.rows[0] || null;
+};
+
+/**
+ * `userManagementRefusal` for an existing account: 404 when it does not exist, the refusal when the
+ * caller may not manage it (or may not give it `requestedRole`), null when they may.
+ */
+const refuseUserManagement = async ({ actor, auth, targetUserId, requestedRole = "" }, client = pool) => {
+  const target = await loadManagedUser(targetUserId, client);
+  if (!target) return { status: 404, code: "USER_NOT_FOUND", message: "User not found" };
+  return userManagementRefusal({
+    actorRole: actor?.role_name,
+    actorBranchId: auth?.branchId,
+    targetRole: target.role_name,
+    targetBranchId: target.branch_id,
+    requestedRole,
+  });
+};
+
+const sendUserManagementRefusal = (res, refusal) =>
+  res.status(refusal.status).json({ code: refusal.code, message: refusal.message });
+
+/**
+ * The `reports` permission, for the report reads (Owner and Admin always). Sends the 403 and
+ * returns true when the caller lacks it; the route returns at once. Report reads used to check
+ * nothing beyond the session, so a Cashier with Reports unticked could still read the balance
+ * sheet, cash book, day book and P&L by asking the API directly.
+ */
+const denyWithoutReportsPermission = async (req, res) => {
+  if (await getStaffPermissionUser(req.auth.userId, "reports")) return false;
+  res.status(403).json({ code: "REPORTS_PERMISSION_REQUIRED", message: "You do not have permission to view reports." });
+  return true;
 };
 
 const buildCanonicalIdentity = (user, { authenticated = true, sessionId = "" } = {}) => {
@@ -4462,6 +4580,10 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
     )`);
   }
   const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  // `customers` has no branch, so an opening balance belongs to the company, not to any one shop.
+  // Counting it in branch scope added every customer's opening balance to every branch's
+  // receivables; it is counted once, in company scope, and the shop figures start from zero.
+  const openingBalanceSql = scope.isCompany ? "COALESCE(c.opening_balance, 0)" : "0";
   const result = await pool.query(
     `
     WITH sale_summary AS (
@@ -4472,9 +4594,12 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
         SUM(CASE WHEN s.sale_status = 'CANCELLED' THEN s.total_amount ELSE 0 END) AS total_cancelled
       FROM sales s
       ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+      -- A 'CREDIT' payment line is the unpaid part of the bill, not money received. Sale edits
+      -- wrote such lines; they stay in the table and are left out of every "paid" figure.
       LEFT JOIN (
         SELECT sale_id, SUM(amount) AS total_paid
         FROM sale_payments
+        WHERE payment_mode IS DISTINCT FROM 'CREDIT'
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
       WHERE ${scope.predicate("s.")}
@@ -4509,8 +4634,9 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
       COALESCE(ss.sale_paid, 0) + COALESCE(cps.total_customer_paid, 0) AS total_paid,
       COALESCE(ss.total_cancelled, 0) AS total_cancelled,
       COALESCE(rcs.total_return_credit, 0) AS total_return_credit,
+      ${openingBalanceSql} AS counted_opening_balance,
       ROUND((
-        COALESCE(c.opening_balance, 0)
+        ${openingBalanceSql}
         + COALESCE(ss.total_sales, 0)
         - COALESCE(ss.sale_paid, 0)
         - COALESCE(cps.total_customer_paid, 0)
@@ -4551,109 +4677,19 @@ const buildCustomerSummaryPayload = (rows) => {
  * reason the summary/detail rule in CLAUDE.md exists: the two halves have to share filter semantics
  * or the difference reads as missing money.
  *
- * The cash CTEs scope on `s.branch_id` (the sale) rather than `sp.branch_id` (the payment line).
- * Both columns exist and should agree, but the sale is the parent record and the one the rest of the
- * report already filters on.
+ * Cash and bank come from `getCashBookReport`, which is scoped to the same branch arm by arm.
  */
 const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchId } = {}) => {
   if (!parsePositiveInteger(branchId)) {
     throw new Error("getBalanceSheetSnapshot requires a branchId");
   }
   const asAtDate = isDateInput(dateTo) ? dateTo : toDateKey(new Date());
-  const bankModesSql = BANK_PAYMENT_MODES.map((mode) => `'${mode}'`).join(", ");
-  const [cashResult, inventoryResult, profitLossResult, supplierRows, customerRows] = await Promise.all([
-    pool.query(
-      `
-      SELECT
-        COALESCE((
-          SELECT SUM(sp.amount)
-          FROM sale_payments sp
-          JOIN sales s ON s.id = sp.sale_id
-          WHERE s.branch_id = $2
-            AND s.sale_status <> 'CANCELLED'
-            AND sp.payment_mode = 'CASH'
-            AND s.sale_date <= $1
-        ), 0)
-        + COALESCE((
-          SELECT SUM(payment_amount)
-          FROM customer_payments
-          WHERE branch_id = $2
-            AND cancelled = FALSE
-            AND payment_mode = 'CASH'
-            AND payment_date <= $1
-        ), 0)
-        - COALESCE((
-          SELECT SUM(payment_amount)
-          FROM supplier_payments
-          WHERE branch_id = $2
-            AND cancelled = FALSE
-            AND payment_mode = 'CASH'
-            AND payment_date <= $1
-        ), 0)
-        - COALESCE((
-          SELECT SUM(COALESCE(paid_amount, 0))
-          FROM purchases
-          WHERE branch_id = $2
-            AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
-            AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
-            AND COALESCE(payment_mode, '') = 'CASH'
-            AND purchase_date <= $1
-        ), 0)
-        - COALESCE((
-          SELECT SUM(amount)
-          FROM expenses
-          WHERE branch_id = $2
-            AND active IS DISTINCT FROM FALSE
-            AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
-            AND payment_mode = 'CASH'
-            AND expense_date <= $1
-        ), 0) AS cash_in_hand,
-        COALESCE((
-          SELECT SUM(sp.amount)
-          FROM sale_payments sp
-          JOIN sales s ON s.id = sp.sale_id
-          WHERE s.branch_id = $2
-            AND s.sale_status <> 'CANCELLED'
-            AND sp.payment_mode IN (${bankModesSql})
-            AND s.sale_date <= $1
-        ), 0)
-        + COALESCE((
-          SELECT SUM(payment_amount)
-          FROM customer_payments
-          WHERE branch_id = $2
-            AND cancelled = FALSE
-            AND payment_mode IN (${bankModesSql})
-            AND payment_date <= $1
-        ), 0)
-        - COALESCE((
-          SELECT SUM(payment_amount)
-          FROM supplier_payments
-          WHERE branch_id = $2
-            AND cancelled = FALSE
-            AND payment_mode IN (${bankModesSql})
-            AND payment_date <= $1
-        ), 0)
-        - COALESCE((
-          SELECT SUM(COALESCE(paid_amount, 0))
-          FROM purchases
-          WHERE branch_id = $2
-            AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
-            AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
-            AND COALESCE(payment_mode, '') IN (${bankModesSql})
-            AND purchase_date <= $1
-        ), 0)
-        - COALESCE((
-          SELECT SUM(amount)
-          FROM expenses
-          WHERE branch_id = $2
-            AND active IS DISTINCT FROM FALSE
-            AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
-            AND payment_mode IN (${bankModesSql})
-            AND expense_date <= $1
-        ), 0) AS cash_at_bank
-      `,
-      [asAtDate, branchId]
-    ),
+  // Cash and bank are the cash book's closing balances, so the headline and its drill-down
+  // (`/reports/balance-sheet/details/cash_in_hand`, which reads the cash book) are one figure. A
+  // separate SQL here once left out sale-return refunds and contra entries and dated a pending
+  // purchase bill paid later by its arrival date, so the two disagreed.
+  const [cashBook, inventoryResult, profitLossResult, supplierRows, customerRows] = await Promise.all([
+    getCashBookReport({ branchId, dateFrom: asAtDate, dateTo: asAtDate }),
     pool.query(
       `
       SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate)), 0) AS inventory_value
@@ -4683,7 +4719,6 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchI
     getCustomerSummaryRows({ dateTo: asAtDate, branchId }),
   ]);
 
-  const cash = cashResult.rows[0] || {};
   const profitLoss = profitLossResult.rows[0] || {};
   const inventoryValue = Number(inventoryResult.rows[0]?.inventory_value || 0);
   const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
@@ -4697,8 +4732,8 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchI
     - Number(profitLoss.supplier_rebate_received || 0);
   const grossProfit = Number(profitLoss.sales_revenue || 0) - costOfGoodsSold;
   const netProfit = grossProfit - Number(profitLoss.expenses || 0);
-  const cashInHand = Number(cash.cash_in_hand || 0);
-  const cashAtBank = Number(cash.cash_at_bank || 0);
+  const cashInHand = Number(cashBook.closing_cash || 0);
+  const cashAtBank = Number(cashBook.closing_bank || 0);
   const totalAssets = cashInHand + cashAtBank + inventoryValue + customerReceivable;
   const ownerCapital = roundCurrency(totalAssets - supplierPayable - netProfit);
 
@@ -4816,7 +4851,7 @@ const getCashBookReport = async ({
       WHERE s.branch_id = $2
         AND s.sale_status <> 'CANCELLED'
         AND s.sale_date <= $1
-        AND sp.payment_mode <> 'CREDIT'
+        AND sp.payment_mode IS DISTINCT FROM 'CREDIT'
       UNION ALL
       SELECT
         cp.payment_date AS date,
@@ -4837,8 +4872,9 @@ const getCashBookReport = async ({
         AND cp.cancelled = FALSE
         AND cp.payment_date <= $1
       UNION ALL
+      -- A pending bill completed later is paid on its payment_date, not its arrival date.
       SELECT
-        p.purchase_date AS date,
+        COALESCE(p.payment_date, p.purchase_date) AS date,
         p.created_at AS entry_time,
         'Supplier A/c - ' || COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS account_name,
         'SUPPLIER' AS account_type,
@@ -4857,7 +4893,7 @@ const getCashBookReport = async ({
         AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
         AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         AND COALESCE(p.paid_amount, 0) > 0
-        AND p.purchase_date <= $1
+        AND COALESCE(p.payment_date, p.purchase_date) <= $1
         AND COALESCE(p.payment_mode, '') <> ''
       UNION ALL
       SELECT
@@ -5661,6 +5697,11 @@ const getSettingsBundle = async (auth, deviceId = "") => {
     const { text, values } = buildSettingsUserListQuery(scope);
     usersResult = await pool.query(text, values);
   }
+  // Every one of these is the caller's company only (`req.auth.companyId`, from the verified session).
+  // They used to return every company's devices, activation codes, shops, counters and exit attempts
+  // to any Owner or Admin. A device is placed by its own company, or by its assigned shop's when it
+  // has none yet (registration does not write one); an exit attempt by its device or its user.
+  const bundleCompanyId = parsePositiveInteger(auth?.companyId);
   const [devicesResult, activationResult, branchesResult, countersResult, backupSettingsResult, backupLogsResult, systemInfo, exitLogsResult] = manager ? await Promise.all([
     pool.query(`
       SELECT d.*, b.branch_name, c.counter_name, u.full_name AS approved_by_name
@@ -5668,21 +5709,23 @@ const getSettingsBundle = async (auth, deviceId = "") => {
       LEFT JOIN branches b ON b.id = d.assigned_branch_id
       LEFT JOIN counters c ON c.id = d.assigned_counter_id
       LEFT JOIN users u ON u.id = d.approved_by
+      WHERE COALESCE(d.company_id, b.company_id) = $1
       ORDER BY d.status = 'PENDING' DESC, d.updated_at DESC, d.id DESC
-    `),
+    `, [bundleCompanyId]),
     pool.query(`
       SELECT ac.id, ac.code_label, ac.branch_id, ac.counter_id, b.branch_name, c.counter_name,
              ac.created_by, u.full_name AS created_by_name, ac.created_at, ac.expires_at,
              ac.used_by_device_id, ac.used_at, ac.status
       FROM activation_codes ac
-      LEFT JOIN branches b ON b.id = ac.branch_id
+      JOIN branches b ON b.id = ac.branch_id
       LEFT JOIN counters c ON c.id = ac.counter_id
       LEFT JOIN users u ON u.id = ac.created_by
+      WHERE b.company_id = $1
       ORDER BY ac.created_at DESC, ac.id DESC
       LIMIT 50
-    `),
-    pool.query("SELECT * FROM branches ORDER BY active DESC, id"),
-    pool.query("SELECT c.*, b.branch_name FROM counters c LEFT JOIN branches b ON b.id = c.branch_id ORDER BY c.active DESC, c.id"),
+    `, [bundleCompanyId]),
+    pool.query("SELECT * FROM branches WHERE company_id = $1 ORDER BY active DESC, id", [bundleCompanyId]),
+    pool.query("SELECT c.*, b.branch_name FROM counters c JOIN branches b ON b.id = c.branch_id WHERE b.company_id = $1 ORDER BY c.active DESC, c.id", [bundleCompanyId]),
     pool.query("SELECT * FROM backup_settings WHERE id = 1"),
     pool.query("SELECT * FROM backup_logs ORDER BY started_at DESC, id DESC LIMIT 20"),
     getSystemInfo(deviceId),
@@ -5690,9 +5733,13 @@ const getSettingsBundle = async (auth, deviceId = "") => {
       SELECT l.*, u.full_name AS user_name
       FROM device_exit_attempt_logs l
       LEFT JOIN users u ON u.id = l.user_id
+      LEFT JOIN branches ub ON ub.id = u.branch_id
+      LEFT JOIN authorized_devices d ON d.device_id = l.device_id
+      LEFT JOIN branches db ON db.id = d.assigned_branch_id
+      WHERE COALESCE(d.company_id, db.company_id, ub.company_id) = $1
       ORDER BY l.attempted_at DESC, l.id DESC
       LIMIT 20
-    `),
+    `, [bundleCompanyId]),
   ]) : [
     { rows: [] },
     { rows: [] },
@@ -6065,7 +6112,7 @@ const getSalePermissionUser = async (userId, action, client = pool) => {
  * Returns `{ ok: true, approverId }` (null when none was needed) or
  * `{ ok: false, code: "SALE_CHANGE_APPROVAL_REQUIRED", detail, message }`.
  */
-const authorizeSaleChange = async (client, { actor, action, approvalId, sale, companyId, deviceId }) => {
+const authorizeSaleChange = async (client, { actor, action, approvalId, sale, companyId, deviceId, branchId = null, viaSync = false }) => {
   if (!saleChangeApproval.approvalRequired(actor?.role_name)) return { ok: true, approverId: null };
   const id = saleChangeApproval.normalizeApprovalId(approvalId);
   if (!id) return saleChangeApproval.missingApproval();
@@ -6084,8 +6131,13 @@ const authorizeSaleChange = async (client, { actor, action, approvalId, sale, co
     saleRefs: saleChangeApproval.saleRefsOf(sale),
     requesterId: actor?.id,
     companyId,
+    branchId,
     deviceId,
+    // Server clock against the server-written `created_at` / `expires_at`; never a device time.
     nowMs: Date.now(),
+    // The desktop's sync push spends an approval up to 7 days after it was granted, so a bill the
+    // counter already changed offline is not left disagreeing with the server. Online: 15 minutes.
+    viaSync: viaSync === true,
   });
   if (!binding.ok) return binding;
   await client.query(
@@ -6747,6 +6799,14 @@ const buildSalePayload = async (
     // For an edit: the lot discounts the sale already carried (its `sale_items` rows). A special
     // price the sale was billed at is not an override just because the discount stopped since.
     priorLotDiscounts = [],
+    // For an edit: the bill's stored `sale_items` rows. A line left at the rate it was billed at is
+    // not a rate override, whatever today's product or lot rate is -- an edit that only fixed the
+    // customer used to be refused for a Cashier once the morning's rates had moved.
+    priorSaleItems = [],
+    // A requested rate of exactly 0 is billed as 0 only when the caller says the POS allowed it
+    // (a desktop bill already handed over; an Owner/Admin edit), or the edited line was already 0.
+    // It used to be parsed as "no rate" and silently re-priced at the default rate.
+    allowZeroRate = false,
   }
 ) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
@@ -6755,7 +6815,10 @@ const buildSalePayload = async (
     inventoryBatchId: parsePositiveInteger(item.inventory_batch_id),
     quantity: parsePositiveNumber(item.quantity),
     discountAmount: parseNonNegativeNumber(item.discount_amount),
-    requestedRate: parsePositiveNumber(item.selling_rate),
+    // Presence first, then a non-negative parse: 0 is a rate, absent is not.
+    requestedRate: item.selling_rate === null || item.selling_rate === undefined || String(item.selling_rate).trim() === ""
+      ? null
+      : parseNonNegativeNumber(item.selling_rate),
     lotDiscountId: parsePositiveInteger(item.lot_discount_id),
     lotDiscountType: item.lot_discount_type ? String(item.lot_discount_type).trim().toUpperCase() : null,
     lotDiscountValue: parseNonNegativeNumber(item.lot_discount_value),
@@ -6885,13 +6948,35 @@ const buildSalePayload = async (
         priorClaims: priorLotDiscounts,
       })
       && roundCurrency(sellingRate) === roundCurrency(requestedItem.lotDiscountValue);
-    const manualRateOverride = hasRequestedRate
-      && !verifiedSpecialRate
-      && roundCurrency(sellingRate) !== roundCurrency(defaultSellingRate);
-    if (!Number.isFinite(sellingRate) || sellingRate <= 0) {
+    // On an edit, a line of this product that the bill already carried at this exact rate. Keeping
+    // it is not a new override, so it needs no override permission and is not audited as one again.
+    const keptBilledLine = hasRequestedRate
+      ? (Array.isArray(priorSaleItems) ? priorSaleItems : []).find((prior) =>
+        parsePositiveInteger(prior?.product_id) === requestedItem.productId
+        && prior.selling_rate !== null && prior.selling_rate !== undefined && prior.selling_rate !== ""
+        && Number.isFinite(Number(prior.selling_rate))
+        && roundCurrency(prior.selling_rate) === roundCurrency(sellingRate))
+      : undefined;
+    const keptBilledRate = Boolean(keptBilledLine);
+    const manualRateOverride = keptBilledRate
+      ? keptBilledLine.manual_rate_override === true
+      : hasRequestedRate
+        && !verifiedSpecialRate
+        && roundCurrency(sellingRate) !== roundCurrency(defaultSellingRate);
+    if (!Number.isFinite(sellingRate) || sellingRate < 0) {
       return { error: { status: 400, message: `${product.product_name} does not have a valid selling rate` } };
     }
-    if (manualRateOverride && !allowRateOverride) {
+    if (sellingRate === 0 && !(hasRequestedRate && (allowZeroRate || keptBilledRate || verifiedSpecialRate))) {
+      return {
+        error: {
+          status: 400,
+          message: hasRequestedRate
+            ? `A zero sale rate for ${product.product_name} needs Owner/Admin confirmation`
+            : `${product.product_name} does not have a valid selling rate`,
+        },
+      };
+    }
+    if (manualRateOverride && !keptBilledRate && !allowRateOverride) {
       return { error: { status: 403, message: "You do not have permission to change sale rate" } };
     }
 
@@ -6927,6 +7012,7 @@ const buildSalePayload = async (
       sellingRate,
       defaultSellingRate,
       manualRateOverride,
+      keptBilledRate,
       grossAmount: itemGross,
       netAmount: roundCurrency(itemGross - requestedItem.discountAmount),
       costAmount: roundCurrency(itemCost),
@@ -7456,6 +7542,14 @@ app.put("/settings/role-permissions/:roleName", async (req, res) => {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage role permissions" });
     const roleName = cleanText(req.params.roleName);
+    // An Admin editing the Admin row could grant themselves anything; editing the Owner row is the
+    // Owner's business. Compared normalised, so "ADMIN" or "admin" is not a way round it.
+    if (roleMatches(roleName, PRIVILEGED_ACCOUNT_ROLES) && !isOwnerRole(manager.role_name)) {
+      return res.status(403).json({
+        code: "OWNER_REQUIRED_FOR_PRIVILEGED_ROLE",
+        message: "Only the Owner can change what the Owner and Admin roles may do.",
+      });
+    }
     const permissions = req.body.permissions && typeof req.body.permissions === "object" ? req.body.permissions : {};
     const normalized = PERMISSION_KEYS.reduce((payload, key) => ({ ...payload, [key]: Boolean(permissions[key]) }), {});
     const result = await pool.query(
@@ -7634,15 +7728,51 @@ app.put("/settings/device-control", async (req, res) => {
   }
 });
 
+/**
+ * Wrong exit codes allowed per device, and per signed-in user, inside the window before further
+ * attempts are refused with 429. The code is a 4+ digit number, so without a ceiling it falls to
+ * anyone left at a locked counter in minutes. Counted from `device_exit_attempt_logs`, which every
+ * attempt already writes; a refused attempt is logged under its own reason and does not count, so
+ * the window always lifts.
+ */
+const EXIT_CODE_FAILURE_LIMIT = 5;
+const EXIT_CODE_FAILURE_WINDOW_MINUTES = 15;
+const EXIT_CODE_INVALID_REASON = "Invalid exit code";
+const EXIT_CODE_LOCKED_REASON = "Too many attempts";
+
 app.post("/settings/device-control/verify-exit-code", async (req, res) => {
   try {
-    const userId = parsePositiveInteger(req.body.user_id);
-    const deviceId = cleanText(req.body.device_id);
+    // Who and where come from the verified session. The body's user_id / device_id are pinned to it
+    // by the substitution check anyway, but a body field may be omitted and the session cannot.
+    const userId = parsePositiveInteger(req.auth.userId);
+    const deviceId = cleanText(req.auth.deviceId) || cleanText(req.body.device_id);
     const exitCode = cleanText(req.body.exit_code);
     const settingsResult = await pool.query("SELECT * FROM device_control_settings WHERE id = 1");
     const settings = settingsResult.rows[0] || {};
     if (!settings.exit_code_hash) {
       return res.status(409).json({ message: "No Owner exit code is configured. Set one in Branches & Counters > Counter screen lock." });
+    }
+    const recentFailures = await pool.query(
+      `
+      SELECT COUNT(*)::INTEGER AS failures
+      FROM device_exit_attempt_logs
+      WHERE success = FALSE
+        AND failure_reason = $3
+        AND attempted_at > CURRENT_TIMESTAMP - ($4 || ' minutes')::interval
+        AND (($1::TEXT IS NOT NULL AND device_id = $1) OR ($2::INTEGER IS NOT NULL AND user_id = $2))
+      `,
+      [deviceId || null, userId, EXIT_CODE_INVALID_REASON, String(EXIT_CODE_FAILURE_WINDOW_MINUTES)]
+    );
+    if (Number(recentFailures.rows[0]?.failures || 0) >= EXIT_CODE_FAILURE_LIMIT) {
+      await pool.query(
+        "INSERT INTO device_exit_attempt_logs (user_id, device_id, success, failure_reason) VALUES ($1, $2, FALSE, $3)",
+        [userId, deviceId || null, EXIT_CODE_LOCKED_REASON]
+      );
+      res.set("Retry-After", String(EXIT_CODE_FAILURE_WINDOW_MINUTES * 60));
+      return res.status(429).json({
+        code: "EXIT_CODE_ATTEMPTS_LOCKED",
+        message: `Too many wrong exit codes. Try again in about ${EXIT_CODE_FAILURE_WINDOW_MINUTES} minutes.`,
+      });
     }
     const valid = Boolean(settings.exit_code_hash) && hashExitCode(exitCode) === settings.exit_code_hash;
     await pool.query(
@@ -7650,7 +7780,7 @@ app.post("/settings/device-control/verify-exit-code", async (req, res) => {
       INSERT INTO device_exit_attempt_logs (user_id, device_id, success, failure_reason)
       VALUES ($1, $2, $3, $4)
       `,
-      [userId, deviceId || null, valid, valid ? null : "Invalid exit code"]
+      [userId, deviceId || null, valid, valid ? null : EXIT_CODE_INVALID_REASON]
     );
     if (!valid) return res.status(403).json({ message: "Invalid exit code" });
     return res.json({ success: true });
@@ -8358,6 +8488,15 @@ app.post("/users", async (req, res) => {
     }
     const newUserBranchId = requestedUserBranchId || req.auth.branchId;
     const payload = readUserPayload(req.body);
+    // The role is the caller's to choose only below Admin, and the branch only their own shop,
+    // unless they are the Owner. See `userManagementRefusal`.
+    const createRefusal = userManagementRefusal({
+      actorRole: manager.role_name,
+      actorBranchId: req.auth.branchId,
+      targetBranchId: newUserBranchId,
+      requestedRole: payload.role,
+    });
+    if (createRefusal) return sendUserManagementRefusal(res, createRefusal);
     const password = String(req.body.password || "");
     const confirmPassword = String(req.body.confirm_password || "");
     const roleId = await getRoleIdByName(payload.role);
@@ -8398,6 +8537,10 @@ app.put("/users/:id", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can edit users" });
     if (!userId) return res.status(400).json({ message: "Invalid user" });
     const payload = readUserPayload(req.body);
+    // Both the role the account has now and the one the body asks for: an Admin may neither edit an
+    // Owner/Admin nor make anyone one, themselves included.
+    const editRefusal = await refuseUserManagement({ actor: manager, auth: req.auth, targetUserId: userId, requestedRole: payload.role });
+    if (editRefusal) return sendUserManagementRefusal(res, editRefusal);
     const roleId = await getRoleIdByName(payload.role);
     if (!payload.full_name || !payload.username || !roleId) {
       return res.status(400).json({ message: "Enter valid user details" });
@@ -8436,11 +8579,67 @@ app.put("/users/:id/password", async (req, res) => {
     // supplied both sides and a Cashier could name themselves the actor on the Owner's account.
     const userId = parsePositiveInteger(req.params.id);
     const actorId = req.auth.userId;
-    const manager = await requireRateManager(actorId);
+    const isSelf = Boolean(userId) && userId === parsePositiveInteger(actorId);
+    const manager = isSelf ? null : await requireRateManager(actorId);
     const password = String(req.body.password || "");
     const confirmPassword = String(req.body.confirm_password || "");
-    if (!userId || (!manager && actorId !== userId)) return res.status(403).json({ message: "Not allowed to change this password" });
+    if (!userId || (!manager && !isSelf)) return res.status(403).json({ message: "Not allowed to change this password" });
+    if (!isSelf) {
+      // A reset of somebody else's password is account takeover when it is pointed upwards, so it
+      // is held to the same rule as every other user-management write.
+      const resetRefusal = await refuseUserManagement({ actor: manager, auth: req.auth, targetUserId: userId });
+      if (resetRefusal) return sendUserManagementRefusal(res, resetRefusal);
+    }
     if (password.length < 4 || password !== confirmPassword) return res.status(400).json({ message: "Enter matching password with at least 4 characters" });
+    if (isSelf) {
+      // Changing your own password needs the one you have now. Without it, anyone who finds a
+      // counter left signed in can make the account theirs. Failures count towards the same lockout
+      // as /login, so this is not a second, unlimited place to guess the password.
+      const currentPassword = String(req.body.current_password || "");
+      const selfResult = await pool.query(
+        `SELECT id, username, password_hash, locked_until, failed_login_attempts, last_failed_login_at
+           FROM users WHERE id = $1 AND active = TRUE`,
+        [userId]
+      );
+      const self = selfResult.rows[0];
+      if (!self) return res.status(404).json({ message: "User not found" });
+      const selfLock = resolveLockState({ lockedUntil: self.locked_until });
+      if (selfLock.locked) {
+        return res.status(423).json({ code: "USER_LOCKED", message: lockMessage(selfLock.remainingMs) });
+      }
+      if (!currentPassword) {
+        return res.status(400).json({ code: "CURRENT_PASSWORD_REQUIRED", message: "Enter your current password to change it." });
+      }
+      if (!(await checkPassword(currentPassword, self.password_hash))?.ok) {
+        const outcome = registerFailedAttempt({
+          failedAttempts: self.failed_login_attempts,
+          lastFailedAt: self.last_failed_login_at,
+        });
+        try {
+          await pool.query(
+            `UPDATE users
+                SET failed_login_attempts = $2,
+                    last_failed_login_at = CURRENT_TIMESTAMP,
+                    locked_until = $3,
+                    updated_at = CURRENT_TIMESTAMP
+              WHERE id = $1`,
+            [self.id, outcome.failedAttempts, outcome.lockedUntilMs ? new Date(outcome.lockedUntilMs) : null]
+          );
+        } catch (error) {
+          console.error("Password-change failed-attempt bookkeeping failed", error);
+        }
+        await writeAuthAudit({
+          userId: self.id,
+          actorUserId: actorId,
+          username: self.username,
+          action: "USER_PASSWORD_CHANGE_FAILED",
+          safeCode: "CURRENT_PASSWORD_INVALID",
+          ipAddress: req.ip,
+        });
+        // 403, not 401: the session is fine, and a 401 reads to the client as "signed out".
+        return res.status(403).json({ code: "CURRENT_PASSWORD_INVALID", message: "Your current password is not correct." });
+      }
+    }
     const result = await pool.query(
       `
       UPDATE users
@@ -8459,7 +8658,7 @@ app.put("/users/:id/password", async (req, res) => {
         userId,
         actorUserId: actorId,
         username: result.rows[0].username,
-        action: manager ? "ADMIN_PASSWORD_RESET" : "USER_PASSWORD_CHANGE",
+        action: isSelf ? "USER_PASSWORD_CHANGE" : "ADMIN_PASSWORD_RESET",
         safeCode: "PASSWORD_UPDATED",
         ipAddress: req.ip,
       });
@@ -8477,6 +8676,8 @@ app.post("/users/:id/deactivate", async (req, res) => {
     const userId = parsePositiveInteger(req.params.id);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate users" });
     if (!userId || userId === manager.id) return res.status(400).json({ message: "Invalid user deactivation request" });
+    const deactivateRefusal = await refuseUserManagement({ actor: manager, auth: req.auth, targetUserId: userId });
+    if (deactivateRefusal) return sendUserManagementRefusal(res, deactivateRefusal);
     const result = await pool.query("UPDATE users SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id", [userId]);
     return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "User not found" });
   } catch (error) {
@@ -8490,6 +8691,8 @@ app.post("/users/:id/reactivate", async (req, res) => {
     const manager = await requireRateManager(req.auth.userId);
     const userId = parsePositiveInteger(req.params.id);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can reactivate users" });
+    const reactivateRefusal = await refuseUserManagement({ actor: manager, auth: req.auth, targetUserId: userId });
+    if (reactivateRefusal) return sendUserManagementRefusal(res, reactivateRefusal);
     const result = await pool.query("UPDATE users SET active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id", [userId]);
     return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "User not found" });
   } catch (error) {
@@ -8504,6 +8707,8 @@ app.delete("/users/:id", async (req, res) => {
     const userId = parsePositiveInteger(req.params.id);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can delete users" });
     if (!userId || userId === manager.id) return res.status(400).json({ message: "Invalid user delete request" });
+    const deleteRefusal = await refuseUserManagement({ actor: manager, auth: req.auth, targetUserId: userId });
+    if (deleteRefusal) return sendUserManagementRefusal(res, deleteRefusal);
     const transactionCount = await getUserTransactionCount(userId);
     if (transactionCount > 0) {
       await pool.query("UPDATE users SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [userId]);
@@ -8534,7 +8739,7 @@ app.get("/auth/recovery/config", async (req, res) => {
 app.get("/auth/recovery/profile", requireAuth, async (req, res) => {
   try {
     const userId = parsePositiveInteger(req.query.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.auth.userId);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, pool, req.auth.branchId);
     if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to view recovery profile" });
     const result = await pool.query(
       `
@@ -8564,7 +8769,7 @@ app.post("/auth/recovery/contact/request", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client, req.auth.branchId);
     const contactType = cleanText(req.body.contact_type).toLowerCase();
     if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to update recovery contact" });
     if (!["email", "mobile"].includes(contactType)) return res.status(400).json({ code: "INVALID_CONTACT_TYPE", message: "Select email or mobile recovery contact." });
@@ -8658,7 +8863,7 @@ app.post("/auth/recovery/contact/verify", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client, req.auth.branchId);
     const contactType = cleanText(req.body.contact_type).toLowerCase();
     if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to verify recovery contact" });
     if (!["email", "mobile"].includes(contactType)) return res.status(400).json({ code: "INVALID_CONTACT_TYPE", message: "Select email or mobile recovery contact." });
@@ -8741,7 +8946,7 @@ app.post("/api/auth/email/send-verification", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client, req.auth.branchId);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to update this email verification." });
     const email = normalizeRecoveryEmail(req.body.email || req.body.contact_value);
     if (!email) return res.status(400).json({ code: "INVALID_EMAIL", message: "Enter a valid email address." });
@@ -8793,7 +8998,7 @@ app.post("/api/auth/email/verify", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client, req.auth.branchId);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to verify this email." });
     await client.query("BEGIN");
     const verification = await verifyOtpRequest({ requestId: cleanText(req.body.request_id), otp: cleanText(req.body.otp), purpose: "contact_email", client });
@@ -8838,7 +9043,7 @@ app.post("/api/auth/phone/send-otp", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client, req.auth.branchId);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to update this phone verification." });
     const mobile = normalizeRecoveryMobile(req.body.phone || req.body.mobile || req.body.contact_value);
     if (!mobile) return res.status(400).json({ code: "INVALID_PHONE", message: "Enter a valid Indian mobile number." });
@@ -8890,7 +9095,7 @@ app.post("/api/auth/phone/verify-otp", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client, req.auth.branchId);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to verify this phone." });
     await client.query("BEGIN");
     const verification = await verifyOtpRequest({ requestId: cleanText(req.body.request_id), otp: cleanText(req.body.otp), purpose: "contact_mobile", client });
@@ -9321,7 +9526,7 @@ app.post("/users/:id/recovery-action", async (req, res) => {
     if (!userId || userId === manager.id) return res.status(400).json({ code: "INVALID_USER_ACTION", message: "Select a valid staff account." });
     const userResult = await pool.query(
       `
-      SELECT u.id, u.username, u.email, u.mobile_number, u.verified_email, u.verified_mobile, r.role_name
+      SELECT u.id, u.username, u.email, u.mobile_number, u.verified_email, u.verified_mobile, u.branch_id, r.role_name
       FROM users u
       JOIN roles r ON r.id = u.role_id
       WHERE u.id = $1
@@ -9330,9 +9535,15 @@ app.post("/users/:id/recovery-action", async (req, res) => {
     );
     const target = userResult.rows[0];
     if (!target) return res.status(404).json({ code: "USER_NOT_FOUND", message: "User not found" });
-    if (RATE_MANAGER_ROLES.has(target.role_name) && manager.role_name !== "Owner") {
-      return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Only Owner can manage Owner/Admin recovery actions." });
-    }
+    // Owner/Admin accounts are the Owner's to manage, and another shop's staff are not this
+    // manager's -- the same rule as every other user-management write (`userManagementRefusal`).
+    const recoveryRefusal = userManagementRefusal({
+      actorRole: manager.role_name,
+      actorBranchId: req.auth.branchId,
+      targetRole: target.role_name,
+      targetBranchId: target.branch_id,
+    });
+    if (recoveryRefusal) return sendUserManagementRefusal(res, recoveryRefusal);
     if (action === "RESET_PASSWORD") {
       const requestedPassword = String(req.body.temporary_password || "");
       const temporaryPassword = requestedPassword.length >= 4 ? requestedPassword : generateTemporaryPassword();
@@ -10506,8 +10717,27 @@ const upsertDeviceRequest = async (device, client = pool) => {
   return result.rows[0];
 };
 
+/**
+ * Device statuses that are somebody's decision, and that approval never undoes.
+ *
+ * The owner's rule: one physical device is one device id forever, and a retired id is never
+ * revived. DISABLED and REVOKED are the same kind of decision. `approveDevice` used to set APPROVED
+ * on whatever row it found, so a one-time activation code (or the first-owner bootstrap) quietly
+ * brought a retired or disabled machine back to life.
+ */
+const DEVICE_STATUSES_NEVER_REAPPROVED = Object.freeze(["RETIRED", "DISABLED", "REVOKED"]);
+
+/**
+ * Approve a device, unless its current status is one of the above. A refused device is returned
+ * exactly as it stands -- not APPROVED, nothing written -- so every caller already treats it as a
+ * device that is not approved, and `/login` answers it as DEVICE_DISABLED / DEVICE_REVOKED.
+ */
 const approveDevice = async ({ deviceId, approvedBy, branchId = 1, counterId = null, reason = "Approved" }, client = pool) => {
   const beforeResult = await client.query("SELECT * FROM authorized_devices WHERE device_id = $1", [deviceId]);
+  const before = beforeResult.rows[0];
+  if (before && DEVICE_STATUSES_NEVER_REAPPROVED.includes(String(before.status || "").trim().toUpperCase())) {
+    return before;
+  }
   const result = await client.query(
     `
     UPDATE authorized_devices
@@ -10519,10 +10749,16 @@ const approveDevice = async ({ deviceId, approvedBy, branchId = 1, counterId = n
         last_active_at = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
     WHERE device_id = $1
+      AND UPPER(COALESCE(status, '')) NOT IN ('RETIRED', 'DISABLED', 'REVOKED')
     RETURNING *
     `,
     [deviceId, approvedBy, branchId, counterId]
   );
+  // Lost a race with a retirement between the read and the write: report the row as it now is.
+  if (!result.rows[0]) {
+    const current = await client.query("SELECT * FROM authorized_devices WHERE device_id = $1", [deviceId]);
+    return current.rows[0] || before;
+  }
   await client.query(
     `
     INSERT INTO device_audit_trail (device_id, action, old_value, new_value, reason, changed_by)
@@ -10743,6 +10979,33 @@ const logSyncChange = async (client, {
   return result.rows[0];
 };
 
+/*
+ * A change to company-wide master data (product, sale_rate, product_category): one change row per
+ * active branch of the company, because sync pull reads `sync_change_log` by branch. Logged to the
+ * editor's branch alone, a Product Master or morning rate change reached that branch's counters and
+ * no other branch's, which kept selling at the old rate until a full re-bootstrap.
+ *
+ * `branchId` is the anchor: the caller's own branch, never one a request names. The company comes
+ * from it, so the fan-out cannot leave the caller's company. Returns the anchor's row.
+ */
+const logMasterDataSyncChange = async (client, { branchId, ...change }) => {
+  const anchorBranchId = parsePositiveInteger(branchId);
+  const anchorChange = await logSyncChange(client, { ...change, branchId: anchorBranchId });
+  const siblings = await client.query(
+    `SELECT id FROM branches
+     WHERE company_id = (SELECT company_id FROM branches WHERE id = $1)
+       AND id <> $1
+       AND active IS DISTINCT FROM FALSE
+     ORDER BY id`,
+    [anchorBranchId]
+  );
+  for (const row of siblings.rows) {
+    const siblingBranchId = parsePositiveInteger(row.id);
+    if (siblingBranchId) await logSyncChange(client, { ...change, branchId: siblingBranchId });
+  }
+  return anchorChange;
+};
+
 const processedAckFromRow = (row) => ({
   operation_id: row.operation_id,
   status: row.result_status,
@@ -10795,6 +11058,28 @@ const storeProcessedOperation = async (client, operation, context, ack, { replac
     ]
   );
 };
+
+/*
+ * A write that belongs to a refusal (the sync_conflict_log row) rather than to the operation. A
+ * handler hangs it on its ack under this key; `processSyncOperation` runs it after rolling the
+ * operation back, then removes the key so it never reaches a stored or returned ack.
+ */
+const SYNC_DEFERRED_WRITE = Symbol("syncDeferredWrite");
+
+/*
+ * Refusals that are not final: they are answered but not stored, so the same operation is judged
+ * again on the next push. An offline edit or cancel arriving before its bill (DEPENDENCY_MISSING:
+ * a push batch is sorted by operation id, not by causality), or pushed by a session that lacks the
+ * permission when another session that has it will push it later (AUTHORIZATION_ERROR), used to be
+ * stored as refused and replayed verbatim forever. Nothing of a refused operation is written (it
+ * is rolled back to its savepoint), and the edit path's own version check keeps a stale replay
+ * from overwriting a newer edit, so judging it again is safe.
+ */
+const isRetryableSyncRejection = (operation, ack) =>
+  operation.entity_type === "pos_sale"
+  && ["SALE_EDIT", "SALE_CANCEL"].includes(operation.operation_type)
+  && ack.status === "rejected"
+  && ["AUTHORIZATION_ERROR", "DEPENDENCY_MISSING"].includes(ack.error_code);
 
 const rejectOperation = (operation, errorCode, message) => ({
   operation_id: operation.operation_id,
@@ -10888,21 +11173,42 @@ const processSyncTestOperation = async (client, operation, context) => {
   };
 };
 
+/*
+ * The server's integer id for a product or a lot, from whatever id a desktop holds for it.
+ *
+ * A desktop knows a row by its global id: a uuid, `offline-lot-...` for a lot it made itself, or
+ * the backfilled `product-12` / `inventory-lot-12`. Its snapshot also writes that last form for a
+ * row whose stored global id is a uuid. A bare integer is the server's id. Anything else is looked
+ * up by `global_id` first, and only then read as the `<prefix><n>` alias. Nothing is parseInt'ed:
+ * a uuid that starts with digits is not that number. Callers still apply their own scope to the id
+ * this returns -- `global_id` is unique, so the lookup itself needs none.
+ */
+const SERVER_ID_LOOKUPS = {
+  inventory_batches: /^inventory-lot-(\d+)$/,
+  products: /^product-(\d+)$/,
+};
+const resolveServerEntityId = async (client, table, rawId) => {
+  const aliasPattern = SERVER_ID_LOOKUPS[table];
+  if (!aliasPattern) throw new Error(`resolveServerEntityId: unsupported table ${table}`);
+  const key = typeof rawId === "number" || typeof rawId === "string" ? String(rawId).trim() : "";
+  if (!key) return null;
+  if (/^\d+$/.test(key)) return parsePositiveInteger(key);
+  const result = await client.query(`SELECT id FROM ${table} WHERE global_id = $1 LIMIT 1`, [key]);
+  if (result.rows[0]) return parsePositiveInteger(result.rows[0].id);
+  const alias = key.match(aliasPattern);
+  return alias ? parsePositiveInteger(alias[1]) : null;
+};
+const resolveInventoryLotId = (client, rawId) => resolveServerEntityId(client, "inventory_batches", rawId);
+const resolveProductId = (client, rawId) => resolveServerEntityId(client, "products", rawId);
+
 const normalizeSyncSaleItems = async (client, items = []) => {
   const normalized = [];
   for (const item of Array.isArray(items) ? items : []) {
-    const lotId = parsePositiveInteger(item.inventory_batch_id || item.lot_id);
-    let productId = parsePositiveInteger(item.product_id);
-    if (!productId) {
-      const productKey = cleanText(item.product_id);
-      if (productKey) {
-        const productResult = await client.query(
-          "SELECT id FROM products WHERE global_id = $1 OR id::text = $1 LIMIT 1",
-          [productKey]
-        );
-        productId = parsePositiveInteger(productResult.rows[0]?.id);
-      }
-    }
+    // A lot made offline (`offline-lot-...`), or known to the desktop only by its global id, used
+    // to come out of here as no lot at all, and the bill was refused for good as "POS sale items
+    // require product, lot and quantity".
+    const lotId = await resolveInventoryLotId(client, item.inventory_batch_id || item.lot_id);
+    let productId = await resolveProductId(client, item.product_id);
     if (!productId && lotId) {
       const lotResult = await client.query("SELECT product_id FROM inventory_batches WHERE id = $1 LIMIT 1", [lotId]);
       productId = parsePositiveInteger(lotResult.rows[0]?.product_id);
@@ -11047,8 +11353,12 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     };
   }
 
-  const conflict = async (reason, serverPayload = {}) => {
-    await client.query(
+  // The conflict row is written by `processSyncOperation` AFTER it rolls this operation back to its
+  // savepoint: a conflict found late (in `buildSalePayload`, after lots were already decremented)
+  // must leave the lots as they were, and the row recording it must survive that rollback.
+  const conflict = async (reason, serverPayload = {}) => ({
+    ...rejectOperation(operation, "CONFLICT", reason),
+    [SYNC_DEFERRED_WRITE]: () => client.query(
       `
       INSERT INTO sync_conflict_log (
         operation_id, device_id, company_id, branch_id, operational_location_id,
@@ -11071,9 +11381,8 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
         JSON.stringify(serverPayload),
         reason,
       ]
-    );
-    return rejectOperation(operation, "CONFLICT", reason);
-  };
+    ),
+  });
 
   const invalidItem = payload.items.find((item) => Number(item.quantity || 0) <= 0);
   if (invalidItem) return conflict("Invalid POS item quantity; invoice retained locally for review");
@@ -11145,6 +11454,9 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     billDate: toBusinessDateKey(payload.bill_date || payload.bill_datetime || new Date()),
     payments: payload.payments || [],
     allowRateOverride: true,
+    // The desktop POS bills a 0 rate only after an Owner/Admin confirmed it, and the customer has
+    // the bill; re-pricing that line at the default rate put money on it nobody collected.
+    allowZeroRate: true,
     companyId: context.companyId,
     operationalLocationId: context.operationalLocationId,
     // An offline bill carries its charge lines the same way it carries its items, and they are
@@ -11465,7 +11777,7 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     };
   }
   if (await saleHasReturns(client, currentSale.id)) return rejectSaleHasReturns(operation);
-  const approval = await authorizeSaleChange(client, { actor: editor, action: "edit", approvalId, sale: currentSale, companyId: context.companyId, deviceId: context.deviceId });
+  const approval = await authorizeSaleChange(client, { actor: editor, action: "edit", approvalId, sale: currentSale, companyId: context.companyId, branchId: context.branchId, deviceId: context.deviceId, viaSync: true });
   if (!approval.ok) return rejectOperation(operation, "AUTHORIZATION_ERROR", approval.message);
 
   const requestedSaleDate = invoice.bill_date || invoice.sale_date
@@ -11485,7 +11797,8 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   const syncEditInvoiceDiscount = firstPresentValue(invoice.bill_discount_total, invoice.invoice_discount_amount, 0);
   const salePayload = await buildSalePayload(client, {
     items: normalizedItems,
-    branchId: parsePositiveInteger(invoice.branch_id) || context.branchId,
+    // The bill's own branch, from the locked row -- never the payload's invoice.branch_id.
+    branchId: currentSale.branch_id,
     createdBy: editor.id,
     customer: {
       account_id: invoice.customer_id || "",
@@ -11504,8 +11817,12 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     }),
     billDate: requestedSaleDate,
     priorLotDiscounts: oldSnapshot.items,
+    // A line kept at its billed rate is not an override; a changed rate needs what POS needs.
+    priorSaleItems: oldSnapshot.items,
     payments: (sale.payments || []).filter((payment) => payment.posting_type !== "PAYMENT_REVERSAL"),
-    allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
+    allowRateOverride: ["Owner", "Admin"].includes(editor.role_name)
+      || Boolean(await getPermissionUser(editor.id, "manual_pos_rate_override", ["Owner", "Admin"], client)),
+    allowZeroRate: ["Owner", "Admin"].includes(editor.role_name),
     // Re-priced here from the stored slabs, exactly as a new offline bill is. The device's own
     // arithmetic is what it shows the cashier; it is not what the shop's books record.
     charges: editCharges ?? [],
@@ -11626,7 +11943,9 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     );
   }
 
-  for (const payment of salePayload.payments) {
+  // CREDIT is not money received, exactly as on a new bill: a CREDIT row here made an edited credit
+  // bill read as paid.
+  for (const payment of salePayload.payments.filter((entry) => entry.mode !== "CREDIT")) {
     await insertSalePaymentAllocation(client, {
       saleId: currentSale.id,
       payment,
@@ -11714,7 +12033,7 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
     };
   }
   if (await saleHasReturns(client, currentSale.id)) return rejectSaleHasReturns(operation);
-  const approval = await authorizeSaleChange(client, { actor: canceller, action: "cancel", approvalId, sale: currentSale, companyId: context.companyId, deviceId: context.deviceId });
+  const approval = await authorizeSaleChange(client, { actor: canceller, action: "cancel", approvalId, sale: currentSale, companyId: context.companyId, branchId: context.branchId, deviceId: context.deviceId, viaSync: true });
   if (!approval.ok) return rejectOperation(operation, "AUTHORIZATION_ERROR", approval.message);
   const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
   await restoreSaleInventory(client, currentSale.id, canceller.id, "Offline cancellation reversal for invoice", "IN");
@@ -12459,8 +12778,8 @@ const processSyncOperation = async (client, operation, context) => {
     [operation.operation_id, context.companyId, context.branchId]
   );
   // A stored acknowledgement is final, with one exception: a new desktop bill that was held back as
-  // a conflict. Nothing of it was written (every conflict in `processPosSaleFoundationOperation`
-  // returns before the first insert), so judging it again cannot apply it twice, and returning the
+  // a conflict. Nothing of it was written (every refusal is rolled back to the operation's
+  // savepoint below), so judging it again cannot apply it twice, and returning the
   // stored refusal kept a bill out of the books forever even after its cause was fixed -- which is
   // what the lot-scope bug of 27 Sep 2026 did. Edits and cancels keep the stored answer: replaying
   // a stale edit later could overwrite a newer one.
@@ -12481,6 +12800,14 @@ const processSyncOperation = async (client, operation, context) => {
   // `SYNC_OPERATION_TYPES` already admits CREATE, UPDATE and DELETE, none of which any POS handler
   // understands, so operations were reaching the sale handler by accident before customer orders
   // existed at all.
+  //
+  // Every operation runs inside its own savepoint, and anything short of `accepted` is rolled back
+  // to it before the answer is stored. A push batch is one transaction, and the handlers refuse at
+  // many depths: an offline edit restored stock and deleted the bill's items, allocations and
+  // payments before `buildSalePayload` refused it, and a new bill decremented its lots before a
+  // payment or charge check refused it. Without the savepoint that half-done work committed with
+  // the rest of the batch while the device was told "rejected".
+  await client.query("SAVEPOINT sync_operation");
   let ack;
   switch (operation.entity_type) {
     case "sync_test":
@@ -12504,6 +12831,14 @@ const processSyncOperation = async (client, operation, context) => {
       );
       break;
   }
+  const deferredWrite = ack[SYNC_DEFERRED_WRITE];
+  delete ack[SYNC_DEFERRED_WRITE];
+  if (ack.status !== "accepted") {
+    await client.query("ROLLBACK TO SAVEPOINT sync_operation");
+    if (typeof deferredWrite === "function") await deferredWrite();
+  }
+  await client.query("RELEASE SAVEPOINT sync_operation");
+  if (isRetryableSyncRejection(operation, ack)) return ack;
   await storeProcessedOperation(client, operation, context, ack, { replacingConflict: storedConflictedSale });
   if (storedConflictedSale && ack.status === "accepted") {
     await client.query(
@@ -13922,29 +14257,44 @@ app.post("/devices/activate", async (req, res) => {
     }
     await client.query("BEGIN");
     await upsertDeviceRequest(device, client);
+    // Issuing codes is retired (`POST /settings/activation-codes` answers 426), so only codes made
+    // before that can arrive here. One still counts only if whoever made it is an active Owner
+    // *today* and it names a shop that belongs to a company: an Admin used to be able to mint
+    // these, for any branch id the body named.
     const codeResult = await client.query(
       `
-      SELECT *
-      FROM activation_codes
-      WHERE code_hash = $1
-        AND status = 'ACTIVE'
-        AND expires_at > CURRENT_TIMESTAMP
-      FOR UPDATE
+      SELECT ac.*, b.company_id AS code_company_id, r.role_name AS creator_role_name
+      FROM activation_codes ac
+      LEFT JOIN branches b ON b.id = ac.branch_id
+      LEFT JOIN users u ON u.id = ac.created_by AND u.active = TRUE
+      LEFT JOIN roles r ON r.id = u.role_id
+      WHERE ac.code_hash = $1
+        AND ac.status = 'ACTIVE'
+        AND ac.expires_at > CURRENT_TIMESTAMP
+      FOR UPDATE OF ac
       `,
       [codeHash]
     );
     const activationCode = codeResult.rows[0];
-    if (!activationCode) {
+    if (!activationCode || !isOwnerRole(activationCode.creator_role_name) || !parsePositiveInteger(activationCode.code_company_id)) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Activation code is invalid, expired or already used" });
     }
     const approvedDevice = await approveDevice({
       deviceId: device.device_id,
       approvedBy: activationCode.created_by,
-      branchId: activationCode.branch_id || device.assigned_branch_id || 1,
+      branchId: activationCode.branch_id,
       counterId: activationCode.counter_id || device.assigned_counter_id,
       reason: "Approved by one-time activation code",
     }, client);
+    if (String(approvedDevice?.status || "").toUpperCase() !== "APPROVED") {
+      // A retired, disabled or revoked id stays that way; the code is not spent on it.
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        code: "DEVICE_DISABLED",
+        message: "This device has been retired or disabled and cannot be activated again.",
+      });
+    }
     await client.query(
       `
       UPDATE activation_codes
@@ -14077,6 +14427,11 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
       counterId: devicePayload.assigned_counter_id,
       reason: "One-time first owner device bootstrap",
     });
+    if (String(device?.status || "").toUpperCase() !== "APPROVED") {
+      // `approveDevice` never revives a retired, disabled or revoked id; say so rather than
+      // reporting success with that status attached.
+      return res.status(403).json({ code: "DEVICE_DISABLED", message: "This device has been retired or disabled and cannot be approved again." });
+    }
     console.info("first owner device auto-approved", {
       username: user.username,
       user_id: user.id,
@@ -14098,8 +14453,10 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
 
 app.put("/settings/devices/:deviceId", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage authorized devices" });
+    // The `device_management` toggle on the role screen, which no route used to read. Owner and Admin
+    // always hold it.
+    const manager = await getStaffPermissionUser(req.auth.userId, "device_management");
+    if (!manager) return res.status(403).json({ message: "You do not have permission to manage authorized devices" });
     const deviceId = cleanText(req.params.deviceId);
     const action = cleanText(req.body.action).toUpperCase();
     if (!deviceId || !["APPROVE", "REJECT", "DISABLE", "RENAME"].includes(action)) {
@@ -14125,6 +14482,18 @@ app.put("/settings/devices/:deviceId", async (req, res) => {
     // Deliberately the same 404 an unknown device gets. A distinct "not yours" would confirm the
     // device exists to someone who should not be able to learn that.
     if (!beforeResult.rows[0]) return res.status(404).json({ message: "Device not found" });
+    // Below the Owner, a manager manages their own shop's devices only, and may not move one to
+    // another shop -- disabling the Owner's machine in another branch is not a shop manager's call.
+    if (!isOwnerRole(manager.role_name)) {
+      const ownBranchId = parsePositiveInteger(req.auth.branchId);
+      const movingTo = parsePositiveInteger(req.body.assigned_branch_id);
+      if (!ownBranchId || parsePositiveInteger(beforeResult.rows[0].assigned_branch_id) !== ownBranchId) {
+        return res.status(404).json({ message: "Device not found" });
+      }
+      if (action === "RENAME" && movingTo && movingTo !== ownBranchId) {
+        return res.status(403).json({ code: "OWNER_REQUIRED_TO_MOVE_DEVICE", message: "Only the Owner can move a device to another shop." });
+      }
+    }
     let result;
     if (action === "RENAME") {
       // Re-pointing a device is not a rename, whatever the action is called: /login mints the
@@ -14183,42 +14552,40 @@ app.put("/settings/devices/:deviceId", async (req, res) => {
   }
 });
 
-app.post("/settings/activation-codes", async (req, res) => {
-  try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can generate activation codes" });
-    const expiresHours = Math.max(Number(req.body.expires_in_hours || 24), 1);
-    const code = generateActivationCode();
-    const result = await pool.query(
-      `
-      INSERT INTO activation_codes (
-        code_hash, code_label, branch_id, counter_id, created_by, expires_at, status
-      )
-      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP + ($6 || ' hours')::interval, 'ACTIVE')
-      RETURNING id, code_label, branch_id, counter_id, created_by, created_at, expires_at, status
-      `,
-      [
-        hashActivationCode(code),
-        nullableText(req.body.code_label) || "Device activation",
-        parsePositiveInteger(req.body.branch_id) || 1,
-        parsePositiveInteger(req.body.counter_id),
-        manager.id,
-        expiresHours,
-      ]
-    );
-    return res.json({ ...result.rows[0], code });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: "Error Generating Activation Code" });
-  }
+/**
+ * Retired. One-time activation codes are no longer issued.
+ *
+ * This minted a code that approves any device that presents it, and it was open to Admin, took its
+ * branch from the body with no company check, and had no ceiling on how long a code lived. Its only
+ * screen (`LegacySecurityDevicesSection`) is no longer mounted, and a device is now approved through
+ * protocol-v3 device approval or an Owner-issued offline activation file
+ * (`POST /api/activation/licences`, Owner only). Answered 426 like the other retired routes, so an
+ * old client is told what to use rather than handed a 404. Codes issued before this keep working
+ * until they expire or are revoked; see `/devices/activate` for what they can still do.
+ */
+app.post("/settings/activation-codes", async (_req, res) => {
+  return res.status(426).json({
+    code: "CLIENT_UPGRADE_REQUIRED",
+    message: "Activation codes are no longer issued. Approve the device from Computers & phones, or issue an activation file.",
+    replacement_route: "/api/activation/licences",
+  });
 });
 
 app.put("/settings/activation-codes/:id/revoke", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can revoke activation codes" });
+    // Owner only, and only a code for one of this company's shops. Revoking is still worth keeping
+    // open after issuing was retired: it is how an outstanding code is shut before it expires.
+    const owner = await getOwnerUser(req.auth.userId);
+    if (!owner) return res.status(403).json({ code: "OWNER_ONLY", message: "Only the Owner can revoke activation codes" });
     const codeId = parsePositiveInteger(req.params.id);
-    const result = await pool.query("UPDATE activation_codes SET status = 'REVOKED' WHERE id = $1 RETURNING id", [codeId]);
+    const result = await pool.query(
+      `UPDATE activation_codes ac
+          SET status = 'REVOKED'
+         FROM branches b
+        WHERE ac.id = $1 AND b.id = ac.branch_id AND b.company_id = $2
+        RETURNING ac.id`,
+      [codeId, req.auth.companyId]
+    );
     return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Activation code not found" });
   } catch (error) {
     console.error(error);
@@ -14543,16 +14910,21 @@ app.get("/api/activation/licences/:id/file", async (req, res) => {
 
 app.post("/settings/branches", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage branches" });
+    // Opening a shop is the Owner's decision, and the shop belongs to the Owner's company. This used
+    // to admit Admin and insert `company_id` NULL, which every company-scoped reader then skips: a
+    // branch nobody's session could ever reach.
+    const owner = await getOwnerUser(req.auth.userId);
+    if (!owner) return res.status(403).json({ code: "OWNER_ONLY", message: "Only the Owner can add a branch" });
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return res.status(400).json({ message: "This session has no company." });
     if (!cleanText(req.body.branch_name)) return res.status(400).json({ message: "Enter the branch name." });
     const result = await pool.query(
       `
-      INSERT INTO branches (branch_name, address, phone_number, gst_number, active)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO branches (branch_name, address, phone_number, gst_number, active, company_id)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
       `,
-      [cleanText(req.body.branch_name), nullableText(req.body.address), nullableText(req.body.phone_number), nullableText(req.body.gst_number), req.body.active !== false]
+      [cleanText(req.body.branch_name), nullableText(req.body.address), nullableText(req.body.phone_number), nullableText(req.body.gst_number), req.body.active !== false, companyId]
     );
     return res.json(result.rows[0]);
   } catch (error) {
@@ -14563,16 +14935,29 @@ app.post("/settings/branches", async (req, res) => {
 
 app.post("/settings/counters", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage counters" });
+    // `branch_settings` (Owner and Admin always). The counter goes in the caller's own shop: the body's
+    // `branch_id` is already pinned to the session by the substitution check, and the old `|| 1`
+    // fallback filed a counter under Branch 1 whatever shop the caller was in.
+    const manager = await getStaffPermissionUser(req.auth.userId, "branch_settings");
+    if (!manager) return res.status(403).json({ message: "You do not have permission to manage counters" });
     if (!cleanText(req.body.counter_name)) return res.status(400).json({ message: "Enter the counter name." });
+    const counterBranchId = parsePositiveInteger(req.body.branch_id) || parsePositiveInteger(req.auth.branchId);
+    const counterBranch = counterBranchId
+      ? await pool.query(
+        "SELECT id FROM branches WHERE id = $1 AND company_id = $2 AND active IS DISTINCT FROM FALSE LIMIT 1",
+        [counterBranchId, req.auth.companyId]
+      )
+      : { rows: [] };
+    if (!counterBranch.rows[0]) {
+      return res.status(400).json({ code: "BRANCH_NOT_IN_COMPANY", message: "That branch does not exist for this business, or is not active." });
+    }
     const result = await pool.query(
       `
       INSERT INTO counters (branch_id, counter_name, counter_type, active)
       VALUES ($1, $2, $3, $4)
       RETURNING *
       `,
-      [parsePositiveInteger(req.body.branch_id) || 1, cleanText(req.body.counter_name), cleanText(req.body.counter_type) || "RETAIL_COUNTER", req.body.active !== false]
+      [counterBranchId, cleanText(req.body.counter_name), cleanText(req.body.counter_type) || "RETAIL_COUNTER", req.body.active !== false]
     );
     return res.json(result.rows[0]);
   } catch (error) {
@@ -14583,8 +14968,8 @@ app.post("/settings/counters", async (req, res) => {
 
 app.put("/settings/backup", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage backups" });
+    const manager = await getStaffPermissionUser(req.auth.userId, "backup_restore");
+    if (!manager) return res.status(403).json({ message: "You do not have permission to manage backups" });
     const result = await pool.query(
       `
       UPDATE backup_settings
@@ -14616,8 +15001,8 @@ app.put("/settings/backup", async (req, res) => {
 
 app.post("/settings/backup-now", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can run backups" });
+    const manager = await getStaffPermissionUser(req.auth.userId, "backup_restore");
+    if (!manager) return res.status(403).json({ message: "You do not have permission to run backups" });
     if (!inProcessBackupsEnabled) {
       return res.status(409).json({ code: "BACKUP_LOCATION_NOT_DURABLE", message: IN_PROCESS_BACKUP_REFUSAL });
     }
@@ -14631,8 +15016,8 @@ app.post("/settings/backup-now", async (req, res) => {
 
 app.post("/settings/safe-shutdown", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.auth.userId);
-    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can safely close software" });
+    const manager = await getStaffPermissionUser(req.auth.userId, "backup_restore");
+    if (!manager) return res.status(403).json({ message: "You do not have permission to safely close software" });
     if (!inProcessBackupsEnabled) {
       return res.status(409).json({ code: "BACKUP_LOCATION_NOT_DURABLE", message: IN_PROCESS_BACKUP_REFUSAL });
     }
@@ -14649,6 +15034,10 @@ app.post("/settings/safe-shutdown", async (req, res) => {
 
 app.get("/settings/system-info", async (req, res) => {
   try {
+    // The `system_info` toggle (Owner and Admin always): LAN addresses, ports, versions.
+    if (!(await getStaffPermissionUser(req.auth.userId, "system_info"))) {
+      return res.status(403).json({ message: "You do not have permission to view system information" });
+    }
     return res.json(await getSystemInfo(req.query.device_id));
   } catch (error) {
     console.error(error);
@@ -15204,7 +15593,7 @@ app.post("/login", async (req, res) => {
 
 const listProductCategoriesHandler = async (req, res) => {
   try {
-    await ensureProductEntrySchema();
+    await ensureProductEntrySchemaOnce();
     const context = req.v3OperationalContext;
     const result = await pool.query(
       `
@@ -15277,8 +15666,8 @@ const createProductCategoryHandler = async (req, res) => {
       `,
       [result.rows[0].id, JSON.stringify(result.rows[0]), cleanText(req.body.reason) || "Category created", manager.id]
     );
-    await logSyncChange(client, {
-      branchId: context?.branch_id || 1,
+    await logMasterDataSyncChange(client, {
+      branchId: context?.branch_id || req.auth.branchId || 1,
       entityType: "product_category",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
@@ -15365,8 +15754,8 @@ const updateProductCategoryHandler = async (req, res) => {
       `,
       [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), reason, manager.id]
     );
-    await logSyncChange(client, {
-      branchId: context?.branch_id || 1,
+    await logMasterDataSyncChange(client, {
+      branchId: context?.branch_id || req.auth.branchId || 1,
       entityType: "product_category",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
@@ -15431,8 +15820,8 @@ const deactivateProductCategoryHandler = async (req, res) => {
         `,
         [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), "This category has items or transactions. It can only be deactivated.", manager.id]
       );
-      await logSyncChange(client, {
-        branchId: context?.branch_id || 1,
+      await logMasterDataSyncChange(client, {
+        branchId: context?.branch_id || req.auth.branchId || 1,
         entityType: "product_category",
         entityId: result.rows[0].global_id,
         operationType: "DELETE",
@@ -15465,8 +15854,8 @@ const deactivateProductCategoryHandler = async (req, res) => {
       `,
       [categoryId, JSON.stringify(current), reason, manager.id]
     );
-    await logSyncChange(client, {
-      branchId: context?.branch_id || 1,
+    await logMasterDataSyncChange(client, {
+      branchId: context?.branch_id || req.auth.branchId || 1,
       entityType: "product_category",
       entityId: tombstoneResult.rows[0].global_id,
       operationType: "DELETE",
@@ -15646,6 +16035,25 @@ const ensureProductEntrySchema = async (client = pool) => {
   `);
 };
 
+/*
+ * `ensureProductEntrySchema` once per process, for the request paths.
+ *
+ * It is DDL: its ALTER TABLEs take AccessExclusiveLock. Run on every Products or categories load,
+ * two loads at once (the Products screen asks for both) deadlocked each other (40P01) and the
+ * screen showed "Database Error". Startup already runs it; here it runs at most once more, with
+ * concurrent first callers sharing the one run. A failure clears the memo so the next call retries.
+ */
+let productEntrySchemaReady = null;
+const ensureProductEntrySchemaOnce = () => {
+  if (!productEntrySchemaReady) {
+    productEntrySchemaReady = ensureProductEntrySchema().catch((error) => {
+      productEntrySchemaReady = null;
+      throw error;
+    });
+  }
+  return productEntrySchemaReady;
+};
+
 const getProductPersistenceErrorMessage = (error, fallback) => {
   if (error.code === "42703") return `Product database column missing: ${error.message}`;
   if (error.code === "42P01") return `Product database table missing: ${error.message}`;
@@ -15655,7 +16063,7 @@ const getProductPersistenceErrorMessage = (error, fallback) => {
 
 app.get("/products", async (req, res) => {
   try {
-    await ensureProductEntrySchema();
+    await ensureProductEntrySchemaOnce();
     const result = await pool.query(`
       SELECT
         p.*,
@@ -15686,7 +16094,7 @@ app.get("/products", async (req, res) => {
 const createProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    await ensureProductEntrySchema(client);
+    await ensureProductEntrySchemaOnce();
     const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, remarks, branch_id } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
@@ -15719,8 +16127,8 @@ const createProductHandler = async (req, res) => {
         [`category-${crypto.randomUUID()}`, normalizedCategory, rateManager.id, context?.company_id || null]
       );
       selectedCategory = categoryResult.rows[0];
-      await logSyncChange(client, {
-        branchId: 1,
+      await logMasterDataSyncChange(client, {
+        branchId: context?.branch_id || req.auth.branchId || 1,
         entityType: "product_category",
         entityId: selectedCategory.global_id,
         operationType: "UPSERT",
@@ -15771,8 +16179,8 @@ const createProductHandler = async (req, res) => {
       `,
       [product.id, JSON.stringify(product), "Product item created", rateManager.id]
     );
-    await logSyncChange(client, {
-      branchId: parsePositiveInteger(branch_id) || 1,
+    await logMasterDataSyncChange(client, {
+      branchId: req.v3OperationalContext?.branch_id || req.auth.branchId || 1,
       entityType: "product",
       entityId: product.global_id,
       operationType: "UPSERT",
@@ -15836,7 +16244,7 @@ app.post("/api/v3/products", rateLimitSyncRequest, v3WriteAdapter(createProductH
 const updateProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    await ensureProductEntrySchema(client);
+    await ensureProductEntrySchemaOnce();
     const productId = parsePositiveInteger(req.params.id);
     const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, rate_change_reason, remarks } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
@@ -15891,8 +16299,8 @@ const updateProductHandler = async (req, res) => {
           message: `A category named "${requestedCategoryName}" already exists but is not available to this shop. Pick it from the list or use another name.`,
         });
       }
-      await logSyncChange(client, {
-        branchId: context?.branch_id || 1,
+      await logMasterDataSyncChange(client, {
+        branchId: context?.branch_id || req.auth.branchId || 1,
         entityType: "product_category",
         entityId: selectedCategory.global_id,
         operationType: "UPSERT",
@@ -15960,8 +16368,8 @@ const updateProductHandler = async (req, res) => {
       `,
       [productId, JSON.stringify(current), JSON.stringify(result.rows[0]), rate_change_reason?.trim() || "Product master update", req.auth.userId]
     );
-    await logSyncChange(client, {
-      branchId: req.v3OperationalContext?.branch_id || 1,
+    await logMasterDataSyncChange(client, {
+      branchId: req.v3OperationalContext?.branch_id || req.auth.branchId || 1,
       entityType: sellingRateChanged ? "sale_rate" : "product",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
@@ -16229,7 +16637,7 @@ app.delete("/api/v3/products/:id/photo", removeProductPhotoHandler);
 const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") => {
   const client = await pool.connect();
   try {
-    await ensureProductEntrySchema(client);
+    await ensureProductEntrySchemaOnce();
     const productId = parsePositiveInteger(req.params[productIdParam]);
     const manager = await requireRateManager(req.auth.userId, client);
     const lots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [req.body];
@@ -16301,6 +16709,9 @@ const lotUsage = (lot) => Math.max(0, Number(lot.purchase_qty || 0) - Number(lot
 const stockInventorySelectSql = `
   SELECT
     ib.id,
+    -- The id sync knows the lot by. Without it the desktop filed a lot read here under its integer
+    -- id and the same lot pulled by sync under its global id: one lot, two rows.
+    ib.global_id,
     ib.product_id,
     p.product_name,
     p.category,
@@ -16410,7 +16821,9 @@ app.get("/products/:id/lots", async (req, res) => {
 const updateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    const lotId = parsePositiveInteger(req.params.lotId);
+    // The desktop addresses a lot by its snapshot id (`inventory-lot-42`, a uuid global id), not
+    // only the server's integer -- see `resolveServerEntityId`. The scoped lookup below still applies.
+    const lotId = await resolveInventoryLotId(client, req.params.lotId);
     const manager = await requireRateManager(req.auth.userId, client);
     const purchaseRate = parsePositiveNumber(req.body.purchase_rate || req.body.opening_cost);
     const saleRate = parsePositiveNumber(req.body.sale_rate);
@@ -16513,7 +16926,7 @@ const updateInventoryLotHandler = async (req, res) => {
         [saleRate, manager.id, lot.product_id, context?.company_id || null]
       );
       if (productResult.rows[0]) {
-        await logSyncChange(client, {
+        await logMasterDataSyncChange(client, {
           branchId: context?.branch_id || lot.branch_id || 1,
           entityType: "sale_rate",
           entityId: productResult.rows[0].global_id,
@@ -16550,7 +16963,7 @@ app.put("/api/v3/inventory-lots/:lotId", rateLimitSyncRequest, v3WriteAdapter(up
 const addInventoryLotQuantityHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    const lotId = parsePositiveInteger(req.params.lotId);
+    const lotId = await resolveInventoryLotId(client, req.params.lotId);
     const quantity = parsePositiveNumber(req.body.quantity);
     const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason || "Quantity added to lot");
@@ -16622,7 +17035,7 @@ app.post("/api/v3/inventory-lots/:lotId/add-quantity", rateLimitSyncRequest, v3W
 const adjustInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    const lotId = parsePositiveInteger(req.params.lotId);
+    const lotId = await resolveInventoryLotId(client, req.params.lotId);
     const physicalQuantity = parseNonNegativeNumber(req.body.physical_quantity ?? req.body.balance_qty ?? req.body.new_balance_qty ?? req.body.new_quantity ?? req.body.quantity);
     const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason);
@@ -16740,7 +17153,7 @@ app.post("/api/v3/inventory-lots/:lotId/adjust", rateLimitSyncRequest, v3WriteAd
 const deactivateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    const lotId = parsePositiveInteger(req.params.lotId);
+    const lotId = await resolveInventoryLotId(client, req.params.lotId);
     const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate lots" });
@@ -16818,7 +17231,7 @@ app.post("/api/v3/inventory-lots/:lotId/deactivate", rateLimitSyncRequest, v3Wri
 const reactivateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    const lotId = parsePositiveInteger(req.params.lotId);
+    const lotId = await resolveInventoryLotId(client, req.params.lotId);
     const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can reactivate lots" });
@@ -17132,8 +17545,8 @@ const cancelProductHandler = async (req, res) => {
       `,
       [productId, Number(usageResult.rows[0].usage_count || 0) > 0 ? "DEACTIVATE" : "CANCEL", JSON.stringify(product), JSON.stringify(result.rows[0]), reason, manager.id]
     );
-    await logSyncChange(client, {
-      branchId: req.v3OperationalContext?.branch_id || 1,
+    await logMasterDataSyncChange(client, {
+      branchId: req.v3OperationalContext?.branch_id || req.auth.branchId || 1,
       entityType: "product",
       entityId: result.rows[0].global_id,
       operationType: "DELETE",
@@ -17260,9 +17673,12 @@ app.get("/sale-rates", async (req, res) => {
           AND ib.branch_id = $1
       ) stock ON TRUE
       WHERE p.active = TRUE
+        -- The caller's company's catalogue, not every tenant's. A product with no company recorded
+        -- (older than migration 009 and not yet backfilled) still shows, as everywhere else.
+        AND (p.company_id IS NULL OR p.company_id = $2)
       ORDER BY p.product_name, ib.purchase_date, ib.created_at, ib.id
       `,
-      [req.auth.branchId]
+      [req.auth.branchId, req.auth.companyId]
     );
     // No purchase cost means no suggestion (null), not the current rate handed back as one.
     return res.json(result.rows.map((row) => ({
@@ -17330,7 +17746,11 @@ app.post("/sale-rates/bulk", async (req, res) => {
         saved.push({ ...updatedBatch.rows[0], product_name: batch.product_name });
         continue;
       }
-      const currentResult = await client.query("SELECT id, selling_rate FROM products WHERE id = $1 AND active = TRUE FOR UPDATE", [productId]);
+      // Only this company's product: a hand-made request must not re-price another tenant's.
+      const currentResult = await client.query(
+        "SELECT id, selling_rate FROM products WHERE id = $1 AND active = TRUE AND (company_id IS NULL OR company_id = $2) FOR UPDATE",
+        [productId, req.auth.companyId]
+      );
       if (currentResult.rows.length === 0) {
         await client.query("ROLLBACK");
         return res.status(404).json({ message: "Product not found" });
@@ -17356,7 +17776,7 @@ app.post("/sale-rates/bulk", async (req, res) => {
       );
       // Published to the owner's branch, as a Product Master rate edit is, so that branch's
       // desktop counters pick the new product rate up at their next pull.
-      await logSyncChange(client, {
+      await logMasterDataSyncChange(client, {
         branchId: req.auth.branchId || 1,
         entityType: "sale_rate",
         entityId: productResult.rows[0].global_id,
@@ -17388,9 +17808,12 @@ app.get("/sale-rate-history", async (req, res) => {
       FROM sale_rate_history h
       JOIN products p ON p.id = h.product_id
       JOIN users u ON u.id = h.changed_by
+      -- The caller's company's products only (history has no company of its own).
+      WHERE p.company_id IS NULL OR p.company_id = $1
       ORDER BY h.changed_at DESC, h.id DESC
       LIMIT 100
-      `
+      `,
+      [req.auth.companyId]
     );
     return res.json(result.rows);
   } catch (error) {
@@ -17898,20 +18321,17 @@ app.get("/accounts/ledger", async (req, res) => {
             COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') || ' - ' || COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks,
             s.created_at
           FROM sales s
-          JOIN customers c ON c.id = $1
+          ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+          JOIN customers c ON c.id = matched.customer_id
           LEFT JOIN (
             SELECT sale_id, SUM(amount) AS total_paid
             FROM sale_payments
+            WHERE payment_mode IS DISTINCT FROM 'CREDIT'
             GROUP BY sale_id
           ) pay ON pay.sale_id = s.id
-          WHERE s.sale_status <> 'CANCELLED'
-            AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $4)
-            AND (
-              s.customer_id = $1
-              OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND s.customer_mobile = $2)
-              OR (s.customer_id IS NULL AND c.system_account = TRUE AND (s.customer_name IS NULL OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'))
-              OR (s.customer_id IS NULL AND c.system_account IS DISTINCT FROM TRUE AND s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(s.customer_name) = LOWER($3))
-            )
+          WHERE matched.customer_id = $1
+            AND s.sale_status <> 'CANCELLED'
+            AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
           UNION ALL
           SELECT cp.payment_date AS date, 'Customer Payment' AS transaction_type,
             COALESCE(cp.reference_number, '') AS invoice_no,
@@ -17924,7 +18344,7 @@ app.get("/accounts/ledger", async (req, res) => {
             cp.created_at
           FROM customer_payments cp
           WHERE cp.customer_id = $1 AND cp.cancelled = FALSE
-            AND cp.branch_id IN (SELECT id FROM branches WHERE company_id = $4)
+            AND cp.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
           UNION ALL
           -- Credit-note returns only, matched through the bill as getCustomerSummaryRows matches
           -- them, so this ledger ends on the balance the account list shows.
@@ -17943,11 +18363,11 @@ app.get("/accounts/ledger", async (req, res) => {
           WHERE matched.customer_id = $1
             AND sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL}
             AND s.sale_status <> 'CANCELLED'
-            AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $4)
+            AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
         ) entries
         ORDER BY date, created_at
         `,
-        [sourceId, customers[0].mobile_number || "", customers[0].customer_name, req.auth.companyId]
+        [sourceId, req.auth.companyId]
       );
       let balance = Number(customers[0].opening_balance || 0);
       const ledger = [];
@@ -18108,7 +18528,8 @@ app.post("/accounts/payments", async (req, res) => {
         [
           sourceId, req.body.payment_date || toDateKey(new Date()), amount, paymentMode,
           nullableText(req.body.reference_number), nullableText(req.body.remarks),
-          parsePositiveInteger(req.body.branch_id), req.auth.userId,
+          // The money came in at the signed-in counter's branch; a body branch_id is not trusted.
+          req.auth.branchId, req.auth.userId,
         ]
       );
       return res.status(201).json(result.rows[0]);
@@ -18133,7 +18554,7 @@ app.post("/accounts/payments", async (req, res) => {
           supplierPaymentAmount,
           supplierRebateAmount,
           paymentMode, nullableText(req.body.reference_number), nullableText(req.body.remarks),
-          parsePositiveInteger(req.body.branch_id), req.auth.userId,
+          req.auth.branchId, req.auth.userId,
         ]
       );
       return res.status(201).json(result.rows[0]);
@@ -18201,7 +18622,8 @@ app.put("/accounts/payments/:paymentKey", async (req, res) => {
         `,
         [
           accountId, paymentDate, paymentAmount, paymentMode, nullableText(req.body.reference_number),
-          nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id), editedBy, reason, paymentId,
+          // An edit corrects the payment; it does not move it to the editor's branch.
+          nullableText(req.body.remarks), oldPayment.branch_id, editedBy, reason, paymentId,
         ]
       );
       await client.query(
@@ -18240,7 +18662,7 @@ app.put("/accounts/payments/:paymentKey", async (req, res) => {
         `,
         [
           accountId, paymentDate, paymentAmount, rebateAmount, paymentMode, nullableText(req.body.reference_number),
-          nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id), editedBy, reason, paymentId,
+          nullableText(req.body.remarks), oldPayment.branch_id, editedBy, reason, paymentId,
         ]
       );
       await client.query(
@@ -18771,7 +19193,7 @@ app.post("/customer-payments", async (req, res) => {
       `,
       [
         customerId, paymentDate, paymentAmount, paymentMode, nullableText(req.body.reference_number),
-        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id), req.auth.userId,
+        nullableText(req.body.remarks), req.auth.branchId, req.auth.userId,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -18847,6 +19269,7 @@ app.get("/pending-bills/customer", async (req, res) => {
       LEFT JOIN (
         SELECT sale_id, SUM(amount) AS sale_paid
         FROM sale_payments
+        WHERE payment_mode IS DISTINCT FROM 'CREDIT'
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
       WHERE s.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
@@ -18859,7 +19282,7 @@ app.get("/pending-bills/customer", async (req, res) => {
       // until 3 Oct 2026, which only worked where the two happen to be the same number.
       [req.auth.companyId]
     );
-    const [paymentsResult, returnCreditsResult] = await Promise.all([
+    const [paymentsResult, returnCreditsResult, openingBalancesResult] = await Promise.all([
       pool.query(
         `
         SELECT
@@ -18886,13 +19309,32 @@ app.get("/pending-bills/customer", async (req, res) => {
         `,
         [req.auth.companyId]
       ),
+      // Receipts settle the opening balance first, as Accounts counts it. Only customers with a
+      // receipt in this company matter, since an opening balance only ever absorbs receipts.
+      pool.query(
+        `
+        SELECT c.id AS customer_id, c.opening_balance
+        FROM customers c
+        WHERE COALESCE(c.opening_balance, 0) > 0
+          AND c.id IN (
+            SELECT cp.customer_id FROM customer_payments cp
+            WHERE cp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
+          )
+        `,
+        [req.auth.companyId]
+      ),
     ]);
+    const customerKey = (value) => (value === null || value === undefined ? "" : String(value));
     const receiptsByCustomer = new Map(
-      paymentsResult.rows.map((row) => [row.customer_id === null || row.customer_id === undefined ? "" : String(row.customer_id), Number(row.total_received || 0)])
+      paymentsResult.rows.map((row) => [customerKey(row.customer_id), Number(row.total_received || 0)])
+    );
+    const openingBalanceByCustomer = new Map(
+      openingBalancesResult.rows.map((row) => [customerKey(row.customer_id), Number(row.opening_balance || 0)])
     );
     const { summary: summaryRows, invoices } = saleReturnRules.buildCustomerPendingBills(creditSalesResult.rows, {
       receiptsByCustomer,
       returnCredits: returnCreditsResult.rows,
+      openingBalanceByCustomer,
     });
     return res.json({ summary: summaryRows, invoices });
   } catch (error) {
@@ -18912,18 +19354,18 @@ app.get("/customer-ledger", async (req, res) => {
     const [salesResult, paymentResult, returnCreditResult] = await Promise.all([
       pool.query(
         `
-        SELECT s.*, c.id AS customer_id, COALESCE(pay.total_paid, 0) AS total_paid
+        SELECT s.*, matched.customer_id, COALESCE(pay.total_paid, 0) AS total_paid
         FROM sales s
-        JOIN customers c ON (
-          s.customer_id = c.id
-          OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
-          OR (s.customer_id IS NULL AND c.system_account = TRUE AND (s.customer_name IS NULL OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'))
-          OR (s.customer_id IS NULL AND c.system_account IS DISTINCT FROM TRUE AND s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(c.customer_name) = LOWER(s.customer_name))
-        )
+        -- One customer per bill, the same match the balance uses: an OR join put a bill on every
+        -- customer it could match (two customers sharing a mobile number each got it).
+        ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
         LEFT JOIN (
-          SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id
+          SELECT sale_id, SUM(amount) AS total_paid
+          FROM sale_payments
+          WHERE payment_mode IS DISTINCT FROM 'CREDIT'
+          GROUP BY sale_id
         ) pay ON pay.sale_id = s.id
-        WHERE c.id = ANY($1::INT[])
+        WHERE matched.customer_id = ANY($1::INT[])
           AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
         ORDER BY s.sale_date, s.created_at, s.id
         `,
@@ -19128,6 +19570,7 @@ app.get("/dashboard-expense-trend", async (req, res) => {
 
 app.get("/reports/balance-sheet", async (req, res) => {
   try {
+    if (await denyWithoutReportsPermission(req, res)) return;
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom;
     const dateTo = req.query.date_to || reportRange.dateTo;
@@ -19155,6 +19598,7 @@ app.get("/reports/balance-sheet", async (req, res) => {
 
 app.get("/reports/cash-book", async (req, res) => {
   try {
+    if (await denyWithoutReportsPermission(req, res)) return;
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom;
     const dateTo = req.query.date_to || reportRange.dateTo;
@@ -19232,7 +19676,7 @@ app.post("/contra-entries", async (req, res) => {
         cleanText(req.body.bank_account) || "Bank",
         nullableText(req.body.reference_number),
         nullableText(req.body.remarks),
-        parsePositiveInteger(req.body.branch_id),
+        req.auth.branchId,
         req.auth.userId,
       ]
     );
@@ -19245,6 +19689,7 @@ app.post("/contra-entries", async (req, res) => {
 
 app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
   try {
+    if (await denyWithoutReportsPermission(req, res)) return;
     const lineKey = String(req.params.lineKey || "").toLowerCase();
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom;
@@ -19395,10 +19840,12 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
         columns: ["Customer", "Opening", "Credit Sales", "Receipts", "Returns", "Balance"],
         rows: snapshot.customerRows.map((row) => ({
           customer_name: row.customer_name,
-          opening_balance: row.opening_balance,
+          // What the balance actually counted: a shop's receivables carry no opening balance.
+          opening_balance: row.counted_opening_balance,
           credit_sales: row.total_sales,
           receipts: row.total_paid,
-          returns: row.total_cancelled,
+          // Credit-note returns are what reduce the balance; a cancelled bill is not a return.
+          returns: row.total_return_credit,
           balance: row.outstanding_balance,
         })),
         breakdown: [
@@ -19496,6 +19943,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
 
 app.get("/reports/day-book", async (req, res) => {
   try {
+    if (await denyWithoutReportsPermission(req, res)) return;
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom;
     const dateTo = req.query.date_to || reportRange.dateTo;
@@ -19529,12 +19977,32 @@ app.get("/reports/day-book", async (req, res) => {
           'CUSTOMER' AS account_type,
           COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
           sp.payment_mode,
-          CASE WHEN sp.payment_mode = 'CREDIT' THEN s.total_amount ELSE 0 END AS debit,
-          CASE WHEN sp.payment_mode = 'CREDIT' THEN 0 ELSE sp.amount END AS credit,
+          0::NUMERIC AS debit,
+          sp.amount AS credit,
           COALESCE(s.invoice_no, 'POS sale') AS narration
         FROM sales s
-        LEFT JOIN sale_payments sp ON sp.sale_id = s.id
+        JOIN sale_payments sp ON sp.sale_id = s.id AND sp.payment_mode IS DISTINCT FROM 'CREDIT'
         WHERE s.branch_id = $3 AND s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+        UNION ALL
+        -- What was not paid at the counter went on the customer's account. A credit bill has no
+        -- payment line at all, so this is taken from the bill, not from a 'CREDIT' payment line
+        -- (older sale edits wrote those; they are ignored here as everywhere else).
+        SELECT s.sale_date AS date, 'POS Sale' AS transaction_type,
+          COALESCE(s.customer_name, 'Walk-in Customer') AS party_name,
+          'CUSTOMER' AS account_type,
+          COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
+          'CREDIT' AS payment_mode,
+          s.total_amount - COALESCE(paid.amount, 0) AS debit,
+          0::NUMERIC AS credit,
+          COALESCE(s.invoice_no, 'POS sale') AS narration
+        FROM sales s
+        LEFT JOIN LATERAL (
+          SELECT SUM(sp.amount) AS amount
+          FROM sale_payments sp
+          WHERE sp.sale_id = s.id AND sp.payment_mode IS DISTINCT FROM 'CREDIT'
+        ) paid ON TRUE
+        WHERE s.branch_id = $3 AND s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+          AND s.total_amount - COALESCE(paid.amount, 0) > 0.005
         UNION ALL
         SELECT p.purchase_date AS date, 'Purchase' AS transaction_type,
           COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS party_name,
@@ -19695,6 +20163,7 @@ const EMPTY_BALANCE_SHEET = Object.freeze({
 
 app.get("/reports/summary", async (req, res) => {
   try {
+    if (await denyWithoutReportsPermission(req, res)) return;
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom || "1900-01-01";
     const dateTo = req.query.date_to || reportRange.dateTo || "2999-12-31";
@@ -20160,22 +20629,9 @@ app.get("/reports/summary", async (req, res) => {
           WHERE p.purchase_date BETWEEN $1 AND $2 AND p.branch_id = $3
             AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
             AND COALESCE(p.rebate_amount, 0) > 0
-          UNION ALL
-          SELECT p.cancelled_at::date AS date, 'Supplier Purchase Cancellation' AS transaction_type,
-            p.supplier_name AS party_name,
-            'SUPPLIER' AS account_type,
-            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
-            'Purchase Cancellation' AS voucher_type,
-            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
-            COALESCE(p.payment_mode, '') AS payment_mode,
-            COALESCE(NULLIF(p.net_payable, 0), NULLIF(p.gross_amount, 0), p.total_amount, 0) AS debit,
-            0::NUMERIC AS credit,
-            'CANCELLED' AS status,
-            COALESCE(p.cancellation_reason, 'Purchase cancelled') AS remarks,
-            COALESCE(p.cancellation_reason, 'Purchase cancelled') AS narration
-          FROM purchases p
-          WHERE p.cancelled_at::date BETWEEN $1 AND $2 AND p.branch_id = $3
-            AND COALESCE(p.purchase_status, 'ACTIVE') = 'CANCELLED'
+          -- A cancelled purchase or sale is left out together with its reversal. Listing only the
+          -- reversal (the original being filtered out above) credited the party with the full amount
+          -- of a document that was never counted; the same goes for cancelled payments and expenses.
           UNION ALL
           SELECT sp.payment_date AS date, 'Supplier Payment' AS transaction_type,
             s.supplier_name AS party_name,
@@ -20192,6 +20648,7 @@ app.get("/reports/summary", async (req, res) => {
           FROM supplier_payments sp
           JOIN suppliers s ON s.id = sp.supplier_id
           WHERE sp.payment_date BETWEEN $1 AND $2 AND sp.branch_id = $3
+            AND sp.cancelled = FALSE
           UNION ALL
           SELECT s.sale_date AS date, 'Customer Sale' AS transaction_type,
             COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS party_name,
@@ -20210,29 +20667,12 @@ app.get("/reports/summary", async (req, res) => {
             ) AS narration
           FROM sales s
           LEFT JOIN customers c ON c.id = s.customer_id
-          LEFT JOIN (SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id) pay ON pay.sale_id = s.id
+          LEFT JOIN (SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments WHERE payment_mode IS DISTINCT FROM 'CREDIT' GROUP BY sale_id) pay ON pay.sale_id = s.id
           LEFT JOIN sale_items si ON si.sale_id = s.id
           LEFT JOIN products pr ON pr.id = si.product_id
           WHERE s.sale_date BETWEEN $1 AND $2 AND s.branch_id = $3
             AND s.sale_status <> 'CANCELLED'
           GROUP BY s.id, c.id, c.customer_name, pay.total_paid
-          UNION ALL
-          SELECT s.cancelled_at::date AS date, 'Customer Sale Cancellation' AS transaction_type,
-            COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS party_name,
-            'CUSTOMER' AS account_type,
-            'CUSTOMER-' || COALESCE(s.customer_id, c.id, 0) AS account_key,
-            'Sale Cancellation' AS voucher_type,
-            COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
-            s.payment_mode,
-            0::NUMERIC AS debit,
-            s.total_amount AS credit,
-            'CANCELLED' AS status,
-            COALESCE(s.cancellation_reason, 'Invoice cancelled') AS remarks,
-            COALESCE(s.cancellation_reason, 'Invoice cancelled') AS narration
-          FROM sales s
-          LEFT JOIN customers c ON c.id = s.customer_id
-          WHERE s.cancelled_at::date BETWEEN $1 AND $2 AND s.branch_id = $3
-            AND s.sale_status = 'CANCELLED'
           UNION ALL
           SELECT cp.payment_date AS date, 'Customer Payment' AS transaction_type,
             c.customer_name AS party_name,
@@ -20249,6 +20689,7 @@ app.get("/reports/summary", async (req, res) => {
           FROM customer_payments cp
           JOIN customers c ON c.id = cp.customer_id
           WHERE cp.payment_date BETWEEN $1 AND $2 AND cp.branch_id = $3
+            AND cp.cancelled = FALSE
           UNION ALL
           SELECT e.expense_date AS date, 'Expense' AS transaction_type,
             COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
@@ -20264,6 +20705,8 @@ app.get("/reports/summary", async (req, res) => {
             e.category || CASE WHEN COALESCE(e.paid_to, e.vendor_name, '') <> '' THEN ' paid to ' || COALESCE(e.paid_to, e.vendor_name) ELSE '' END AS narration
           FROM expenses e
           WHERE e.expense_date BETWEEN $1 AND $2 AND e.branch_id = $3
+            AND e.active IS DISTINCT FROM FALSE
+            AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
           UNION ALL
           SELECT sr.return_date AS date, 'Sale Return' AS transaction_type,
             COALESCE(sr.customer_name, 'Walk-in Customer') AS party_name,
@@ -20475,6 +20918,14 @@ app.get("/reports/summary", async (req, res) => {
           s.total_amount,
           s.total_cost,
           s.profit,
+          -- The money taken at the counter, line by line, so a MIXED bill can be split by mode.
+          -- 'CREDIT' lines are not money received and are left out: the credit part of a bill is
+          -- total_amount less the sum of these.
+          COALESCE((
+            SELECT JSON_AGG(JSON_BUILD_OBJECT('mode', sp.payment_mode, 'amount', sp.amount) ORDER BY sp.id)
+            FROM sale_payments sp
+            WHERE sp.sale_id = s.id AND sp.payment_mode IS DISTINCT FROM 'CREDIT'
+          ), '[]'::json) AS payments,
           COALESCE(
             JSON_AGG(
               JSON_BUILD_OBJECT(
@@ -20707,6 +21158,7 @@ app.get("/reports/summary", async (req, res) => {
           FROM sale_payments sp
           JOIN sales s ON s.id = sp.sale_id
           WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2 AND s.branch_id = $3
+            AND sp.payment_mode IS DISTINCT FROM 'CREDIT'
           UNION ALL
           SELECT cp.payment_date AS transaction_date, 'Customer Receipt' AS source, cp.payment_mode, cp.payment_amount AS amount
           FROM customer_payments cp
@@ -20905,7 +21357,7 @@ app.post("/expenses", async (req, res) => {
         req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
         nullableText(req.body.reference_number), nullableText(req.body.vendor_name || req.body.paid_to),
         nullableText(req.body.paid_to || req.body.vendor_name),
-        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id),
+        nullableText(req.body.remarks), req.auth.branchId,
         req.auth.userId, req.body.active !== false,
       ]
     );
@@ -20961,7 +21413,7 @@ app.put("/expenses/:id", async (req, res) => {
         req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
         nullableText(req.body.reference_number), nullableText(req.body.vendor_name || req.body.paid_to),
         nullableText(req.body.paid_to || req.body.vendor_name),
-        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id),
+        nullableText(req.body.remarks), oldExpense.branch_id,
         editorId, reason, expenseId,
       ]
     );
@@ -21073,7 +21525,8 @@ app.post("/supplier-payments", async (req, res) => {
     const paymentAmount = parseNonNegativeNumber(req.body.payment_amount);
     const rebateAmount = parseNonNegativeNumber(req.body.rebate_received ?? req.body.rebate_amount);
     const paymentMode = normalizePaymentMode(req.body.payment_mode);
-    const branchId = parsePositiveInteger(req.body.branch_id);
+    // The signed-in branch, never a body field: see /accounts/payments.
+    const branchId = req.auth.branchId;
     const createdBy = req.auth.userId;
     const paymentDate = req.body.payment_date || toDateKey(new Date());
 
@@ -21169,7 +21622,7 @@ app.put("/supplier-payments/:id", async (req, res) => {
       [
         supplierId, paymentDate, paymentAmount, rebateAmount, paymentMode,
         nullableText(req.body.reference_number), nullableText(req.body.remarks),
-        parsePositiveInteger(req.body.branch_id), editedBy, reason, paymentId,
+        oldPayment.branch_id, editedBy, reason, paymentId,
       ]
     );
     await client.query(
@@ -22106,6 +22559,11 @@ const createPurchaseBillHandler = async (req, res) => {
   const client = await pool.connect();
 
   try {
+    // Recording a purchase is the `purchases` permission. Owner and Admin always hold it; anyone
+    // else by their role's stored row. Checked before anything is read or opened.
+    if (!(await getStaffPermissionUser(req.auth.userId, "purchases", client))) {
+      return res.status(403).json({ code: "PURCHASE_PERMISSION_REQUIRED", message: "You do not have permission to record purchases." });
+    }
     const baseEntry = readPurchaseEntryPayload(req.body, req.auth.userId);
     const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
     if (!baseEntry.supplierId) return res.status(400).json({ message: "Add New Supplier" });
@@ -22379,8 +22837,10 @@ const createPurchaseBillHandler = async (req, res) => {
           [temporaryRate, manager.id, productId, context?.company_id || null]
         );
         if (productRateResult.rows[0]) {
-          await logSyncChange(client, {
-            branchId: context?.branch_id || baseEntry.branchId,
+          // A product rate is company-wide: every active branch's counters must pull it. Anchored on
+          // the caller's own branch, never the one the body names.
+          await logMasterDataSyncChange(client, {
+            branchId: context?.branch_id || req.auth.branchId || baseEntry.branchId,
             entityType: "sale_rate",
             entityId: productRateResult.rows[0].global_id,
             operationType: "UPSERT",
@@ -23117,9 +23577,12 @@ const completePendingBillLines = async (client, { req, purchaseId, oldPurchase, 
       ]
     );
     updatedLots.push(lotResult.rows[0]);
+    // Sold stock is repriced at the basic purchase rate, as a sale made after completion is costed
+    // (batch.purchase_rate). The P&L adds Mandi Tax, freight, labour and other charges and takes off
+    // rebates from the purchase itself, so costing at the landed rate counted them twice.
     await client.query(
       "UPDATE sale_batch_allocations SET purchase_rate = $1, cost_amount = ROUND((quantity * $1)::NUMERIC, 2) WHERE inventory_batch_id = $2",
-      [financials.effectiveCostPerUnit, lot.id]
+      [entry.purchaseRate, lot.id]
     );
     await recalculateSalesForBatch(client, lot.id);
     if (entry.quantity !== oldQuantity) {
@@ -23322,9 +23785,10 @@ const completePurchaseBillHandler = async (req, res) => {
         entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
       ]
     );
+    // At the basic purchase rate, as in completePendingBillLines: the P&L adds the charges itself.
     await client.query(
       "UPDATE sale_batch_allocations SET purchase_rate = $1, cost_amount = ROUND((quantity * $1)::NUMERIC, 2) WHERE inventory_batch_id = $2",
-      [financials.effectiveCostPerUnit, batch.id]
+      [entry.purchaseRate, batch.id]
     );
     await recalculateSalesForBatch(client, batch.id);
     if (entry.quantity !== oldQuantity) {
@@ -23501,6 +23965,12 @@ const createSaleHandler = async (req, res) => {
   const client = await pool.connect();
 
   try {
+    // Billing is the `billing` permission (Owner and Admin always). This is the browser path only:
+    // a desktop bill arrives through sync (`processPosSaleFoundationOperation`), which never refuses
+    // a bill the customer already holds.
+    if (!(await getStaffPermissionUser(req.auth.userId, "billing", client))) {
+      return res.status(403).json({ code: "BILLING_PERMISSION_REQUIRED", message: "You do not have permission to create bills." });
+    }
     const {
       product_id,
       quantity,
@@ -24413,6 +24883,7 @@ app.get("/sales-history/:id", async (req, res) => {
 
 app.get("/sales-report/changes", async (req, res) => {
   try {
+    if (await denyWithoutReportsPermission(req, res)) return;
     const [editedResult, cancelledResult, totalsResult] = await Promise.all([
       pool.query(
         `
@@ -24930,7 +25401,9 @@ app.get("/waste-entries", async (req, res) => {
 const createWasteEntryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    const productId = parsePositiveInteger(req.body.product_id);
+    // The desktop sends the product's snapshot id (`product-12`, a uuid global id), not only the
+    // server's integer; it used to be refused as "Enter valid waste details".
+    const productId = await resolveProductId(client, req.body.product_id);
     const quantity = parsePositiveNumber(req.body.quantity);
     const wasteType = normalizeWasteType(req.body.waste_type);
     const branchId = parsePositiveInteger(req.body.branch_id);
@@ -25058,15 +25531,19 @@ app.get("/sales/:id/audit", async (req, res) => {
   try {
     const saleId = parsePositiveInteger(req.params.id);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
+    // Only a bill of the caller's branch, as the invoice list it is opened from: by id alone any
+    // signed-in user could read any branch's change history, old and new snapshots included.
     const result = await pool.query(
       `
       SELECT sat.*, u.full_name AS edited_by_name
       FROM sale_audit_trail sat
+      JOIN sales s ON s.id = sat.sale_id
       LEFT JOIN users u ON u.id = sat.edited_by
       WHERE sat.sale_id = $1
+        AND s.branch_id = $2
       ORDER BY sat.edited_at DESC, sat.id DESC
       `,
-      [saleId]
+      [saleId, req.auth.branchId]
     );
     return res.json(result.rows);
   } catch (error) {
@@ -25089,18 +25566,19 @@ const updateSaleHandler = async (req, res) => {
     const replay = await beginV3BusinessOperation(client, req, "pos_sale");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+    // The bill must be this shop's -- company and branch, as a sale return requires -- not this
+    // counter's. Requiring the operational location too refused, as "Invoice not found", every bill
+    // made on another counter of the same branch, though it was picked from this branch's list.
     const saleLockResult = await client.query(
       `SELECT * FROM sales
        WHERE id = $1
-         AND ($2::INTEGER IS NULL OR (
-           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
-         ))
+         AND branch_id = $2
+         AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
        FOR UPDATE`,
       [
         saleId,
-        context?.company_id || null,
-        context?.branch_id || null,
-        context?.operational_location_id || null,
+        parsePositiveInteger(context?.branch_id) || parsePositiveInteger(req.auth.branchId),
+        parsePositiveInteger(context?.company_id) || parsePositiveInteger(req.auth.companyId) || null,
       ]
     );
     const currentSale = saleLockResult.rows[0];
@@ -25161,7 +25639,9 @@ const updateSaleHandler = async (req, res) => {
 
     const salePayload = await buildSalePayload(client, {
       items: req.body.items,
-      branchId: parsePositiveInteger(req.body.branch_id) || currentSale.branch_id,
+      // The bill's own branch, from the locked row. A branch_id in the body moved the bill (and drew
+      // its stock) to whatever branch the request named.
+      branchId: currentSale.branch_id,
       createdBy: editor.id,
       customer: req.body.customer,
       invoiceDiscount: req.body.invoice_discount,
@@ -25176,8 +25656,12 @@ const updateSaleHandler = async (req, res) => {
       }),
       billDate: requestedSaleDate,
       priorLotDiscounts: oldSnapshot.items,
+      // A line kept at its billed rate is not an override; a changed rate needs what POS needs.
+      priorSaleItems: oldSnapshot.items,
       payments: req.body.payments,
-      allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
+      allowRateOverride: ["Owner", "Admin"].includes(editor.role_name)
+        || Boolean(await getPermissionUser(editor.id, "manual_pos_rate_override", ["Owner", "Admin"], client)),
+      allowZeroRate: ["Owner", "Admin"].includes(editor.role_name),
       // Re-priced from the stored slabs on the way through, exactly as on a new bill. An edit is
       // not a place where a client's arithmetic starts being trusted.
       charges: editCharges ?? [],
@@ -25276,7 +25760,8 @@ const updateSaleHandler = async (req, res) => {
         ]
       );
       const saleItemId = saleItemResult.rows[0].id;
-      if (item.manualRateOverride) {
+      // A rate kept as billed was audited when it was billed; this editor did not set it.
+      if (item.manualRateOverride && !item.keptBilledRate) {
         await client.query(
           `
           INSERT INTO pos_rate_override_audit (
@@ -25318,7 +25803,9 @@ const updateSaleHandler = async (req, res) => {
       );
     }
 
-    for (const payment of salePayload.payments) {
+    // CREDIT is not money received, exactly as on a new bill: a CREDIT row here made an edited
+    // credit bill read as paid.
+    for (const payment of salePayload.payments.filter((entry) => entry.mode !== "CREDIT")) {
       await insertSalePaymentAllocation(client, {
         saleId,
         payment,
@@ -25408,18 +25895,18 @@ const cancelSaleHandler = async (req, res) => {
     const replay = await beginV3BusinessOperation(client, req, "pos_sale");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+    // Company and branch, as an edit and a sale return: a bill from another counter of this branch
+    // is this shop's bill, and was refused as "Invoice not found" when the counter had to match.
     const saleLockResult = await client.query(
       `SELECT * FROM sales
        WHERE id = $1
-         AND ($2::INTEGER IS NULL OR (
-           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
-         ))
+         AND branch_id = $2
+         AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
        FOR UPDATE`,
       [
         saleId,
-        context?.company_id || null,
-        context?.branch_id || null,
-        context?.operational_location_id || null,
+        parsePositiveInteger(context?.branch_id) || parsePositiveInteger(req.auth.branchId),
+        parsePositiveInteger(context?.company_id) || parsePositiveInteger(req.auth.companyId) || null,
       ]
     );
     const currentSale = saleLockResult.rows[0];
@@ -25660,7 +26147,8 @@ const createSaleChangeApprovalHandler = async (req, res) => {
     }
 
     const approvalId = crypto.randomUUID();
-    const expiresAt = saleChangeApproval.expiresAtFrom(Date.now());
+    // 15 minutes for cancel/edit/return, 7 days for a discount (`saleChangeApproval.approvalTtlMs`).
+    const expiresAt = saleChangeApproval.expiresAtFrom(Date.now(), request.action);
     await client.query(
       `INSERT INTO sale_change_approvals (
          id, status, action, sale_ref, requester_id, approver_id, company_id, branch_id, device_id, reason, expires_at
@@ -25692,6 +26180,8 @@ app.get("/sales/:id", async (req, res) => {
     const saleId = parsePositiveInteger(req.params.id);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
 
+    // The caller's branch only, as the invoice list. The items and payments below are read only
+    // once this has found the bill, so they inherit the scope.
     const saleResult = await pool.query(
       `
       SELECT s.*, b.branch_name, u.full_name AS created_by_name
@@ -25699,8 +26189,9 @@ app.get("/sales/:id", async (req, res) => {
       LEFT JOIN branches b ON b.id = s.branch_id
       LEFT JOIN users u ON u.id = s.created_by
       WHERE s.id = $1
+        AND s.branch_id = $2
       `,
-      [saleId]
+      [saleId, req.auth.branchId]
     );
     if (saleResult.rows.length === 0) {
       return res.status(404).json({ message: "Invoice not found" });
@@ -26082,6 +26573,10 @@ module.exports = {
   // Exported so `saleReturns.test.js` can run the reversal against a real Postgres (PGlite) and see
   // that stock a return already put back is not put back again.
   restoreSaleInventory,
+  // Exported so `salesSyncIntegrity.test.js` can drive how a desktop's product or lot id becomes
+  // the server's, and the memo that keeps product-schema DDL off every request.
+  resolveServerEntityId,
+  ensureProductEntrySchemaOnce,
   // Exported so `deviceMachineFingerprint.test.js` can run the device upsert against PGlite and see
   // that an absent or malformed fingerprint never erases a stored one.
   readDevicePayload,

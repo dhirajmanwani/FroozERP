@@ -256,6 +256,19 @@ const describeGap = (ms) => {
   return `${days} day${days === 1 ? "" : "s"}`;
 };
 
+const MONTHS = Object.freeze(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]);
+// India Standard Time has no daylight saving, so a fixed offset is exact, and it keeps the wording
+// independent of whatever timezone the host happens to be set to.
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
+/** A moment as the shop reads it: "22 Sep 2026 at 11:30" (IST, 24-hour). */
+const describeMoment = (ms) => {
+  const ist = new Date(ms + IST_OFFSET_MS);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${ist.getUTCDate()} ${MONTHS[ist.getUTCMonth()]} ${ist.getUTCFullYear()} `
+    + `at ${pad(ist.getUTCHours())}:${pad(ist.getUTCMinutes())}`;
+};
+
 /**
  * Has this row been put away, by any of the means the panel offers?
  *
@@ -283,7 +296,7 @@ const isPutAway = (row, nowMs) => {
 
 const severityFor = (value) => FROST_SEVERITY_TO_NOTIFICATION[upper(value)] || UNKNOWN_FROST_SEVERITY;
 
-const buildItem = ({ kind, identity, severity, title, message, at, sticky, overdueMs, rowId }) => {
+const buildItem = ({ kind, identity, severity, title, message, timing = "", at, sticky, overdueMs, rowId }) => {
   const key = frostBellKey(kind, identity.scope, identity.value);
   return {
     id: key,
@@ -297,6 +310,10 @@ const buildItem = ({ kind, identity, severity, title, message, at, sticky, overd
     // Carried for the screen and used as sort keys. `createNotification` reads only the fields
     // above and ignores these, so an item can be handed to it unchanged.
     kind,
+    // How long ago, in words ("It was due 3 days ago."). Kept out of `message` on purpose: App.jsx
+    // re-raises a row whenever its message changes, so wording that moves with the clock would mark
+    // the row unread again on every poll. Read this for display only, never for change detection.
+    timing,
     frostId: rowId ?? null,
     overdueMs,
   };
@@ -354,15 +371,19 @@ const reminderItem = (row, nowMs, at) => {
   // strangely in a bell row addressed to the owner, and it is only a fallback when the reminder
   // carries no explanation of its own.
   const body = firstText(row.message, row.draft_message, row.draftMessage);
+  // The message names the due moment, which does not move; the relative "3 days ago" changes on
+  // every poll and so lives in `timing` instead (see `buildItem`).
+  const due = dueAt === null ? "No due date was set on it." : `It was due on ${describeMoment(dueAt)}.`;
   const timing = dueAt === null
-    ? "No due date was set on it."
+    ? ""
     : (overdueMs < 60000 ? "It is due now." : `It was due ${describeGap(overdueMs)} ago.`);
   return buildItem({
     kind: FROST_BELL_KIND.REMINDER,
     identity,
     severity: severityFor(row.priority),
     title: firstText(row.title, row.message) || "A FROST reminder is due",
-    message: body ? `${body} ${timing}` : timing,
+    message: body ? `${body} ${due}` : due,
+    timing,
     at,
     // A reminder is something the owner asked for and can put away in the panel with one click, so
     // it does not need to resist "clear all" the way an unpaid customer does.

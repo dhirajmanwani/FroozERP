@@ -54,6 +54,40 @@ test("reminder dedup key is stable per linked item and due date", () => {
   assert.equal(first, second);
 });
 
+test("two different owner notes on the same day are two reminders, not one dropped", () => {
+  // The bug: an OWNER_NOTE is linked to nothing, so type, entity and day were the whole key. The
+  // second note of the day hit ON CONFLICT, was silently dropped, and FROST still said "Saved".
+  const note = (title) => buildReminderDedupKey({
+    branchId: 2, reminderType: "OWNER_NOTE", entityType: "manual", entityId: "", dueDate: "2026-10-07", title,
+  });
+  assert.notEqual(note("Ramesh ko phone karna"), note("bank jana hai"));
+  // Saying the same note twice is still one reminder: case and spacing are not a different note.
+  assert.equal(note("Ramesh ko phone karna"), note("  ramesh  KO phone karna "));
+  // A 220-character title still fits `dedup_key VARCHAR(240)`.
+  assert.ok(note("x".repeat(220)).length <= 240);
+});
+
+test("a linked reminder is still keyed by its account and day, not its wording", () => {
+  // A COLLECT_PAYMENT reminder for one customer on one day is one reminder however it was phrased.
+  const key = (title) => buildReminderDedupKey({
+    branchId: 2, reminderType: "COLLECT_PAYMENT", entityType: "customer", entityId: "4", dueDate: "2026-10-07", title,
+  });
+  assert.equal(key("Ramesh se paisa lena"), key("collect from Ramesh"));
+});
+
+test("FROST matches a bill to its customer with the server's own SQL, character for character", () => {
+  // FROST matched by customer_id alone, so a bill rung up against a mobile number or a name was owed
+  // to nobody in FROST and to the right customer in Accounts. The service carries a copy because
+  // server.js requires it, not the other way round; this keeps the copy honest.
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const server = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const match = server.match(/const SALE_CUSTOMER_MATCH_LATERAL_SQL = `([\s\S]*?)`;/);
+  assert.ok(match, "SALE_CUSTOMER_MATCH_LATERAL_SQL was not found in server.js");
+  const { SALE_CUSTOMER_MATCH_LATERAL_SQL } = require("./aiBusinessAssistantService");
+  assert.equal(SALE_CUSTOMER_MATCH_LATERAL_SQL, match[1]);
+});
+
 test("AI answer grounding rejects unsupported money amounts", () => {
   assert.equal(assertGroundedAnswer({ answer: "Outstanding is ₹1,250.00", facts: [{ amount: 1250 }] }), true);
   assert.equal(assertGroundedAnswer({ answer: "Outstanding is ₹9,999.00", facts: [{ amount: 1250 }] }), false);

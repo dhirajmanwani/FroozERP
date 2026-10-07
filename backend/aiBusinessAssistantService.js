@@ -9,6 +9,7 @@ const {
 const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
 const { ANSWER_FORMAT_VERSION, buildDeterministicAnswer } = require("./frostAnswer");
 const { detectReminderDueDate, detectSmallTalk, detectSpokenRange, reminderTitleFrom } = require("./frostLanguage");
+const { CUSTOMER_CREDIT_REFUND_TYPES_SQL } = require("./saleReturns");
 const { CONTACT_STATUS, normalizeReminderDueAt, prepareCustomerDueReminder, reminderDueAtWallClock } = require("./frostReminders");
 const {
   buildCustomerLedger,
@@ -16,6 +17,7 @@ const {
   buildPaymentsDue,
   buildSupplierLedger,
   linkReminderDraft,
+  oldestUnpaidPurchaseDates,
   resolvePaymentsDueDate,
   shortDay,
 } = require("./frostAccounts");
@@ -371,69 +373,191 @@ const buildFact = (type, sourceModule, periodLabel, rows, summary = {}) => ({
   },
 });
 
-const getCustomerOutstanding = async (pool, branchId, settings) => {
+/**
+ * How many rows of an outstanding list go into a fact.
+ *
+ * Facts are what the model is shown, so the list is cut for it. The *totals* are not: they are
+ * summed over every account before the cut. A `LIMIT 50` in the query used to cut both, so the
+ * dues panel, the briefing card and "kitna baaki hai" all reported the top fifty debtors' total as
+ * the shop's total -- and the overdue alert for the fifty-first debtor was never raised.
+ */
+const FACT_ROW_LIMIT = 50;
+
+/**
+ * Which customer a bill belongs to, as `matched.customer_id`: its customer id, else its mobile,
+ * else the walk-in system account, else an exact name. Needs the bill aliased `s`.
+ *
+ * A **verbatim copy** of `SALE_CUSTOMER_MATCH_LATERAL_SQL` in `server.js`, which this module cannot
+ * import (server.js requires this file, not the other way round). FROST matched bills by
+ * `customer_id` alone, so a credit bill rung up against a mobile number or a name was owed to
+ * nobody in FROST and to the right customer in Accounts. `aiBusinessAssistantRules.test.js` pins
+ * the two copies to identical text, so they cannot drift apart quietly.
+ */
+const SALE_CUSTOMER_MATCH_LATERAL_SQL = `JOIN LATERAL (
+        SELECT c.id AS customer_id
+        FROM customers c
+        WHERE
+          s.customer_id = c.id
+          OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
+          OR (
+            s.customer_id IS NULL
+            AND c.system_account = TRUE
+            AND (
+              s.customer_name IS NULL
+              OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'
+            )
+          )
+          OR (
+            s.customer_id IS NULL
+            AND c.system_account IS DISTINCT FROM TRUE
+            AND s.customer_mobile IS NULL
+            AND s.customer_name IS NOT NULL
+            AND LOWER(c.customer_name) = LOWER(s.customer_name)
+          )
+        ORDER BY CASE WHEN s.customer_id = c.id THEN 0 WHEN c.mobile_number = s.customer_mobile THEN 1 ELSE 2 END, c.id
+        LIMIT 1
+      ) matched ON TRUE`;
+
+/**
+ * Every customer's receivable at this branch, at the grain FIFO needs: one row per bill that still
+ * has money on it, and one row per customer for what has been paid or credited since.
+ *
+ * The formula is `getCustomerSummaryRows` in `server.js`, in its branch scope, so FROST and the
+ * Accounts screens give one answer to "kitna baaki hai":
+ *
+ * - **every** non-cancelled bill counts, not only `payment_mode = 'CREDIT'` ones -- a cash bill
+ *   that was part-paid at the counter is owed too. What is owed on a bill is its total less what
+ *   was paid against it at the counter (`amount_due`);
+ * - a `sale_payments` line with `payment_mode = 'CREDIT'` is the unpaid part of the bill, written by
+ *   sale edits, and is never counted as money received;
+ * - payments are `customer_payments` not cancelled; credit-note and future-adjustment returns
+ *   credit the customer, matched through the bill exactly as the bill is matched;
+ * - bills are matched to customers by `SALE_CUSTOMER_MATCH_LATERAL_SQL`, not by `customer_id` alone;
+ * - the customer's `opening_balance` is **not** added. `customers` has no branch, and the server
+ *   counts an opening balance once, in company scope, never in a branch's figures. FROST is
+ *   branch-scoped (A-7), so the same rule applies here.
+ *
+ * A bill whose `amount_due` is exactly zero -- paid in full at the counter -- is left out of the
+ * read: it cannot move a balance, and it is most of the shop's bills.
+ */
+const getCustomerReceivableInputs = async (pool, branchId) => {
   const branch = requireBranchScope(branchId);
-  const result = await pool.query(`
-    WITH credit_sales AS (
-      SELECT
-        COALESCE(s.customer_id, c.id) AS customer_id,
-        MAX(COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer')) AS customer_name,
-        MAX(c.mobile_number) AS mobile_number,
-        SUM(CASE WHEN s.payment_mode = 'CREDIT' AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED' THEN s.total_amount ELSE 0 END) AS credit_amount,
-        MIN(CASE WHEN s.payment_mode = 'CREDIT' AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED' THEN s.sale_date END) AS oldest_invoice_date,
-        MIN(CASE WHEN s.payment_mode = 'CREDIT' AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED' THEN s.due_date END) AS oldest_due_date
-      FROM sales s
-      LEFT JOIN customers c ON c.id = s.customer_id
-      WHERE s.branch_id = $1
-      GROUP BY COALESCE(s.customer_id, c.id)
-    ),
-    payments AS (
+  const bills = await pool.query(`
+    SELECT
+      s.id,
+      matched.customer_id,
+      c.customer_name,
+      c.mobile_number,
+      s.sale_date,
+      s.due_date,
+      s.total_amount,
+      s.total_amount - COALESCE(pay.total_paid, 0) AS amount_due
+    FROM sales s
+    ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+    JOIN customers c ON c.id = matched.customer_id
+    LEFT JOIN (
+      SELECT sale_id, SUM(amount) AS total_paid
+      FROM sale_payments
+      WHERE payment_mode IS DISTINCT FROM 'CREDIT'
+      GROUP BY sale_id
+    ) pay ON pay.sale_id = s.id
+    WHERE s.branch_id = $1
+      AND s.sale_status <> 'CANCELLED'
+      AND s.total_amount - COALESCE(pay.total_paid, 0) <> 0
+    ORDER BY s.sale_date, s.id
+  `, [branch]);
+  const credits = await pool.query(`
+    WITH customer_paid AS (
       SELECT customer_id, SUM(payment_amount) AS paid_amount, MAX(payment_date) AS last_payment_date
       FROM customer_payments
-      WHERE cancelled IS DISTINCT FROM TRUE AND branch_id = $1
+      WHERE cancelled = FALSE
+        AND branch_id = $1
       GROUP BY customer_id
     ),
-    returns AS (
-      SELECT s.customer_id, SUM(sr.total_return_amount) AS returned_amount
+    return_credit AS (
+      SELECT matched.customer_id, SUM(sr.total_return_amount) AS returned_amount
       FROM sale_returns sr
       JOIN sales s ON s.id = sr.sale_id
-      WHERE sr.refund_type IN ('CREDIT_NOTE', 'FUTURE_ADJUSTMENT')
-        AND s.branch_id = $1
-      GROUP BY s.customer_id
+      ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+      WHERE s.branch_id = $1
+        AND sr.refund_type IN ${CUSTOMER_CREDIT_REFUND_TYPES_SQL}
+        AND s.sale_status <> 'CANCELLED'
+      GROUP BY matched.customer_id
     )
     SELECT
-      cs.customer_id,
-      cs.customer_name,
-      cs.mobile_number,
-      cs.oldest_invoice_date,
-      cs.oldest_due_date,
-      COALESCE(p.last_payment_date, NULL) AS last_payment_date,
-      GREATEST(COALESCE(cs.credit_amount, 0) - COALESCE(p.paid_amount, 0) - COALESCE(r.returned_amount, 0), 0) AS outstanding_amount
-    FROM credit_sales cs
-    LEFT JOIN payments p ON p.customer_id = cs.customer_id
-    LEFT JOIN returns r ON r.customer_id = cs.customer_id
-    WHERE GREATEST(COALESCE(cs.credit_amount, 0) - COALESCE(p.paid_amount, 0) - COALESCE(r.returned_amount, 0), 0) > 0
-    ORDER BY outstanding_amount DESC, oldest_due_date NULLS LAST
-    LIMIT 50
+      c.id AS customer_id,
+      c.customer_name,
+      c.mobile_number,
+      COALESCE(cp.paid_amount, 0) AS paid_amount,
+      COALESCE(rc.returned_amount, 0) AS returned_amount,
+      cp.last_payment_date
+    FROM customers c
+    LEFT JOIN customer_paid cp ON cp.customer_id = c.id
+    LEFT JOIN return_credit rc ON rc.customer_id = c.id
+    WHERE cp.customer_id IS NOT NULL OR rc.customer_id IS NOT NULL
   `, [branch]);
-  const rows = result.rows.map((row) => {
-    const overdueDays = calculateOverdueDays(row.oldest_due_date);
-    const risk = classifyCustomerRisk({ overdueDays: overdueDays || 0, outstanding: row.outstanding_amount }, settings.thresholds);
-    return {
-      ...row,
-      mobile_number: maskPhone(row.mobile_number),
-      outstanding_amount: roundCurrency(row.outstanding_amount),
-      overdue_days: overdueDays,
-      due_status: classifyDueStatus(row.oldest_due_date, new Date(), settings.thresholds),
-      risk_classification: risk,
-      promised_payment_date: null,
-      average_payment_delay_days: null,
-    };
-  });
-  return buildFact("customer_outstanding", "Accounts", "Current outstanding", rows, {
-    totalOutstanding: roundCurrency(rows.reduce((sum, row) => sum + row.outstanding_amount, 0)),
-    count: rows.length,
-  });
+  return { customers: credits.rows, customerBills: bills.rows };
+};
+
+/**
+ * Every customer who owes this branch money, unlimited, with the oldest *unpaid* bill's dates.
+ *
+ * "Overdue" and "since" come from FIFO (`buildCustomerLedger`): payments settle the oldest bill
+ * first, and the first bill they do not cover is where the unpaid money starts. The old query took
+ * `MIN(due_date)` over every credit bill, paid ones included, so a customer who had cleared last
+ * year's bill and owed only on yesterday's was reported as a year overdue.
+ *
+ * `netOutstanding` is the sum over every customer, advances (negative balances) included -- the
+ * figure the dashboard's receivables tile shows for this branch. `rows` are the customers who owe.
+ */
+const getCustomerOutstandingRows = async (pool, branchId, settings) => {
+  const inputs = await getCustomerReceivableInputs(pool, branchId);
+  const mobileBy = new Map();
+  for (const row of [...inputs.customerBills, ...inputs.customers]) {
+    const key = contactKey(row.customer_id);
+    if (!mobileBy.has(key) && row.mobile_number) mobileBy.set(key, row.mobile_number);
+  }
+  const ledger = buildCustomerLedger(inputs);
+  const netOutstanding = roundCurrency(ledger.reduce((sum, row) => sum + toNumber(row.billed_amount) - toNumber(row.credited_amount), 0));
+  const rows = ledger
+    .filter((row) => toNumber(row.outstanding_amount) > 0)
+    .map((row) => {
+      const overdueDays = calculateOverdueDays(row.next_due_date);
+      const outstanding = roundCurrency(row.outstanding_amount);
+      return {
+        customer_id: row.customer_id,
+        customer_name: row.customer_name,
+        mobile_number: maskPhone(mobileBy.get(contactKey(row.customer_id))),
+        oldest_invoice_date: row.unpaid_since,
+        oldest_due_date: row.next_due_date,
+        last_payment_date: row.last_payment_date,
+        outstanding_amount: outstanding,
+        overdue_days: overdueDays,
+        due_status: classifyDueStatus(row.next_due_date, new Date(), settings.thresholds),
+        risk_classification: classifyCustomerRisk({ overdueDays: overdueDays || 0, outstanding }, settings.thresholds),
+        promised_payment_date: null,
+        average_payment_delay_days: null,
+      };
+    })
+    .sort((a, b) => (b.outstanding_amount - a.outstanding_amount)
+      || String(a.oldest_due_date || "9999-12-31").localeCompare(String(b.oldest_due_date || "9999-12-31")));
+  return { rows, netOutstanding };
+};
+
+/**
+ * Totals over every row, then the rows cut to `FACT_ROW_LIMIT` for the model. `shownCount` says how
+ * many rows the fact carries, so "50 of 63" is visible rather than reading as "63".
+ */
+const outstandingFactSummary = (rows, extra = {}) => ({
+  totalOutstanding: roundCurrency(rows.reduce((sum, row) => sum + toNumber(row.outstanding_amount), 0)),
+  count: rows.length,
+  shownCount: Math.min(rows.length, FACT_ROW_LIMIT),
+  ...extra,
+});
+
+const getCustomerOutstanding = async (pool, branchId, settings) => {
+  const { rows, netOutstanding } = await getCustomerOutstandingRows(pool, branchId, settings);
+  return buildFact("customer_outstanding", "Accounts", "Current outstanding", rows.slice(0, FACT_ROW_LIMIT), outstandingFactSummary(rows, { netOutstanding }));
 };
 
 /**
@@ -448,18 +572,19 @@ const getCustomerOutstanding = async (pool, branchId, settings) => {
 const OVERDUE_DUE_STATUSES = Object.freeze(["OVERDUE", "SERIOUSLY_OVERDUE", "CRITICAL_OUTSTANDING"]);
 
 const getOverdueCustomerInvoices = async (pool, branchId, settings) => {
-  const outstanding = await getCustomerOutstanding(pool, branchId, settings);
-  const rows = outstanding.rows.filter((row) => OVERDUE_DUE_STATUSES.includes(row.due_status));
-  return buildFact("overdue_customer_invoices", "Customer Ledgers", "Current outstanding", rows, {
+  const { rows: outstanding } = await getCustomerOutstandingRows(pool, branchId, settings);
+  const rows = outstanding.filter((row) => OVERDUE_DUE_STATUSES.includes(row.due_status));
+  return buildFact("overdue_customer_invoices", "Customer Ledgers", "Current outstanding", rows.slice(0, FACT_ROW_LIMIT), {
     totalOverdue: roundCurrency(rows.reduce((sum, row) => sum + row.outstanding_amount, 0)),
     count: rows.length,
+    shownCount: Math.min(rows.length, FACT_ROW_LIMIT),
   });
 };
 
 /**
  * Entity ids are opaque strings, and the two halves of the dues panel are joined on one.
  *
- * `getCustomerOutstanding` groups on `COALESCE(s.customer_id, c.id)` and the contact query returns
+ * `getCustomerReceivableInputs` keys on `matched.customer_id` and the contact query returns
  * `c.id`; both arrive from `pg` as whatever the column type deserialises to. Coercing either side
  * with `Number()` is the join failure `CLAUDE.md` records -- "004" and 4 are different entities --
  * and here it would not empty the table, it would attach one customer's phone number to another
@@ -482,14 +607,18 @@ const contactKey = (value) => String(value ?? "").trim();
  */
 const getCustomerContactChannels = async (pool, branchId) => {
   const branch = requireBranchScope(branchId);
+  // Matched as the receivable is matched -- `SALE_CUSTOMER_MATCH_LATERAL_SQL` -- so a customer whose
+  // bills carry only a mobile number or a name still has his contact row found here, rather than
+  // owing money in the panel while showing "no number on file".
   const result = await pool.query(`
     SELECT DISTINCT
       c.id AS customer_id,
       c.whatsapp_number,
       c.mobile_number,
       c.whatsapp_opt_in
-    FROM customers c
-    JOIN sales s ON s.customer_id = c.id
+    FROM sales s
+    ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+    JOIN customers c ON c.id = matched.customer_id
     WHERE s.branch_id = $1
   `, [branch]);
   const byCustomer = new Map();
@@ -533,8 +662,9 @@ const getBusinessName = async (pool) => {
  * asking for a different list.
  */
 const getCustomerDueReminders = async (pool, branchId, settings) => {
+  // Every debtor, not the fact's top fifty: the panel's total is the shop's total.
   const [outstanding, contacts, shopName] = await Promise.all([
-    getCustomerOutstanding(pool, branchId, settings),
+    getCustomerOutstandingRows(pool, branchId, settings),
     getCustomerContactChannels(pool, branchId),
     getBusinessName(pool),
   ]);
@@ -562,116 +692,113 @@ const getCustomerDueReminders = async (pool, branchId, settings) => {
   };
 };
 
-const getSupplierOutstanding = async (pool, branchId) => {
-  const branch = requireBranchScope(branchId);
-  const result = await pool.query(`
-    SELECT
-      p.supplier_id,
-      COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS supplier_name,
-      MIN(COALESCE(p.bill_date, p.purchase_date)) AS oldest_purchase_date,
-      SUM(COALESCE(p.balance_amount, 0)) AS outstanding_amount,
-      COUNT(*) FILTER (WHERE p.purchase_bill_status = 'BILL_PENDING') AS pending_bill_count
-    FROM purchases p
-    LEFT JOIN suppliers s ON s.id = p.supplier_id
-    WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
-      AND COALESCE(p.balance_amount, 0) > 0
-      AND p.branch_id = $1
-    GROUP BY p.supplier_id, COALESCE(s.supplier_name, p.supplier_name, 'Supplier')
-    ORDER BY outstanding_amount DESC
-    LIMIT 50
-  `, [branch]);
-  const rows = result.rows.map((row) => ({ ...row, outstanding_amount: roundCurrency(row.outstanding_amount) }));
-  return buildFact("supplier_outstanding", "Purchases", "Current outstanding", rows, {
-    totalOutstanding: roundCurrency(rows.reduce((sum, row) => sum + row.outstanding_amount, 0)),
-    count: rows.length,
-  });
-};
-
 /**
- * The per-bill input the FIFO in `frostAccounts.js` needs, which `getCustomerOutstanding` cannot give.
+ * Every supplier's balance at this branch, with the day its oldest unpaid purchase was made.
  *
- * `getCustomerOutstanding` answers "how much" with one row per customer, which is right for the
- * alerts and the dues panel, and it stays exactly as it is -- `runAlertRules` reads its
- * `oldest_due_date`. But "since when" is a question about bills: the oldest bill's due date is the
- * wrong answer for a customer who has paid that bill and the next one. So the same three sources are
- * read again here, at the grain FIFO needs, and with the same rules: non-cancelled CREDIT sales,
- * payments not cancelled, and credit-note returns.
+ * The formula is `getSupplierSummaryRows` in `server.js`, in its branch scope: opening balance plus
+ * completed, non-cancelled purchases (gross), less purchase rebates, less what was paid on the
+ * purchase, less supplier payments and their rebates. It used to be `SUM(purchases.balance_amount)`,
+ * which no supplier payment ever updates: Accounts showed ₹0 owed while FROST said "pay ₹10,000".
+ * A `BILL_PENDING` purchase is not in the balance, as on the server; it is counted separately.
  *
- * Unlimited, unlike the fact query's `LIMIT 50`. A payment reminder due today for the fifty-first
- * largest debtor must show that customer's balance, not read as "settled" because the balance fell
- * off the end of a top-50 list.
- */
-const getCustomerCreditInputs = async (pool, branchId) => {
-  const branch = requireBranchScope(branchId);
-  const bills = await pool.query(`
-    SELECT
-      s.id,
-      s.customer_id,
-      COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') AS customer_name,
-      s.sale_date,
-      s.due_date,
-      s.total_amount
-    FROM sales s
-    LEFT JOIN customers c ON c.id = s.customer_id
-    WHERE s.branch_id = $1
-      AND s.payment_mode = 'CREDIT'
-      AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
-    ORDER BY s.sale_date, s.id
-  `, [branch]);
-  // A return with no customer is left out, as it is in `getCustomerOutstanding`, whose join on
-  // `customer_id` can never match a NULL. Keeping it here would pay down the walk-in group's bills
-  // with money that query never credits, and the two totals would disagree.
-  const credits = await pool.query(`
-    WITH payments AS (
-      SELECT customer_id, SUM(payment_amount) AS paid_amount, MAX(payment_date) AS last_payment_date
-      FROM customer_payments
-      WHERE cancelled IS DISTINCT FROM TRUE AND branch_id = $1
-      GROUP BY customer_id
-    ),
-    returns AS (
-      SELECT s.customer_id, SUM(sr.total_return_amount) AS returned_amount
-      FROM sale_returns sr
-      JOIN sales s ON s.id = sr.sale_id
-      WHERE sr.refund_type IN ('CREDIT_NOTE', 'FUTURE_ADJUSTMENT')
-        AND s.branch_id = $1
-      GROUP BY s.customer_id
-    )
-    SELECT
-      COALESCE(p.customer_id, r.customer_id) AS customer_id,
-      c.customer_name,
-      COALESCE(p.paid_amount, 0) AS paid_amount,
-      COALESCE(r.returned_amount, 0) AS returned_amount,
-      p.last_payment_date
-    FROM payments p
-    FULL OUTER JOIN returns r ON r.customer_id = p.customer_id
-    LEFT JOIN customers c ON c.id = COALESCE(p.customer_id, r.customer_id)
-    WHERE COALESCE(p.customer_id, r.customer_id) IS NOT NULL
-  `, [branch]);
-  return { customers: credits.rows, customerBills: bills.rows };
-};
-
-/**
- * Every supplier this branch has bought from, with what is still owed -- zero included.
+ * Every supplier in the directory is returned, zero balances included -- "Verma ko kitna dena hai"
+ * about a supplier owed nothing is answered "nothing now", not "I could not find Verma". As on the
+ * server, `opening_balance` sits on the company-wide supplier row and is counted in branch scope.
  *
- * The same balance `getSupplierOutstanding` sums, without its `LIMIT 50` and without dropping the
- * suppliers who are paid up: "Verma ko kitna dena hai" about a supplier owed nothing is answered
- * "nothing now", not "I could not find Verma".
+ * "Since when" is FIFO over the purchases (`oldestUnpaidPurchaseDates`): payments settle the
+ * opening balance first, then the oldest purchase.
  */
 const getSupplierBalanceRows = async (pool, branchId) => {
   const branch = requireBranchScope(branchId);
-  const result = await pool.query(`
+  const balances = await pool.query(`
+    WITH purchase_summary AS (
+      SELECT
+        supplier_id,
+        SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS total_purchases,
+        SUM(COALESCE(rebate_amount, 0)) AS purchase_rebate,
+        SUM(COALESCE(paid_amount, 0)) AS purchase_paid
+      FROM purchases
+      WHERE supplier_id IS NOT NULL
+        AND branch_id = $1
+        AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+        AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+      GROUP BY supplier_id
+    ),
+    payment_summary AS (
+      SELECT
+        supplier_id,
+        SUM(payment_amount) AS total_paid,
+        SUM(rebate_amount) AS payment_rebate
+      FROM supplier_payments
+      WHERE cancelled = FALSE
+        AND branch_id = $1
+      GROUP BY supplier_id
+    ),
+    pending_bills AS (
+      SELECT supplier_id, COUNT(*)::INTEGER AS pending_bill_count
+      FROM purchases
+      WHERE supplier_id IS NOT NULL
+        AND branch_id = $1
+        AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+        AND purchase_bill_status = 'BILL_PENDING'
+      GROUP BY supplier_id
+    )
     SELECT
-      p.supplier_id,
-      COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS supplier_name,
-      MIN(CASE WHEN COALESCE(p.balance_amount, 0) > 0 THEN COALESCE(p.bill_date, p.purchase_date) END) AS oldest_purchase_date,
-      SUM(CASE WHEN COALESCE(p.balance_amount, 0) > 0 THEN p.balance_amount ELSE 0 END) AS outstanding_amount
-    FROM purchases p
-    LEFT JOIN suppliers s ON s.id = p.supplier_id
-    WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
-      AND p.branch_id = $1
-    GROUP BY p.supplier_id, COALESCE(s.supplier_name, p.supplier_name, 'Supplier')
+      s.id AS supplier_id,
+      s.supplier_name,
+      COALESCE(s.opening_balance, 0) AS opening_balance,
+      COALESCE(pay.total_paid, 0) + COALESCE(pay.payment_rebate, 0) AS payment_credit,
+      COALESCE(pb.pending_bill_count, 0) AS pending_bill_count,
+      ROUND((
+        COALESCE(s.opening_balance, 0)
+        + COALESCE(ps.total_purchases, 0)
+        - COALESCE(ps.purchase_rebate, 0)
+        - COALESCE(ps.purchase_paid, 0)
+        - COALESCE(pay.total_paid, 0)
+        - COALESCE(pay.payment_rebate, 0)
+      )::NUMERIC, 2) AS outstanding_amount
+    FROM suppliers s
+    LEFT JOIN purchase_summary ps ON ps.supplier_id = s.id
+    LEFT JOIN payment_summary pay ON pay.supplier_id = s.id
+    LEFT JOIN pending_bills pb ON pb.supplier_id = s.id
   `, [branch]);
-  return result.rows;
+  // The same purchases, one row each, with what is still owed on each after its own rebate and
+  // payment. Fully settled purchases cannot move the FIFO and are left out of the read.
+  const purchases = await pool.query(`
+    SELECT
+      p.id,
+      p.supplier_id,
+      COALESCE(p.bill_date, p.purchase_date) AS purchase_date,
+      COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) - COALESCE(p.rebate_amount, 0) - COALESCE(p.paid_amount, 0) AS amount_due
+    FROM purchases p
+    WHERE p.supplier_id IS NOT NULL
+      AND p.branch_id = $1
+      AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+      AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+      AND COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) - COALESCE(p.rebate_amount, 0) - COALESCE(p.paid_amount, 0) <> 0
+    ORDER BY COALESCE(p.bill_date, p.purchase_date), p.id
+  `, [branch]);
+  const oldest = oldestUnpaidPurchaseDates({ suppliers: balances.rows, purchases: purchases.rows });
+  return balances.rows.map((row) => ({
+    supplier_id: row.supplier_id,
+    supplier_name: row.supplier_name,
+    outstanding_amount: roundCurrency(row.outstanding_amount),
+    oldest_purchase_date: oldest.get(contactKey(row.supplier_id)) || null,
+    pending_bill_count: Number.parseInt(row.pending_bill_count, 10) || 0,
+  }));
+};
+
+/**
+ * The suppliers this branch owes, largest first. Totals over all of them; rows cut for the model.
+ * `netOutstanding` nets advances paid to suppliers, as the dashboard's payables tile does.
+ */
+const getSupplierOutstanding = async (pool, branchId) => {
+  const all = await getSupplierBalanceRows(pool, branchId);
+  const netOutstanding = roundCurrency(all.reduce((sum, row) => sum + toNumber(row.outstanding_amount), 0));
+  const rows = all
+    .filter((row) => toNumber(row.outstanding_amount) > 0)
+    .sort((a, b) => (b.outstanding_amount - a.outstanding_amount) || String(a.supplier_name).localeCompare(String(b.supplier_name)));
+  return buildFact("supplier_outstanding", "Purchases", "Current outstanding", rows.slice(0, FACT_ROW_LIMIT), outstandingFactSummary(rows, { netOutstanding }));
 };
 
 /**
@@ -711,7 +838,7 @@ const getOpenPaymentReminders = async (pool, branchId) => {
 };
 
 const getPaymentsDueInputs = async (pool, branchId) => {
-  const { customers, customerBills } = await getCustomerCreditInputs(pool, branchId);
+  const { customers, customerBills } = await getCustomerReceivableInputs(pool, branchId);
   const suppliers = await getSupplierBalanceRows(pool, branchId);
   const reminders = await getOpenPaymentReminders(pool, branchId);
   return { customers, customerBills, suppliers, reminders };
@@ -743,7 +870,7 @@ const answerDuesQuestion = async (pool, branchId, question, date = toDateKey()) 
  * See `linkReminderDraft`; this only reads the names it matches against.
  */
 const linkSpokenReminder = async (pool, branchId, question, title) => {
-  const { customers, customerBills } = await getCustomerCreditInputs(pool, branchId);
+  const { customers, customerBills } = await getCustomerReceivableInputs(pool, branchId);
   const suppliers = await getSupplierBalanceRows(pool, branchId);
   return linkReminderDraft({
     question,
@@ -1754,6 +1881,7 @@ const getCollectionSummary = async (pool, branchId, range) => {
     JOIN sales s ON s.id = sp.sale_id
     WHERE s.sale_date BETWEEN $1 AND $2
       AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+      AND sp.payment_mode IS DISTINCT FROM 'CREDIT'
       AND s.branch_id = $3
     GROUP BY sp.payment_mode
   `, [range.dateFrom, range.dateTo, branch]);
@@ -1772,14 +1900,37 @@ const getCollectionSummary = async (pool, branchId, range) => {
   });
 };
 
+/**
+ * The key `facts` carries once the condition behind an alert has gone away -- written only by
+ * `resolveClearedCustomerOverdueAlerts`.
+ *
+ * It is what separates "the owner resolved this" from "this stopped being true". A resolved alert
+ * stays resolved while its condition holds, because the owner said so and a rule re-firing every
+ * briefing must not overrule him. Once the condition has cleared and then comes back -- a customer
+ * paid up and is late again -- that is a new event, and the alert reopens.
+ */
+const ALERT_CONDITION_CLEARED_KEY = "condition_cleared_at";
+
 const upsertAlert = async (pool, branchId, alert) => {
   const branch = requireBranchScope(branchId);
   await pool.query(`
     INSERT INTO ai_alerts (company_id, branch_id, dedup_key, alert_type, severity, source_module, linked_entity_type, linked_entity_id, title, message, facts, detected_at, updated_at)
     VALUES (NULL, $10, $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ON CONFLICT (dedup_key)
-    DO UPDATE SET severity = EXCLUDED.severity, message = EXCLUDED.message, facts = EXCLUDED.facts, updated_at = CURRENT_TIMESTAMP
+    DO UPDATE SET
+      severity = EXCLUDED.severity,
+      message = EXCLUDED.message,
+      facts = EXCLUDED.facts,
+      status = CASE WHEN ai_alerts.status = 'RESOLVED' THEN 'OPEN' ELSE ai_alerts.status END,
+      detected_at = CASE WHEN ai_alerts.status = 'RESOLVED' THEN CURRENT_TIMESTAMP ELSE ai_alerts.detected_at END,
+      resolved_at = CASE WHEN ai_alerts.status = 'RESOLVED' THEN NULL ELSE ai_alerts.resolved_at END,
+      resolved_by = CASE WHEN ai_alerts.status = 'RESOLVED' THEN NULL ELSE ai_alerts.resolved_by END,
+      acknowledged_at = CASE WHEN ai_alerts.status = 'RESOLVED' THEN NULL ELSE ai_alerts.acknowledged_at END,
+      acknowledged_by = CASE WHEN ai_alerts.status = 'RESOLVED' THEN NULL ELSE ai_alerts.acknowledged_by END,
+      snoozed_until = CASE WHEN ai_alerts.status = 'RESOLVED' THEN NULL ELSE ai_alerts.snoozed_until END,
+      updated_at = CURRENT_TIMESTAMP
     WHERE ai_alerts.status <> 'RESOLVED'
+      OR ai_alerts.facts ->> '${ALERT_CONDITION_CLEARED_KEY}' IS NOT NULL
   `, [
     alert.dedupKey,
     alert.type,
@@ -1794,15 +1945,46 @@ const upsertAlert = async (pool, branchId, alert) => {
   ]);
 };
 
+/**
+ * Close the overdue alerts of customers who are no longer overdue, and mark them so they reopen if
+ * the customer falls behind again.
+ *
+ * Nothing used to do this: a customer who paid in full kept his "payment overdue" alert open until
+ * somebody resolved it by hand, and a resolved alert never came back when he was late again.
+ *
+ * `stillOverdueKeys` must be the **whole** overdue set, read without a row limit -- a customer left
+ * out of it is treated as having paid. It is only ever called after that read succeeded, so a
+ * failed read raises rather than resolving everything. Rows the owner resolved himself are not
+ * touched except to carry the marker; `resolved_at` keeps his time.
+ */
+const resolveClearedCustomerOverdueAlerts = async (pool, branchId, stillOverdueKeys) => {
+  const branch = requireBranchScope(branchId);
+  await pool.query(`
+    UPDATE ai_alerts
+    SET status = 'RESOLVED',
+        resolved_at = CASE WHEN status = 'RESOLVED' THEN resolved_at ELSE CURRENT_TIMESTAMP END,
+        facts = facts || jsonb_build_object('${ALERT_CONDITION_CLEARED_KEY}', CURRENT_TIMESTAMP),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE branch_id = $1
+      AND alert_type = 'CUSTOMER_PAYMENT_OVERDUE'
+      AND facts ->> '${ALERT_CONDITION_CLEARED_KEY}' IS NULL
+      AND NOT (dedup_key = ANY($2::text[]))
+  `, [branch, stillOverdueKeys]);
+};
+
+const customerOverdueAlertKey = (branchId, row) => `customer-overdue:${branchId}:${row.customer_id || row.customer_name}`;
+
 const runAlertRules = async (pool, branchId, settings) => {
   const [customerOutstanding, pendingPurchases, lowStock] = await Promise.all([
-    getCustomerOutstanding(pool, branchId, settings),
+    // Every debtor, not the fact's top fifty: a customer missing from this list is resolved below.
+    getCustomerOutstandingRows(pool, branchId, settings),
     getPendingPurchaseBills(pool, branchId),
     getLowStockProducts(pool, branchId),
   ]);
-  for (const row of customerOutstanding.rows.filter((item) => OVERDUE_DUE_STATUSES.includes(item.due_status))) {
+  const overdueCustomers = customerOutstanding.rows.filter((item) => OVERDUE_DUE_STATUSES.includes(item.due_status));
+  for (const row of overdueCustomers) {
     await upsertAlert(pool, branchId, {
-      dedupKey: `customer-overdue:${branchId}:${row.customer_id || row.customer_name}`,
+      dedupKey: customerOverdueAlertKey(branchId, row),
       type: "CUSTOMER_PAYMENT_OVERDUE",
       severity: severityFromRisk(row.risk_classification),
       sourceModule: "Accounts",
@@ -1813,6 +1995,7 @@ const runAlertRules = async (pool, branchId, settings) => {
       facts: row,
     });
   }
+  await resolveClearedCustomerOverdueAlerts(pool, branchId, overdueCustomers.map((row) => customerOverdueAlertKey(branchId, row)));
   for (const row of pendingPurchases.rows.filter((item) => Number(item.pending_days || 0) >= settings.thresholds.purchaseBillPendingDays)) {
     await upsertAlert(pool, branchId, {
       dedupKey: `purchase-pending:${branchId}:${row.id}`,
@@ -1946,12 +2129,26 @@ const emptyBriefingFact = (type, sourceModule, periodLabel, summary = {}, error 
   { ...summary, unavailable: Boolean(error), error }
 );
 
+/**
+ * A summary whose read failed: every figure becomes `null`, never `0`.
+ *
+ * The fallback summaries are written with zeros so their shape is visible, and those zeros used to
+ * ship beside `unavailable: true`. Any screen that read the figure before the flag -- the briefing
+ * cards, the insight tiles -- then showed "Outstanding Receivables ₹0" for a query that had failed.
+ * An error must never render as zero; a null cannot be formatted into a rupee amount by accident.
+ */
+const unavailableSummary = (summary = {}, error = "") => ({
+  ...Object.fromEntries(Object.entries(summary).map(([key, value]) => [key, typeof value === "number" ? null : value])),
+  unavailable: true,
+  error,
+});
+
 const safeBriefingFact = async (label, fallback, producer) => {
   try {
     return await producer();
   } catch (error) {
     console.warn("FROST briefing fact unavailable", { label, message: error.message });
-    return { ...fallback, summary: { ...(fallback.summary || {}), unavailable: true, error: error.message } };
+    return { ...fallback, summary: unavailableSummary(fallback.summary || {}, error.message) };
   }
 };
 
@@ -1986,6 +2183,7 @@ const buildDailyBriefing = async (pool, branchId, settings, range) => {
       priority: "Information",
       title: "Revenue",
       value: sales.summary.totalSales,
+      unavailable: Boolean(sales.summary.unavailable),
       sourceModule: "POS Billing",
       actions: ["View"],
     },
@@ -1994,6 +2192,7 @@ const buildDailyBriefing = async (pool, branchId, settings, range) => {
       priority: customerOutstanding.summary.totalOutstanding > 0 ? "Warning" : "Information",
       title: "Outstanding Receivables",
       value: customerOutstanding.summary.totalOutstanding,
+      unavailable: Boolean(customerOutstanding.summary.unavailable),
       sourceModule: "Accounts",
       actions: ["View", "Open Ledger", "Remind"],
     },
@@ -2002,6 +2201,7 @@ const buildDailyBriefing = async (pool, branchId, settings, range) => {
       priority: lowStock.summary.count > 0 ? "Critical" : "Information",
       title: "Low Stock",
       value: lowStock.summary.count,
+      unavailable: Boolean(lowStock.summary.unavailable),
       sourceModule: "Inventory Lots",
       actions: ["View", "Purchase", "Ignore"],
     },
@@ -2010,6 +2210,7 @@ const buildDailyBriefing = async (pool, branchId, settings, range) => {
       priority: expiringLots.summary.count > 0 ? "Warning" : "Information",
       title: "Inventory Nearing Expiry",
       value: expiringLots.summary.count,
+      unavailable: Boolean(expiringLots.summary.unavailable),
       sourceModule: "Inventory Lots",
       actions: ["View", "Purchase", "Ignore"],
     },
@@ -2018,6 +2219,7 @@ const buildDailyBriefing = async (pool, branchId, settings, range) => {
       priority: waste.summary.totalWasteCost > 0 ? "Warning" : "Information",
       title: "High Waste",
       value: waste.summary.totalWasteCost,
+      unavailable: Boolean(waste.summary.unavailable),
       sourceModule: "Waste",
       actions: ["View", "Ignore"],
     },
@@ -2605,7 +2807,10 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const entityType = cleanText(req.body.linked_entity_type || "manual");
     const entityId = cleanText(req.body.linked_entity_id || "");
     const dueAt = req.body.due_at || null;
-    const dedupKey = buildReminderDedupKey({ reminderType, entityType, entityId, dueDate: dueAt || toDateKey(), branchId: req.auth.branchId });
+    const title = cleanText(req.body.title || "AI reminder");
+    // The title is part of an OWNER_NOTE's key -- see `buildReminderDedupKey` -- so two different
+    // undated notes made on one day are two reminders, not one silently dropped.
+    const dedupKey = buildReminderDedupKey({ reminderType, entityType, entityId, dueDate: dueAt || toDateKey(), title, branchId: req.auth.branchId });
     const result = await pool.query(`
       INSERT INTO ai_reminders (company_id, branch_id, dedup_key, reminder_type, priority, due_at, linked_entity_type, linked_entity_id, title, message, draft_message, owner_notes, created_by)
       VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -2620,7 +2825,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       dueAt,
       entityType,
       entityId,
-      cleanText(req.body.title || "AI reminder"),
+      title,
       cleanText(req.body.message || "Follow up required"),
       cleanText(req.body.draft_message || ""),
       cleanText(req.body.owner_notes || ""),
@@ -3087,4 +3292,12 @@ module.exports = {
   FINANCIAL_INTENTS,
   INVENTORY_INTENTS,
   SUGGESTED_QUESTIONS,
+  // Exported for the FROST tests that drive them against a scripted database.
+  getCustomerOutstanding,
+  getSupplierOutstanding,
+  getSupplierBalanceRows,
+  runAlertRules,
+  safeBriefingFact,
+  emptyBriefingFact,
+  SALE_CUSTOMER_MATCH_LATERAL_SQL,
 };
