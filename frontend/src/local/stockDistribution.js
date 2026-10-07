@@ -63,6 +63,21 @@ export const TRANSFER_SOURCE_ACTIONS = Object.freeze([
 ]);
 const SOURCE_ACTIONS = new Set(TRANSFER_SOURCE_ACTIONS);
 
+/**
+ * Whether `action` on `transfer` is the source's to take. Mirrors the server's one exception to
+ * `sourceActions` (`requesterWithdrawsDraft` in operationalV3.js): a DRAFT is withdrawn by the side
+ * that wrote it, so a DESTINATION_REQUESTED draft is cancelled by the shop that asked. Cancelling an
+ * APPROVED_RESERVED consignment releases stock the source holds, so that stays the source's in
+ * both modes.
+ */
+export const sourceSideAction = (action, transfer) => {
+  if (!SOURCE_ACTIONS.has(action)) return false;
+  const requesterWithdrawsDraft = action === "cancel"
+    && text(transfer?.status).toUpperCase() === "DRAFT"
+    && text(transfer?.initiation_mode).toUpperCase() === "DESTINATION_REQUESTED";
+  return !requesterWithdrawsDraft;
+};
+
 export const TRANSFER_SIDE = Object.freeze({
   SOURCE: "SOURCE",
   DESTINATION: "DESTINATION",
@@ -154,9 +169,10 @@ export const transferSideFor = (transfer, scope) => {
 export const availableTransferActions = (transfer, scope) => {
   const side = transferSideFor(transfer, scope);
   if (side === TRANSFER_SIDE.BYSTANDER) return [];
-  const legal = TRANSFER_TRANSITIONS[text(transfer?.status).toUpperCase()] || {};
+  const status = text(transfer?.status).toUpperCase();
+  const legal = TRANSFER_TRANSITIONS[status] || {};
   return Object.keys(legal)
-    .filter((action) => (SOURCE_ACTIONS.has(action) ? side === TRANSFER_SIDE.SOURCE : side === TRANSFER_SIDE.DESTINATION))
+    .filter((action) => (sourceSideAction(action, transfer) ? side === TRANSFER_SIDE.SOURCE : side === TRANSFER_SIDE.DESTINATION))
     .map((action) => ({
       action,
       nextStatus: legal[action],

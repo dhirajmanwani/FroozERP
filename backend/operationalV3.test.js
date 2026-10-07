@@ -822,3 +822,128 @@ test("receiving compares quantities at three decimals, not on raw floats", async
   );
   assert.ok(statements.some((entry) => entry.sql.includes("received_quantity = received_quantity + $2")));
 });
+
+test("a requested draft is withdrawn by the shop that asked, not by the shop being asked", async () => {
+  const requested = transferRow({ initiation_mode: "DESTINATION_REQUESTED" });
+
+  const asker = transferRouteHarness({
+    transfers: [requested],
+    context: { ...ownerContext, operational_location_id: 20 },
+  });
+  const withdrawn = await asker.act("55", "cancel");
+  assert.equal(withdrawn.statusCode, 200, JSON.stringify(withdrawn.payload));
+  assert.equal(withdrawn.payload.transfer.status, "CANCELLED");
+
+  const asked = transferRouteHarness({ transfers: [requested] });
+  const refused = await quietly(() => asked.act("55", "cancel"));
+  assert.equal(refused.statusCode, 403);
+  assert.equal(refused.payload.code, "TRANSFER_ACTION_SCOPE_REJECTED");
+});
+
+test("cancelling an approved consignment stays with the source, however it was initiated", async () => {
+  for (const mode of ["SOURCE_INITIATED", "DESTINATION_REQUESTED"]) {
+    const approved = transferRow({ status: "APPROVED_RESERVED", initiation_mode: mode });
+
+    const destination = transferRouteHarness({
+      transfers: [approved],
+      context: { ...ownerContext, operational_location_id: 20 },
+    });
+    const refused = await quietly(() => destination.act("55", "cancel"));
+    assert.equal(refused.statusCode, 403, `${mode}: the destination must not release the source's stock`);
+    assert.equal(refused.payload.code, "TRANSFER_ACTION_SCOPE_REJECTED");
+    assert.equal(destination.calls.some((entry) => entry.sql.startsWith("UPDATE stock_reservations")), false);
+
+    const source = transferRouteHarness({ transfers: [approved] });
+    const allowed = await source.act("55", "cancel");
+    assert.equal(allowed.statusCode, 200, `${mode}: ${JSON.stringify(allowed.payload)}`);
+    assert.equal(allowed.payload.transfer.status, "CANCELLED");
+  }
+});
+
+test("a replayed transfer action key returns the transfer only to its own company", async () => {
+  const own = transferRow({ status: "CANCELLED" });
+  const replay = transferRouteHarness({
+    extra: (sql) => (sql.includes("FROM inventory_transfer_events") ? { rows: [own] } : null),
+  });
+  const ok = await replay.act("55", "cancel");
+  assert.equal(ok.statusCode, 200, JSON.stringify(ok.payload));
+  assert.equal(ok.payload.transfer.id, 55);
+  assert.equal(replay.calls.some((entry) => entry.sql.startsWith("UPDATE")), false, "a replay writes nothing");
+
+  const foreign = transferRouteHarness({
+    extra: (sql) => (sql.includes("FROM inventory_transfer_events")
+      ? { rows: [transferRow({ company_id: 2, transfer_number: "OTHER-CO" })] }
+      : null),
+  });
+  const refused = await quietly(() => foreign.act("55", "cancel"));
+  assert.equal(refused.statusCode, 409);
+  assert.equal(refused.payload.code, "IDEMPOTENCY_KEY_CONFLICT");
+  assert.equal(JSON.stringify(refused.payload).includes("OTHER-CO"), false, "another company's transfer is never returned");
+  assert.equal(foreign.calls.some((entry) => entry.sql.startsWith("UPDATE")), false);
+});
+
+test("a replayed transfer create key returns the transfer only to its own company", async () => {
+  const body = {
+    idempotency_key: "create-replay",
+    initiation_mode: "SOURCE_INITIATED",
+    destination_branch_id: 2,
+    destination_operational_location_id: 20,
+    items: [{ product_id: 12, source_lot_id: 42, requested_quantity: 1 }],
+  };
+  const location = (sql) => (sql.includes("FROM operational_locations") ? { rows: [{ id: 20, branch_id: 2, active: true }] } : null);
+
+  const own = transferRouteHarness({
+    extra: (sql, params) => location(sql) ||
+      (sql.startsWith("SELECT * FROM inventory_transfers WHERE idempotency_key") ? { rows: [transferRow()] } : null),
+  });
+  const ok = await own.create(body);
+  assert.equal(ok.statusCode, 201, JSON.stringify(ok.payload));
+  assert.equal(ok.payload.transfer.id, 55);
+  assert.equal(own.calls.some((entry) => entry.sql.startsWith("INSERT")), false, "a replay writes nothing");
+
+  const foreign = transferRouteHarness({
+    extra: (sql) => location(sql) ||
+      (sql.startsWith("SELECT * FROM inventory_transfers WHERE idempotency_key")
+        ? { rows: [transferRow({ company_id: 2, transfer_number: "OTHER-CO" })] }
+        : null),
+  });
+  const refused = await quietly(() => foreign.create(body));
+  assert.equal(refused.statusCode, 409);
+  assert.equal(refused.payload.code, "IDEMPOTENCY_KEY_CONFLICT");
+  assert.equal(JSON.stringify(refused.payload).includes("OTHER-CO"), false);
+  assert.equal(foreign.calls.some((entry) => entry.sql.startsWith("INSERT")), false);
+});
+
+test("a request line naming another company's product by number is refused", async () => {
+  const harness = (ownedProducts) => transferRouteHarness({
+    extra: (sql, params) => {
+      if (sql.includes("FROM operational_locations")) return { rows: [{ id: 30, branch_id: 3, active: true }] };
+      if (sql.startsWith("INSERT INTO inventory_transfers")) return { rows: [{ id: 61 }] };
+      if (sql === "SELECT id FROM products WHERE id = $1 AND company_id = $2") {
+        return { rows: ownedProducts.includes(params[0]) && params[1] === 1 ? [{ id: params[0] }] : [] };
+      }
+      return null;
+    },
+  });
+  const request = (key, productId) => ({
+    idempotency_key: key,
+    initiation_mode: "DESTINATION_REQUESTED",
+    source_branch_id: 3,
+    source_operational_location_id: 30,
+    items: [{ product_id: productId, requested_quantity: 2 }],
+  });
+
+  const foreign = harness([12]);
+  const refused = await quietly(() => foreign.create(request("request-foreign", 999)));
+  assert.equal(refused.statusCode, 400);
+  assert.equal(refused.payload.code, "INVALID_TRANSFER_ITEM");
+  assert.equal(foreign.calls.some((entry) => entry.sql.startsWith("INSERT INTO inventory_transfer_items")), false);
+
+  const owned = harness([12]);
+  const accepted = await owned.create(request("request-owned", "12"));
+  assert.equal(accepted.statusCode, 201, JSON.stringify(accepted.payload));
+  const line = owned.calls.find((entry) => entry.sql.startsWith("INSERT INTO inventory_transfer_items"));
+  assert.deepEqual(line.params, [61, 12, 2]);
+  const check = owned.calls.find((entry) => entry.sql === "SELECT id FROM products WHERE id = $1 AND company_id = $2");
+  assert.deepEqual(check.params, [12, 1]);
+});

@@ -419,6 +419,24 @@ const SALE_CUSTOMER_MATCH_LATERAL_SQL = `JOIN LATERAL (
       ) matched ON TRUE`;
 
 /**
+ * The server's branch-scope rules for customer and supplier balances, copied from
+ * `getCustomerSummaryRows` / `getSupplierSummaryRows` with `$1` the branch. Copies for the same
+ * reason as the lateral match above; `frostAccounts.test.js` pins them to the server's text.
+ *
+ * - Only this company's accounts, or ones with no company recorded. Without it another company's
+ *   suppliers appeared in FROST's payables and in its name matching.
+ * - A customer's opening balance belongs to the company, not a shop: counted in branch scope only
+ *   when the branch's company has exactly one active branch, else 0.
+ */
+const BRANCH_COMPANY_SQL = "(SELECT company_id FROM branches WHERE id = $1)";
+const branchCompanyAccountFilter = (alias) => `(${alias}.company_id IS NULL OR ${alias}.company_id = ${BRANCH_COMPANY_SQL})`;
+const BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL = `CASE WHEN (
+        SELECT COUNT(*) FROM branches ob
+        WHERE ob.active IS DISTINCT FROM FALSE
+          AND ob.company_id IS NOT DISTINCT FROM (SELECT company_id FROM branches WHERE id = $1)
+      ) = 1 THEN COALESCE(c.opening_balance, 0) ELSE 0 END`;
+
+/**
  * Every customer's receivable at this branch, at the grain FIFO needs: one row per bill that still
  * has money on it, and one row per customer for what has been paid or credited since.
  *
@@ -433,9 +451,11 @@ const SALE_CUSTOMER_MATCH_LATERAL_SQL = `JOIN LATERAL (
  * - payments are `customer_payments` not cancelled; credit-note and future-adjustment returns
  *   credit the customer, matched through the bill exactly as the bill is matched;
  * - bills are matched to customers by `SALE_CUSTOMER_MATCH_LATERAL_SQL`, not by `customer_id` alone;
- * - the customer's `opening_balance` is **not** added. `customers` has no branch, and the server
- *   counts an opening balance once, in company scope, never in a branch's figures. FROST is
- *   branch-scoped (A-7), so the same rule applies here.
+ * - the customer's `opening_balance` is counted by the server's branch-scope rule,
+ *   `BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL`: only when the branch's company has exactly one
+ *   active branch (the shop is the company); with several it would be added at every shop, so it
+ *   is 0. Receipts are subtracted either way. FIFO pays the opening balance off first;
+ * - only this company's customers, or ones with no company recorded, as the server filters them.
  *
  * A bill whose `amount_due` is exactly zero -- paid in full at the counter -- is left out of the
  * read: it cannot move a balance, and it is most of the shop's bills.
@@ -462,6 +482,7 @@ const getCustomerReceivableInputs = async (pool, branchId) => {
       GROUP BY sale_id
     ) pay ON pay.sale_id = s.id
     WHERE s.branch_id = $1
+      AND ${branchCompanyAccountFilter("c")}
       AND s.sale_status <> 'CANCELLED'
       AND s.total_amount - COALESCE(pay.total_paid, 0) <> 0
     ORDER BY s.sale_date, s.id
@@ -488,13 +509,19 @@ const getCustomerReceivableInputs = async (pool, branchId) => {
       c.id AS customer_id,
       c.customer_name,
       c.mobile_number,
+      ${BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL} AS opening_balance,
       COALESCE(cp.paid_amount, 0) AS paid_amount,
       COALESCE(rc.returned_amount, 0) AS returned_amount,
       cp.last_payment_date
     FROM customers c
     LEFT JOIN customer_paid cp ON cp.customer_id = c.id
     LEFT JOIN return_credit rc ON rc.customer_id = c.id
-    WHERE cp.customer_id IS NOT NULL OR rc.customer_id IS NOT NULL
+    WHERE ${branchCompanyAccountFilter("c")}
+      AND (
+        cp.customer_id IS NOT NULL
+        OR rc.customer_id IS NOT NULL
+        OR ${BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL} <> 0
+      )
   `, [branch]);
   return { customers: credits.rows, customerBills: bills.rows };
 };
@@ -701,9 +728,10 @@ const getCustomerDueReminders = async (pool, branchId, settings) => {
  * which no supplier payment ever updates: Accounts showed ₹0 owed while FROST said "pay ₹10,000".
  * A `BILL_PENDING` purchase is not in the balance, as on the server; it is counted separately.
  *
- * Every supplier in the directory is returned, zero balances included -- "Verma ko kitna dena hai"
- * about a supplier owed nothing is answered "nothing now", not "I could not find Verma". As on the
- * server, `opening_balance` sits on the company-wide supplier row and is counted in branch scope.
+ * Every supplier of this branch's company (or with no company recorded) is returned, zero balances
+ * included -- "Verma ko kitna dena hai" about a supplier owed nothing is answered "nothing now", not
+ * "I could not find Verma". As on the server, a supplier's `opening_balance` is counted in branch
+ * scope.
  *
  * "Since when" is FIFO over the purchases (`oldestUnpaidPurchaseDates`): payments settle the
  * opening balance first, then the oldest purchase.
@@ -761,6 +789,7 @@ const getSupplierBalanceRows = async (pool, branchId) => {
     LEFT JOIN purchase_summary ps ON ps.supplier_id = s.id
     LEFT JOIN payment_summary pay ON pay.supplier_id = s.id
     LEFT JOIN pending_bills pb ON pb.supplier_id = s.id
+    WHERE ${branchCompanyAccountFilter("s")}
   `, [branch]);
   // The same purchases, one row each, with what is still owed on each after its own rebate and
   // payment. Fully settled purchases cannot move the FIFO and are left out of the read.
@@ -3300,4 +3329,6 @@ module.exports = {
   safeBriefingFact,
   emptyBriefingFact,
   SALE_CUSTOMER_MATCH_LATERAL_SQL,
+  BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL,
+  branchCompanyAccountFilter,
 };

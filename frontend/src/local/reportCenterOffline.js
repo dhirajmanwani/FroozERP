@@ -28,7 +28,7 @@ const STATEMENT_KEYS = new Set(["balanceSheet", "profitLoss", "cashBookReport"])
 // Load bookkeeping that is not a report and is set explicitly by the caller.
 const BOOKKEEPING_KEYS = new Set([
   "inventoryLoadState", "inventoryLoadError", "dateFrom", "dateTo",
-  "offlineUnavailable", "salesHistoryLoadError",
+  "offlineUnavailable", "salesHistoryLoadError", "serverReportsError",
 ]);
 
 /**
@@ -62,6 +62,7 @@ export const buildLocalOnlyReportsData = (current = {}, {
     inventoryLoadState: "ready",
     inventoryLoadError: "",
     offlineUnavailable: true,
+    serverReportsError: "",
     dateFrom,
     dateTo,
   };
@@ -84,5 +85,23 @@ export const resolveReportAvailability = (reportId, data = {}, { selfContained =
   if (data?.offlineUnavailable === true && !OFFLINE_COMPUTED_REPORTS.includes(reportId)) {
     return { available: false, tone: "note", message: OFFLINE_REPORT_NOTE };
   }
+  if (String(data?.serverReportsError || "").trim() && !OFFLINE_COMPUTED_REPORTS.includes(reportId)) {
+    return { available: false, tone: "error", message: `This report could not be loaded from the server: ${data.serverReportsError}` };
+  }
   return { available: true };
 };
+
+/**
+ * The report flags after a load that went to the server. The offline mark always clears — the
+ * machine is online — but when the summary failed straight after an offline period, the blanked
+ * reports have nothing behind them, and they say the load failed rather than "no records".
+ */
+export const reportFlagsAfterServerLoad = (current = {}, { summaryFailed = false, summaryError = "" } = {}) => ({
+  offlineUnavailable: false,
+  serverReportsError: summaryFailed && (current?.offlineUnavailable === true || String(current?.serverReportsError || "").trim())
+    ? (String(summaryError || "").trim() || "no answer from the server")
+    : "",
+});
+
+/** Whether a reconnect should reload Report Center because it still shows the offline blanks. */
+export const shouldReloadReportsOnReconnect = ({ offlineUnavailable = false, online = false } = {}) => offlineUnavailable === true && online === true;

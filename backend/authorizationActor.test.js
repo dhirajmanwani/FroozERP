@@ -468,8 +468,8 @@ test("the Owner may still create an Admin", async () => {
   assert.notEqual(response.status, 403);
 });
 
-test("an Admin cannot promote anyone to Admin, themselves included, nor edit the Owner", async () => {
-  for (const [target, role] of [[3, "Admin"], [2, "Admin"], [1, "Owner"], [1, "Cashier"], [5, "Cashier"]]) {
+test("an Admin cannot promote anyone to Admin, nor edit the Owner or another Admin", async () => {
+  for (const [target, role] of [[3, "Admin"], [1, "Owner"], [1, "Cashier"], [5, "Cashier"], [5, "Admin"]]) {
     const { response, statements } = await actAs(2, "PUT", `/users/${target}`, { full_name: "X", username: `x${target}`, role });
     assert.equal(response.status, 403, `user ${target} -> ${role}: ${response.text}`);
     assert.equal(response.code, "OWNER_REQUIRED_FOR_PRIVILEGED_ACCOUNT");
@@ -529,7 +529,7 @@ test("changing your own password needs the current one, and a wrong one counts t
   const wrong = await actAs(3, "PUT", "/users/3/password", { current_password: "wrong", password: "newpass1", confirm_password: "newpass1" });
   assert.equal(wrong.response.status, 403);
   assert.equal(wrong.response.code, "CURRENT_PASSWORD_INVALID");
-  assert.equal(wrote(wrong.statements, /password_hash/), false, "a wrong current password changes nothing");
+  assert.equal(wrote(wrong.statements, /password_hash/), false, "a wrong current password changes nothing; password writes seen: " + JSON.stringify(wrong.statements.filter(({ sql }) => /password_hash/.test(sql)).map(({ sql, values }) => [sql.slice(0, 160), values])));
   assert.equal(wrote(wrong.statements, /failed_login_attempts/), true, "and is counted like a failed sign-in");
 
   // The same holds for an Admin changing their own: being a manager does not skip the check.
@@ -657,4 +657,52 @@ test("the settings bundle shows this company's devices, codes, shops, counters a
     assert.match(statement.sql, /company_id\)? = \$1/, `${pattern} must be company-scoped`);
     assert.deepEqual(statement.values, [1], `${pattern} is scoped to the session's company`);
   }
+});
+
+test("an Admin may edit their own name and contact details, and nothing that carries authority", async () => {
+  const own = { full_name: "Admin Renamed", username: "person2", mobile_number: "9000000002", email: "a@shop.in", role: "Admin" };
+  const allowed = await actAs(2, "PUT", "/users/2", own);
+  assert.notEqual(allowed.response.status, 403, allowed.response.text);
+  assert.equal(wrote(allowed.statements, /^UPDATE users/), true, "the edit is saved");
+
+  for (const [change, why] of [
+    [{ role: "Owner" }, "promotion"],
+    [{ role: "Cashier" }, "a role change, even downwards"],
+    [{ active: false }, "switching themselves off"],
+    [{ recovery_enabled: false }, "a recovery switch"],
+    [{ staff_self_recovery_enabled: true }, "the other recovery switch"],
+  ]) {
+    const { response, statements } = await actAs(2, "PUT", "/users/2", { ...own, ...change });
+    assert.equal(response.status, 403, why);
+    assert.equal(response.code, "OWNER_REQUIRED_FOR_PRIVILEGED_ACCOUNT", why);
+    assert.equal(wrote(statements, /users/), false, `${why} writes nothing`);
+  }
+});
+
+test("an Admin may act on a pending device that is not yet placed, but not across the company line", async () => {
+  const device = (row) => (sql) => {
+    if (/^SELECT \* FROM authorized_devices WHERE device_id = \$1 AND company_id = \$2/.test(sql)) return { rows: [row], rowCount: 1 };
+    if (/FROM counters c JOIN branches b/.test(sql)) return { rows: row.assigned_counter_id === 77 ? [{ id: 77 }] : [], rowCount: 0 };
+    return undefined;
+  };
+  const pending = { device_id: "FZDEV-NEW", status: "PENDING", company_id: 1, assigned_branch_id: 9, assigned_counter_id: null };
+  const unplaced = await actAs(2, "PUT", "/settings/devices/FZDEV-NEW", { action: "REJECT" }, { extra: device(pending) });
+  assert.notEqual(unplaced.response.status, 404, unplaced.response.text);
+  assert.equal(wrote(unplaced.statements, /authorized_devices/), true);
+
+  const ownCompanyCounter = await actAs(2, "PUT", "/settings/devices/FZDEV-NEW", { action: "REJECT" }, { extra: device({ ...pending, assigned_counter_id: 77 }) });
+  assert.notEqual(ownCompanyCounter.response.status, 404, "a counter of this company is still unplaced for this purpose");
+
+  const foreignCounter = await actAs(2, "PUT", "/settings/devices/FZDEV-NEW", { action: "REJECT" }, { extra: device({ ...pending, assigned_counter_id: 78 }) });
+  assert.equal(foreignCounter.response.status, 404, "a counter of another company is not this Admin's");
+
+  const approvedElsewhere = await actAs(2, "PUT", "/settings/devices/FZDEV-NEW", { action: "DISABLE" }, { extra: device({ ...pending, status: "APPROVED" }) });
+  assert.equal(approvedElsewhere.response.status, 404, "an approved device in another shop is still out of reach");
+
+  const moveAway = await actAs(2, "PUT", "/settings/devices/FZDEV-NEW", { action: "RENAME", assigned_branch_id: 9 }, { extra: device(pending) });
+  assert.equal(moveAway.response.code, "OWNER_REQUIRED_TO_MOVE_DEVICE", "placing it is into their own shop only");
+
+  // The company line: a device the company-scoped read does not return is 404 whatever its status.
+  const otherCompany = await actAs(2, "PUT", "/settings/devices/FZDEV-NEW", { action: "REJECT" });
+  assert.equal(otherCompany.response.status, 404);
 });

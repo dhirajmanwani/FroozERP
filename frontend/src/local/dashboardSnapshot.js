@@ -11,7 +11,7 @@ const dateKey = (value) => {
 
 const roundMoney = (value) => Math.round((numberValue(value) + Number.EPSILON) * 100) / 100;
 
-const rangeBounds = ({ range = "7", customRange = {}, today } = {}) => {
+export const rangeBounds = ({ range = "7", customRange = {}, today } = {}) => {
   if (range === "custom" && customRange.date_from && customRange.date_to) {
     return { from: dateKey(customRange.date_from), to: dateKey(customRange.date_to) };
   }
@@ -23,6 +23,20 @@ const rangeBounds = ({ range = "7", customRange = {}, today } = {}) => {
   const fromDate = new Date(`${end}T00:00:00.000Z`);
   fromDate.setUTCDate(fromDate.getUTCDate() - days + 1);
   return { from: fromDate.toISOString().slice(0, 10), to: end };
+};
+
+/**
+ * The local sales a dashboard build needs: the selected range and today (Today's Sales and Today's
+ * Profit are about today whatever range is chosen), as one inclusive YYYY-MM-DD window for
+ * `pos_sale_list_local_range`. The 200-bill list it replaces silently dropped older bills, so a
+ * 30-day trend on a busy counter showed only its last few days.
+ */
+export const localSalesWindow = ({ range = "7", customRange = {}, today } = {}) => {
+  const todayKey = dateKey(today) || new Date().toISOString().slice(0, 10);
+  const bounds = rangeBounds({ range, customRange, today: todayKey });
+  const from = bounds.from && bounds.from < todayKey ? bounds.from : todayKey;
+  const to = bounds.to && bounds.to > todayKey ? bounds.to : todayKey;
+  return { fromDate: from, toDate: to };
 };
 
 // Lots the server leaves out of stock (`batch_status <> 'CANCELLED'`, plus INACTIVE): they are not

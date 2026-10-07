@@ -881,9 +881,65 @@ test("FROST reads receivables with the Accounts formula: every bill, counter pay
   assert.ok(bills.text.includes(service.SALE_CUSTOMER_MATCH_LATERAL_SQL));
   assert.ok(credits.text.includes(service.SALE_CUSTOMER_MATCH_LATERAL_SQL));
   assert.match(credits.text, /cancelled = FALSE/);
-  // Branch scope: the server never counts a customer's company-wide opening balance in a branch.
-  assert.doesNotMatch(bills.text + credits.text, /opening_balance/);
-  for (const statement of [bills, credits]) assert.deepEqual(statement.values, [2]);
+  // The opening balance by the server's branch rule, on the per-customer read only.
+  assert.doesNotMatch(bills.text, /opening_balance/);
+  assert.ok(credits.text.includes(service.BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL));
+  // Only this company's customers, on both reads.
+  for (const statement of [bills, credits]) {
+    assert.ok(statement.text.includes(service.branchCompanyAccountFilter("c")));
+    assert.deepEqual(statement.values, [2]);
+  }
+});
+
+/** The text between two markers in a source, whitespace-normalised. */
+const squash = (text) => text.replace(/\s+/g, " ").trim();
+
+test("the branch-scope opening-balance rule and the company filter are the server's, verbatim", () => {
+  // A change to either rule in getCustomerSummaryRows / getSupplierSummaryRows that is not made
+  // here would put FROST and the Accounts screens a balance apart again.
+  const fs = require("node:fs");
+  const server = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const opening = server.match(/: `(CASE WHEN \(\s*SELECT COUNT\(\*\) FROM branches ob[\s\S]*?END)`;/);
+  assert.ok(opening, "the server's branch-scope opening-balance rule was not found");
+  assert.equal(service.BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL, opening[1]);
+  for (const alias of ["c", "s"]) {
+    const pattern = new RegExp("const filters = \\[`\\(" + alias + "\\.company_id IS NULL OR " + alias + "\\.company_id = \\$\\{scope\\.isCompany \\? \"\\$1\" : \"([^\"]+)\"\\}\\)`\\]");
+    const match = server.match(pattern);
+    assert.ok(match, `the server's company filter on ${alias}. was not found`);
+    assert.equal(
+      squash(service.branchCompanyAccountFilter(alias)),
+      squash(`(${alias}.company_id IS NULL OR ${alias}.company_id = ${match[1]})`),
+    );
+  }
+});
+
+test("an opening balance is the oldest debt: paid first, and with no day of its own", async () => {
+  const bill = { id: 1, customer_id: 4, customer_name: "Ravi", sale_date: "2026-08-10", due_date: "2026-08-20", total_amount: 300, amount_due: 300 };
+  const read = async (credit) => (await service.getCustomerOutstanding(
+    scriptedPool([[RECEIVABLE_BILLS, [bill]], [RECEIVABLE_CREDITS, [credit]]]),
+    2,
+    FACT_SETTINGS,
+  )).rows;
+  // ₹500 opening + ₹300 bill - ₹600 paid: the opening balance is cleared, the bill is what is owed.
+  const [cleared] = await read({ customer_id: 4, customer_name: "Ravi", opening_balance: 500, paid_amount: 600, returned_amount: 0, last_payment_date: "2026-08-15" });
+  assert.equal(cleared.outstanding_amount, 200);
+  assert.equal(cleared.oldest_invoice_date, "2026-08-10");
+  // Only ₹100 paid: the opening balance itself is unpaid, so "since" predates the books; the bill
+  // behind it still gives the due date.
+  const [open] = await read({ customer_id: 4, customer_name: "Ravi", opening_balance: 500, paid_amount: 100, returned_amount: 0, last_payment_date: "2026-08-15" });
+  assert.equal(open.outstanding_amount, 700);
+  assert.equal(open.oldest_invoice_date, null);
+  assert.equal(open.oldest_due_date, "2026-08-20");
+});
+
+test("a customer who owes only an opening balance is a debtor", async () => {
+  const pool = scriptedPool([
+    [RECEIVABLE_BILLS, []],
+    [RECEIVABLE_CREDITS, [{ customer_id: "004", customer_name: "Old Account", opening_balance: 1200, paid_amount: 200, returned_amount: 0, last_payment_date: null }]],
+  ]);
+  const fact = await service.getCustomerOutstanding(pool, 2, FACT_SETTINGS);
+  assert.deepEqual(fact.rows.map((row) => [row.customer_id, row.customer_name, row.outstanding_amount]), [["004", "Old Account", 1000]]);
+  assert.equal(fact.summary.netOutstanding, 1000);
 });
 
 test("a part-paid cash bill is owed, and the CREDIT line on it is not counted as paid", async () => {
@@ -990,6 +1046,8 @@ test("supplier dues use the Accounts formula -- payments count -- not purchases.
   assert.match(balances.text, /cancelled = FALSE/);
   assert.match(balances.text, /COALESCE\(purchase_bill_status, 'BILL_COMPLETED'\) = 'BILL_COMPLETED'/);
   assert.match(balances.text, /COALESCE\(purchase_status, 'ACTIVE'\) <> 'CANCELLED'/);
+  // Only this company's suppliers: another company's must not appear in payables or name matching.
+  assert.ok(balances.text.includes(service.branchCompanyAccountFilter("s")));
   for (const statement of [balances, purchases]) assert.deepEqual(statement.values, [2]);
 });
 

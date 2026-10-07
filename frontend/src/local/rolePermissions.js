@@ -146,3 +146,17 @@ export const mayReadReports = ({ role, permissions } = {}) => {
   if (!permissions || typeof permissions !== "object") return true;
   return permissions.reports === true;
 };
+
+/**
+ * The payment action the Payments form should hold. The form's first value is taken when it opens,
+ * and the role's permissions may load after that; a held action the role may not use is replaced by
+ * the first one it may (receive from customers, else pay suppliers). `null` when it may use neither.
+ */
+export const allowedPaymentAction = (current, permissions = {}) => {
+  const allowed = [
+    ...(permissions.customerPayments === true ? ["RECEIVE_CUSTOMER"] : []),
+    ...(permissions.supplierPayments === true ? ["PAY_SUPPLIER"] : []),
+  ];
+  if (allowed.includes(current)) return current;
+  return allowed[0] || null;
+};

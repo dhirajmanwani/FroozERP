@@ -84,6 +84,8 @@ const BILL_CHANGE_APPROVAL_TTL_MS = 15 * 60 * 1000;
  * Every other binding (single use, action, bill, requester, company, branch, device) is unchanged.
  */
 const SYNC_APPROVAL_WINDOW_MS = APPROVAL_TTL_MS;
+/** Allowed skew between the database clock (`created_at`) and the Node clock (`nowMs`). */
+const SYNC_CLOCK_TOLERANCE_MS = 60 * 1000;
 const SHORT_LIVED_ACTIONS = Object.freeze(["cancel", "edit", "return"]);
 
 /**
@@ -237,7 +239,11 @@ const approvalStillLive = (row, nowMs, viaSync) => {
   if (!Number.isFinite(now)) return false;
   if (viaSync === true) {
     const grantedAt = timeMs(row.created_at);
-    return Number.isFinite(grantedAt) && now >= grantedAt && now - grantedAt < SYNC_APPROVAL_WINDOW_MS;
+    // `created_at` comes from Postgres's clock and `nowMs` from Node's; up to a minute of skew
+    // between the two is tolerated before a grant time "in the future" is refused.
+    return Number.isFinite(grantedAt)
+      && now >= grantedAt - SYNC_CLOCK_TOLERANCE_MS
+      && now - grantedAt < SYNC_APPROVAL_WINDOW_MS;
   }
   const expiresAt = timeMs(row.expires_at);
   return Number.isFinite(expiresAt) && expiresAt > now;
@@ -355,6 +361,7 @@ module.exports = {
   APPROVER_ROLES,
   BILL_CHANGE_APPROVAL_TTL_MS,
   SYNC_APPROVAL_WINDOW_MS,
+  SYNC_CLOCK_TOLERANCE_MS,
   SHORT_LIVED_ACTIONS,
   approvalTtlMs,
   BINDING_DETAILS,

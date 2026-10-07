@@ -7,7 +7,7 @@
  * balance after payment at zero, so paying more than is owed showed a tidy ₹0.00 instead of the
  * advance it would actually create.
  */
-import { inventoryIdsEqual } from "./stockInventory.js";
+import { canonicalInventoryId, inventoryIdsEqual } from "./stockInventory.js";
 
 const finite = (value) => {
   if (value === null || value === undefined || value === "") return null;
@@ -89,4 +89,41 @@ export const findSaleCustomer = (customers = [], sale = {}) => {
     if (name.includes("walk-in")) return rows.find((item) => item?.system_account === true) || null;
   }
   return null;
+};
+
+/**
+ * The supplier a purchase names, out of `suppliers`: the same id first (canonical, never
+ * `Number()` -- a purchase from the local snapshot carries a global id such as "supplier-12", and
+ * "004" is not 4), then the supplier's name. `null` when neither matches.
+ */
+export const findPurchaseSupplier = (suppliers = [], purchase = {}) => {
+  const rows = Array.isArray(suppliers) ? suppliers : [];
+  const ids = [purchase?.supplier_id, purchase?.supplier_global_id].filter((value) => text(value));
+  if (ids.length) {
+    const byId = rows.find((item) => ids.some((id) => inventoryIdsEqual(item?.id, id) || inventoryIdsEqual(item?.global_id, id)));
+    if (byId) return byId;
+  }
+  const name = lowered(purchase?.supplier_name);
+  if (name) {
+    const byName = rows.find((item) => lowered(item?.supplier_name) === name);
+    if (byName) return byName;
+  }
+  return null;
+};
+
+const SERVER_ROW_ID = /^[1-9]\d*$/;
+
+/**
+ * The ledger key (`SUPPLIER-<server row id>`) for the supplier a purchase names, or "" when it
+ * cannot be told. A matched supplier supplies its own id. Without a match, the purchase's own
+ * `supplier_id` is used only when it is already a plain server row id -- a global id or a
+ * zero-padded one would name a different account, or none, and an empty ledger would read as
+ * "no transactions".
+ */
+export const supplierLedgerKey = (suppliers = [], purchase = {}) => {
+  const supplier = findPurchaseSupplier(suppliers, purchase);
+  const matchedId = canonicalInventoryId(supplier?.id);
+  if (matchedId) return `SUPPLIER-${matchedId}`;
+  const ownId = canonicalInventoryId(purchase?.supplier_id);
+  return SERVER_ROW_ID.test(ownId) ? `SUPPLIER-${ownId}` : "";
 };

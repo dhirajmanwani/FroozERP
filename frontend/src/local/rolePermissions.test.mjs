@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   OWNER_ONLY_VIEWS,
   accountMasterTypeOptions,
+  allowedPaymentAction,
   branchesScreenPlan,
   mayReadReports,
   canEditAccountRow,
@@ -119,4 +121,21 @@ test("Report Center data is not asked for without the Reports permission", () =>
   assert.equal(mayReadReports({ role: "Cashier", permissions: {} }), false);
   assert.equal(mayReadReports({ role: "Purchase Manager", permissions: { reports: true } }), true);
   assert.equal(mayReadReports({ role: "Cashier", permissions: undefined }), true, "map not loaded yet: ask, the server decides");
+});
+
+test("a held payment action the role may not use moves to the first one it may", () => {
+  const both = { customerPayments: true, supplierPayments: true };
+  assert.equal(allowedPaymentAction("PAY_SUPPLIER", both), "PAY_SUPPLIER");
+  assert.equal(allowedPaymentAction("RECEIVE_CUSTOMER", { customerPayments: false, supplierPayments: true }), "PAY_SUPPLIER");
+  assert.equal(allowedPaymentAction("PAY_SUPPLIER", { customerPayments: true, supplierPayments: false }), "RECEIVE_CUSTOMER");
+  assert.equal(allowedPaymentAction("", { supplierPayments: true }), "PAY_SUPPLIER");
+  assert.equal(allowedPaymentAction("RECEIVE_CUSTOMER", {}), null, "nothing allowed: no action is invented");
+  assert.equal(allowedPaymentAction("RECEIVE_CUSTOMER", { customerPayments: "true" }), null, "only a real grant counts");
+
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const at = app.indexOf("const next = allowedPaymentAction(payment.payment_action");
+  assert.ok(at > 0);
+  const effect = app.slice(app.lastIndexOf("useEffect(() => {", at), app.indexOf("]);", at) + 3);
+  assert.match(effect, /if \(next && next !== payment\.payment_action\)/);
+  assert.match(effect, /\[canUseCustomerPayments, canUseSupplierPayments, payment\.payment_action\]/);
 });

@@ -74,3 +74,13 @@ export const unavailableBriefingNote = (cards) => {
     .map(([section]) => BRIEFING_SECTION_NAMES[section] || section);
   return names.length ? `Could not be worked out just now: ${names.join(", ")}. Shown as —, not as zero.` : "";
 };
+
+/**
+ * A FROST insight card's figure: a number through `formatMoney`, text as it came, and `null`,
+ * `undefined` or empty text as "—" marked unavailable. A null value used to render an empty box.
+ */
+export const insightCardValue = (value, formatMoney = (number) => String(number)) => {
+  if (typeof value === "number" && Number.isFinite(value)) return { text: formatMoney(value), unavailable: false };
+  if (typeof value === "string" && value.trim()) return { text: value, unavailable: false };
+  return { text: UNKNOWN_FIGURE, unavailable: true };
+};

@@ -161,7 +161,7 @@ const SCHEMA = `
   CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, active BOOLEAN DEFAULT TRUE);
   CREATE TABLE customers (
     id INTEGER PRIMARY KEY, customer_name TEXT, mobile_number TEXT, gst_number TEXT, system_account BOOLEAN DEFAULT FALSE,
-    active BOOLEAN DEFAULT TRUE, opening_balance NUMERIC(14,2) DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    active BOOLEAN DEFAULT TRUE, opening_balance NUMERIC(14,2) DEFAULT 0, company_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE products (id INTEGER PRIMARY KEY, product_name TEXT, unit TEXT);
   CREATE TABLE sales (

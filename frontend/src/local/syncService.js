@@ -7,6 +7,7 @@ import { isTauriRuntime } from "./localDatabase";
 import { currentDevicePlatform } from "./mobileGateway.js";
 import { repositories } from "./repositories";
 import { classifySyncError } from "./syncClassification";
+import { createSingleFlight } from "./syncSingleFlight.js";
 import { purchaseReplayBody, runPushCycle, runPushThenPull } from "./syncPushCycle.js";
 import { canonicalizeCloudApiUrl, isHostedCloudOrigin } from "./cloudOrigins.js";
 import {
@@ -17,7 +18,8 @@ import {
   observeServerTime,
 } from "./serverTime";
 
-let runningSync = null;
+// One cycle at a time; a forced request that finds one running gets one more after it (syncSingleFlight.js).
+const syncFlight = createSingleFlight();
 let backoffMs = 2000;
 let lastStatus = {
   online: false,
@@ -476,13 +478,18 @@ export async function getSyncStatus() {
   return lastStatus;
 }
 
-export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
+export async function syncNow({ apiUrl, user, deviceInfo, branchId, force = false }) {
   if (cloudAccessDisabledByOwner()) {
     writeSyncLog("INFO", "sync-blocked", { code: "APP_LOCAL_ONLY", apiUrl: normalizeApiUrl(apiUrl) });
     return simulatedOfflineStatus(apiUrl, "sync");
   }
-  if (runningSync) return runningSync;
-  runningSync = (async () => {
+  return syncFlight.run(async () => {
+    // Checked again when the cycle actually starts: a forced follow-up can start after Local Only
+    // was switched on while it waited, and then it must not reach the cloud.
+    if (cloudAccessDisabledByOwner()) {
+      writeSyncLog("INFO", "sync-blocked", { code: "APP_LOCAL_ONLY", apiUrl: normalizeApiUrl(apiUrl) });
+      return simulatedOfflineStatus(apiUrl, "sync");
+    }
     lastStatus = { ...lastStatus, syncing: true, lastError: "", apiUrl: normalizeApiUrl(apiUrl), syncStage: "starting", pullCompleted: false };
     // True once this cycle's pull loop finished, even if the push failed: the caller refreshes POS
     // and business data on it, because new lots arrived either way.
@@ -541,11 +548,8 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
         pullCompleted,
       };
       return lastStatus;
-    } finally {
-      runningSync = null;
     }
-  })();
-  return runningSync;
+  }, { force: force === true });
 }
 
 export async function initialPullForApprovedDevice({ apiUrl, user, deviceInfo, branchId }) {

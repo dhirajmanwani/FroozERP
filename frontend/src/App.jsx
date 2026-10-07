@@ -21,6 +21,7 @@ import {
   isTauriRuntime,
   listLocalPurchases,
   listLocalPosSales,
+  listLocalPosSalesBetween,
   loadLocalReferenceSnapshot,
   loadLocalPosSale,
   queueLocalPurchase,
@@ -101,7 +102,8 @@ import {
   unreadCount,
 } from "./local/notificationCenter";
 import { sameIdentityRecord, buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
-import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
+import { buildLocalDashboardSnapshot, localSalesWindow } from "./local/dashboardSnapshot";
+import { DASHBOARD_FILL, NULL_DASHBOARD_METRICS, fillUncomputedMetrics, shouldFetchCloudDashboardMetrics, unknownMetricNote } from "./local/dashboardCloudFill";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
 import { resolveShellStatus } from "./local/shellStatus";
@@ -304,12 +306,12 @@ import {
 import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
 import { describeInitialPullFailure } from "./local/freshDeviceOnboarding";
 import { plainRefusalMessage } from "./local/refusalMessages";
-import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
-import { findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation } from "./local/accountsPresentation";
+import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
+import { findPurchaseSupplier, findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation, supplierLedgerKey } from "./local/accountsPresentation";
 import { productStockKeyResolver, wasteEntryProductId } from "./local/wasteStock";
 import { UNDRAWN_TRANSFER_ACTION_NOTE, crateAllocationsForApproval, drawableTransferActions, transferActionId, transferItemsForSend } from "./local/distributionWrites";
-import { buildLocalOnlyReportsData, resolveReportAvailability } from "./local/reportCenterOffline";
-import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, pickDashboardMetric, unavailableBriefingNote } from "./local/figurePresentation";
+import { buildLocalOnlyReportsData, reportFlagsAfterServerLoad, resolveReportAvailability, shouldReloadReportsOnReconnect } from "./local/reportCenterOffline";
+import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, insightCardValue, pickDashboardMetric, unavailableBriefingNote } from "./local/figurePresentation";
 import { UPI_BANK_PAYMENT_MODES, dayBookVoucherLabel, paymentReportTotals, saleGrossAmount, salesHistoryMoneyTotals } from "./local/salesReportTotals";
 import { checkoutFingerprint, resolveCheckoutRef } from "./local/checkoutRetry";
 import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
@@ -2547,7 +2549,11 @@ function App() {
     date_from: toDateKey(new Date()),
     date_to: toDateKey(new Date()),
   });
-  const [dashboardAnalytics, setDashboardAnalytics] = useState(emptyDashboardAnalytics);
+  // No summary until a load answers: the empty analytics' zeros would otherwise be read as figures.
+  const [dashboardAnalytics, setDashboardAnalytics] = useState({ ...emptyDashboardAnalytics, summary: {} });
+  // Where the desktop's ten server-only tiles stand (local/dashboardCloudFill.js): decides whether an
+  // unknown one says "Not available offline" or "Could not load".
+  const [dashboardCloudFill, setDashboardCloudFill] = useState(DASHBOARD_FILL.IDLE);
   const [dashboardError, setDashboardError] = useState("");
   const [aiAssistantData, setAiAssistantData] = useState({
     briefing: null,
@@ -2656,26 +2662,8 @@ function App() {
   // redraw the whole of App.
   const frostVoiceLevelRef = useRef(null);
   if (!frostVoiceLevelRef.current) frostVoiceLevelRef.current = createVoiceLevelChannel();
-  const [supplierDashboard, setSupplierDashboard] = useState({
-    todaySales: 0,
-    todayProfit: 0,
-    stockValue: 0,
-    lowStockItems: 0,
-    transactions: 0,
-    supplierOutstanding: 0,
-    customerOutstanding: 0,
-    todayExpenses: 0,
-    todayReturns: 0,
-    monthlyReturns: 0,
-    todayWaste: 0,
-    monthlyWaste: 0,
-    wastePercentage: 0,
-    totalRebateReceived: 0,
-    todaySupplierPayments: 0,
-    total_supplier_outstanding: 0,
-    total_rebate_received: 0,
-    todays_supplier_payments: 0,
-  });
+  // Every figure unknown until a load answers, so a failed load can never show ₹0.00.
+  const [supplierDashboard, setSupplierDashboard] = useState(NULL_DASHBOARD_METRICS);
 
   const [productName, setProductName] = useState("");
   const [sellingRate, setSellingRate] = useState("");
@@ -3707,11 +3695,14 @@ function App() {
     }
     if (force) lastAutoSyncStartedAtRef.current = Date.now();
     setSyncMessage("Syncing...");
+    // A forced sync that finds a cycle running gets one more cycle after it, so a purchase saved
+    // mid-cycle is pushed now rather than on the next timer tick (local/syncSingleFlight.js).
     const status = await syncNow({
       apiUrl: SYNC_API_URL,
       user,
       deviceInfo,
       branchId: user.branch_id || 1,
+      force,
     });
     setSyncStatus(status);
     applyCanonicalIdentityFromSync(status);
@@ -4382,29 +4373,19 @@ function App() {
   }, [user, activeView, settingsData.roles]);
 
   const kpis = useMemo(() => {
-    const today = toDateKey(new Date());
-    const todaysSales = salesHistory.filter((sale) => toDateKey(sale.sale_date) === today);
-    const total = (items, key) =>
-      items.reduce((sum, item) => sum + Number(item[key] || 0), 0);
-    const stockValue = inventory.reduce(
-      (sum, item) => sum + Number(item.remaining_qty || 0) * Number(item.effective_cost_per_unit || item.purchase_rate || 0),
-      0
-    );
-    const stockByProduct = inventory.reduce((stock, item) => {
-      stock.set(item.product_name, (stock.get(item.product_name) || 0) + Number(item.remaining_qty || 0));
-      return stock;
-    }, new Map());
-    const lowStockItems = [...stockByProduct.values()].filter((quantity) => quantity <= 5).length;
     const analyticsSummary = dashboardAnalytics.summary || {};
+    // Every tile null-aware: a figure no load has answered is "—", never ₹0.00. The headline tiles
+    // used to fall back to totals worked out from whatever sales and lots happened to be in memory,
+    // which after a failed load was nothing, and printed as zero.
     const metrics = {
-      todaySales: supplierDashboard.todaySales ?? total(todaysSales, "amount"),
-      todayProfit: supplierDashboard.todayProfit ?? total(todaysSales, "profit"),
-      stockValue: supplierDashboard.stockValue ?? stockValue,
-      lowStockItems: supplierDashboard.lowStockItems ?? lowStockItems,
-      transactions: supplierDashboard.transactions ?? todaysSales.length,
+      todaySales: pickDashboardMetric(supplierDashboard.todaySales),
+      todayProfit: pickDashboardMetric(supplierDashboard.todayProfit),
+      stockValue: pickDashboardMetric(supplierDashboard.stockValue),
+      lowStockItems: pickDashboardMetric(supplierDashboard.lowStockItems),
+      transactions: pickDashboardMetric(supplierDashboard.transactions),
       // Not worked out by the local dashboard, which says so with `null` (LOCAL_UNCOMPUTED_METRICS in
-      // local/dashboardSnapshot.js). `null` stays unknown and prints "—"; `?? 0` and `Number(x || 0)`
-      // used to turn it into ₹0.00 (local/figurePresentation.js).
+      // local/dashboardSnapshot.js); filled from the server when it can be reached
+      // (local/dashboardCloudFill.js). `null` stays unknown and prints "—".
       supplierOutstanding: pickDashboardMetric(supplierDashboard.supplierOutstanding, supplierDashboard.total_supplier_outstanding),
       customerOutstanding: pickDashboardMetric(analyticsSummary.customerOutstanding, supplierDashboard.customerOutstanding),
       todayExpenses: pickDashboardMetric(analyticsSummary.todayExpenses, supplierDashboard.todayExpenses),
@@ -4417,14 +4398,18 @@ function App() {
       todaySupplierPayments: pickDashboardMetric(supplierDashboard.todaySupplierPayments, supplierDashboard.todays_supplier_payments),
     };
     const rupees = (value) => formatKnownFigure(value, (number) => currency.format(number));
+    const whole = (value) => formatKnownFigure(value);
     // [label, value, icon, note]. The note is printed under the figure: the caveat on a profit that
-    // includes provisional costs, the stock still waiting for a bill, or why a tile is blank.
-    const unknownNote = (value) => (value === null ? "Not available offline" : "");
+    // includes provisional costs, the stock still waiting for a bill, or why a tile is blank --
+    // offline, or online and the read failed.
+    const missing = unknownMetricNote({ fill: dashboardCloudFill, loadFailed: Boolean(dashboardError) });
+    const unknownNote = (value) => (value === null ? missing : "");
+    const withNote = (value, note) => (value === null ? unknownNote(value) : String(note || ""));
 
     return [
-      ["Today's Sales", currency.format(Number(metrics.todaySales || 0)), "rupee"],
-      ["Today's Profit", currency.format(Number(metrics.todayProfit || 0)), "trend", String(supplierDashboard.profitNote || "")],
-      ["Stock Value", currency.format(Number(metrics.stockValue || 0)), "layers", String(supplierDashboard.stockValueNote || "")],
+      ["Today's Sales", rupees(metrics.todaySales), "rupee", unknownNote(metrics.todaySales)],
+      ["Today's Profit", rupees(metrics.todayProfit), "trend", withNote(metrics.todayProfit, supplierDashboard.profitNote)],
+      ["Stock Value", rupees(metrics.stockValue), "layers", withNote(metrics.stockValue, supplierDashboard.stockValueNote)],
       ["Supplier Outstanding", rupees(metrics.supplierOutstanding), "wallet", unknownNote(metrics.supplierOutstanding)],
       ["Customer Outstanding", rupees(metrics.customerOutstanding), "users", unknownNote(metrics.customerOutstanding)],
       ["Today's Expenses", rupees(metrics.todayExpenses), "wallet", unknownNote(metrics.todayExpenses)],
@@ -4435,10 +4420,10 @@ function App() {
       ["Today's Waste", rupees(metrics.todayWaste), "alert", unknownNote(metrics.todayWaste)],
       ["Monthly Waste", rupees(metrics.monthlyWaste), "alert", unknownNote(metrics.monthlyWaste)],
       ["Waste Percentage", formatKnownFigure(metrics.wastePercentage, (number) => `${number.toFixed(2)}%`), "chart", unknownNote(metrics.wastePercentage)],
-      ["Low Stock Items", Number(metrics.lowStockItems || 0), "alert"],
-      ["Transactions", Number(metrics.transactions || 0), "receipt"],
+      ["Low Stock Items", whole(metrics.lowStockItems), "alert", unknownNote(metrics.lowStockItems)],
+      ["Transactions", whole(metrics.transactions), "receipt", unknownNote(metrics.transactions)],
     ];
-  }, [dashboardAnalytics, inventory, salesHistory, supplierDashboard]);
+  }, [dashboardAnalytics, dashboardCloudFill, dashboardError, supplierDashboard]);
 
   const activeSuppliers = useMemo(
     () => suppliers.filter((supplier) =>
@@ -4638,7 +4623,10 @@ function App() {
     setPurchases(snapshot?.offline_purchases || bundle.offlinePurchases || []);
     setSuppliers(bundle.offlineSuppliers || []);
     setAccounts(bundle.offlineAccounts || []);
-    setAccountOutstanding(bundle.offlineAccountOutstanding || null);
+    // `{}` when the saved bundle has none: the Outstanding tab then says "not available" instead of
+    // "Loading…" for ever. Fresh figures here also retire an older load's error.
+    setAccountOutstanding(bundle.offlineAccountOutstanding || {});
+    if (resolveOutstandingPresentation(bundle.offlineAccountOutstanding).kind === "ready") setAccountOutstandingError("");
     setExpenses(bundle.offlineExpenses || []);
     setSaleReturns(bundle.offlineSaleReturns || []);
     setWasteEntries(bundle.offlineWasteEntries || []);
@@ -6757,7 +6745,8 @@ function App() {
         let localRows = [];
         let salesError = "";
         try {
-          localRows = await listLocalPosSales();
+          // Every bill in the chosen period, not the newest 200 (local/localDatabase.js).
+          localRows = await listLocalPosSalesBetween(normalizedParams.date_from, normalizedParams.date_to);
         } catch (salesReadError) {
           salesError = getErrorMessage(salesReadError, salesReadError?.message || "the local sales could not be read");
           writeDiagnosticLog("ERROR", "local-sales-report-load-failed", { message: salesError });
@@ -6829,8 +6818,12 @@ function App() {
     setReportsData((current) => ({
       ...current,
       ...(summaryFailed ? {} : (values.summary || {})),
-      // Back on the server's figures: nothing is marked offline-only any more.
-      ...(summaryFailed ? {} : { offlineUnavailable: false }),
+      // Online: nothing is marked offline-only any more, even when the summary failed -- then the
+      // blanked reports say the load failed instead of "no records" (local/reportCenterOffline.js).
+      ...reportFlagsAfterServerLoad(current, {
+        summaryFailed,
+        summaryError: failures.find((failure) => failure.key === "summary")?.message,
+      }),
       salesHistoryLoadError: "",
       stockReport: inventoryFailure ? current.stockReport : nextStockReport,
       stockLotReport: inventoryFailure ? current.stockLotReport : nextStockLots,
@@ -6843,6 +6836,22 @@ function App() {
     }));
     return { params: normalizedParams, source: "HYBRID_LOCAL", failures: effectiveFailures };
   };
+
+  // Back online, Report Center still showing the offline blanks reloads from the server. Tied to
+  // the connectivity state itself, so the flag cannot outlive the outage when the first summary
+  // request after it fails (local/reportCenterOffline.js, shouldReloadReportsOnReconnect).
+  const reportsConnectivityOnline = !offlineMode
+    && !isLocalOnlyConnectivitySelected()
+    && cloudHealth?.online !== false
+    && internetAvailable !== false;
+  useEffect(() => {
+    if (!user) return;
+    if (!shouldReloadReportsOnReconnect({ offlineUnavailable: reportsData.offlineUnavailable === true, online: reportsConnectivityOnline })) return;
+    loadReports().catch((error) => {
+      writeDiagnosticLog("WARN", "report-reload-on-reconnect-failed", { message: error?.message || String(error) });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, reportsConnectivityOnline, connectivityMode, reportsData.offlineUnavailable]);
 
   const loadExpenses = async () => {
     const response = await axios.get(`${API_URL}/expenses`);
@@ -7313,23 +7322,56 @@ function App() {
   const loadDashboardAnalytics = async (range = dashboardRange, customRange = dashboardCustomRange) => {
     if (user && !hasModuleAccess("dashboard")) return;
     if (isTauriRuntime()) {
-      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
-      const localRows = await listLocalPosSales();
-      const localSales = localRows.map(localSnapshotToInvoice);
-      const localDashboard = buildLocalDashboardSnapshot({
-        inventoryLots: snapshot?.inventory_lots || [],
-        // Each product's own minimum stock, for the low-stock count.
-        products: snapshot?.products,
-        sales: localSales,
-        range,
-        customRange,
-        today: toDateKey(new Date()),
-      });
-      setInventory(snapshot?.inventory_lots || []);
-      setSalesHistory(localSales);
-      setSupplierDashboard(localDashboard.metrics);
+      let localDashboard;
+      try {
+        const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+        // Every bill in the window, not the newest 200 (local/dashboardSnapshot.js, localSalesWindow).
+        const { fromDate, toDate } = localSalesWindow({ range, customRange, today: toDateKey(new Date()) });
+        const localRows = await listLocalPosSalesBetween(fromDate, toDate);
+        const localSales = localRows.map(localSnapshotToInvoice);
+        localDashboard = buildLocalDashboardSnapshot({
+          inventoryLots: snapshot?.inventory_lots || [],
+          // Each product's own minimum stock, for the low-stock count.
+          products: snapshot?.products,
+          sales: localSales,
+          range,
+          customRange,
+          today: toDateKey(new Date()),
+        });
+        setInventory(snapshot?.inventory_lots || []);
+      } catch (error) {
+        // A failed read leaves every tile unknown with a banner saying so. It used to throw past
+        // this point and leave the zeros the dashboard started with on screen.
+        writeDiagnosticLog("ERROR", "local-dashboard-load-failed", { message: getErrorMessage(error, error?.message || "unknown") });
+        setSupplierDashboard(NULL_DASHBOARD_METRICS);
+        setDashboardAnalytics({ ...emptyDashboardAnalytics, summary: {} });
+        setDashboardError(`The dashboard could not be read from this computer: ${getErrorMessage(error, error?.message || "unknown error")}`);
+        return;
+      }
       setDashboardAnalytics(localDashboard.analytics);
+      setSupplierDashboard(localDashboard.metrics);
       setDashboardError("");
+      // The ten tiles this device cannot work out: asked of the server when it can be reached, and
+      // filling only those still null. LOCAL_ONLY and offline never ask.
+      if (!shouldFetchCloudDashboardMetrics({
+        localOnly: isLocalOnlyConnectivitySelected(),
+        offlineMode,
+        cloudOnline: cloudHealth?.online,
+        internetAvailable,
+      })) {
+        setDashboardCloudFill(DASHBOARD_FILL.OFFLINE);
+        return;
+      }
+      try {
+        const response = await axios.get(`${API_URL}/dashboard-metrics`, { params: { user_id: user?.id } });
+        const filled = fillUncomputedMetrics(localDashboard.metrics, response.data || {});
+        setSupplierDashboard(filled);
+        setDashboardAnalytics({ ...localDashboard.analytics, summary: fillUncomputedMetrics(localDashboard.analytics.summary, response.data || {}) });
+        setDashboardCloudFill(DASHBOARD_FILL.LOADED);
+      } catch (error) {
+        writeDiagnosticLog("WARN", "dashboard-cloud-metrics-failed", { message: getErrorMessage(error, error?.message || "unknown") });
+        setDashboardCloudFill(DASHBOARD_FILL.FAILED);
+      }
       return;
     }
     const response = await axios.get(`${API_URL}/dashboard-analytics`, {
@@ -7337,6 +7379,9 @@ function App() {
     });
     setDashboardAnalytics(response.data);
     if (response.data.summary) setSupplierDashboard(response.data.summary);
+    // The server answered: a figure it sends as null is one it could not work out, and the tile
+    // says "Could not load" rather than printing nothing (local/dashboardCloudFill.js).
+    setDashboardCloudFill(DASHBOARD_FILL.LOADED);
     setDashboardError("");
   };
 
@@ -7355,7 +7400,10 @@ function App() {
     }
     if (salesResult.status === "fulfilled") setSalesHistory(salesResult.value.data || []);
     if (metricsResult.status === "fulfilled") setSupplierDashboard(metricsResult.value.data || {});
-    if (analyticsResult.status === "fulfilled") setDashboardAnalytics(analyticsResult.value.data || emptyDashboardAnalytics);
+    // Answered or not, an unknown tile online says "Could not load" -- a metric the server could
+    // not work out comes back null, never 0 (local/dashboardCloudFill.js).
+    setDashboardCloudFill(metricsResult.status === "fulfilled" ? DASHBOARD_FILL.LOADED : DASHBOARD_FILL.FAILED);
+    if (analyticsResult.status === "fulfilled") setDashboardAnalytics(analyticsResult.value.data || { ...emptyDashboardAnalytics, summary: {} });
     const failures = requests.filter((result) => result.status === "rejected");
     if (failures.length) {
       console.warn("Dashboard refresh partially failed", failures.map((result) => getErrorMessage(result.reason, result.reason?.message || "Unknown dashboard error")));
@@ -8984,12 +9032,21 @@ function App() {
   };
 
   const openSupplierLedgerFromReport = async (purchase) => {
-    const supplierId = Number(purchase.supplier_id || 0);
-    if (!supplierId) {
+    // The same id first (canonical, never Number()), then the name; the list on screen may be a
+    // search result, so a miss asks for the whole list once (local/accountsPresentation.js).
+    let accountKey = supplierLedgerKey(suppliers, purchase);
+    if (!findPurchaseSupplier(suppliers, purchase) && !isLocalOnlyConnectivitySelected()) {
+      try {
+        const response = await axios.get(`${API_URL}/suppliers`);
+        accountKey = supplierLedgerKey(response.data, purchase) || accountKey;
+      } catch (error) {
+        writeDiagnosticLog("WARN", "supplier-ledger-lookup-failed", { message: error?.message || String(error) });
+      }
+    }
+    if (!accountKey) {
       alert("Supplier account is not linked to this purchase.");
       return;
     }
-    const accountKey = `SUPPLIER-${supplierId}`;
     setAccountLedgerFocusKey(accountKey);
     setActiveView("accounts");
     await loadAccountLedger(accountKey);
@@ -12080,7 +12137,10 @@ function AiBusinessAssistantModule({
             <article className={`frost-insight-card frost-priority-${String(card.priority || "Information").toLowerCase()}`} key={card.id}>
               <span>{card.priority}</span>
               <strong>{card.title}</strong>
-              <p>{typeof card.value === "number" ? money(card.value) : card.value}</p>
+              {/* A card whose figure could not be worked out arrives with `value: null`; it says
+                  so rather than drawing an empty box (local/figurePresentation.js). */}
+              <p>{insightCardValue(card.value, money).text}</p>
+              {insightCardValue(card.value, money).unavailable && <small className="cell-note">Unavailable just now</small>}
               <small>{card.sourceModule}</small>
               <div className="button-row">
                 {(card.actions || []).map((action) => (
@@ -19866,6 +19926,14 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
   const paymentActionOptions = accountPaymentActions.filter(([value]) =>
     value === "RECEIVE_CUSTOMER" ? canUseCustomerPayments : canUseSupplierPayments
   );
+  // The form's action was taken when it opened; the role's permissions can arrive later. A held
+  // action this role may not use moves to the first it may (local/rolePermissions.js).
+  useEffect(() => {
+    const next = allowedPaymentAction(payment.payment_action, { customerPayments: canUseCustomerPayments, supplierPayments: canUseSupplierPayments });
+    if (next && next !== payment.payment_action) {
+      setPayment((current) => ({ ...current, payment_action: next, account_key: "", rebate_amount: "" }));
+    }
+  }, [canUseCustomerPayments, canUseSupplierPayments, payment.payment_action]);
   const filteredAccounts = accounts.filter((account) =>
     account.account_name.toLowerCase().includes(search.toLowerCase()) ||
     String(account.mobile_number || "").includes(search)

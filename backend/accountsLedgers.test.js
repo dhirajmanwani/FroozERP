@@ -68,7 +68,7 @@ const SCHEMA = `
   CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, active BOOLEAN DEFAULT TRUE);
   CREATE TABLE customers (
     id INTEGER PRIMARY KEY, customer_name TEXT, mobile_number TEXT, gst_number TEXT, system_account BOOLEAN DEFAULT FALSE,
-    active BOOLEAN DEFAULT TRUE, opening_balance NUMERIC(14,2) DEFAULT 0, created_at TIMESTAMP DEFAULT '2026-08-01'
+    active BOOLEAN DEFAULT TRUE, opening_balance NUMERIC(14,2) DEFAULT 0, company_id INTEGER, created_at TIMESTAMP DEFAULT '2026-08-01'
   );
   CREATE TABLE products (id INTEGER PRIMARY KEY, product_name TEXT, unit TEXT, category TEXT);
   CREATE TABLE sales (
@@ -107,7 +107,7 @@ const SCHEMA = `
   );
   CREATE TABLE suppliers (
     id INTEGER PRIMARY KEY, supplier_name TEXT, firm_name TEXT, mobile_number TEXT, city TEXT, gst_number TEXT,
-    opening_balance NUMERIC(14,2) DEFAULT 0, active BOOLEAN DEFAULT TRUE
+    opening_balance NUMERIC(14,2) DEFAULT 0, active BOOLEAN DEFAULT TRUE, company_id INTEGER
   );
   CREATE TABLE purchases (
     id INTEGER PRIMARY KEY, supplier_id INTEGER, supplier_name TEXT, purchase_date DATE, payment_date DATE, payment_mode TEXT,
@@ -145,6 +145,8 @@ const SCHEMA = `
   -- Ravi carries an opening balance of 100. Sita and Gita share a mobile number.
   INSERT INTO customers (id, customer_name, mobile_number, opening_balance) VALUES
     (5, 'Ravi', '9000000001', 100), (6, 'Sita', '9000000002', 0), (7, 'Gita', '9000000002', 0);
+  -- Another company's customer and supplier: never on this company's sheet.
+  INSERT INTO customers (id, customer_name, mobile_number, opening_balance, company_id) VALUES (8, 'Other Co', '9000000009', 999, 2);
 
   -- 200: a 1000 credit bill carrying a legacy 'CREDIT' payment line for the full amount.
   -- 201: a 500 MIXED bill: 300 cash, and a legacy 'CREDIT' line for the other 200.
@@ -168,7 +170,7 @@ const SCHEMA = `
   -- 50 cash into the bank on the 4th.
   INSERT INTO contra_entries (contra_date, contra_type, amount, branch_id) VALUES ('2026-09-04', 'CASH_TO_BANK', 50, 1);
   -- A pending bill that arrived on the 1st and was completed and paid 300 cash on the 10th.
-  INSERT INTO suppliers (id, supplier_name) VALUES (40, 'Mandi Traders');
+  INSERT INTO suppliers (id, supplier_name, company_id, opening_balance) VALUES (40, 'Mandi Traders', 1, 0), (41, 'Elsewhere Ltd', 2, 500);
   INSERT INTO purchases (id, supplier_id, supplier_name, purchase_date, payment_date, payment_mode, paid_amount, purchase_status,
     purchase_bill_status, branch_id, gross_amount, total_amount, net_payable, rebate_amount, purchase_type) VALUES
     (300, 40, 'Mandi Traders', '2026-09-01', '2026-09-10', 'CASH', 300, 'ACTIVE', 'BILL_COMPLETED', 1, 300, 300, 300, 0, 'CASH');
@@ -274,6 +276,23 @@ test("balance sheet: cash is the cash book's closing cash, and receivables carry
     assert.equal(money(ravi.returns), 30, "credit-note returns, not the cancelled 400 bill");
     assert.equal(money(ravi.opening_balance), 0, "the opening balance the shop figure did not count");
     assert.equal(money(ravi.balance), 1020);
+    assert.equal(sheet.supplierPayable, 0, "another company's supplier is not this shop's payable");
+    assert.ok(!receivables.rows.some((row) => row.customer_name === "Other Co"));
+  });
+});
+
+test("a company with one active branch: the shop's receivables carry the opening balance, as Accounts does", async () => {
+  await withDatabase(async ({ db }) => {
+    await db.query("UPDATE branches SET active = FALSE WHERE id = 2");
+    const sheet = await get("/reports/balance-sheet?date_to=2026-09-08");
+    // 1270 + Ravi's 100. Other Co's 999 belongs to company 2.
+    assert.equal(sheet.customerReceivable, 1370);
+    const receivables = await get("/reports/balance-sheet/details/customer_receivables?date_from=2026-09-01&date_to=2026-09-08");
+    const ravi = receivables.rows.find((row) => row.customer_name === "Ravi");
+    assert.equal(money(ravi.opening_balance), 100);
+    assert.equal(money(ravi.balance), 1120);
+    const accounts = await get("/customer-summary?customer_id=5");
+    assert.equal(money(accounts.customers[0].outstanding_balance), money(ravi.balance), "the sheet and Accounts agree");
   });
 });
 

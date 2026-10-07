@@ -62,12 +62,21 @@ const ENTITY_REFERENCES = Object.freeze({
 /**
  * Resolve a product or lot reference to its numeric row id within one company, or `null`.
  *
- * A plain number is taken as the row id. Anything else is looked up by `global_id`, then by the
- * alias above -- never by reading digits out of it.
+ * A plain number is taken as the row id (checked against the company when `verifyNumeric` is set).
+ * Anything else is looked up by `global_id`, then by the alias above -- never by reading digits
+ * out of it.
  */
-const resolveEntityReference = async (client, kind, value, companyId) => {
+const resolveEntityReference = async (client, kind, value, companyId, { verifyNumeric = false } = {}) => {
   const numeric = positiveId(value);
-  if (numeric) return numeric;
+  // `verifyNumeric` is for callers with no later company-scoped query to catch a foreign row id.
+  if (numeric && !verifyNumeric) return numeric;
+  if (numeric) {
+    const owned = await client.query(
+      `SELECT id FROM ${ENTITY_REFERENCES[kind].table} WHERE id = $1 AND company_id = $2`,
+      [numeric, companyId]
+    );
+    return owned.rows?.[0] ? numeric : null;
+  }
   const reference = cleanText(value);
   if (!reference) return null;
   const { table, alias } = ENTITY_REFERENCES[kind];
@@ -115,6 +124,20 @@ const routeError = (status, code, message, details) => {
   error.code = code;
   error.details = details;
   return error;
+};
+
+/**
+ * A row found by an idempotency key, returned only to its own company.
+ *
+ * Keys are unique across the whole table and chosen by the client, so a key seen before may belong
+ * to another company. Replaying it must not hand that company's row back; it is refused instead.
+ */
+const replayedForCompany = (row, context) => {
+  if (!row) return null;
+  if (Number(row.company_id) !== Number(context.company_id)) {
+    throw routeError(409, "IDEMPOTENCY_KEY_CONFLICT", "This operation key was already used for a different request");
+  }
+  return row;
 };
 
 const requiredIdempotencyKey = (body) => {
@@ -1349,7 +1372,8 @@ const registerOperationalV3Routes = ({
     if (items.length === 0) throw routeError(400, "TRANSFER_ITEMS_REQUIRED", "At least one transfer item is required");
     const saved = await withTransaction(database, async (client) => {
       const existing = await client.query("SELECT * FROM inventory_transfers WHERE idempotency_key = $1", [key]);
-      if (existing.rows?.[0]) return existing.rows[0];
+      const replayed = replayedForCompany(existing.rows?.[0], context);
+      if (replayed) return replayed;
       const transfer = await client.query(
         `INSERT INTO inventory_transfers
           (global_id, company_id, source_branch_id, source_operational_location_id,
@@ -1373,7 +1397,11 @@ const registerOperationalV3Routes = ({
         const quantity = positiveNumber(item.requested_quantity);
         // The desktop names products and lots by their snapshot ids (`product-12`, a uuid global
         // id, `inventory-lot-42`), so these are resolved within the company, never parsed.
-        const productId = await resolveEntityReference(client, "product", item.product_id, context.company_id);
+        // Verified even when numeric: a request line (no lot) has no later query that would notice
+        // a product belonging to another company.
+        const productId = await resolveEntityReference(
+          client, "product", item.product_id, context.company_id, { verifyNumeric: true }
+        );
         const lotNamed = cleanText(item.source_lot_id) !== "";
         const lotId = lotNamed
           ? await resolveEntityReference(client, "lot", item.source_lot_id, context.company_id)
@@ -1449,13 +1477,13 @@ const registerOperationalV3Routes = ({
     if (!transferReference) throw routeError(400, "TRANSFER_REQUIRED", "A transfer is required");
     const saved = await withTransaction(database, async (client) => {
       const existingEvent = await client.query(
-        "SELECT transfer_id FROM inventory_transfer_events WHERE idempotency_key = $1",
+        `SELECT t.* FROM inventory_transfer_events e
+         JOIN inventory_transfers t ON t.id = e.transfer_id
+         WHERE e.idempotency_key = $1`,
         [key]
       );
-      if (existingEvent.rows?.[0]) {
-        const existing = await client.query("SELECT * FROM inventory_transfers WHERE id = $1", [existingEvent.rows[0].transfer_id]);
-        return existing.rows[0];
-      }
+      const replayed = replayedForCompany(existingEvent.rows?.[0], context);
+      if (replayed) return replayed;
       const locked = transferId
         ? await client.query(
           "SELECT * FROM inventory_transfers WHERE id = $1 AND company_id = $2 FOR UPDATE",
@@ -1469,10 +1497,17 @@ const registerOperationalV3Routes = ({
       if (!transfer || Number(transfer.company_id) !== context.company_id) {
         throw routeError(404, "TRANSFER_NOT_FOUND", "Transfer was not found");
       }
-      // Mirrored by SOURCE_ACTIONS in frontend/src/local/stockDistribution.js. `cancel` is the
-      // sender's: it drops a draft, or releases what approval held before anything has left.
+      // Mirrored by SOURCE_ACTIONS in frontend/src/local/stockDistribution.js (a test pins the two
+      // lists). `cancel` is the source's, with one exception: a DRAFT is withdrawn by whichever side
+      // wrote it, so a DESTINATION_REQUESTED draft belongs to the shop that asked. Cancelling an
+      // approved consignment releases stock the source holds, so that stays with the source.
       const sourceActions = ["submit", "approve", "reject", "dispatch", "return", "source_receive", "close", "cancel"];
-      const requiredLocation = sourceActions.includes(action)
+      const requesterWithdrawsDraft =
+        action === "cancel" &&
+        cleanText(transfer.status).toUpperCase() === "DRAFT" &&
+        cleanText(transfer.initiation_mode).toUpperCase() === "DESTINATION_REQUESTED";
+      const sourceSide = sourceActions.includes(action) && !requesterWithdrawsDraft;
+      const requiredLocation = sourceSide
         ? Number(transfer.source_operational_location_id)
         : Number(transfer.destination_operational_location_id);
       if (requiredLocation !== context.operational_location_id) {

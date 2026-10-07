@@ -1856,7 +1856,7 @@ const loadManagedUser = async (userId, client = pool) => {
   if (!parsedUserId) return null;
   const result = await client.query(
     `
-    SELECT u.id, u.username, u.branch_id, u.active, r.role_name
+    SELECT u.id, u.username, u.branch_id, u.active, u.recovery_enabled, u.staff_self_recovery_enabled, r.role_name
     FROM users u
     LEFT JOIN roles r ON r.id = u.role_id
     WHERE u.id = $1
@@ -1880,6 +1880,24 @@ const refuseUserManagement = async ({ actor, auth, targetUserId, requestedRole =
     targetBranchId: target.branch_id,
     requestedRole,
   });
+};
+
+/**
+ * A non-Owner manager editing their own row: allowed only when nothing that carries authority
+ * changes. Null when allowed, a refusal otherwise.
+ */
+const selfEditRefusal = async (userId, payload, client = pool) => {
+  const self = await loadManagedUser(userId, client);
+  if (!self) return { status: 404, code: "USER_NOT_FOUND", message: "User not found" };
+  const unchanged = normalizeRoleName(self.role_name) === normalizeRoleName(payload.role)
+    && self.active !== false && payload.active === true
+    && (self.recovery_enabled !== false) === payload.recovery_enabled
+    && (self.staff_self_recovery_enabled === true) === payload.staff_self_recovery_enabled;
+  return unchanged ? null : {
+    status: 403,
+    code: "OWNER_REQUIRED_FOR_PRIVILEGED_ACCOUNT",
+    message: "You can change your own name and contact details. Your role, status and recovery settings are changed by the Owner.",
+  };
 };
 
 const sendUserManagementRefusal = (res, refusal) =>
@@ -2382,6 +2400,8 @@ const initializeDatabase = async () => {
     -- the columns exist. ai_settings.company_id above is bare for the same reason.
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS company_id INTEGER;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS operational_location_id INTEGER;
+    -- The supplier summary filters on this; migration 009 owns its constraint.
+    ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS company_id INTEGER;
     CREATE INDEX IF NOT EXISTS inventory_batches_location_fifo_idx
       ON inventory_batches(company_id, branch_id, operational_location_id, product_id, purchase_date, created_at, id)
       WHERE remaining_qty > 0;
@@ -2732,6 +2752,8 @@ const initializeDatabase = async () => {
 
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS firm_name VARCHAR(160);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS alternate_number VARCHAR(30);
+    -- The customer summary filters on this; migration 009 owns its constraint.
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS company_id INTEGER;
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS city VARCHAR(100);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS bank_name VARCHAR(120);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS account_number VARCHAR(80);
@@ -4270,7 +4292,9 @@ const previousDateKey = (dateValue) => {
 const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, branchId, companyId } = {}) => {
   const scope = resolveMoneyScope({ branchId, companyId });
   if (scope.isCompany) await assertCompanyBranchLink();
-  const filters = [];
+  // Only this company's suppliers (or ones with no company recorded). In branch scope the company
+  // is the branch's; without this a shop's balance sheet listed every company's suppliers.
+  const filters = [`(s.company_id IS NULL OR s.company_id = ${scope.isCompany ? "$1" : "(SELECT company_id FROM branches WHERE id = $1)"})`];
   const values = [scope.value];
   const purchaseDateFilter = isDateInput(dateTo) ? `AND purchase_date <= $${values.push(dateTo)}` : "";
   const paymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
@@ -4558,7 +4582,8 @@ const SALE_CUSTOMER_MATCH_LATERAL_SQL = `JOIN LATERAL (
 const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, branchId, companyId } = {}) => {
   const scope = resolveMoneyScope({ branchId, companyId });
   if (scope.isCompany) await assertCompanyBranchLink();
-  const filters = [];
+  // Only this company's customers (or ones with no company recorded), as for suppliers.
+  const filters = [`(c.company_id IS NULL OR c.company_id = ${scope.isCompany ? "$1" : "(SELECT company_id FROM branches WHERE id = $1)"})`];
   const values = [scope.value];
   const saleDateFilter = isDateInput(dateTo) ? `AND s.sale_date <= $${values.push(dateTo)}` : "";
   const customerPaymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
@@ -4581,9 +4606,19 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
   }
   const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
   // `customers` has no branch, so an opening balance belongs to the company, not to any one shop.
-  // Counting it in branch scope added every customer's opening balance to every branch's
-  // receivables; it is counted once, in company scope, and the shop figures start from zero.
-  const openingBalanceSql = scope.isCompany ? "COALESCE(c.opening_balance, 0)" : "0";
+  // The rule (FROST mirrors it):
+  //   - company scope: always counted;
+  //   - branch scope, the branch's company has exactly one active branch: counted (the shop IS the
+  //     company, and receipts against the opening balance are subtracted here too);
+  //   - branch scope, several active branches: not counted, since it would be added at every shop.
+  // A branch with no company counts the active branches that have none.
+  const openingBalanceSql = scope.isCompany
+    ? "COALESCE(c.opening_balance, 0)"
+    : `CASE WHEN (
+        SELECT COUNT(*) FROM branches ob
+        WHERE ob.active IS DISTINCT FROM FALSE
+          AND ob.company_id IS NOT DISTINCT FROM (SELECT company_id FROM branches WHERE id = $1)
+      ) = 1 THEN COALESCE(c.opening_balance, 0) ELSE 0 END`;
   const result = await pool.query(
     `
     WITH sale_summary AS (
@@ -5192,11 +5227,11 @@ const DEFAULT_DASHBOARD_SUMMARY = Object.freeze({
 /**
  * Runs one dashboard tile's query.
  *
- * The catch below turns a failure into a zero, which is the pattern CLAUDE.md warns about — a broken
- * tile is indistinguishable from a quiet day. That is pre-existing and left alone here, but it makes
- * branch scoping unusually easy to get wrong: a query whose placeholders and values disagree throws,
- * gets swallowed, and shows ₹0 instead of an error. So the placeholder count is checked *before* the
- * try, where a mistake fails loudly at startup of the request rather than dissolving into a zero.
+ * A failed query answers null, never 0: a broken tile must not be indistinguishable from a quiet
+ * day (CLAUDE.md, "Errors must never render as zero"). The dashboard shows "Could not load" for a
+ * null, and `getDashboardSummary` names the failed tiles in `failed_metrics`. The placeholder count
+ * is still checked *before* the try, so a query whose placeholders and values disagree fails the
+ * request loudly instead of becoming one more unknown tile.
  */
 const readDashboardMetric = async (metricName, query, values = []) => {
   // Highest placeholder number, not the count of distinct ones: pg numbers positionally, so a query
@@ -5210,19 +5245,24 @@ const readDashboardMetric = async (metricName, query, values = []) => {
   }
   try {
     const result = await pool.query(query, values);
-    return Number(result.rows[0]?.value || 0);
+    // A query that answered with no row, or no number, is as unknown as one that failed. (Every
+    // tile's query COALESCEs, so a real quiet day is a row holding 0.)
+    const raw = result.rows[0]?.value;
+    const value = raw === null || raw === undefined ? NaN : Number(raw);
+    return Number.isFinite(value) ? value : null;
   } catch (error) {
-    console.warn(`Dashboard metric ${metricName} defaulted to zero: ${error.code || error.message}`);
-    return 0;
+    console.warn(`Dashboard metric ${metricName} could not be loaded: ${error.code || error.message}`);
+    return null;
   }
 };
 
 const readDashboardOutstanding = async (label, loader, summaryBuilder, branchId) => {
   try {
-    return Number(summaryBuilder(await loader({ branchId })).outstandingBalance || 0);
+    const value = Number(summaryBuilder(await loader({ branchId })).outstandingBalance ?? 0);
+    return Number.isFinite(value) ? value : null;
   } catch (error) {
-    console.warn(`Dashboard ${label} outstanding defaulted to zero: ${error.code || error.message}`);
-    return 0;
+    console.warn(`Dashboard ${label} outstanding could not be loaded: ${error.code || error.message}`);
+    return null;
   }
 };
 
@@ -5317,17 +5357,41 @@ const getDashboardSummary = async (branchId) => {
     supplier_count: supplierCount,
     active_supplier_count: activeSupplierCount,
   };
-  return {
+  // A percentage of an unknown is unknown.
+  const wastePercentage = metrics.stockValue === null || metrics.monthlyWaste === null
+    ? null
+    : metrics.stockValue > 0
+      ? roundCurrency((metrics.monthlyWaste / (metrics.stockValue + metrics.monthlyWaste)) * 100)
+      : 0;
+  const summary = {
     ...DEFAULT_DASHBOARD_SUMMARY,
     ...metrics,
-    wastePercentage: metrics.stockValue > 0
-      ? roundCurrency((metrics.monthlyWaste / (metrics.stockValue + metrics.monthlyWaste)) * 100)
-      : 0,
+    wastePercentage,
     total_supplier_outstanding: supplierOutstanding,
     total_rebate_received: totalRebateReceived,
     todays_supplier_payments: todaySupplierPayments,
   };
+  return {
+    ...summary,
+    // The tiles that could not be loaded, by name, so a screen can say which ones -- empty when all
+    // loaded. Every one of them is null above, never 0.
+    failed_metrics: Object.keys(summary).filter((key) => summary[key] === null),
+  };
 };
+
+/** Every tile unknown: the summary when the summary itself could not be built. */
+const UNKNOWN_DASHBOARD_SUMMARY = Object.freeze({
+  ...Object.fromEntries(Object.keys(DEFAULT_DASHBOARD_SUMMARY).map((key) => [key, null])),
+  total_supplier_outstanding: null,
+  total_rebate_received: null,
+  todays_supplier_payments: null,
+  failed_metrics: Object.freeze([
+    ...Object.keys(DEFAULT_DASHBOARD_SUMMARY),
+    "total_supplier_outstanding",
+    "total_rebate_received",
+    "todays_supplier_payments",
+  ]),
+});
 
 const getDashboardSalesTrend = async (dateFrom, dateTo, branchId) => {
   const result = await pool.query(
@@ -5536,12 +5600,15 @@ const buildDashboardInsights = ({ summary, salesTrend, expenseTrend, topSellingP
     insights.push("No top product yet because no items were sold in this period.");
   }
 
-  insights.push(`Supplier outstanding is ${roundCurrency(summary.supplierOutstanding || 0).toLocaleString("en-IN")} INR.`);
+  insights.push(summary.supplierOutstanding === null || summary.supplierOutstanding === undefined
+    ? "Supplier outstanding could not be loaded."
+    : `Supplier outstanding is ${roundCurrency(summary.supplierOutstanding).toLocaleString("en-IN")} INR.`);
   return insights;
 };
 
 const dashboardAnalyticsFallbacks = [
-  DEFAULT_DASHBOARD_SUMMARY,
+  // Unknown, not zero: a summary that could not be built must not show as a quiet day.
+  UNKNOWN_DASHBOARD_SUMMARY,
   [],
   [],
   [],
@@ -6771,6 +6838,21 @@ const getSaleCharges = async (client, saleId) => {
   return result.rows;
 };
 
+/*
+ * The rate a sale line asks for, or null when it asks for none (the default rate applies).
+ *
+ * Only a number, or a string that is one, is a rate. 0 is a rate -- the line was billed free --
+ * while a missing, null, blank or non-numeric value is not, and must never become 0: `allowZeroRate`
+ * lets an explicit 0 through, so reading `false` or "" as 0 would bill a line free that nobody
+ * priced at all.
+ */
+const readRequestedSaleRate = (value) => {
+  let number = null;
+  if (typeof value === "number") number = value;
+  else if (typeof value === "string" && value.trim() !== "") number = Number(value.trim());
+  return Number.isFinite(number) && number >= 0 ? number : null;
+};
+
 const buildSalePayload = async (
   client,
   {
@@ -6815,10 +6897,7 @@ const buildSalePayload = async (
     inventoryBatchId: parsePositiveInteger(item.inventory_batch_id),
     quantity: parsePositiveNumber(item.quantity),
     discountAmount: parseNonNegativeNumber(item.discount_amount),
-    // Presence first, then a non-negative parse: 0 is a rate, absent is not.
-    requestedRate: item.selling_rate === null || item.selling_rate === undefined || String(item.selling_rate).trim() === ""
-      ? null
-      : parseNonNegativeNumber(item.selling_rate),
+    requestedRate: readRequestedSaleRate(item.selling_rate),
     lotDiscountId: parsePositiveInteger(item.lot_discount_id),
     lotDiscountType: item.lot_discount_type ? String(item.lot_discount_type).trim().toUpperCase() : null,
     lotDiscountValue: parseNonNegativeNumber(item.lot_discount_value),
@@ -8538,8 +8617,13 @@ app.put("/users/:id", async (req, res) => {
     if (!userId) return res.status(400).json({ message: "Invalid user" });
     const payload = readUserPayload(req.body);
     // Both the role the account has now and the one the body asks for: an Admin may neither edit an
-    // Owner/Admin nor make anyone one, themselves included.
-    const editRefusal = await refuseUserManagement({ actor: manager, auth: req.auth, targetUserId: userId, requestedRole: payload.role });
+    // Owner/Admin nor make anyone one. The one exception is an Admin's own row, and only its own
+    // ordinary details (name, username, mobile, email, joining date, notes): the role, the active
+    // flag and the two recovery switches must arrive exactly as stored. `PUT /users/:id` writes no
+    // branch and no permissions, so those cannot change here at all.
+    const editRefusal = userId === parsePositiveInteger(req.auth.userId) && !isOwnerRole(manager.role_name)
+      ? await selfEditRefusal(userId, payload)
+      : await refuseUserManagement({ actor: manager, auth: req.auth, targetUserId: userId, requestedRole: payload.role });
     if (editRefusal) return sendUserManagementRefusal(res, editRefusal);
     const roleId = await getRoleIdByName(payload.role);
     if (!payload.full_name || !payload.username || !roleId) {
@@ -11455,7 +11539,9 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     payments: payload.payments || [],
     allowRateOverride: true,
     // The desktop POS bills a 0 rate only after an Owner/Admin confirmed it, and the customer has
-    // the bill; re-pricing that line at the default rate put money on it nobody collected.
+    // the bill; re-pricing that line at the default rate put money on it nobody collected. It covers
+    // only a line that carried an explicit 0 (`readRequestedSaleRate`): a line with no rate, a
+    // blank or a null one still takes the default rate, as before.
     allowZeroRate: true,
     companyId: context.companyId,
     operationalLocationId: context.operationalLocationId,
@@ -14228,12 +14314,18 @@ app.get("/api/owner/dashboard-foundation", async (req, res) => {
         expenses: Number(expenses.rows[0]?.total_expenses || metrics.todayExpenses || 0),
       },
       balances: {
-        customer_receivables: Number(metrics.customerOutstanding || 0),
-        supplier_payables: Number(metrics.supplierOutstanding || 0),
+        // Unknown stays null (see `readDashboardOutstanding`); a failed read is not a zero balance.
+        customer_receivables: metrics.customerOutstanding === null ? null : Number(metrics.customerOutstanding || 0),
+        supplier_payables: metrics.supplierOutstanding === null ? null : Number(metrics.supplierOutstanding || 0),
         stock_value: Number(stock.rows[0]?.stock_value || metrics.stockValue || 0),
         active_lots: stock.rows[0]?.active_lots || 0,
         empty_lots: stock.rows[0]?.empty_lots || 0,
       },
+      // The balances above that could not be loaded (null, never 0), by name.
+      failed_metrics: [
+        ...(metrics.customerOutstanding === null ? ["customer_receivables"] : []),
+        ...(metrics.supplierOutstanding === null ? ["supplier_payables"] : []),
+      ],
       devices: devices.rows,
       sync: {
         processed_operations_last_24h: processedSync.rows[0]?.processed_count || 0,
@@ -14487,7 +14579,20 @@ app.put("/settings/devices/:deviceId", async (req, res) => {
     if (!isOwnerRole(manager.role_name)) {
       const ownBranchId = parsePositiveInteger(req.auth.branchId);
       const movingTo = parsePositiveInteger(req.body.assigned_branch_id);
-      if (!ownBranchId || parsePositiveInteger(beforeResult.rows[0].assigned_branch_id) !== ownBranchId) {
+      const device = beforeResult.rows[0];
+      // A PENDING device has been placed nowhere yet: registration files it under whatever branch
+      // it reported, usually the default one. A manager may act on it (approve-by-rename into their
+      // own shop, reject, disable) unless it already names a counter of another company. The company
+      // boundary itself is the `company_id = $2` read above and is not relaxed.
+      let unplacedPending = false;
+      if (String(device.status || "").toUpperCase() === "PENDING") {
+        const counterId = parsePositiveInteger(device.assigned_counter_id);
+        unplacedPending = !counterId || Boolean((await pool.query(
+          "SELECT c.id FROM counters c JOIN branches b ON b.id = c.branch_id WHERE c.id = $1 AND b.company_id = $2 LIMIT 1",
+          [counterId, req.auth.companyId]
+        )).rows[0]);
+      }
+      if (!ownBranchId || (!unplacedPending && parsePositiveInteger(device.assigned_branch_id) !== ownBranchId)) {
         return res.status(404).json({ message: "Device not found" });
       }
       if (action === "RENAME" && movingTo && movingTo !== ownBranchId) {
@@ -19316,6 +19421,7 @@ app.get("/pending-bills/customer", async (req, res) => {
         SELECT c.id AS customer_id, c.opening_balance
         FROM customers c
         WHERE COALESCE(c.opening_balance, 0) > 0
+          AND (c.company_id IS NULL OR c.company_id = $1)
           AND c.id IN (
             SELECT cp.customer_id FROM customer_payments cp
             WHERE cp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
@@ -25527,12 +25633,35 @@ const createWasteEntryHandler = async (req, res) => {
 app.post("/waste-entries", createWasteEntryHandler);
 app.post("/api/v3/waste-entries", rateLimitSyncRequest, v3WriteAdapter(createWasteEntryHandler));
 
+/*
+ * Which branches' bills a caller may open, edit or cancel by id.
+ *
+ * Owner and Admin see the whole company: the customer ledger and pending-bills screens list every
+ * branch's bills of the company, and a bill picked there must open rather than say "Invoice not
+ * found". Every other role sees its own branch. The role is read from the database, never from the
+ * token. Used as `saleBranchScopeSql(...)` below with ($branch, $company, $companyWide).
+ */
+const SALE_COMPANY_SCOPE_ROLES = new Set(["Owner", "Admin"]);
+const saleScopeIsCompanyWide = (roleName) => SALE_COMPANY_SCOPE_ROLES.has(roleName);
+const readSaleScopeRole = async (userId, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return null;
+  const result = await client.query(
+    "SELECT r.role_name FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = $1 AND u.active = TRUE",
+    [parsedUserId]
+  );
+  return result.rows[0]?.role_name || null;
+};
+const saleBranchScopeSql = (column, branchParam, companyParam, companyWideParam) =>
+  `(${column} = ${branchParam} OR (${companyWideParam}::BOOLEAN AND ${column} IN (SELECT id FROM branches WHERE company_id = ${companyParam})))`;
+
 app.get("/sales/:id/audit", async (req, res) => {
   try {
     const saleId = parsePositiveInteger(req.params.id);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
-    // Only a bill of the caller's branch, as the invoice list it is opened from: by id alone any
+    // Only a bill the caller may open (its branch; the company for Owner/Admin): by id alone any
     // signed-in user could read any branch's change history, old and new snapshots included.
+    const companyWide = saleScopeIsCompanyWide(await readSaleScopeRole(req.auth.userId));
     const result = await pool.query(
       `
       SELECT sat.*, u.full_name AS edited_by_name
@@ -25540,10 +25669,10 @@ app.get("/sales/:id/audit", async (req, res) => {
       JOIN sales s ON s.id = sat.sale_id
       LEFT JOIN users u ON u.id = sat.edited_by
       WHERE sat.sale_id = $1
-        AND s.branch_id = $2
+        AND ${saleBranchScopeSql("s.branch_id", "$2", "$3", "$4")}
       ORDER BY sat.edited_at DESC, sat.id DESC
       `,
-      [saleId, req.auth.branchId]
+      [saleId, req.auth.branchId, req.auth.companyId, companyWide]
     );
     return res.json(result.rows);
   } catch (error) {
@@ -25569,16 +25698,18 @@ const updateSaleHandler = async (req, res) => {
     // The bill must be this shop's -- company and branch, as a sale return requires -- not this
     // counter's. Requiring the operational location too refused, as "Invoice not found", every bill
     // made on another counter of the same branch, though it was picked from this branch's list.
+    // Owner/Admin: any branch of the company, as the ledger and pending-bills lists show them.
     const saleLockResult = await client.query(
       `SELECT * FROM sales
        WHERE id = $1
-         AND branch_id = $2
+         AND ${saleBranchScopeSql("branch_id", "$2", "$3", "$4")}
          AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
        FOR UPDATE`,
       [
         saleId,
         parsePositiveInteger(context?.branch_id) || parsePositiveInteger(req.auth.branchId),
         parsePositiveInteger(context?.company_id) || parsePositiveInteger(req.auth.companyId) || null,
+        saleScopeIsCompanyWide(editor.role_name),
       ]
     );
     const currentSale = saleLockResult.rows[0];
@@ -25667,7 +25798,9 @@ const updateSaleHandler = async (req, res) => {
       charges: editCharges ?? [],
       allowManualChargeAmount: Boolean(await getPermissionUser(editor.id, "manual_pos_rate_override", ["Owner", "Admin"], client)),
       companyId: context?.company_id || null,
-      operationalLocationId: context?.operational_location_id || null,
+      // The bill's own counter, like its branch: the edited lines draw from the stock the bill was
+      // made from. The editor's counter found no lot for a bill made on another one.
+      operationalLocationId: currentSale.operational_location_id || null,
     });
     if (salePayload.error) {
       await client.query("ROLLBACK");
@@ -25856,9 +25989,10 @@ const updateSaleHandler = async (req, res) => {
 
     const responsePayload = { success: true, message: "Invoice Updated", sale: updatedSale };
     if (context) {
+      // Published to the bill's branch and counter, whose devices hold it -- not the editor's.
       await logSyncChange(client, {
-        branchId: context.branch_id,
-        operationalLocationId: context.operational_location_id,
+        branchId: currentSale.branch_id,
+        operationalLocationId: currentSale.operational_location_id || null,
         assignmentGeneration: context.assignment_generation,
         entityType: "pos_sale",
         entityId: updatedSale.global_id,
@@ -25897,16 +26031,18 @@ const cancelSaleHandler = async (req, res) => {
     const context = req.v3OperationalContext;
     // Company and branch, as an edit and a sale return: a bill from another counter of this branch
     // is this shop's bill, and was refused as "Invoice not found" when the counter had to match.
+    // Owner/Admin: any branch of the company, as the ledger and pending-bills lists show them.
     const saleLockResult = await client.query(
       `SELECT * FROM sales
        WHERE id = $1
-         AND branch_id = $2
+         AND ${saleBranchScopeSql("branch_id", "$2", "$3", "$4")}
          AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
        FOR UPDATE`,
       [
         saleId,
         parsePositiveInteger(context?.branch_id) || parsePositiveInteger(req.auth.branchId),
         parsePositiveInteger(context?.company_id) || parsePositiveInteger(req.auth.companyId) || null,
+        saleScopeIsCompanyWide(canceller.role_name),
       ]
     );
     const currentSale = saleLockResult.rows[0];
@@ -25958,9 +26094,10 @@ const cancelSaleHandler = async (req, res) => {
     );
     const responsePayload = { success: true, message: "Invoice Cancelled", sale: cancelledSale };
     if (context) {
+      // Published to the bill's branch and counter, whose devices hold it -- not the canceller's.
       await logSyncChange(client, {
-        branchId: context.branch_id,
-        operationalLocationId: context.operational_location_id,
+        branchId: currentSale.branch_id,
+        operationalLocationId: currentSale.operational_location_id || null,
         assignmentGeneration: context.assignment_generation,
         entityType: "pos_sale",
         entityId: cancelledSale.global_id,
@@ -26180,8 +26317,10 @@ app.get("/sales/:id", async (req, res) => {
     const saleId = parsePositiveInteger(req.params.id);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
 
-    // The caller's branch only, as the invoice list. The items and payments below are read only
-    // once this has found the bill, so they inherit the scope.
+    // The caller's branch, as the invoice list; the company for Owner/Admin, as the customer ledger
+    // and pending-bills lists. The items and payments below are read only once this has found the
+    // bill, so they inherit the scope.
+    const companyWide = saleScopeIsCompanyWide(await readSaleScopeRole(req.auth.userId));
     const saleResult = await pool.query(
       `
       SELECT s.*, b.branch_name, u.full_name AS created_by_name
@@ -26189,9 +26328,9 @@ app.get("/sales/:id", async (req, res) => {
       LEFT JOIN branches b ON b.id = s.branch_id
       LEFT JOIN users u ON u.id = s.created_by
       WHERE s.id = $1
-        AND s.branch_id = $2
+        AND ${saleBranchScopeSql("s.branch_id", "$2", "$3", "$4")}
       `,
-      [saleId, req.auth.branchId]
+      [saleId, req.auth.branchId, req.auth.companyId, companyWide]
     );
     if (saleResult.rows.length === 0) {
       return res.status(404).json({ message: "Invoice not found" });

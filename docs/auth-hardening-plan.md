@@ -2116,7 +2116,10 @@ shop. Now one rule, `userManagementRefusal`, is applied by every user-management
 manager half of `requireSelfOrRateManager`, which the recovery-contact routes use):
 
 - an account that **is** Owner/Admin, or **would become** one, is managed by the Owner only
-  (403 `OWNER_REQUIRED_FOR_PRIVILEGED_ACCOUNT`) -- so an Admin cannot edit their own row either;
+  (403 `OWNER_REQUIRED_FOR_PRIVILEGED_ACCOUNT`). One exception: an Admin may edit their **own** row
+  through `PUT /users/:id` when only ordinary details change (name, username, mobile, email, joining
+  date, notes) and the role, active flag and both recovery switches arrive exactly as stored
+  (`selfEditRefusal`); that route writes no branch or permissions;
 - anyone else manages only users whose `branch_id` is the session's branch (403
   `USER_NOT_IN_YOUR_BRANCH`). The actor's role is re-read from the database; the branch is
   `req.auth.branchId`.
@@ -2140,7 +2143,7 @@ Resetting someone else's password is unchanged apart from the rule above.
 | `createSaleHandler` (`POST /api/v3/sales`, browser checkout) | `billing` -- 403 `BILLING_PERMISSION_REQUIRED`. Sync (`processPosSaleFoundationOperation`) is untouched and never refuses. |
 | `createPurchaseBillHandler` (`POST /api/v3/purchase-bills`) | `purchases` -- 403 `PURCHASE_PERMISSION_REQUIRED` |
 | `GET /reports/summary`, `/balance-sheet`, `/balance-sheet/details/:lineKey`, `/cash-book`, `/day-book`, `/sales-report/changes` | `reports` -- 403 `REPORTS_PERMISSION_REQUIRED` |
-| `PUT /settings/devices/:deviceId` | `device_management`; below the Owner, own shop's devices only, and no moving one to another shop |
+| `PUT /settings/devices/:deviceId` | `device_management`; below the Owner, own shop's devices only, and no moving one to another shop. A PENDING device not yet placed (no counter, or a counter of this company) may be acted on whatever branch it registered under; the company read (`company_id = session`) is unchanged |
 | `POST /settings/counters` | `branch_settings`; branch must be in the session's company (the `|| 1` fallback is gone) |
 | `PUT /settings/backup`, `POST /settings/backup-now`, `POST /settings/safe-shutdown` | `backup_restore` |
 | `GET /settings/system-info` | `system_info` |
@@ -2172,8 +2175,8 @@ Resetting someone else's password is unchanged apart from the rule above.
   cancel/edit approval is accepted up to 7 days (`SYNC_APPROVAL_WINDOW_MS`) after it was granted, so
   a bill the counter already changed offline does not end up disagreeing with the server. The window
   is judged by server timestamps only -- the row's server-written `created_at` against the server's
-  `Date.now()` -- never a device-supplied time; a missing, unreadable or future `created_at` is
-  refused. Everything else still binds on that path: single use, action, bill, requester, company,
+  `Date.now()` -- never a device-supplied time; a missing or unreadable `created_at`, or one more than
+  60 seconds ahead of the Node clock (`SYNC_CLOCK_TOLERANCE_MS`, for Postgres/Node skew), is refused. Everything else still binds on that path: single use, action, bill, requester, company,
   device, and now the branch (`APPROVAL_WRONG_BRANCH`, the sync session's branch against the
   approval's). Returns have no offline path, so they keep 15 minutes everywhere. The approval is
   still not bound to the change's content.

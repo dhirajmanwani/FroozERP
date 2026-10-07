@@ -218,6 +218,22 @@ test("an edited line already billed at 0 may stay 0 for any editor", async () =>
   assert.equal(result.invoiceItems[0].sellingRate, 0);
 });
 
+test("allowZeroRate covers only a line that carried an explicit 0; a missing, null, blank or non-number rate takes the default", async () => {
+  for (const missing of [undefined, null, "", "  ", false, "abc", [], {}]) {
+    const line = { ...paidLine };
+    if (missing === undefined) delete line.selling_rate;
+    else line.selling_rate = missing;
+    const result = await recordedBill([line], { payments: [{ mode: "CASH", amount: 100 }], options: { allowRateOverride: true, allowZeroRate: true } });
+    assert.equal(result.error, undefined, `${JSON.stringify(missing)}: ${JSON.stringify(result.error)}`);
+    assert.equal(result.invoiceItems[0].sellingRate, 100, `${JSON.stringify(missing)} must not bill the line free`);
+  }
+  for (const zero of [0, "0", "0.00"]) {
+    const result = await recordedBill([{ ...freeLine, selling_rate: zero }, paidLine], { payments: [{ mode: "CASH", amount: 100 }], options: { allowRateOverride: true, allowZeroRate: true } });
+    assert.equal(result.error, undefined, JSON.stringify(result.error));
+    assert.equal(result.invoiceItems[0].sellingRate, 0, `${JSON.stringify(zero)} is an explicit 0`);
+  }
+});
+
 test("a blank rate is not a rate: the default applies, as before", async () => {
   const result = await recordedBill([{ ...paidLine, selling_rate: "" }], { payments: [{ mode: "CASH", amount: 100 }] });
   assert.equal(result.error, undefined, JSON.stringify(result.error));
@@ -267,9 +283,13 @@ test("both edit paths leave CREDIT out of the payment rows, as a new bill does",
 // ---------------------------------------------------------------------------------------------
 
 test("edit and cancel find a bill by company and branch, not by this counter", () => {
-  for (const marker of ["const updateSaleHandler", "const cancelSaleHandler"]) {
+  for (const [marker, actor] of [["const updateSaleHandler", "editor"], ["const cancelSaleHandler", "canceller"]]) {
+    // Company-wide for Owner/Admin, decided from the role the database returned for the actor.
+    assert.match(bodyOf(marker), new RegExp(`saleScopeIsCompanyWide\\(${actor}\\.role_name\\)`), marker);
+    // The change is published where the bill lives, and its lines draw from the bill's own counter.
+    assert.match(bodyOf(marker), /branchId: currentSale\.branch_id,\s*operationalLocationId: currentSale\.operational_location_id \|\| null,/, marker);
     const lock = /const saleLockResult = await client\.query\(\s*`([\s\S]*?)`/.exec(bodyOf(marker))?.[1] || "";
-    assert.match(lock, /AND branch_id = \$2/, marker);
+    assert.match(lock, /AND \$\{saleBranchScopeSql\("branch_id", "\$2", "\$3", "\$4"\)\}/, marker);
     assert.match(lock, /company_id IS NULL OR company_id = \$3/, marker);
     assert.doesNotMatch(lock, /operational_location_id/, `${marker}: another counter's bill is this shop's bill`);
   }
@@ -296,22 +316,79 @@ const call = async (method, url, answer = () => undefined) => {
   }
 };
 
-test("GET /sales/:id finds a bill only in the caller's branch", async () => {
+const ROLE_SQL = /^SELECT r\.role_name FROM users u JOIN roles r ON r\.id = u\.role_id WHERE u\.id = \$1 AND u\.active = TRUE$/;
+const asRole = (role) => (sql) => (ROLE_SQL.test(sql) ? rows(role ? [{ role_name: role }] : []) : undefined);
+
+/**
+ * GET /sales/:id against a real Postgres: branch 3 (the session's) and branch 4 belong to company 1,
+ * branch 9 to company 2. Bill 55 is in branch 4, bill 66 in branch 9.
+ */
+const openBill = async (saleId, role) => {
+  const { PGlite } = require("@electric-sql/pglite");
+  const db = new PGlite();
+  try {
+    await db.exec(`
+      CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, branch_name TEXT);
+      CREATE TABLE users (id INTEGER PRIMARY KEY, full_name TEXT);
+      CREATE TABLE sales (id INTEGER PRIMARY KEY, branch_id INTEGER, created_by INTEGER, invoice_no TEXT);
+      INSERT INTO branches VALUES (3, 1, 'Main'), (4, 1, 'Second'), (9, 2, 'Other company');
+      INSERT INTO sales VALUES (55, 4, NULL, 'FZ-55'), (66, 9, NULL, 'FZ-66');
+    `);
+    const lookups = [];
+    const pending = [];
+    const result = await call("GET", `/sales/${saleId}`, (sql, values) => {
+      if (ROLE_SQL.test(sql)) return rows(role ? [{ role_name: role }] : []);
+      if (/FROM sales s LEFT JOIN branches b/.test(sql)) {
+        lookups.push({ sql, values });
+        const answer = db.query(sql, values);
+        pending.push(answer);
+        return answer;
+      }
+      return undefined;
+    });
+    await Promise.all(pending);
+    return { ...result, lookups };
+  } finally {
+    await db.close();
+  }
+};
+
+test("GET /sales/:id: a Cashier opens only their own branch's bill", async () => {
+  const { response, lookups } = await openBill(55, "Cashier");
+  assert.equal(response.status, 404);
+  assert.deepEqual(lookups[0].values, [55, 3, 1, false]);
+});
+
+test("GET /sales/:id: an Owner opens another branch's bill of the company, as the ledger lists it", async () => {
+  const { response } = await openBill(55, "Owner");
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.invoice_no, "FZ-55");
+  assert.equal((await openBill(55, "Admin")).response.status, 200);
+});
+
+test("GET /sales/:id: not even an Owner opens another company's bill", async () => {
+  const { response } = await openBill(66, "Owner");
+  assert.equal(response.status, 404);
+});
+
+test("GET /sales/:id: no role found is branch scope, never company scope", async () => {
   const { response, statements } = await call("GET", "/sales/55");
   assert.equal(response.status, 404);
   const [sale] = statements.filter(({ sql }) => /FROM sales s LEFT JOIN branches b/.test(sql));
-  assert.match(sale.sql, /WHERE s\.id = \$1 AND s\.branch_id = \$2/);
-  assert.deepEqual(sale.values, [55, 3]);
+  assert.match(sale.sql, /WHERE s\.id = \$1 AND \(s\.branch_id = \$2 OR \(\$4::BOOLEAN AND s\.branch_id IN \(SELECT id FROM branches WHERE company_id = \$3\)\)\)/);
+  assert.deepEqual(sale.values, [55, 3, 1, false]);
   assert.equal(statements.filter(({ sql }) => /FROM sale_items si/.test(sql)).length, 0, "no lines read for a bill not found");
 });
 
-test("GET /sales/:id/audit reads only a bill of the caller's branch", async () => {
-  const { response, statements } = await call("GET", "/sales/55/audit");
-  assert.equal(response.status, 200);
-  const [audit] = statements.filter(({ sql }) => /FROM sale_audit_trail sat/.test(sql));
-  assert.match(audit.sql, /JOIN sales s ON s\.id = sat\.sale_id/);
-  assert.match(audit.sql, /AND s\.branch_id = \$2/);
-  assert.deepEqual(audit.values, [55, 3]);
+test("GET /sales/:id/audit: branch scope for a Cashier, company scope for an Owner", async () => {
+  for (const [role, companyWide] of [["Cashier", false], ["Owner", true]]) {
+    const { response, statements } = await call("GET", "/sales/55/audit", asRole(role));
+    assert.equal(response.status, 200);
+    const [audit] = statements.filter(({ sql }) => /FROM sale_audit_trail sat/.test(sql));
+    assert.match(audit.sql, /JOIN sales s ON s\.id = sat\.sale_id/);
+    assert.match(audit.sql, /AND \(s\.branch_id = \$2 OR \(\$4::BOOLEAN AND s\.branch_id IN \(SELECT id FROM branches WHERE company_id = \$3\)\)\)/);
+    assert.deepEqual(audit.values, [55, 3, 1, companyWide], role);
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -377,4 +454,55 @@ test("a purchase's temporary product rate is logged to every active branch of th
   assert.match(rateChange[2], /^context\?\.branch_id \|\| req\.auth\.branchId/, "anchored on the caller's branch first");
   const leftovers = [...SOURCE.matchAll(/await logSyncChange\(client, \{\s*branchId: [^\n]*\n\s*entityType: (sellingRateChanged \? )?"(product|product_category|sale_rate)"/g)];
   assert.deepEqual(leftovers.map((match) => match[0]), [], "no master-data change is logged to one branch only");
+});
+
+// ---------------------------------------------------------------------------------------------
+// The dashboard: a tile that could not be loaded is null and named, never ₹0
+// ---------------------------------------------------------------------------------------------
+
+const dashboardCall = (failing) => call("GET", "/dashboard-metrics", (sql) => {
+  if (/role_permission_settings/i.test(sql)) {
+    return rows([{ id: 7, full_name: "Rig Owner", username: "rig", branch_id: 3, role_name: "Owner", permissions: { dashboard: true } }]);
+  }
+  if (failing.test(sql)) throw Object.assign(new Error("relation does not exist"), { code: "42P01" });
+  if (/AS value/.test(sql)) return rows([{ value: "0" }]);
+  return undefined;
+});
+
+test("GET /dashboard-metrics: a failed tile comes back null and named in failed_metrics, the rest as figures", async () => {
+  const { response } = await dashboardCall(/FROM expenses WHERE branch_id = \$1 AND expense_date = CURRENT_DATE/);
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.todayExpenses, null, "a failed read is not a quiet day");
+  assert.deepEqual(response.body.failed_metrics, ["todayExpenses"]);
+  assert.equal(response.body.todaySales, 0, "a real 0 is still 0");
+  assert.equal(response.body.stockValue, 0);
+});
+
+test("GET /dashboard-metrics: an unknown stock value or monthly waste makes the waste percentage unknown too", async () => {
+  const { response } = await dashboardCall(/FROM inventory_batches WHERE branch_id = \$1 AND COALESCE\(batch_status/);
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.stockValue, null);
+  assert.equal(response.body.wastePercentage, null);
+  assert.deepEqual([...response.body.failed_metrics].sort(), ["stockValue", "wastePercentage"]);
+});
+
+test("GET /dashboard-metrics: nothing failed, nothing named", async () => {
+  const { response } = await dashboardCall(/^$a/);
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.deepEqual(response.body.failed_metrics, []);
+  for (const [key, value] of Object.entries(response.body)) {
+    if (key !== "failed_metrics") assert.equal(typeof value, "number", key);
+  }
+});
+
+test("no dashboard path turns a failed figure back into 0", () => {
+  const metric = bodyOf("const readDashboardMetric");
+  assert.doesNotMatch(metric, /return 0;/);
+  assert.match(metric, /return null;/);
+  assert.doesNotMatch(bodyOf("const readDashboardOutstanding"), /return 0;/);
+  // The analytics bundle's fallback for a summary that could not be built is all-unknown.
+  assert.match(bodyOf("const dashboardAnalyticsFallbacks"), /UNKNOWN_DASHBOARD_SUMMARY,/);
+  assert.match(bodyOf("const buildDashboardInsights"), /Supplier outstanding could not be loaded\./);
+  assert.match(SOURCE, /customer_receivables: metrics\.customerOutstanding === null \? null :/);
+  assert.match(SOURCE, /supplier_payables: metrics\.supplierOutstanding === null \? null :/);
 });

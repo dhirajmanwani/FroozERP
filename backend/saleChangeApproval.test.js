@@ -27,6 +27,7 @@ const {
   APPROVAL_TTL_MS,
   BILL_CHANGE_APPROVAL_TTL_MS,
   SYNC_APPROVAL_WINDOW_MS,
+  SYNC_CLOCK_TOLERANCE_MS,
   approvalTtlMs,
   approvalAttemptsLocked,
   approvalRequired,
@@ -259,8 +260,14 @@ test("through the sync push, an approval lives 7 days from when the server grant
 
 test("the sync window is measured from the server's grant time and nothing else", () => {
   // No grant time, an unreadable one, or one later than the server clock: refused, never assumed.
-  for (const created_at of [undefined, null, "", "not a date", new Date(NOW + 60 * 1000).toISOString()]) {
+  for (const created_at of [undefined, null, "", "not a date", new Date(NOW + 61 * 1000).toISOString()]) {
     assert.equal(checkApprovalBinding(issuedRow({ created_at }), binding({ viaSync: true })).detail, BINDING_DETAILS.EXPIRED, String(created_at));
+  }
+  // `created_at` is the database's clock and `nowMs` Node's: up to a minute of skew is not "future".
+  assert.equal(SYNC_CLOCK_TOLERANCE_MS, 60 * 1000);
+  for (const ahead of [1000, 59 * 1000, 60 * 1000]) {
+    const skewed = issuedRow({ created_at: new Date(NOW + ahead).toISOString(), expires_at: new Date(NOW - 1) });
+    assert.equal(checkApprovalBinding(skewed, binding({ viaSync: true })).ok, true, `${ahead} ms ahead is clock skew`);
   }
   // `viaSync` must be exactly true; a truthy string from anywhere does not switch windows.
   const aged = issuedRow({ created_at: new Date(NOW - 30 * 60 * 1000), expires_at: new Date(NOW - 15 * 60 * 1000) });

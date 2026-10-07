@@ -1,7 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
-import { findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation } from "./accountsPresentation.js";
+import {
+  findPurchaseSupplier,
+  findSaleCustomer,
+  overpaymentWarning,
+  paymentBalancePreview,
+  resolveOutstandingPresentation,
+  supplierLedgerKey,
+} from "./accountsPresentation.js";
 
 test("outstanding: not loaded, failed and empty-bundle are never zero", () => {
   assert.equal(resolveOutstandingPresentation(null).kind, "loading");
@@ -45,4 +53,48 @@ test("ledger lookup: id first, then mobile, then name, never Number()", () => {
   assert.equal(findSaleCustomer(customers, { customer_name: " ravi " }).id, "4");
   assert.equal(findSaleCustomer(customers, { customer_name: "Walk-in" }).id, "9");
   assert.equal(findSaleCustomer(customers, { customer_id: "77" }), null);
+});
+
+test("an empty outstanding bundle says unavailable, never loading forever", () => {
+  assert.equal(resolveOutstandingPresentation({}).kind, "unavailable");
+  assert.equal(resolveOutstandingPresentation({ totalReceivable: 10 }).kind, "unavailable");
+  assert.equal(resolveOutstandingPresentation(null).kind, "loading");
+  assert.equal(resolveOutstandingPresentation({ totalReceivable: 0, totalPayable: 0 }).kind, "ready", "zero is a real balance");
+  assert.equal(resolveOutstandingPresentation({ totalReceivable: 0, totalPayable: 0 }, "502").kind, "error");
+
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  // The snapshot path hands over `{}` rather than leaving null (which reads as "Loading…"), and a
+  // good bundle clears an error left by an earlier failed server read.
+  assert.match(app, /setAccountOutstanding\(bundle\.offlineAccountOutstanding \|\| \{\}\);\n\s+if \(resolveOutstandingPresentation\(bundle\.offlineAccountOutstanding\)\.kind === "ready"\) setAccountOutstandingError\(""\);/);
+  const loader = app.slice(app.indexOf("const loadAccountOutstanding = async"), app.indexOf("const loadAccountOutstanding = async") + 500);
+  assert.match(loader, /setAccountOutstanding\(response\.data\);\n\s+setAccountOutstandingError\(""\);/);
+});
+
+test("a purchase finds its supplier by canonical id first, then by name, never by Number()", () => {
+  const suppliers = [
+    { id: 4, global_id: "supplier-4", supplier_name: "Ravi Traders" },
+    { id: "004", supplier_name: "Padded" },
+    { id: 12, global_id: "supplier-12", supplier_name: "Mandi Co" },
+  ];
+  assert.equal(findPurchaseSupplier(suppliers, { supplier_id: "004", supplier_name: "Ravi Traders" }).supplier_name, "Padded",
+    "\"004\" is not 4, and the id beats a name match");
+  assert.equal(findPurchaseSupplier(suppliers, { supplier_id: "supplier-12" }).id, 12, "a snapshot global id finds the row");
+  assert.equal(findPurchaseSupplier(suppliers, { supplier_id: "4" }).id, 4);
+  assert.equal(findPurchaseSupplier(suppliers, { supplier_id: "", supplier_name: " mandi co " }).id, 12);
+  assert.equal(findPurchaseSupplier(suppliers, { supplier_id: "99" }), null);
+  assert.equal(findPurchaseSupplier(null, { supplier_id: 4 }), null);
+
+  assert.equal(supplierLedgerKey(suppliers, { supplier_id: "supplier-12" }), "SUPPLIER-12", "the key uses the server row id");
+  assert.equal(supplierLedgerKey(suppliers, { supplier_id: "004" }), "SUPPLIER-004");
+  assert.equal(supplierLedgerKey([], { supplier_id: 7 }), "SUPPLIER-7", "a plain server id still works without the list");
+  assert.equal(supplierLedgerKey([], { supplier_id: "supplier-7" }), "", "a global id is not guessed into a key");
+  assert.equal(supplierLedgerKey([], { supplier_id: "007" }), "", "a padded id is not turned into 7");
+  assert.equal(supplierLedgerKey([], { supplier_id: 0 }), "");
+  assert.equal(supplierLedgerKey([], {}), "");
+
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const opener = app.slice(app.indexOf("const openSupplierLedgerFromReport = async"), app.indexOf("const openCustomerLedgerFromReport = async"));
+  assert.doesNotMatch(opener.replace(/\/\/.*$/gm, ""), /Number\(/);
+  assert.match(opener, /supplierLedgerKey\(suppliers, purchase\)/);
+  assert.match(opener, /!isLocalOnlyConnectivitySelected\(\)/, "Local Only never asks the server for the list");
 });
