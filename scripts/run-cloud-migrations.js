@@ -87,6 +87,12 @@ const migrationFiles = [
   // so without this file the column does not exist there -- `verifyDeclaredSchema` refuses to
   // start, and every device registration would 500 on it once it did.
   "backend/migrations/cloud/022_device_machine_fingerprint.sql",
+  // 023 adds `products.pos_section`: the owner's chosen POS shelf ('retail' | 'bar' | 'moments'),
+  // NULL meaning the shelf is still derived from category and name. Declared in
+  // `initializeDatabase()`, which never runs on a hosted deployment, so without this file the column
+  // does not exist there -- `verifyDeclaredSchema` refuses to start, and every product create or
+  // edit would 500 on it once it did.
+  "backend/migrations/cloud/023_product_pos_section.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };
