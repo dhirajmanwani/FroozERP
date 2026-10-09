@@ -128,14 +128,37 @@ const resolvePaymentsDueDate = (value, serverDay) => {
  * undated walk-up bill must not hide the overdue dated one behind it. When no uncovered bill carries
  * a date, `next_due_date` is null: a customer who was given no due date is not overdue.
  *
+ * What a bill puts into the FIFO is its `amount_due` -- the total less what was paid against it at
+ * the counter -- when the row carries one, as the service's receivable query does; a bare
+ * `total_amount` is a bill nothing was paid on at the counter. A negative `amount_due` (a bill
+ * overpaid at the counter) adds to the pool at its turn, so the ledger total still equals the
+ * Accounts formula, which sums it.
+ *
  * Returns a Map keyed by `idKey(customer_id)`.
  */
+const billAmountDue = (bill) => {
+  // Not `??`: an `amount_due` of 0 is a real value and must not fall through to the bill total.
+  if (bill.amount_due !== undefined && bill.amount_due !== null && bill.amount_due !== "") return bill.amount_due;
+  return bill.total_amount;
+};
+
 const nextUnpaidDueDates = ({ bills = [], credits = [] } = {}) => {
   const creditBy = new Map();
+  // A customer's opening balance, when the service counts it, is the oldest debt there is: it is
+  // paid off before any bill. It carries no day, so when it is the first thing left unpaid the
+  // debt predates the books and `unpaid_since` is null -- an honest "unknown", not the date of a
+  // later bill -- while the first uncovered *dated* bill still gives the due date.
+  const openingBy = new Map();
+  const customerIdBy = new Map();
   for (const row of Array.isArray(credits) ? credits : []) {
     if (!row) continue;
     const key = idKey(row.customer_id);
     creditBy.set(key, (creditBy.get(key) || 0) + toPaise(row.paid_amount) + toPaise(row.returned_amount));
+    const opening = toPaise(row.opening_balance);
+    if (opening !== 0) {
+      openingBy.set(key, (openingBy.get(key) || 0) + opening);
+      if (!customerIdBy.has(key)) customerIdBy.set(key, row.customer_id ?? null);
+    }
   }
   const billsBy = new Map();
   for (const bill of Array.isArray(bills) ? bills : []) {
@@ -143,41 +166,45 @@ const nextUnpaidDueDates = ({ bills = [], credits = [] } = {}) => {
     const key = idKey(bill.customer_id);
     if (!billsBy.has(key)) billsBy.set(key, []);
     billsBy.get(key).push(bill);
+    if (!customerIdBy.has(key)) customerIdBy.set(key, bill.customer_id ?? null);
   }
   const result = new Map();
-  for (const [key, list] of billsBy) {
+  for (const key of new Set([...billsBy.keys(), ...openingBy.keys()])) {
+    const list = billsBy.get(key) || [];
     // An undated bill sorts last rather than first: "" would put it ahead of every real day.
     const ordered = list
       .map((bill, index) => ({ bill, index, day: dayKey(bill.sale_date) || "9999-12-31" }))
       .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : a.index - b.index))
-      .map(({ bill }) => bill);
+      .map(({ bill }) => ({ amount: toPaise(billAmountDue(bill)), saleDay: dayKey(bill.sale_date), dueDay: dayKey(bill.due_date), id: bill.id ?? null }));
+    const opening = openingBy.get(key) || 0;
+    const items = opening !== 0 ? [{ amount: opening, saleDay: null, dueDay: null, id: null }, ...ordered] : ordered;
     let pool = creditBy.get(key) || 0;
     let billed = 0;
+    let unpaidFound = false;
     let unpaidSince = null;
     let unpaidBillId = null;
     let nextDueDate = null;
     let nextDueBillId = null;
-    for (const bill of ordered) {
-      const amount = toPaise(bill.total_amount);
-      billed += amount;
-      if (pool >= amount) {
-        pool -= amount;
+    for (const item of items) {
+      billed += item.amount;
+      if (pool >= item.amount) {
+        pool -= item.amount;
         continue;
       }
       pool = 0;
-      if (unpaidBillId === null) {
-        unpaidSince = dayKey(bill.sale_date);
-        unpaidBillId = bill.id ?? null;
+      if (!unpaidFound) {
+        unpaidFound = true;
+        unpaidSince = item.saleDay;
+        unpaidBillId = item.id;
       }
-      const due = dayKey(bill.due_date);
-      if (due && nextDueDate === null) {
-        nextDueDate = due;
-        nextDueBillId = bill.id ?? null;
+      if (item.dueDay && nextDueDate === null) {
+        nextDueDate = item.dueDay;
+        nextDueBillId = item.id;
       }
     }
     const credited = creditBy.get(key) || 0;
     result.set(key, {
-      customer_id: list[0].customer_id ?? null,
+      customer_id: customerIdBy.get(key) ?? null,
       billed_amount: fromPaise(billed),
       credited_amount: fromPaise(credited),
       outstanding_amount: fromPaise(Math.max(0, billed - credited)),
@@ -235,6 +262,49 @@ const buildCustomerLedger = ({ customers = [], customerBills = [] } = {}) => {
     customer_name: names.get(key) || "Walk-in Customer",
     last_payment_date: lastPayment.get(key) || null,
   }));
+};
+
+/**
+ * The day each supplier's oldest unpaid purchase was made, by FIFO -- the same rule as
+ * `nextUnpaidDueDates`, for the other side of the books.
+ *
+ * `suppliers` carries one row per supplier with `opening_balance` and `payment_credit` (supplier
+ * payments plus their rebates); `purchases` one row per purchase with what is still owed on it after
+ * its own rebate and payment (`amount_due`). The opening balance is the oldest debt and is paid off
+ * first. When it is the first thing the pool does not cover, the debt predates the books and the day
+ * is null -- an honest "unknown", not the date of some later purchase. A supplier who is owed
+ * nothing has no day.
+ *
+ * Returns a Map keyed by `idKey(supplier_id)`; suppliers with no unpaid day are absent.
+ */
+const oldestUnpaidPurchaseDates = ({ suppliers = [], purchases = [] } = {}) => {
+  const byKey = new Map();
+  for (const purchase of Array.isArray(purchases) ? purchases : []) {
+    if (!purchase) continue;
+    const key = idKey(purchase.supplier_id);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(purchase);
+  }
+  const result = new Map();
+  for (const supplier of Array.isArray(suppliers) ? suppliers : []) {
+    if (!supplier) continue;
+    const key = idKey(supplier.supplier_id);
+    const ordered = (byKey.get(key) || [])
+      .map((purchase, index) => ({ purchase, index, day: dayKey(purchase.purchase_date) || "9999-12-31" }))
+      .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : a.index - b.index))
+      .map(({ purchase }) => ({ day: dayKey(purchase.purchase_date), amount: toPaise(purchase.amount_due) }));
+    const items = [{ day: null, amount: toPaise(supplier.opening_balance) }, ...ordered];
+    let pool = toPaise(supplier.payment_credit);
+    for (const item of items) {
+      if (pool >= item.amount) {
+        pool -= item.amount;
+        continue;
+      }
+      if (item.day) result.set(key, item.day);
+      break;
+    }
+  }
+  return result;
 };
 
 /**
@@ -899,6 +969,7 @@ module.exports = {
   idKey,
   linkReminderDraft,
   nextUnpaidDueDates,
+  oldestUnpaidPurchaseDates,
   resolvePaymentsDueDate,
   shortDay,
 };

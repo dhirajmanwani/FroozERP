@@ -304,8 +304,9 @@ const stubPool = ({ outstanding = [], contacts = [], businessName = SHOP } = {})
     statements,
     query: async (text, values = []) => {
       statements.push({ text, values });
-      if (/WITH credit_sales/.test(text)) return { rows: outstanding, rowCount: outstanding.length };
-      if (/FROM customers c/.test(text)) return { rows: contacts, rowCount: contacts.length };
+      if (RECEIVABLE_BILLS_SQL.test(text)) return { rows: billsFrom(outstanding), rowCount: outstanding.length };
+      if (RECEIVABLE_CREDITS_SQL.test(text)) return { rows: creditsFrom(outstanding), rowCount: outstanding.length };
+      if (CONTACT_SQL.test(text)) return { rows: contacts, rowCount: contacts.length };
       if (/FROM business_settings/.test(text)) return { rows: [{ business_name: businessName }], rowCount: 1 };
       return { rows: [], rowCount: 0 };
     },
@@ -333,6 +334,29 @@ const LEDGER_ROWS = [
     outstanding_amount: 800,
   },
 ];
+
+/**
+ * The receivable is read at bill grain now -- one row per bill still owed on, one row per customer
+ * for payments and credit-note returns -- and FIFO in `buildCustomerLedger` turns it into the rows
+ * above. Each ledger row is stated as one unpaid bill on its oldest day, which is what the two
+ * reads look like for that customer.
+ */
+const RECEIVABLE_BILLS_SQL = /AS amount_due\s+FROM sales s/;
+const RECEIVABLE_CREDITS_SQL = /WITH customer_paid AS/;
+const CONTACT_SQL = /SELECT DISTINCT\s+c\.id AS customer_id/;
+const billsFrom = (rows) => rows.map((row, index) => ({
+  id: 500 + index,
+  customer_id: row.customer_id,
+  customer_name: row.customer_name,
+  mobile_number: row.mobile_number,
+  sale_date: row.oldest_invoice_date,
+  due_date: row.oldest_due_date,
+  total_amount: row.outstanding_amount,
+  amount_due: row.outstanding_amount,
+}));
+const creditsFrom = (rows) => rows
+  .filter((row) => row.last_payment_date)
+  .map((row) => ({ customer_id: row.customer_id, customer_name: row.customer_name, mobile_number: row.mobile_number, paid_amount: 0, returned_amount: 0, last_payment_date: row.last_payment_date }));
 
 const CONTACT_ROWS = [
   { customer_id: 4, whatsapp_number: "919812345678", mobile_number: "9812345678", whatsapp_opt_in: true },
@@ -490,8 +514,9 @@ const callDuesRoute = async ({ branchId = 2, permissionUser = OWNER_ROW, headers
   setQueryResponder((sql, values) => {
     statements.push({ sql, values });
     if (/FROM\s+users\s+u\s+JOIN\s+roles\s+r/i.test(sql)) return permissionUser;
-    if (/WITH credit_sales/.test(sql)) return { rows: LEDGER_ROWS, rowCount: LEDGER_ROWS.length };
-    if (/FROM customers c/.test(sql)) return { rows: CONTACT_ROWS, rowCount: CONTACT_ROWS.length };
+    if (RECEIVABLE_BILLS_SQL.test(sql)) return { rows: billsFrom(LEDGER_ROWS), rowCount: LEDGER_ROWS.length };
+    if (RECEIVABLE_CREDITS_SQL.test(sql)) return { rows: creditsFrom(LEDGER_ROWS), rowCount: LEDGER_ROWS.length };
+    if (CONTACT_SQL.test(sql)) return { rows: CONTACT_ROWS, rowCount: CONTACT_ROWS.length };
     if (/FROM business_settings/.test(sql)) return { rows: [{ business_name: SHOP }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   });
@@ -520,8 +545,10 @@ test("the dues route reads the session's branch, never a branch the caller names
   // `req.auth.branchId` is the only branch that may scope a FROST read. A caller asking for
   // somebody else's shop gets their own, and the bound values are what proves it.
   const { statements } = await callDuesRoute({ branchId: 2, headers: { "x-branch-id": "1" } });
-  const ledger = statements.find(({ sql }) => /WITH credit_sales/.test(sql));
-  const contacts = statements.find(({ sql }) => /FROM customers c/.test(sql));
+  const ledger = statements.find(({ sql }) => RECEIVABLE_BILLS_SQL.test(sql));
+  const credits = statements.find(({ sql }) => RECEIVABLE_CREDITS_SQL.test(sql));
+  const contacts = statements.find(({ sql }) => CONTACT_SQL.test(sql));
+  assert.deepEqual(credits.values, [2]);
   assert.deepEqual(ledger.values, [2]);
   assert.deepEqual(contacts.values, [2]);
 });
@@ -545,7 +572,7 @@ test("an unauthenticated caller never reaches the ledger", async () => {
     const response = await probe(app, "GET", "/api/ai/reminders/customer-dues", {});
     assert.ok(response.status === 401 || response.status === 403, `expected a refusal, got ${response.status}`);
     assert.ok(
-      !statements.some((sql) => /WITH credit_sales/.test(sql)),
+      !statements.some((sql) => RECEIVABLE_BILLS_SQL.test(sql) || RECEIVABLE_CREDITS_SQL.test(sql)),
       "the books must not be read before the session is verified",
     );
   } finally {

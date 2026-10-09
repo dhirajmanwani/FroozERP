@@ -211,7 +211,9 @@ test("GET /sale-rates: suggestions from cost at the asked margin, none without a
   assert.equal(lot.suggested_selling_rate, 120, "a 0% target suggests the cost, not cost + 25%");
   assert.equal(product.suggested_selling_rate, null, "no cost, no suggestion");
   const [list] = find(statements, /AS latest_effective_cost/);
-  assert.deepEqual(list.values, [SESSION_BRANCH_ID]);
+  // Branch for the stock, company for the catalogue -- both from the session (company 1).
+  assert.deepEqual(list.values, [SESSION_BRANCH_ID, 1]);
+  assert.match(list.sql, /AND \(p\.company_id IS NULL OR p\.company_id = \$2\)/, "another company's products are not listed");
 });
 
 test("GET /sale-rates is refused to a role that does not manage rates", async () => {
@@ -223,8 +225,9 @@ test("GET /sale-rates is refused to a role that does not manage rates", async ()
 const productRow = (overrides = {}) => ({ id: 3, global_id: "product-rig-3", selling_rate: "150.00", entity_version: 5, product_name: "Rig Mango", ...overrides });
 
 const productSave = ({ current = "150.00" } = {}) => (sql, values) => {
-  if (/^SELECT id, selling_rate FROM products WHERE id = \$1 AND active = TRUE FOR UPDATE$/.test(sql)) {
-    return values[0] === 3 ? rows([{ id: 3, selling_rate: current }]) : rows([]);
+  if (/^SELECT id, selling_rate FROM products WHERE id = \$1 AND active = TRUE AND \(company_id IS NULL OR company_id = \$2\) FOR UPDATE$/.test(sql)) {
+    // Found only for the session's company (1).
+    return values[0] === 3 && values[1] === 1 ? rows([{ id: 3, selling_rate: current }]) : rows([]);
   }
   if (/^UPDATE products SET selling_rate = \$1/.test(sql)) {
     return rows([productRow({ selling_rate: values[0].toFixed(2), entity_version: 6 })]);
@@ -257,6 +260,49 @@ test("POST /sale-rates/bulk: a product-rate save bumps the version and publishes
   assert.equal(JSON.parse(change.values[7]).selling_rate, 160, "the rate is a number the desktop can read");
 
   assert.ok(find(statements, /^COMMIT$/).length === 1);
+});
+
+test("POST /sale-rates/bulk: a product-rate change reaches every active branch of the company", async () => {
+  // Sync pull reads the change log by branch. Logged to the owner's branch alone, the new rate
+  // reached that branch's counters and no other branch's.
+  const OTHER_BRANCH_ID = SESSION_BRANCH_ID + 5;
+  const { response, statements } = await call("POST", "/sale-rates/bulk", {
+    body: { updates: [{ product_id: 3, new_selling_rate: 160 }] },
+    answer: (sql, values) => {
+      if (/^SELECT id FROM branches WHERE company_id = \(SELECT company_id FROM branches WHERE id = \$1\)/.test(sql)) {
+        assert.match(sql, /active IS DISTINCT FROM FALSE/);
+        return values[0] === SESSION_BRANCH_ID ? rows([{ id: OTHER_BRANCH_ID }]) : rows([]);
+      }
+      return productSave()(sql, values);
+    },
+  });
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  const changes = find(statements, /^INSERT INTO sync_change_log/);
+  assert.deepEqual(changes.map((change) => change.values[0]), [SESSION_BRANCH_ID, OTHER_BRANCH_ID]);
+  for (const change of changes) {
+    assert.equal(change.values[3], "sale_rate");
+    assert.equal(change.values[4], "product-rig-3");
+    assert.equal(change.values[6], 6);
+  }
+});
+
+test("POST /sale-rates/bulk: another company's product is not found", async () => {
+  const { response, statements } = await call("POST", "/sale-rates/bulk", {
+    body: { updates: [{ product_id: 4, new_selling_rate: 160 }] },
+    answer: productSave(),
+  });
+  assert.equal(response.status, 404);
+  const [select] = find(statements, /^SELECT id, selling_rate FROM products/);
+  assert.deepEqual(select.values, [4, 1], "the session's company, never one the request names");
+  assert.equal(find(statements, /^UPDATE products/).length, 0);
+});
+
+test("GET /sale-rate-history: only the caller's company's products", async () => {
+  const { response, statements } = await call("GET", "/sale-rate-history");
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  const [history] = find(statements, /FROM sale_rate_history h/);
+  assert.match(history.sql, /WHERE p\.company_id IS NULL OR p\.company_id = \$1/);
+  assert.deepEqual(history.values, [1]);
 });
 
 test("POST /sale-rates/bulk: an unchanged rate (as money) is skipped and not counted", async () => {

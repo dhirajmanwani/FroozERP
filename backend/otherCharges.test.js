@@ -339,6 +339,9 @@ test("any charge the shop invents works the same way, with its own unit", async 
 // A real bill
 // -------------------------------------------------------------------------------------------
 
+const BILLING_PERMISSION_SQL = /SELECT\s+u\.id,\s*u\.full_name,\s*u\.username,\s*u\.branch_id,\s*r\.role_name,\s*COALESCE\(rps\.permissions/i;
+const BILLING_CASHIER = { id: 7, full_name: "Counter", username: "counter", branch_id: 1, role_name: "Cashier", permissions: { billing: true } };
+
 const PRODUCT_ID = 11;
 const LOT_ID = 900;
 const SALE_ID = 4242;
@@ -421,6 +424,9 @@ const billingClient = ({ types = CHARGE_TYPE_ROWS, slabs = SLAB_ROWS } = {}) => 
       if (/^INSERT INTO sale_items/i.test(sql)) {
         return { rows: [{ id: 77 }] };
       }
+      // The `billing` permission check at the top of checkout (7 Oct 2026). A cashier holding
+      // billing and nothing else, so every other permission this bill asks about answers as before.
+      if (BILLING_PERMISSION_SQL.test(sql)) return { rows: [BILLING_CASHIER], rowCount: 1 };
       return { rows: [], rowCount: 0 };
     },
   };
@@ -649,7 +655,7 @@ test("both edit paths re-price charges instead of rebuilding the total without t
   ]) {
     const start = SOURCE.indexOf(marker);
     assert.ok(start > 0, `${label} must exist`);
-    const body = SOURCE.slice(start, start + 9000);
+    const body = SOURCE.slice(start, start + 12000);
     assert.match(body, /charges: editCharges \?\? \[\]/, `${label} must pass the charges through`);
     assert.match(body, /DELETE FROM sale_charges WHERE sale_id/, `${label} must replace the lines wholesale`);
     assert.match(body, /other_charges_amount = \$/, `${label} must rewrite the bill's charge total`);

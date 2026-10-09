@@ -611,10 +611,31 @@ const branchBooks = (day) => ({
   },
 });
 
-const BILLS_SQL = /s\.due_date,\s+s\.total_amount\s+FROM sales s/;
-const CREDITS_SQL = /FULL OUTER JOIN returns r/;
-const SUPPLIERS_SQL = /SUM\(CASE WHEN COALESCE\(p\.balance_amount, 0\) > 0 THEN p\.balance_amount ELSE 0 END\) AS outstanding_amount/;
+const BILLS_SQL = /AS amount_due\s+FROM sales s/;
+const CREDITS_SQL = /WITH customer_paid AS/;
+const SUPPLIERS_SQL = /WITH purchase_summary AS/;
+const PURCHASES_SQL = /COALESCE\(p\.bill_date, p\.purchase_date\) AS purchase_date/;
 const REMINDERS_SQL = /FROM ai_reminders r/;
+
+/**
+ * The supplier balance query returns the server's formula per supplier; the purchase query one row
+ * per purchase still owed on. The books above state each supplier's balance as one unpaid purchase
+ * on its oldest day, which is what these two reads look like for that supplier.
+ */
+const supplierBalanceRows = (suppliers) => suppliers.map((row) => ({
+  supplier_id: row.supplier_id,
+  supplier_name: row.supplier_name,
+  opening_balance: 0,
+  payment_credit: 0,
+  pending_bill_count: 0,
+  outstanding_amount: row.outstanding_amount,
+}));
+const supplierPurchaseRows = (suppliers) => suppliers.map((row, index) => ({
+  id: 7000 + index,
+  supplier_id: row.supplier_id,
+  purchase_date: row.oldest_purchase_date,
+  amount_due: row.outstanding_amount,
+}));
 
 /**
  * The scripted database. Each ledger statement is answered with the rows of the branch it bound,
@@ -630,7 +651,8 @@ const booksResponder = (day, statements, { failOn = null } = {}) => (sql, values
   const scoped = /branch_id = \$1/.test(sql);
   if (BILLS_SQL.test(sql)) return { rows: scoped && books ? books.bills : [], rowCount: 0 };
   if (CREDITS_SQL.test(sql)) return { rows: scoped && books ? books.credits : [], rowCount: 0 };
-  if (SUPPLIERS_SQL.test(sql)) return { rows: scoped && books ? books.suppliers : [], rowCount: 0 };
+  if (SUPPLIERS_SQL.test(sql)) return { rows: scoped && books ? supplierBalanceRows(books.suppliers) : [], rowCount: 0 };
+  if (PURCHASES_SQL.test(sql)) return { rows: scoped && books ? supplierPurchaseRows(books.suppliers) : [], rowCount: 0 };
   if (REMINDERS_SQL.test(sql)) return { rows: scoped && books ? books.reminders : [], rowCount: 0 };
   return { rows: [], rowCount: 0 };
 };
@@ -658,7 +680,7 @@ const call = async (method, url, { branchId = 2, body, failOn, day = today() } =
   }
 };
 
-const LEDGER_SQL = [BILLS_SQL, CREDITS_SQL, SUPPLIERS_SQL, REMINDERS_SQL];
+const LEDGER_SQL = [BILLS_SQL, CREDITS_SQL, SUPPLIERS_SQL, PURCHASES_SQL, REMINDERS_SQL];
 
 test("GET /api/ai/payments-due answers for the caller's branch only", async () => {
   const day = today();
@@ -815,4 +837,323 @@ test("the accounts layer reaches nothing outside the process", () => {
     assert.ok(!code.includes(forbidden), `frostAccounts.js must not contain ${forbidden}`);
   }
   assert.deepEqual([...code.matchAll(/require\("([^"]+)"\)/g)].map(([, name]) => name), ["./frostAnswer"]);
+});
+
+/* ------------------------------------------- FROST's balances are the Accounts screens' balances */
+
+const service = require("./aiBusinessAssistantService");
+const { nextUnpaidDueDates: fifoDates, oldestUnpaidPurchaseDates } = require("./frostAccounts");
+
+const FACT_SETTINGS = { thresholds: { dueSoonDays: 3, seriousOverdueDays: 21, criticalOverdueDays: 45, criticalOutstandingAmount: 100000, highOutstandingAmount: 50000 } };
+
+/** A pool that answers each FROST read by its shape and records every statement it was sent. */
+const scriptedPool = (answers, { failOn = null } = {}) => {
+  const statements = [];
+  return {
+    statements,
+    query: async (text, values = []) => {
+      statements.push({ text, values });
+      if (failOn && failOn.test(text)) throw new Error("connection terminated unexpectedly");
+      for (const [pattern, rows] of answers) {
+        if (pattern.test(text)) return { rows: typeof rows === "function" ? rows(values) : rows, rowCount: 0 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+};
+
+const RECEIVABLE_BILLS = /AS amount_due\s+FROM sales s/;
+const RECEIVABLE_CREDITS = /WITH customer_paid AS/;
+const SUPPLIER_BALANCES = /WITH purchase_summary AS/;
+const SUPPLIER_PURCHASES = /COALESCE\(p\.bill_date, p\.purchase_date\) AS purchase_date/;
+
+test("FROST reads receivables with the Accounts formula: every bill, counter payments, lateral match", async () => {
+  const pool = scriptedPool([]);
+  await service.getCustomerOutstanding(pool, 2, FACT_SETTINGS);
+  const bills = pool.statements.find(({ text }) => RECEIVABLE_BILLS.test(text));
+  const credits = pool.statements.find(({ text }) => RECEIVABLE_CREDITS.test(text));
+  assert.ok(bills && credits, "both receivable reads must run");
+  // Every non-cancelled bill, not only CREDIT-mode ones: a part-paid cash bill is owed too.
+  assert.doesNotMatch(bills.text, /s\.payment_mode = 'CREDIT'/);
+  // A CREDIT payment line is the unpaid part of the bill, never money received.
+  assert.match(bills.text, /payment_mode IS DISTINCT FROM 'CREDIT'/);
+  // Matched as the server matches: id, else mobile, else walk-in, else name.
+  assert.ok(bills.text.includes(service.SALE_CUSTOMER_MATCH_LATERAL_SQL));
+  assert.ok(credits.text.includes(service.SALE_CUSTOMER_MATCH_LATERAL_SQL));
+  assert.match(credits.text, /cancelled = FALSE/);
+  // The opening balance by the server's branch rule, on the per-customer read only.
+  assert.doesNotMatch(bills.text, /opening_balance/);
+  assert.ok(credits.text.includes(service.BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL));
+  // Only this company's customers, on both reads.
+  for (const statement of [bills, credits]) {
+    assert.ok(statement.text.includes(service.branchCompanyAccountFilter("c")));
+    assert.deepEqual(statement.values, [2]);
+  }
+});
+
+/** The text between two markers in a source, whitespace-normalised. */
+const squash = (text) => text.replace(/\s+/g, " ").trim();
+
+test("the branch-scope opening-balance rule and the company filter are the server's, verbatim", () => {
+  // A change to either rule in getCustomerSummaryRows / getSupplierSummaryRows that is not made
+  // here would put FROST and the Accounts screens a balance apart again.
+  const fs = require("node:fs");
+  const server = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const opening = server.match(/: `(CASE WHEN \(\s*SELECT COUNT\(\*\) FROM branches ob[\s\S]*?END)`;/);
+  assert.ok(opening, "the server's branch-scope opening-balance rule was not found");
+  assert.equal(service.BRANCH_SCOPE_CUSTOMER_OPENING_BALANCE_SQL, opening[1]);
+  for (const alias of ["c", "s"]) {
+    const pattern = new RegExp("const filters = \\[`\\(" + alias + "\\.company_id IS NULL OR " + alias + "\\.company_id = \\$\\{scope\\.isCompany \\? \"\\$1\" : \"([^\"]+)\"\\}\\)`\\]");
+    const match = server.match(pattern);
+    assert.ok(match, `the server's company filter on ${alias}. was not found`);
+    assert.equal(
+      squash(service.branchCompanyAccountFilter(alias)),
+      squash(`(${alias}.company_id IS NULL OR ${alias}.company_id = ${match[1]})`),
+    );
+  }
+});
+
+test("an opening balance is the oldest debt: paid first, and with no day of its own", async () => {
+  const bill = { id: 1, customer_id: 4, customer_name: "Ravi", sale_date: "2026-08-10", due_date: "2026-08-20", total_amount: 300, amount_due: 300 };
+  const read = async (credit) => (await service.getCustomerOutstanding(
+    scriptedPool([[RECEIVABLE_BILLS, [bill]], [RECEIVABLE_CREDITS, [credit]]]),
+    2,
+    FACT_SETTINGS,
+  )).rows;
+  // ₹500 opening + ₹300 bill - ₹600 paid: the opening balance is cleared, the bill is what is owed.
+  const [cleared] = await read({ customer_id: 4, customer_name: "Ravi", opening_balance: 500, paid_amount: 600, returned_amount: 0, last_payment_date: "2026-08-15" });
+  assert.equal(cleared.outstanding_amount, 200);
+  assert.equal(cleared.oldest_invoice_date, "2026-08-10");
+  // Only ₹100 paid: the opening balance itself is unpaid, so "since" predates the books; the bill
+  // behind it still gives the due date.
+  const [open] = await read({ customer_id: 4, customer_name: "Ravi", opening_balance: 500, paid_amount: 100, returned_amount: 0, last_payment_date: "2026-08-15" });
+  assert.equal(open.outstanding_amount, 700);
+  assert.equal(open.oldest_invoice_date, null);
+  assert.equal(open.oldest_due_date, "2026-08-20");
+});
+
+test("a customer who owes only an opening balance is a debtor", async () => {
+  const pool = scriptedPool([
+    [RECEIVABLE_BILLS, []],
+    [RECEIVABLE_CREDITS, [{ customer_id: "004", customer_name: "Old Account", opening_balance: 1200, paid_amount: 200, returned_amount: 0, last_payment_date: null }]],
+  ]);
+  const fact = await service.getCustomerOutstanding(pool, 2, FACT_SETTINGS);
+  assert.deepEqual(fact.rows.map((row) => [row.customer_id, row.customer_name, row.outstanding_amount]), [["004", "Old Account", 1000]]);
+  assert.equal(fact.summary.netOutstanding, 1000);
+});
+
+test("a part-paid cash bill is owed, and the CREDIT line on it is not counted as paid", async () => {
+  // Bill 1: ₹1,000 CASH bill, ₹400 paid at the counter -> ₹600 owed (the query's amount_due).
+  // Bill 2: ₹500 CREDIT bill. A ₹300 customer payment settles the oldest first.
+  const pool = scriptedPool([
+    [RECEIVABLE_BILLS, [
+      { id: 1, customer_id: 4, customer_name: "Ravi", mobile_number: "9812345678", sale_date: "2026-08-01", due_date: null, total_amount: 1000, amount_due: 600 },
+      { id: 2, customer_id: 4, customer_name: "Ravi", mobile_number: "9812345678", sale_date: "2026-08-10", due_date: "2026-08-20", total_amount: 500, amount_due: 500 },
+    ]],
+    [RECEIVABLE_CREDITS, [{ customer_id: 4, customer_name: "Ravi", paid_amount: 300, returned_amount: 0, last_payment_date: "2026-08-12" }]],
+  ]);
+  const fact = await service.getCustomerOutstanding(pool, 2, FACT_SETTINGS);
+  assert.equal(fact.rows.length, 1);
+  assert.equal(fact.rows[0].outstanding_amount, 800);
+  assert.equal(fact.summary.totalOutstanding, 800);
+  assert.equal(fact.summary.netOutstanding, 800);
+  assert.equal(fact.rows[0].mobile_number, "******5678", "the fact row carries a masked number only");
+});
+
+test("overdue and since come from the oldest unpaid bill, not the oldest bill ever", async () => {
+  // A year-old ₹1,000 bill paid off in full; a ₹700 bill from last week still open. The old query's
+  // MIN(due_date) over every credit bill called this customer a year overdue.
+  const today = new Date();
+  const dayOffset = (days) => {
+    const date = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + days));
+    return date.toISOString().slice(0, 10);
+  };
+  const pool = scriptedPool([
+    [RECEIVABLE_BILLS, [
+      { id: 1, customer_id: 4, customer_name: "Ravi", sale_date: dayOffset(-380), due_date: dayOffset(-365), total_amount: 1000, amount_due: 1000 },
+      { id: 2, customer_id: 4, customer_name: "Ravi", sale_date: dayOffset(-7), due_date: dayOffset(2), total_amount: 700, amount_due: 700 },
+    ]],
+    [RECEIVABLE_CREDITS, [{ customer_id: 4, customer_name: "Ravi", paid_amount: 1000, returned_amount: 0, last_payment_date: dayOffset(-300) }]],
+  ]);
+  const [row] = (await service.getCustomerOutstanding(pool, 2, FACT_SETTINGS)).rows;
+  assert.equal(row.outstanding_amount, 700);
+  assert.equal(row.oldest_invoice_date, dayOffset(-7));
+  assert.equal(row.oldest_due_date, dayOffset(2));
+  assert.equal(row.overdue_days, 0);
+  assert.equal(row.due_status, "DUE_SOON");
+});
+
+test("totals cover every debtor; only the rows sent to the model are cut", async () => {
+  const bills = Array.from({ length: 63 }, (_, index) => ({
+    id: index + 1, customer_id: index + 1, customer_name: `Customer ${index + 1}`, sale_date: "2026-08-01", due_date: null, total_amount: 100, amount_due: 100,
+  }));
+  const pool = scriptedPool([[RECEIVABLE_BILLS, bills], [RECEIVABLE_CREDITS, []]]);
+  const fact = await service.getCustomerOutstanding(pool, 2, FACT_SETTINGS);
+  assert.equal(fact.rows.length, 50, "the model sees at most fifty rows");
+  assert.equal(fact.summary.count, 63);
+  assert.equal(fact.summary.shownCount, 50);
+  assert.equal(fact.summary.totalOutstanding, 6300, "the total is the shop's, not the top fifty's");
+  // The dues panel is not a fact: it lists everyone, and its total agrees.
+  const dues = await service.getCustomerDueReminders(scriptedPool([[RECEIVABLE_BILLS, bills], [RECEIVABLE_CREDITS, []]]), 2, FACT_SETTINGS);
+  assert.equal(dues.customers.length, 63);
+  assert.equal(dues.summary.total_outstanding, 6300);
+});
+
+test("an advance is netted in netOutstanding, as the dashboard tile nets it, and is not a debtor", async () => {
+  const pool = scriptedPool([
+    [RECEIVABLE_BILLS, [{ id: 1, customer_id: 4, customer_name: "Ravi", sale_date: "2026-08-01", due_date: null, total_amount: 900, amount_due: 900 }]],
+    [RECEIVABLE_CREDITS, [{ customer_id: 5, customer_name: "Sita", paid_amount: 250, returned_amount: 0, last_payment_date: "2026-08-01" }]],
+  ]);
+  const fact = await service.getCustomerOutstanding(pool, 2, FACT_SETTINGS);
+  assert.deepEqual(fact.rows.map((row) => row.customer_name), ["Ravi"]);
+  assert.equal(fact.summary.totalOutstanding, 900);
+  assert.equal(fact.summary.netOutstanding, 650);
+});
+
+test("an amount_due of zero does not fall through to the bill total", () => {
+  // `??` would not catch this, and a bill paid in full at the counter would be billed again.
+  const fifo = fifoDates({
+    bills: [{ id: 1, customer_id: 4, sale_date: "2026-08-01", due_date: "2026-08-05", total_amount: 1000, amount_due: 0 }],
+    credits: [],
+  });
+  assert.equal(fifo.get("4").outstanding_amount, 0);
+  assert.equal(fifo.get("4").next_due_date, null);
+});
+
+test("supplier dues use the Accounts formula -- payments count -- not purchases.balance_amount", async () => {
+  // Accounts showed ₹0 owed while FROST said "pay ₹10,000": supplier payments never touch
+  // purchases.balance_amount, so the old SUM over it could not see any of them.
+  const pool = scriptedPool([
+    [SUPPLIER_BALANCES, [
+      { supplier_id: 9, supplier_name: "Verma Traders", opening_balance: 0, payment_credit: 10000, pending_bill_count: 0, outstanding_amount: "0.00" },
+      { supplier_id: 8, supplier_name: "Gupta Fruits", opening_balance: 2000, payment_credit: 2500, pending_bill_count: 1, outstanding_amount: "4500.00" },
+    ]],
+    [SUPPLIER_PURCHASES, [
+      { id: 1, supplier_id: 9, purchase_date: "2026-08-01", amount_due: 10000 },
+      { id: 2, supplier_id: 8, purchase_date: "2026-08-03", amount_due: 1000 },
+      { id: 3, supplier_id: 8, purchase_date: "2026-08-09", amount_due: 4000 },
+    ]],
+  ]);
+  const fact = await service.getSupplierOutstanding(pool, 2);
+  assert.deepEqual(fact.rows.map((row) => [row.supplier_name, row.outstanding_amount, row.oldest_purchase_date, row.pending_bill_count]), [
+    ["Gupta Fruits", 4500, "2026-08-03", 1],
+  ]);
+  assert.equal(fact.summary.totalOutstanding, 4500);
+  const balances = pool.statements.find(({ text }) => SUPPLIER_BALANCES.test(text));
+  const purchases = pool.statements.find(({ text }) => SUPPLIER_PURCHASES.test(text));
+  assert.doesNotMatch(balances.text + purchases.text, /balance_amount/);
+  assert.match(balances.text, /FROM supplier_payments/);
+  assert.match(balances.text, /cancelled = FALSE/);
+  assert.match(balances.text, /COALESCE\(purchase_bill_status, 'BILL_COMPLETED'\) = 'BILL_COMPLETED'/);
+  assert.match(balances.text, /COALESCE\(purchase_status, 'ACTIVE'\) <> 'CANCELLED'/);
+  // Only this company's suppliers: another company's must not appear in payables or name matching.
+  assert.ok(balances.text.includes(service.branchCompanyAccountFilter("s")));
+  for (const statement of [balances, purchases]) assert.deepEqual(statement.values, [2]);
+});
+
+test("supplier balance SQL is the server's getSupplierSummaryRows outstanding expression", () => {
+  // Same terms, same order, so a change to one that is not made to the other is a failing test.
+  const fs = require("node:fs");
+  const server = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const frost = fs.readFileSync(path.join(__dirname, "aiBusinessAssistantService.js"), "utf8");
+  const expression = (source) => {
+    const match = source.match(/ROUND\(\(\s*COALESCE\(s\.opening_balance, 0\)[\s\S]*?\)::NUMERIC, 2\) AS outstanding_/);
+    assert.ok(match, "the outstanding expression was not found");
+    return match[0].replace(/\s+/g, " ").replace(/AS outstanding_$/, "");
+  };
+  assert.equal(expression(frost), expression(server));
+});
+
+test("supplier FIFO: the opening balance is paid first, and an unpaid opening balance has no day", () => {
+  const dates = oldestUnpaidPurchaseDates({
+    suppliers: [
+      { supplier_id: 1, opening_balance: 500, payment_credit: 700 },
+      { supplier_id: 2, opening_balance: 500, payment_credit: 100 },
+      { supplier_id: 3, opening_balance: 0, payment_credit: 900 },
+      { supplier_id: "004", opening_balance: 0, payment_credit: 0 },
+    ],
+    purchases: [
+      { supplier_id: 1, purchase_date: "2026-08-01", amount_due: 200 },
+      { supplier_id: 1, purchase_date: "2026-08-05", amount_due: 300 },
+      { supplier_id: 2, purchase_date: "2026-08-01", amount_due: 200 },
+      { supplier_id: 3, purchase_date: "2026-08-01", amount_due: 900 },
+      { supplier_id: 4, purchase_date: "2026-07-01", amount_due: 50 },
+    ],
+  });
+  assert.equal(dates.get("1"), "2026-08-05", "the opening balance and the first purchase are covered");
+  assert.equal(dates.has("2"), false, "the opening balance itself is unpaid: the debt predates the books");
+  assert.equal(dates.has("3"), false, "a supplier owed nothing has no day");
+  assert.equal(dates.has("004"), false, '"004" is not supplier 4');
+});
+
+/* ---------------------------------------------- overdue alerts follow the customer's payments */
+
+const overdueBills = (count) => Array.from({ length: count }, (_, index) => ({
+  id: index + 1, customer_id: index + 1, customer_name: `Customer ${index + 1}`, sale_date: "2025-01-01", due_date: "2025-01-15", total_amount: 100, amount_due: 100,
+}));
+
+test("alerts for customers no longer overdue are resolved, and every overdue customer is kept open", async () => {
+  const pool = scriptedPool([[RECEIVABLE_BILLS, overdueBills(55)], [RECEIVABLE_CREDITS, []]]);
+  await service.runAlertRules(pool, 2, FACT_SETTINGS);
+  const upserts = pool.statements.filter(({ text }) => /INSERT INTO ai_alerts/.test(text));
+  const resolve = pool.statements.find(({ text }) => /UPDATE ai_alerts/.test(text));
+  assert.equal(upserts.filter(({ values }) => values[1] === "CUSTOMER_PAYMENT_OVERDUE").length, 55, "the 51st debtor is alerted too");
+  assert.ok(resolve, "the cleared alerts must be resolved");
+  assert.match(resolve.text, /alert_type = 'CUSTOMER_PAYMENT_OVERDUE'/);
+  assert.match(resolve.text, /branch_id = \$1/);
+  assert.equal(resolve.values[0], 2);
+  // The still-overdue set is the whole set: a customer left out of it would be treated as paid.
+  assert.equal(resolve.values[1].length, 55);
+  assert.ok(resolve.values[1].includes("customer-overdue:2:55"));
+  // The resolve runs after the upserts, so a customer overdue now is never closed in between.
+  const resolveIndex = pool.statements.indexOf(resolve);
+  assert.ok(upserts.every((statement) => pool.statements.indexOf(statement) < resolveIndex));
+});
+
+test("a customer who has paid up leaves an empty overdue set, which resolves his alert", async () => {
+  const pool = scriptedPool([
+    [RECEIVABLE_BILLS, overdueBills(1)],
+    [RECEIVABLE_CREDITS, [{ customer_id: 1, customer_name: "Customer 1", paid_amount: 100, returned_amount: 0, last_payment_date: "2026-09-01" }]],
+  ]);
+  await service.runAlertRules(pool, 2, FACT_SETTINGS);
+  const resolve = pool.statements.find(({ text }) => /UPDATE ai_alerts/.test(text));
+  assert.deepEqual(resolve.values, [2, []]);
+});
+
+test("a failed receivable read resolves nothing", async () => {
+  // An error must not read as "nobody is overdue" and close every alert in the shop.
+  const pool = scriptedPool([], { failOn: RECEIVABLE_CREDITS });
+  await assert.rejects(() => service.runAlertRules(pool, 2, FACT_SETTINGS));
+  assert.ok(!pool.statements.some(({ text }) => /UPDATE ai_alerts/.test(text)));
+});
+
+test("an alert reopens when its condition returns, but not over the owner's own resolve", async () => {
+  const pool = scriptedPool([[RECEIVABLE_BILLS, overdueBills(1)], [RECEIVABLE_CREDITS, []]]);
+  await service.runAlertRules(pool, 2, FACT_SETTINGS);
+  const upsert = pool.statements.find(({ text }) => /INSERT INTO ai_alerts/.test(text)).text;
+  const resolve = pool.statements.find(({ text }) => /UPDATE ai_alerts/.test(text)).text;
+  // Resolving because the condition cleared leaves a marker...
+  assert.match(resolve, /jsonb_build_object\('condition_cleared_at'/);
+  // ...and only a marked RESOLVED row is reopened. A row the owner resolved while the customer was
+  // still late carries no marker and stays resolved.
+  assert.match(upsert, /WHERE ai_alerts\.status <> 'RESOLVED'\s+OR ai_alerts\.facts ->> 'condition_cleared_at' IS NOT NULL/);
+  assert.match(upsert, /status = CASE WHEN ai_alerts\.status = 'RESOLVED' THEN 'OPEN'/);
+  assert.match(upsert, /resolved_at = CASE WHEN ai_alerts\.status = 'RESOLVED' THEN NULL/);
+  // The fresh facts replace the marked ones, so the marker goes away when the alert reopens.
+  assert.match(upsert, /facts = EXCLUDED\.facts/);
+});
+
+/* -------------------------------------------------- a failed briefing figure is null, not zero */
+
+test("an unavailable briefing fact carries null figures, never 0", async () => {
+  const fallback = service.emptyBriefingFact("customer_outstanding", "Accounts", "Current branch", { totalOutstanding: 0, count: 0, highestSelling: [] });
+  const fact = await service.safeBriefingFact("customerOutstanding", fallback, async () => {
+    throw new Error("connection terminated unexpectedly");
+  });
+  assert.equal(fact.summary.unavailable, true);
+  assert.equal(fact.summary.totalOutstanding, null);
+  assert.equal(fact.summary.count, null);
+  assert.deepEqual(fact.summary.highestSelling, []);
+  assert.match(fact.summary.error, /connection terminated/);
+  assert.deepEqual(fact.rows, []);
 });

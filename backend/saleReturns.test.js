@@ -161,7 +161,7 @@ const SCHEMA = `
   CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, active BOOLEAN DEFAULT TRUE);
   CREATE TABLE customers (
     id INTEGER PRIMARY KEY, customer_name TEXT, mobile_number TEXT, gst_number TEXT, system_account BOOLEAN DEFAULT FALSE,
-    active BOOLEAN DEFAULT TRUE, opening_balance NUMERIC(14,2) DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    active BOOLEAN DEFAULT TRUE, opening_balance NUMERIC(14,2) DEFAULT 0, company_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE products (id INTEGER PRIMARY KEY, product_name TEXT, unit TEXT);
   CREATE TABLE sales (
@@ -385,6 +385,8 @@ test("a bill with a return cannot be cancelled or edited, online or from a count
 
     const context = { companyId: 1, branchId: 1, operationalLocationId: 1, deviceId: "dev-1", assignmentGeneration: 1, user: { id: OWNER_ID } };
     statements.length = 0;
+    // A push batch is one transaction, and each operation runs in a savepoint inside it.
+    await query("BEGIN");
     for (const operation_type of ["SALE_CANCEL", "SALE_EDIT"]) {
       const ack = await processSyncOperation({ query }, {
         operation_id: `op-${operation_type}`,
@@ -399,6 +401,7 @@ test("a bill with a return cannot be cancelled or edited, online or from a count
       assert.equal(ack.error_code, "SALE_HAS_RETURNS", operation_type);
       assert.equal(ack.message, rules.SALE_HAS_RETURNS.message);
     }
+    await query("COMMIT");
     assert.deepEqual(
       statements.filter((sql) => /^(UPDATE|DELETE)\b/i.test(sql)),
       [],
@@ -525,4 +528,189 @@ test("a Cashier's return needs an Owner or Admin approval for that bill, and spe
   } finally {
     actorRow = OWNER_ROW;
   }
+});
+
+// --- A bill-change approval: 15 minutes online, 7 days through a counter's outbox -------------
+//
+// 7 Oct 2026. Online, a cancel/edit approval lives 15 minutes. A counter that took one online and
+// then lost its connection has already cancelled the bill on its own database, so the sync push
+// accepts it up to 7 days after the server granted it -- judged from the row's server-written
+// `created_at` against the server clock, never a time the device sends. Real Postgres underneath.
+
+const insertAgedApproval = (db, { id, ageSql, device, branch = 1, action = "cancel", saleRef = "100" }) => db.query(
+  `INSERT INTO sale_change_approvals (id, status, action, sale_ref, requester_id, approver_id, company_id, branch_id, device_id, reason, created_at, expires_at)
+   VALUES ($1, 'ISSUED', $2, $3, 9, 7, 1, $4, $5, 'Customer changed mind',
+           CURRENT_TIMESTAMP - ${ageSql}::interval, CURRENT_TIMESTAMP - ${ageSql}::interval + INTERVAL '15 minutes')`,
+  [id, action, saleRef, branch, device]
+);
+
+const SYNC_CANCEL_SCHEMA = `
+  ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS status TEXT;
+  ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_by INTEGER;
+  ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+  ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+  CREATE TABLE IF NOT EXISTS customer_ledger (
+    id SERIAL PRIMARY KEY, sale_id INTEGER, customer_id INTEGER, customer_name TEXT, customer_mobile TEXT,
+    transaction_type TEXT, debit_amount NUMERIC(14,2), credit_amount NUMERIC(14,2), balance_delta NUMERIC(14,2),
+    remarks TEXT, created_by INTEGER, transaction_date DATE, company_id INTEGER, branch_id INTEGER,
+    operational_location_id INTEGER
+  );
+`;
+
+/** The rig answers sync_change_log with no rows; an accepted change needs the row it returns. */
+const withChangeLog = (query) => async (text, values) => {
+  const sql = String(typeof text === "object" && text ? text.text : text || "");
+  if (/INSERT INTO sync_change_log/i.test(sql)) return { rows: [{ change_id: "1", created_at: new Date() }], rowCount: 1 };
+  return query(text, values);
+};
+
+const CANCELLING_CASHIER = { ...CASHIER_ROW, can_cancel_sales: true, can_edit_sales: true };
+
+const syncCancel = (query, approvalId, operationId) => processSyncOperation({ query: withChangeLog(query) }, {
+  operation_id: operationId,
+  entity_type: "pos_sale",
+  entity_id: "sale-g-100",
+  operation_type: "SALE_CANCEL",
+  version: 3,
+  payload: { reason: "Customer changed mind", invoice: { invoice_global_id: "sale-g-100" }, approval_id: approvalId },
+}, { ...syncEditContext(), user: { id: 9 } });
+
+test("a cancel approval 30 minutes old: refused online, accepted from the counter's outbox", async () => {
+  actorRow = CANCELLING_CASHIER;
+  try {
+    await withDatabase(async ({ db, query }) => {
+      // What a cancellation writes that the return tests never needed.
+      await db.exec(SYNC_CANCEL_SCHEMA);
+      await insertAgedApproval(db, { id: "aged-online", ageSql: "'30 minutes'", device: DEVICE_ID });
+      const online = await probe(app, "POST", "/api/v3/sales/100/cancel", headers, {
+        reason: "Customer changed mind", approval_id: "aged-online", idempotency_key: nextKey(),
+      });
+      assert.equal(online.status, 403, JSON.stringify(online.body));
+      assert.equal(online.body.detail, "APPROVAL_EXPIRED", "online keeps the 15-minute life");
+      assert.equal((await one(db, "SELECT status FROM sale_change_approvals WHERE id = 'aged-online'")).status, "ISSUED");
+      assert.equal((await one(db, "SELECT sale_status FROM sales WHERE id = 100")).sale_status, "COMPLETED");
+
+      await insertAgedApproval(db, { id: "aged-sync", ageSql: "'30 minutes'", device: "dev-1" });
+      await query("BEGIN");
+      const ack = await syncCancel(query, "aged-sync", "op-aged-sync");
+      await query("COMMIT");
+      assert.equal(ack.status, "accepted", JSON.stringify(ack));
+      const spent = await one(db, "SELECT status, consumed_sale_id FROM sale_change_approvals WHERE id = 'aged-sync'");
+      assert.equal(spent.status, "CONSUMED", "still single use");
+      assert.equal(spent.consumed_sale_id, 100);
+      assert.equal((await one(db, "SELECT sale_status FROM sales WHERE id = 100")).sale_status, "CANCELLED");
+    });
+  } finally {
+    actorRow = OWNER_ROW;
+  }
+});
+
+test("through the outbox: past 7 days from the grant, or another shop's approval, is still refused", async () => {
+  actorRow = CANCELLING_CASHIER;
+  try {
+    await withDatabase(async ({ db, query }) => {
+      await db.exec(SYNC_CANCEL_SCHEMA);
+      await insertAgedApproval(db, { id: "stale-sync", ageSql: "'8 days'", device: "dev-1" });
+      await insertAgedApproval(db, { id: "other-shop", ageSql: "'1 minute'", device: "dev-1", branch: 2 });
+      await insertAgedApproval(db, { id: "edit-not-cancel", ageSql: "'1 minute'", device: "dev-1", action: "edit" });
+      await query("BEGIN");
+      for (const [id, why] of [["stale-sync", "8 days"], ["other-shop", "branch 2"], ["edit-not-cancel", "wrong action"]]) {
+        const ack = await syncCancel(query, id, `op-${id}`);
+        assert.notEqual(ack.status, "accepted", why);
+        assert.equal(ack.error_code, "AUTHORIZATION_ERROR", `${why}: ${JSON.stringify(ack)}`);
+      }
+      await query("COMMIT");
+      assert.equal((await one(db, "SELECT sale_status FROM sales WHERE id = 100")).sale_status, "COMPLETED");
+      assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_change_approvals WHERE status = 'CONSUMED'")).n), 0);
+    });
+  } finally {
+    actorRow = OWNER_ROW;
+  }
+});
+
+// --- Sync push: one operation's refusal leaves nothing behind -------------------------------
+//
+// A push batch is one transaction. An offline edit restores the bill's stock and deletes its items,
+// allocations and payments before `buildSalePayload` judges the new lines; when that refused the
+// edit, the half-done work committed with the rest of the batch while the counter was told
+// "rejected" -- a bill with no items and its fruit back on the shelf. Each operation now runs in a
+// savepoint and anything short of `accepted` is rolled back to it. Judged by a real Postgres.
+
+const syncEditContext = () => ({ companyId: 1, branchId: 1, operationalLocationId: 1, deviceId: "dev-1", assignmentGeneration: 1, user: { id: OWNER_ID } });
+
+test("a sync edit refused after the bill was taken apart leaves the bill, its lots and its stock untouched", async () => {
+  await withDatabase(async ({ db, query, statements }) => {
+    await db.exec("CREATE TABLE sale_charges (id SERIAL PRIMARY KEY, sale_id INTEGER)");
+    statements.length = 0;
+    await query("BEGIN");
+    const ack = await processSyncOperation({ query }, {
+      operation_id: "op-edit-refused",
+      entity_type: "pos_sale",
+      entity_id: "sale-g-100",
+      operation_type: "SALE_EDIT",
+      version: 2,
+      payload: {
+        reason: "Counter change",
+        other_charges: [],
+        // A customer the server does not have: refused inside buildSalePayload, i.e. after the
+        // reversal and the deletes.
+        invoice: { invoice_global_id: "sale-g-100", customer_id: 999 },
+        items: [{ product_id: 10, inventory_batch_id: 501, quantity: 1, selling_rate: 200 }],
+      },
+    }, syncEditContext());
+    await query("COMMIT");
+    assert.equal(ack.status, "rejected", JSON.stringify(ack));
+    assert.equal(ack.error_code, "VALIDATION_ERROR");
+
+    // The edit really did take the bill apart before it was refused...
+    assert.ok(statements.some((sql) => /^DELETE FROM sale_items WHERE sale_id = \$1$/.test(sql)), "the deletes ran");
+    const savepointAt = statements.indexOf("SAVEPOINT sync_operation");
+    const rollbackAt = statements.indexOf("ROLLBACK TO SAVEPOINT sync_operation");
+    assert.ok(savepointAt >= 0 && rollbackAt > savepointAt, "the operation was rolled back to its own savepoint");
+    // ...and none of it survived.
+    assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_items WHERE sale_id = 100")).n), 2);
+    assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_batch_allocations WHERE sale_item_id IN (1000, 1001)")).n), 3);
+    const lots = (await db.query("SELECT id, remaining_qty FROM inventory_batches WHERE id IN (501, 502, 503) ORDER BY id")).rows.map((row) => [row.id, qty(row.remaining_qty)]);
+    assert.deepEqual(lots, [[501, 0], [502, 0], [503, 0]], "no stock was put back for a bill that still stands");
+    assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM stock_transactions")).n), 0);
+    assert.equal((await one(db, "SELECT sale_status FROM sales WHERE id = 100")).sale_status, "COMPLETED");
+  });
+});
+
+test("an offline edit that arrives before its bill is answered but not stored, so the next push judges it again", async () => {
+  await withDatabase(async ({ query, statements }) => {
+    statements.length = 0;
+    await query("BEGIN");
+    const ack = await processSyncOperation({ query }, {
+      operation_id: "op-edit-early",
+      entity_type: "pos_sale",
+      entity_id: "sale-g-not-yet",
+      operation_type: "SALE_EDIT",
+      version: 2,
+      payload: { reason: "Counter change", other_charges: [], invoice: { invoice_global_id: "sale-g-not-yet" } },
+    }, syncEditContext());
+    await query("COMMIT");
+    assert.equal(ack.status, "rejected");
+    assert.equal(ack.error_code, "DEPENDENCY_MISSING");
+    assert.equal(statements.filter((sql) => /^INSERT INTO sync_processed_operations/.test(sql)).length, 0, "a stored refusal is replayed forever");
+  });
+});
+
+test("an offline edit refused for a real reason is still stored as final", async () => {
+  await withDatabase(async ({ db, query, statements }) => {
+    await db.exec("CREATE TABLE sale_charges (id SERIAL PRIMARY KEY, sale_id INTEGER)");
+    statements.length = 0;
+    await query("BEGIN");
+    const ack = await processSyncOperation({ query }, {
+      operation_id: "op-edit-no-reason",
+      entity_type: "pos_sale",
+      entity_id: "sale-g-100",
+      operation_type: "SALE_EDIT",
+      version: 2,
+      payload: { other_charges: [], invoice: { invoice_global_id: "sale-g-100" } },
+    }, syncEditContext());
+    await query("COMMIT");
+    assert.equal(ack.error_code, "VALIDATION_ERROR");
+    assert.equal(statements.filter((sql) => /^INSERT INTO sync_processed_operations/.test(sql)).length, 1);
+  });
 });

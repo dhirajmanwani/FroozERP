@@ -101,3 +101,23 @@ test("only Owner and Admin poll FROST, matching the panel's own expression", () 
   assert.match(appJsx, /const frostBellAllowed = user\?\.role === "Owner" \|\| user\?\.role === "Admin";/);
   assert.match(loader(), /if \(!user \|\| !frostBellAllowed\) return;/);
 });
+
+test("a row's message does not change from one poll to the next", async () => {
+  // The skip above compares messages. If the message carried "due 10 minutes ago", it would differ
+  // on every 5-minute poll and the skip would never fire: the same overdue reminder re-raised as a
+  // fresh unread notification all day. The relative wording lives in `timing`, outside the compare.
+  const { buildFrostBellNotifications } = await import("./frostBellNotifications.js");
+  const firstPoll = Date.UTC(2026, 8, 22, 6, 0, 0);
+  const rows = {
+    alerts: [{ id: 41, dedup_key: "a-41", severity: "HIGH", status: "OPEN", title: "Overdue", message: "Ram Traders owes 12500.", detected_at: new Date(firstPoll - 3600000).toISOString() }],
+    reminders: [{ id: 12, dedup_key: "r-12", priority: "ATTENTION", status: "OPEN", title: "Pay supplier", message: "Follow up", due_at: new Date(firstPoll - 600000).toISOString() }],
+  };
+  const polls = [0, 5, 60, 24 * 60].map((minutes) => buildFrostBellNotifications({ ...rows, nowMs: firstPoll + minutes * 60000 }));
+  assert.equal(polls[0].keys.length, 2, "both rows should ring");
+  for (const key of polls[0].keys) {
+    const messages = polls.map((poll) => poll.items.find((item) => item.dedupeKey === key)?.message);
+    assert.equal(new Set(messages).size, 1, `${key} changed its message between polls: ${messages.join(" / ")}`);
+  }
+  const timings = polls.map((poll) => poll.items.find((item) => item.kind === "REMINDER")?.timing);
+  assert.ok(new Set(timings).size > 1, "the relative wording is still available, just not in the compared field");
+});

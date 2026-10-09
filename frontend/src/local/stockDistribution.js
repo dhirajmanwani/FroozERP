@@ -33,7 +33,7 @@ import { canonicalInventoryId, inventoryIdsEqual } from "./stockInventory.js";
 export const TRANSFER_TRANSITIONS = Object.freeze({
   DRAFT: Object.freeze({ submit: "APPROVAL_PENDING", cancel: "CANCELLED" }),
   APPROVAL_PENDING: Object.freeze({ approve: "APPROVED_RESERVED", reject: "REJECTED" }),
-  APPROVED_RESERVED: Object.freeze({ dispatch: "DISPATCHED_IN_TRANSIT" }),
+  APPROVED_RESERVED: Object.freeze({ dispatch: "DISPATCHED_IN_TRANSIT", cancel: "CANCELLED" }),
   DISPATCHED_IN_TRANSIT: Object.freeze({
     receive: "RECEIVED",
     partial_receive: "PARTIALLY_RECEIVED",
@@ -58,9 +58,25 @@ export const TRANSFER_TRANSITIONS = Object.freeze({
  * destination's -- the same default the server applies, written the same way round so the two
  * cannot disagree about an action added later.
  */
-const SOURCE_ACTIONS = Object.freeze(new Set([
+export const TRANSFER_SOURCE_ACTIONS = Object.freeze([
   "submit", "approve", "reject", "dispatch", "return", "source_receive", "close", "cancel",
-]));
+]);
+const SOURCE_ACTIONS = new Set(TRANSFER_SOURCE_ACTIONS);
+
+/**
+ * Whether `action` on `transfer` is the source's to take. Mirrors the server's one exception to
+ * `sourceActions` (`requesterWithdrawsDraft` in operationalV3.js): a DRAFT is withdrawn by the side
+ * that wrote it, so a DESTINATION_REQUESTED draft is cancelled by the shop that asked. Cancelling an
+ * APPROVED_RESERVED consignment releases stock the source holds, so that stays the source's in
+ * both modes.
+ */
+export const sourceSideAction = (action, transfer) => {
+  if (!SOURCE_ACTIONS.has(action)) return false;
+  const requesterWithdrawsDraft = action === "cancel"
+    && text(transfer?.status).toUpperCase() === "DRAFT"
+    && text(transfer?.initiation_mode).toUpperCase() === "DESTINATION_REQUESTED";
+  return !requesterWithdrawsDraft;
+};
 
 export const TRANSFER_SIDE = Object.freeze({
   SOURCE: "SOURCE",
@@ -108,6 +124,8 @@ const ACTION_WORDS = Object.freeze({
 const text = (value) => String(value ?? "").trim();
 const rows = (value) => (Array.isArray(value) ? value : []);
 
+const roundQuantity = (value) => Math.round((value + Number.EPSILON) * 1000) / 1000;
+
 /** A quantity, or `null` when the field is genuinely absent rather than zero. */
 export const transferQuantity = (value) => {
   // `??` is wrong for these: a fully-rejected line legitimately carries 0, and a chain of `??`
@@ -151,9 +169,10 @@ export const transferSideFor = (transfer, scope) => {
 export const availableTransferActions = (transfer, scope) => {
   const side = transferSideFor(transfer, scope);
   if (side === TRANSFER_SIDE.BYSTANDER) return [];
-  const legal = TRANSFER_TRANSITIONS[text(transfer?.status).toUpperCase()] || {};
+  const status = text(transfer?.status).toUpperCase();
+  const legal = TRANSFER_TRANSITIONS[status] || {};
   return Object.keys(legal)
-    .filter((action) => (SOURCE_ACTIONS.has(action) ? side === TRANSFER_SIDE.SOURCE : side === TRANSFER_SIDE.DESTINATION))
+    .filter((action) => (sourceSideAction(action, transfer) ? side === TRANSFER_SIDE.SOURCE : side === TRANSFER_SIDE.DESTINATION))
     .map((action) => ({
       action,
       nextStatus: legal[action],
@@ -176,7 +195,11 @@ export const describeTransfer = (transfer, scope) => {
   const side = transferSideFor(transfer, scope);
   const actions = availableTransferActions(transfer, scope);
   return {
+    // `id` is for React keys and matching only: it prefers the global id, which the server does not
+    // accept in a URL. Actions must be posted to `serverId` -- the server's own row id -- because a
+    // global id parsed as an integer there names a *different* consignment.
     id: canonicalInventoryId(transfer?.global_id ?? transfer?.id),
+    serverId: canonicalInventoryId(transfer?.id),
     number: text(transfer?.transfer_number) || "(no number)",
     status,
     known: Boolean(words),
@@ -372,9 +395,11 @@ export const validateAllocation = ({ requested, allocations = [] } = {}) => {
 
   if (usable.length === 0) problems.push("Choose at least one lot to send this from.");
 
-  const total = usable.reduce((sum, entry) => sum + transferQuantity(entry.quantity), 0);
+  // Rounded to the 3 dp quantities carry: summed as raw floats, 0.1 + 0.2 came to 0.30000000000000004
+  // and was refused as more than the 0.3 asked for.
+  const total = roundQuantity(usable.reduce((sum, entry) => sum + transferQuantity(entry.quantity), 0));
   const asked = transferQuantity(requested);
-  if (asked !== null && total > asked) {
+  if (asked !== null && total > roundQuantity(asked)) {
     problems.push(`The lots chosen come to ${total}, which is more than the ${asked} asked for.`);
   }
 
@@ -382,7 +407,7 @@ export const validateAllocation = ({ requested, allocations = [] } = {}) => {
     const available = transferQuantity(entry?.available_quantity);
     // Compared only when it is a real number. `available` of 0 is a genuine answer -- a crate
     // already promised elsewhere -- and a falsy check would skip it and let the crate be sent twice.
-    if (available !== null && transferQuantity(entry.quantity) > available) {
+    if (available !== null && roundQuantity(transferQuantity(entry.quantity)) > roundQuantity(available)) {
       problems.push(`${text(entry?.lot_label) || "A lot"}: only ${available} available.`);
     }
   }

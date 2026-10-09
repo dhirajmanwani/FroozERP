@@ -228,12 +228,21 @@ const idKey = (value) => (value === null || value === undefined ? "" : String(va
  * the order given (customer, then date). Receipts and returns are kept apart so "Received" never
  * contains money that was a return.
  *
+ * On-account receipts settle the customer's opening balance before any bill: it is the oldest debt,
+ * and Accounts (`getCustomerSummaryRows`) counts it, so spending those receipts on bills instead
+ * showed bills as paid while Accounts still showed the customer owing.
+ *
  * @param {object[]} rows                 credit sales, as the route selects them
  * @param {Map<string, number>} receiptsByCustomer  idKey(customer_id) -> on-account receipts
  * @param {object[]} returnCredits        { sale_id, customer_id, credit_amount } for CREDIT_NOTE /
  *                                        FUTURE_ADJUSTMENT returns of non-cancelled sales
+ * @param {Map<string, number>} openingBalanceByCustomer  idKey(customer_id) -> opening balance
  */
-const buildCustomerPendingBills = (rows, { receiptsByCustomer = new Map(), returnCredits = [] } = {}) => {
+const buildCustomerPendingBills = (rows, {
+  receiptsByCustomer = new Map(),
+  returnCredits = [],
+  openingBalanceByCustomer = new Map(),
+} = {}) => {
   const returnBySale = new Map();
   const creditSaleIds = new Set((rows || []).map((row) => idKey(row.id)));
   const returnPool = new Map();
@@ -263,7 +272,11 @@ const buildCustomerPendingBills = (rows, { receiptsByCustomer = new Map(), retur
   }
 
   const remainingReceipts = new Map();
-  for (const [key, amount] of receiptsByCustomer) remainingReceipts.set(key, finiteOrNull(amount) ?? 0);
+  for (const [key, amount] of receiptsByCustomer) {
+    const receipts = finiteOrNull(amount) ?? 0;
+    const opening = Math.max(finiteOrNull(openingBalanceByCustomer.get(key)) ?? 0, 0);
+    remainingReceipts.set(key, roundCurrency(Math.max(receipts - opening, 0)));
+  }
 
   const invoices = [];
   const summaries = new Map();

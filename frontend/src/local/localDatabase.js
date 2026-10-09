@@ -268,6 +268,26 @@ export async function listLocalPosSales() {
   return invokeLocal("pos_sale_list_local");
 }
 
+const LOCAL_DATE_KEY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * This counter's bills dated `fromDate`..`toDate` (YYYY-MM-DD, both inclusive), every one of them.
+ * `listLocalPosSales` returns only the newest 200, which is a recent-bills list, not a period: a
+ * trend or a report built from it silently lost everything older. Bad dates are refused here, in
+ * words, rather than sent for the Rust side to refuse.
+ */
+export async function listLocalPosSalesBetween(fromDate, toDate) {
+  const from = String(fromDate || "").slice(0, 10);
+  const to = String(toDate || "").slice(0, 10);
+  if (!LOCAL_DATE_KEY.test(from) || !LOCAL_DATE_KEY.test(to)) {
+    throw new Error(`Local sales can only be read for whole dates (YYYY-MM-DD); got "${fromDate}" to "${toDate}".`);
+  }
+  if (from > to) throw new Error(`The local sales range starts (${from}) after it ends (${to}).`);
+  if (!isTauriRuntime()) return [];
+  const rows = await invokeLocal("pos_sale_list_local_range", { fromDate: from, toDate: to });
+  return Array.isArray(rows) ? rows : [];
+}
+
 export async function queueLocalPurchase(purchase) {
   if (!isTauriRuntime()) {
     throw new Error("Offline purchase entry is only available inside the FroozERP desktop app.");

@@ -45,7 +45,7 @@ const context = { user_id: 1, device_id: "DEVICE-1", company_id: 1 };
  * Answering every `inventory_transfer_items` query with the same row is what made an earlier
  * fixture claim an already-allocated line was unallocated. The stub distinguishes them.
  */
-const scriptedClient = ({ unallocated = [], allocated = [], lots = {} } = {}) => {
+const scriptedClient = ({ unallocated = [], allocated = [], lots = {}, globalIds = {}, aliasedIds = [] } = {}) => {
   const statements = [];
   let pending = unallocated.length;
   return {
@@ -57,6 +57,14 @@ const scriptedClient = ({ unallocated = [], allocated = [], lots = {} } = {}) =>
 
       if (sql.includes("COUNT(*)") && sql.includes("source_lot_id IS NULL")) {
         return { rows: [{ pending }] };
+      }
+      // Snapshot references: `globalIds` maps a lot's global id to its row id, and `aliasedIds`
+      // lists rows with no global id, which the desktop names `inventory-lot-<id>`.
+      if (sql.startsWith("SELECT id FROM inventory_batches WHERE global_id")) {
+        return { rows: globalIds[values[0]] && values[1] === TRANSFER.company_id ? [{ id: globalIds[values[0]] }] : [] };
+      }
+      if (sql.startsWith("SELECT id FROM inventory_batches WHERE id")) {
+        return { rows: aliasedIds.includes(values[0]) && values[1] === TRANSFER.company_id ? [{ id: values[0] }] : [] };
       }
       if (sql.includes("source_lot_id IS NULL")) {
         return { rows: unallocated };
@@ -225,4 +233,89 @@ test("an already-allocated transfer is untouched by any of this", async () => {
     client.statements.some((entry) => entry.sql.includes("INSERT INTO stock_reservations")),
     "and the stock should still be reserved",
   );
+});
+
+test("crates named by the approver's snapshot ids are resolved, not parsed", async () => {
+  // The approving desktop picks crates from its own snapshot, which names a lot by its global id (a
+  // uuid, which may start with a digit) or `inventory-lot-<id>`. parseInt read the first as a stray
+  // number and nulled the second, so a real allocation was refused as "choose a lot".
+  const uuid = "71f3c2d0-0000-4000-8000-000000000071";
+  const client = scriptedClient({
+    unallocated: [{ id: 50, product_id: 276, requested_quantity: "10" }],
+    allocated: [{ id: 50, source_lot_id: 71, product_id: 276, requested_quantity: "6", remaining_qty: "20" }],
+    lots: {
+      71: { id: 71, effective_cost_per_unit: "80.5", available: "20" },
+      72: { id: 72, effective_cost_per_unit: "95.0", available: "20" },
+    },
+    globalIds: { [uuid]: 71 },
+    aliasedIds: [72],
+  });
+
+  await approve(client, {
+    items: [{
+      item_id: 50,
+      allocations: [
+        { source_lot_id: uuid, quantity: 6 },
+        { source_lot_id: "inventory-lot-72", quantity: 4 },
+      ],
+    }],
+  });
+
+  const rewrite = client.statements.find((entry) => entry.sql.startsWith("UPDATE inventory_transfer_items SET source_lot_id"));
+  assert.deepEqual(rewrite.values, [50, 71, 6, "80.5"], "the uuid resolves to its own lot, not lot #71 by accident of digits");
+  assert.deepEqual(client.inserted[0], [9, 276, 72, 4, "95.0"]);
+  const lookups = client.statements.filter((entry) => entry.sql.startsWith("SELECT id FROM inventory_batches"));
+  // uuid by global id; the alias first by global id (none), then as a row with no global id.
+  assert.equal(lookups.length, 3);
+  assert.ok(lookups.every((entry) => entry.values[1] === TRANSFER.company_id), "lookups are company-scoped");
+});
+
+test("a crate reference that names no lot is refused by name, not dropped", async () => {
+  // Dropping it would approve less than the approver chose, and say nothing.
+  const client = scriptedClient({
+    unallocated: [{ id: 50, product_id: 276, requested_quantity: "10" }],
+    lots: { 71: { id: 71, effective_cost_per_unit: "80", available: "20" } },
+  });
+
+  await assert.rejects(
+    approve(client, {
+      items: [{
+        item_id: 50,
+        allocations: [
+          { source_lot_id: 71, quantity: 6 },
+          { source_lot_id: "71abc-not-a-lot", quantity: 4 },
+        ],
+      }],
+    }),
+    (error) => error.code === "TRANSFER_ALLOCATION_INVALID",
+  );
+  assert.equal(
+    client.statements.filter((entry) => entry.sql.startsWith("UPDATE inventory_transfer_items SET source_lot_id")).length,
+    0,
+    "nothing is allocated when one crate cannot be found",
+  );
+});
+
+test("crates adding up to exactly the request are accepted despite float arithmetic", async () => {
+  // 0.1 + 0.2 is 0.30000000000000004 in floating point, which refused an exact allocation of 0.3 as
+  // "more than was asked for". Quantities carry three decimals and are compared there.
+  const client = scriptedClient({
+    unallocated: [{ id: 50, product_id: 276, requested_quantity: "0.3" }],
+    allocated: [{ id: 50, source_lot_id: 71, product_id: 276, requested_quantity: "0.1", remaining_qty: "20" }],
+    lots: {
+      71: { id: 71, effective_cost_per_unit: "80", available: "20" },
+      72: { id: 72, effective_cost_per_unit: "90", available: "20" },
+    },
+  });
+
+  await approve(client, {
+    items: [{
+      item_id: 50,
+      allocations: [
+        { source_lot_id: 71, quantity: 0.1 },
+        { source_lot_id: 72, quantity: 0.2 },
+      ],
+    }],
+  });
+  assert.equal(client.inserted.length, 1);
 });

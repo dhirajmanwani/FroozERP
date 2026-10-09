@@ -1,3 +1,5 @@
+const crypto = require("node:crypto");
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const toDateOnly = (value) => {
@@ -52,8 +54,21 @@ const forecastStockRunout = ({ availableStock = 0, dailySales = [], minimumHisto
   };
 };
 
-const buildReminderDedupKey = ({ companyId = 1, branchId = 1, reminderType, entityType, entityId, dueDate }) =>
-  [companyId, branchId, reminderType, entityType, entityId || "none", dueDate || "none"].join(":");
+// An owner note is linked to nothing, so type, entity and day are the same for every note he makes
+// that day: without the title in the key, "Ramesh ko phone karna" and "bank jana hai" said on one
+// morning were one row, the second insert hit ON CONFLICT and was dropped, and FROST still said
+// "Saved". The note's own words are what tell two notes apart, so their fingerprint goes in the key.
+// Normalised first -- case and spacing -- so saying the same note twice is still one reminder.
+// Hashed rather than inlined because `dedup_key` is VARCHAR(240) and a title is up to 220.
+const normaliseReminderTitle = (title) => String(title || "").trim().replace(/\s+/g, " ").toLowerCase();
+const reminderTitleFingerprint = (title) =>
+  crypto.createHash("sha256").update(normaliseReminderTitle(title)).digest("hex").slice(0, 16);
+
+const buildReminderDedupKey = ({ companyId = 1, branchId = 1, reminderType, entityType, entityId, dueDate, title }) => {
+  const parts = [companyId, branchId, reminderType, entityType, entityId || "none", dueDate || "none"];
+  if (String(reminderType || "").toUpperCase() === "OWNER_NOTE") parts.push(reminderTitleFingerprint(title));
+  return parts.join(":");
+};
 
 // FROST's one non-negotiable rule: the model phrases, the database answers. No figure may
 // originate in generated text.

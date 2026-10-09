@@ -25,6 +25,10 @@ const {
   FAILURE_LIMIT,
   FAILURE_WINDOW_MS,
   APPROVAL_TTL_MS,
+  BILL_CHANGE_APPROVAL_TTL_MS,
+  SYNC_APPROVAL_WINDOW_MS,
+  SYNC_CLOCK_TOLERANCE_MS,
+  approvalTtlMs,
   approvalAttemptsLocked,
   approvalRequired,
   canApprove,
@@ -214,9 +218,90 @@ test("a bill's references are its row id, global id and offline ref, as strings"
   assert.deepEqual(saleRefsOf(null), []);
 });
 
-test("an approval lasts seven days", () => {
+test("a discount approval lasts seven days; a cancel, edit or return approval fifteen minutes", () => {
+  // 7 Oct 2026: a bill-change approval is given at the counter and spent at once, and it is not
+  // bound to what the change contains, so the window it can be spent in is kept short. A discount
+  // keeps seven days because a synced bill is never refused for it.
   assert.equal(APPROVAL_TTL_MS, 7 * 24 * 60 * 60 * 1000);
-  assert.equal(expiresAtFrom(NOW).getTime(), NOW + APPROVAL_TTL_MS);
+  assert.equal(BILL_CHANGE_APPROVAL_TTL_MS, 15 * 60 * 1000);
+  assert.equal(expiresAtFrom(NOW, "discount").getTime(), NOW + APPROVAL_TTL_MS);
+  for (const action of ["cancel", "edit", "return", "CANCEL"]) {
+    assert.equal(expiresAtFrom(NOW, action).getTime(), NOW + BILL_CHANGE_APPROVAL_TTL_MS, action);
+  }
+  // No action, or one nobody knows, gets the stricter window rather than the longer one.
+  assert.equal(expiresAtFrom(NOW).getTime(), NOW + BILL_CHANGE_APPROVAL_TTL_MS);
+  assert.equal(approvalTtlMs("refund"), BILL_CHANGE_APPROVAL_TTL_MS);
+});
+
+test("a cancel approval sixteen minutes old no longer covers the change", () => {
+  const issued = issuedRow({ expires_at: expiresAtFrom(NOW, "cancel").toISOString() });
+  assert.equal(checkApprovalBinding(issued, binding({ nowMs: NOW + 14 * 60 * 1000 })).ok, true);
+  const late = checkApprovalBinding(issued, binding({ nowMs: NOW + 16 * 60 * 1000 }));
+  assert.equal(late.ok, false);
+  assert.equal(late.detail, BINDING_DETAILS.EXPIRED);
+});
+
+test("through the sync push, an approval lives 7 days from when the server granted it", () => {
+  // created_at is written by the server when the approval is granted; nowMs is the server clock.
+  const granted = (ageMs) => issuedRow({
+    created_at: new Date(NOW - ageMs).toISOString(),
+    expires_at: expiresAtFrom(NOW - ageMs, "cancel").toISOString(),
+  });
+  const thirtyMinutes = granted(30 * 60 * 1000);
+  assert.equal(checkApprovalBinding(thirtyMinutes, binding()).detail, BINDING_DETAILS.EXPIRED, "online: 15 minutes");
+  assert.equal(checkApprovalBinding(thirtyMinutes, binding({ viaSync: true })).ok, true, "sync: still good");
+  assert.equal(checkApprovalBinding(granted(6 * 24 * 60 * 60 * 1000), binding({ viaSync: true })).ok, true);
+  assert.equal(
+    checkApprovalBinding(granted(SYNC_APPROVAL_WINDOW_MS + 1), binding({ viaSync: true })).detail,
+    BINDING_DETAILS.EXPIRED,
+  );
+  assert.equal(SYNC_APPROVAL_WINDOW_MS, 7 * 24 * 60 * 60 * 1000);
+});
+
+test("the sync window is measured from the server's grant time and nothing else", () => {
+  // No grant time, an unreadable one, or one later than the server clock: refused, never assumed.
+  for (const created_at of [undefined, null, "", "not a date", new Date(NOW + 61 * 1000).toISOString()]) {
+    assert.equal(checkApprovalBinding(issuedRow({ created_at }), binding({ viaSync: true })).detail, BINDING_DETAILS.EXPIRED, String(created_at));
+  }
+  // `created_at` is the database's clock and `nowMs` Node's: up to a minute of skew is not "future".
+  assert.equal(SYNC_CLOCK_TOLERANCE_MS, 60 * 1000);
+  for (const ahead of [1000, 59 * 1000, 60 * 1000]) {
+    const skewed = issuedRow({ created_at: new Date(NOW + ahead).toISOString(), expires_at: new Date(NOW - 1) });
+    assert.equal(checkApprovalBinding(skewed, binding({ viaSync: true })).ok, true, `${ahead} ms ahead is clock skew`);
+  }
+  // `viaSync` must be exactly true; a truthy string from anywhere does not switch windows.
+  const aged = issuedRow({ created_at: new Date(NOW - 30 * 60 * 1000), expires_at: new Date(NOW - 15 * 60 * 1000) });
+  assert.equal(checkApprovalBinding(aged, binding({ viaSync: "yes" })).detail, BINDING_DETAILS.EXPIRED);
+});
+
+test("the longer sync window loosens nothing else", () => {
+  const fresh = { created_at: new Date(NOW - 30 * 60 * 1000), expires_at: new Date(NOW - 15 * 60 * 1000) };
+  const sync = (rowOverrides, bindingOverrides = {}) =>
+    checkApprovalBinding(issuedRow({ ...fresh, ...rowOverrides }), binding({ viaSync: true, branchId: 2, ...bindingOverrides }));
+  assert.equal(sync({}).ok, true);
+  assert.equal(sync({ status: APPROVAL_STATUS.CONSUMED }).detail, BINDING_DETAILS.ALREADY_USED, "single use");
+  assert.equal(sync({ action: "edit" }).detail, BINDING_DETAILS.WRONG_ACTION);
+  assert.equal(sync({ sale_ref: "invoice-other" }).detail, BINDING_DETAILS.WRONG_SALE);
+  assert.equal(sync({ company_id: 2 }).detail, BINDING_DETAILS.WRONG_COMPANY);
+  assert.equal(sync({ branch_id: 3 }).detail, BINDING_DETAILS.WRONG_BRANCH);
+  assert.equal(sync({ branch_id: null }).detail, BINDING_DETAILS.WRONG_BRANCH, "an approval with no shop does not match one");
+  assert.equal(sync({ device_id: "FZDEV-OTHER" }).detail, BINDING_DETAILS.WRONG_DEVICE);
+  assert.equal(sync({ requester_id: 99 }).detail, BINDING_DETAILS.WRONG_REQUESTER);
+});
+
+test("only the two sync-push paths ask for the sync window, and they pass the session's branch", () => {
+  const calls = CODE.match(/authorizeSaleChange\(client, \{[^}]*\}\)/g) || [];
+  const viaSync = calls.filter((call) => /viaSync: true/.test(call));
+  assert.equal(viaSync.length, 2, "processPosSaleEditOperation and processPosSaleCancelOperation");
+  for (const call of viaSync) {
+    assert.match(call, /branchId: context\.branchId/);
+    assert.match(call, /action: "(edit|cancel)"/);
+  }
+  assert.match(CODE, /nowMs: Date\.now\(\),\s*viaSync: viaSync === true,/, "server clock, and a strict flag");
+});
+
+test("the approval route stamps the action's own expiry", () => {
+  assert.match(CODE, /saleChangeApproval\.expiresAtFrom\(Date\.now\(\), request\.action\)/);
 });
 
 // ---------------------------------------------------------------------------------------------

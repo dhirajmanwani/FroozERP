@@ -77,6 +77,24 @@ const text = (value) => (typeof value === "string" ? value.trim() : "");
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 /**
+ * The one write a view-only session may make: switching the shop being viewed, which is also the
+ * only way back to the Owner's own shop. It writes no row -- it re-reads the Owner from the
+ * database and mints a new token -- so letting it through cannot file anything against the viewed
+ * shop. Without it the "back to my shop" button was refused by this very gate, and the Owner was
+ * stuck viewing until the token expired.
+ *
+ * Exact `METHOD path`, like the public allow-list: not a prefix, not a pattern.
+ */
+const VIEW_ONLY_ALLOWED_WRITES = new Set(["POST /api/owner/view-branch"]);
+
+const viewOnlyMayProceed = (req) => {
+  if (SAFE_METHODS.has(req.method)) return true;
+  const rawPath = typeof req.path === "string" ? req.path : "";
+  const routePath = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.slice(0, -1) : rawPath;
+  return VIEW_ONLY_ALLOWED_WRITES.has(`${req.method} ${routePath}`);
+};
+
+/**
  * Pull the session token out of a request.
  *
  * `Authorization: Bearer` is checked first because it is the standard and what new clients send;
@@ -200,11 +218,12 @@ const createRequireAuth = ({ secret, verify = verifyDeviceSession, now = () => D
     // would consider that unusual. One method check here is cheaper and far more reliable than
     // auditing every write path for a condition it has no reason to know about.
     //
-    // Blanket, with no allowlist. Some POSTs are morally reads — `/api/sync/pull` is one — but a
-    // sync running under a viewing session would sync the viewed shop's data onto this device,
-    // which is worse than a sync that waits. The token also expires in 30 minutes, so this is a
-    // state nobody can sit in for long.
-    if (auth.viewOnly && !SAFE_METHODS.has(req.method)) {
+    // One exception and no others (`VIEW_ONLY_ALLOWED_WRITES`): the shop switch, which is how the
+    // Owner gets back. Some POSTs are morally reads — `/api/sync/pull` is one — but a sync running
+    // under a viewing session would sync the viewed shop's data onto this device, which is worse
+    // than a sync that waits. The token also expires in 30 minutes, so this is a state nobody can
+    // sit in for long.
+    if (auth.viewOnly && !viewOnlyMayProceed(req)) {
       return sendAuthError(res, AUTH_ERRORS.VIEW_ONLY, req);
     }
 
@@ -239,7 +258,7 @@ const createAttachOptionalAuth = ({ secret, verify = verifyDeviceSession, now = 
     const auth = authContextFromClaims(result.claims);
     // A viewing session is read-only, and these routes are reads, so it is honoured rather than
     // ignored. Kept explicit so the two middlewares cannot drift apart on what a session means.
-    if (auth.viewOnly && !SAFE_METHODS.has(req.method)) return next();
+    if (auth.viewOnly && !viewOnlyMayProceed(req)) return next();
 
     req.auth = auth;
     return next();
@@ -273,6 +292,7 @@ module.exports = {
   AUTH_ERRORS,
   AUTH_HEADER,
   LEGACY_SESSION_HEADER,
+  VIEW_ONLY_ALLOWED_WRITES,
   authContextFromClaims,
   createRequireAuth,
   createAttachOptionalAuth,

@@ -84,3 +84,15 @@ test("completing several fruits names every fruit once, prices each, and keeps e
   assert.match(helper, /'COMPLETE_BILL'/);
   assert.doesNotMatch(helper, /SET product_id/, "a fruit cannot be swapped for another while completing");
 });
+
+test("completing a pending bill reprices sold stock at the basic rate, never the landed cost", () => {
+  // Ordinary sales are costed at batch.purchase_rate and the P&L adds Mandi Tax, freight, labour and
+  // other charges (less rebates) from the purchase itself. Repricing the allocations of a completed
+  // pending bill at effective_cost_per_unit counted those charges a second time.
+  const reprice = /UPDATE sale_batch_allocations SET purchase_rate = \$1, cost_amount = ROUND\(\(quantity \* \$1\)::NUMERIC, 2\) WHERE inventory_batch_id = \$2",\s*\[entry\.purchaseRate, (lot|batch)\.id\]/;
+  for (const start of ["const completePendingBillLines = async", "const completePurchaseBillHandler"]) {
+    const body = between(start, "\n};\n");
+    assert.match(body, reprice, start);
+    assert.doesNotMatch(body, /\[financials\.effectiveCostPerUnit, (lot|batch)\.id\]/, start);
+  }
+});
