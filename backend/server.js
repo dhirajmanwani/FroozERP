@@ -79,6 +79,7 @@ const {
 } = require("./activationLicence");
 const { normaliseLicenceRequest } = require("./activationLicenceRequest");
 const { validateProductPhoto } = require("./productPhoto");
+const { parsePosSection } = require("./productPosSection");
 const saleChangeApproval = require("./saleChangeApproval");
 const {
   effectiveLotRate,
@@ -2175,6 +2176,7 @@ const initializeDatabase = async () => {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS remarks TEXT;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS minimum_stock NUMERIC(14, 3) DEFAULT 0;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS pos_section VARCHAR(20);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS archived_duplicate_of INTEGER;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS archive_reason TEXT;
@@ -16046,6 +16048,7 @@ const ensureProductEntrySchema = async (client = pool) => {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20) DEFAULT 'LOCAL';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(80) DEFAULT 'Fruit';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS minimum_stock NUMERIC(14, 3) DEFAULT 0;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS pos_section VARCHAR(20);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS remarks TEXT;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
@@ -16200,17 +16203,22 @@ const createProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await ensureProductEntrySchemaOnce();
-    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, remarks, branch_id } = req.body;
+    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, remarks, branch_id, pos_section } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "LOCAL").toUpperCase();
     const parsedUnit = normalizeProductUnit(unit);
     const normalizedCategory = cleanText(category) || "Fruit";
+    // NULL (absent, null or "") is automatic: the POS derives the shelf from category and name.
+    const parsedPosSection = parsePosSection(pos_section);
     const rateManager = await requireRateManager(req.auth.userId, client);
 
     if (!rateManager) return res.status(403).json({ success: false, message: "Only Owner or Admin can create owner-approved selling rates" });
     if (!product_name?.trim() || !parsedUnit || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
       return res.status(400).json({ success: false, message: "Enter valid product details" });
+    }
+    if (!parsedPosSection.ok) {
+      return res.status(400).json({ success: false, code: parsedPosSection.code, message: parsedPosSection.message });
     }
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "product");
@@ -16262,9 +16270,9 @@ const createProductHandler = async (req, res) => {
       `
       INSERT INTO products (
         global_id, product_name, selling_rate, unit, barcode, origin_type, category, category_id,
-        minimum_stock, active, remarks, selling_rate_updated_by, company_id
+        minimum_stock, active, remarks, selling_rate_updated_by, company_id, pos_section
       )
-      VALUES ($12,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$13)
+      VALUES ($12,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$13,$14)
       RETURNING *
       `,
       [
@@ -16274,6 +16282,7 @@ const createProductHandler = async (req, res) => {
         rateManager.id,
         `product-${crypto.randomUUID()}`,
         req.v3OperationalContext?.company_id || null,
+        parsedPosSection.value,
       ]
     );
     const product = result.rows[0];
@@ -16356,9 +16365,16 @@ const updateProductHandler = async (req, res) => {
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "").toUpperCase();
     const parsedUnit = normalizeProductUnit(unit);
+    // This PUT rewrites every column, but a desktop build older than the POS-section picker does not
+    // send the field: absent keeps the stored choice, an explicit null or "" resets to automatic.
+    const posSectionSent = Object.hasOwn(req.body || {}, "pos_section");
+    const parsedPosSection = posSectionSent ? parsePosSection(req.body.pos_section) : null;
 
     if (!productId || !product_name?.trim() || !parsedUnit || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
       return res.status(400).json({ message: "Enter valid product details" });
+    }
+    if (parsedPosSection && !parsedPosSection.ok) {
+      return res.status(400).json({ code: parsedPosSection.code, message: parsedPosSection.message });
     }
 
     await client.query("BEGIN");
@@ -16443,7 +16459,7 @@ const updateProductHandler = async (req, res) => {
       SET
         product_name = $1, selling_rate = $2, unit = $3, barcode = $4,
         origin_type = $5, category = $6, category_id = $7, minimum_stock = $8, active = $9,
-        remarks = $10,
+        remarks = $10, pos_section = $13,
         entity_version = entity_version + 1,
         selling_rate_updated_at = CASE WHEN selling_rate <> $2 THEN CURRENT_TIMESTAMP ELSE selling_rate_updated_at END,
         selling_rate_updated_by = CASE WHEN selling_rate <> $2 THEN $11 ELSE selling_rate_updated_by END
@@ -16454,6 +16470,7 @@ const updateProductHandler = async (req, res) => {
         product_name.trim(), parsedSellingRate, parsedUnit, barcode?.trim() || null,
         parsedOriginType, selectedCategory.category_name, selectedCategory.id, parsedMinimumStock, active !== false,
         nullableText(remarks), rateManager?.id || null, productId,
+        parsedPosSection ? parsedPosSection.value : (current.pos_section ?? null),
       ]
     );
 

@@ -173,7 +173,7 @@ import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
 import { findDuplicateProductName, isSameProduct, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
-import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
+import { POS_SECTIONS, chosenPosSection, posSectionAutomatic, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -2675,6 +2675,11 @@ function App() {
   const [productMinimumStock, setProductMinimumStock] = useState("");
   const [productActive, setProductActive] = useState(true);
   const [productRemarks, setProductRemarks] = useState("");
+  // The POS shelf chosen for the product: "" is Automatic (placed by category and name). The
+  // second flag is false only while editing a product whose loaded record did not say what its
+  // shelf is (an older snapshot); the save then leaves the stored choice alone unless it is changed.
+  const [productPosSection, setProductPosSection] = useState("");
+  const [productPosSectionKnown, setProductPosSectionKnown] = useState(true);
   const [addOpeningStock, setAddOpeningStock] = useState(false);
   const [openingStockLots, setOpeningStockLots] = useState([]);
   const [openingStockDraft, setOpeningStockDraft] = useState({
@@ -7762,6 +7767,9 @@ function App() {
         created_by: user.id,
         updated_by: user.id,
         opening_stock_lots: !editingProductId ? normalizedOpeningStockLots : [],
+        // null is Automatic. Left out only when an edit never learned the stored choice, so a
+        // save from an older snapshot cannot quietly reset a shelf the owner chose.
+        ...(productPosSectionKnown ? { pos_section: productPosSection || null } : {}),
       };
       let savedProductId = null;
       let savedProductGlobalId = null;
@@ -7804,6 +7812,14 @@ function App() {
       const reloads = await Promise.allSettled([loadProducts(), loadProductCategories(), loadDashboardData()]);
       const reloadFailure = reloads.find((result) => result.status === "rejected");
       const savedMessage = wasEditing ? "Product Updated" : "Product Added";
+      // POS on this desktop reads SQLite, which learns of the change (a new POS section, a rate) only
+      // at the next background cycle. Pull it now, as after a purchase save; never fails the save, and
+      // LOCAL_ONLY is refused inside runSyncNow before any request.
+      if (shouldSyncAfterPurchaseSave({ tauriRuntime: isTauriRuntime(), queuedOffline: false })) {
+        runSyncNow({ force: true }).catch((syncError) => {
+          writeDiagnosticLog("WARN", "post-product-sync-failed", { message: getErrorMessage(syncError, "Sync after product save failed") });
+        });
+      }
       const notes = [
         photoProblem ? `the photo was not saved: ${photoProblem}` : "",
         reloadFailure ? `the list could not be refreshed (${productSaveErrorMessage(reloadFailure.reason, "no answer")}); open Product Master again to see it` : "",
@@ -7835,6 +7851,8 @@ function App() {
     setProductMinimumStock("");
     setProductActive(true);
     setProductRemarks("");
+    setProductPosSection("");
+    setProductPosSectionKnown(true);
     setAddOpeningStock(false);
     setOpeningStockLots([]);
     setOpeningStockDraft({
@@ -8816,6 +8834,8 @@ function App() {
     setProductMinimumStock(product.minimum_stock || "");
     setProductActive(product.active !== false);
     setProductRemarks(product.remarks || "");
+    setProductPosSection(chosenPosSection(product) || "");
+    setProductPosSectionKnown(Object.prototype.hasOwnProperty.call(product, "pos_section"));
     setAddOpeningStock(false);
     setOpeningStockLots([]);
     setShowOpeningLotForm(false);
@@ -9518,6 +9538,9 @@ function App() {
   const productEditingName = editingProductId
     ? (products.find((product) => isSameProduct(product, editingProductKeys))?.product_name || productName.trim() || "product")
     : "";
+  // The category the form would save, so "Automatic (now: ...)" tracks the form as it is filled in.
+  const productCategoryFormName = productCategories.find((category) => String(category.id) === String(productCategoryId))?.category_name
+    || newProductCategoryName.trim() || productCategory.trim();
   const lotPanelAcceptsNewLot = lotPanelMatchesEdit({ editingProductId, editingProductKeys, lotPanelProduct });
   const productMoreColumnHeaders = showMoreProductColumns ? ["Barcode", "Origin", "Low-stock alert at", "Lots"] : [];
   const lotSearchText = lotListSearch.trim().toLowerCase();
@@ -10274,7 +10297,7 @@ function App() {
                         const lowStock = isLowStock(product);
                         const unitName = unitDisplayName(product.unit);
                         const stockText = formatOptionalQuantity(product.current_stock);
-                        const productNote = [productCategoryLabel(product), String(product.remarks || "").trim()].filter(Boolean).join(" · ");
+                        const productNote = [productCategoryLabel(product), posSectionLabel(posSectionFor(product).key), String(product.remarks || "").trim()].filter(Boolean).join(" · ");
                         return (
                           <tr key={product.id}>
                             <td>
@@ -10355,7 +10378,14 @@ function App() {
                             {PRODUCT_UNITS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                           </select>
                         </Field>
+                        <Field label="POS section">
+                          <select value={productPosSection} onChange={(event) => { setProductPosSection(event.target.value); setProductPosSectionKnown(true); }}>
+                            <option value="">{`Automatic (now: ${posSectionLabel(posSectionAutomatic({ product_name: productName, category: productCategoryFormName }).key)})`}</option>
+                            {POS_SECTIONS.map((section) => <option key={section.key} value={section.key}>{section.label}</option>)}
+                          </select>
+                        </Field>
                       </div>
+                      <p className="pm-hint">POS section decides which POS tab the product shows on. Automatic places it by its category and name; choose a section to move it.</p>
                       <div className="product-photo-field">
                         <span className="product-photo-label">Photo</span>
                         <div className="product-photo-row">
@@ -25707,7 +25737,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                   ? posEmptyReason
                   : posSection === "retail"
                     ? "Nothing in Frooz Retail has stock right now."
-                    : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its category is named "${posSectionLabel(posSection)}" in Product Master and it has a lot in stock.`}
+                    : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its POS section is ${posSectionLabel(posSection)} (choose it in Product Master, Edit) and it has a lot in stock.`}
               </div>
             )}
             {searchResults.length === 0 && (posSearching || !shelf.usable) && (

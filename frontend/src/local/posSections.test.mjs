@@ -7,7 +7,9 @@ import {
   POS_SECTION_STORAGE_KEY,
   TILE_INK_DARK,
   TILE_INK_LIGHT,
+  chosenPosSection,
   normalizePosSection,
+  posSectionAutomatic,
   posSectionCounts,
   posSectionFor,
   posSectionLabel,
@@ -62,6 +64,46 @@ test("the category may arrive as category or category_name", () => {
   assert.equal(posSectionFor(null).key, "retail");
 });
 
+test("a chosen POS section beats both the category and the name", () => {
+  // A Retail product that landed on Bar by its name, moved back by the owner, and the reverse.
+  assert.deepEqual(posSectionFor({ ...product("Mango Juice", "Fruit"), pos_section: "retail" }), { key: "retail", basis: "chosen", category: "Fruit" });
+  assert.equal(posSectionFor({ ...product("Alphonso Mango", "Frooz Retail"), pos_section: "bar" }).key, "bar");
+  assert.equal(posSectionFor({ ...product("Fruit Chaat", "Frooz Bar"), pos_section: "moments" }).key, "moments");
+  assert.equal(posSectionFor({ product_name: "Apple", category: "Juices", pos_section: "retail" }).category, "Juices");
+  // Automatic ignores the choice: it is what the form offers as "Automatic (now: ...)".
+  assert.deepEqual(posSectionAutomatic({ ...product("Mango Juice", "Fruit"), pos_section: "retail" }), { key: "bar", basis: "name", category: "Fruit" });
+  assert.deepEqual(
+    posSectionCounts([{ ...product("Mango Juice"), pos_section: "retail" }, product("Apple")]),
+    { retail: 2, bar: 0, moments: 0 },
+  );
+});
+
+test("the chosen section is case-insensitive, and an invalid or empty one falls through to automatic", () => {
+  assert.equal(posSectionFor({ ...product("Apple"), pos_section: " BAR " }).key, "bar");
+  assert.equal(posSectionFor({ ...product("Apple"), pos_section: "Moments" }).basis, "chosen");
+  for (const value of [null, undefined, "", "   ", "juices", "automatic", 0]) {
+    // Not pinned to Retail the way normalizePosSection would: the name still decides.
+    assert.deepEqual(posSectionFor({ ...product("Fruit Chaat"), pos_section: value }), { key: "bar", basis: "name", category: "Fruit" }, String(value));
+    assert.equal(chosenPosSection({ pos_section: value }), null);
+  }
+  assert.equal(chosenPosSection(null), null);
+  assert.equal(chosenPosSection({ pos_section: "Retail" }), "retail");
+});
+
+test("Product Master lets the owner choose the POS section and sends it with the product", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const save = app.slice(app.indexOf("const addProduct = async () =>"), app.indexOf("const resetProductForm = () =>"));
+  assert.match(save, /pos_section: productPosSection \|\| null/);
+  const reset = app.slice(app.indexOf("const resetProductForm = () =>"), app.indexOf("const saveProductCategory = async () =>"));
+  assert.match(reset, /setProductPosSection\(""\)/);
+  const edit = app.slice(app.indexOf("const editProduct = (product) =>"), app.indexOf("const cancelProductEdit = () =>"));
+  assert.match(edit, /setProductPosSection\(chosenPosSection\(product\) \|\| ""\)/);
+  assert.match(app, /<Field label="POS section">\s*<select value=\{productPosSection\}/);
+  assert.match(app, /Automatic \(now: \$\{posSectionLabel\(posSectionAutomatic\(/);
+  // The empty-shelf hint no longer tells the owner to rename a category to move a product.
+  assert.doesNotMatch(app, /its category is named/);
+});
+
 test("counts carry every shelf, zero included", () => {
   assert.deepEqual(posSectionCounts([]), { retail: 0, bar: 0, moments: 0 });
   assert.deepEqual(
@@ -104,4 +146,13 @@ test("POS wires the shelves in without widening the counter's stock scope", () =
   // The shelf is still cut from the counter-scoped sellable list, never from raw products.
   const memo = app.slice(app.indexOf("const posMatches = useMemo("), app.indexOf("const posSearching ="));
   assert.match(memo, /filterSellableProducts\(products, inventory, new Date\(\), counterScope\)/);
+});
+
+test("saving a product on the desktop pulls it at once, so POS shows the new section", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf('const savedMessage = wasEditing ? "Product Updated" : "Product Added";');
+  assert.ok(start > 0, "product save message not found");
+  const after = app.slice(start, start + 900);
+  assert.match(after, /shouldSyncAfterPurchaseSave\(\{ tauriRuntime: isTauriRuntime\(\), queuedOffline: false \}\)/);
+  assert.match(after, /runSyncNow\(\{ force: true \}\)\.catch/);
 });

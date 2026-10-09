@@ -1,0 +1,26 @@
+-- The owner's choice of POS shelf for a product: `products.pos_section`.
+--
+-- ## What this carries
+--
+-- The POS groups products onto three shelves -- 'retail', 'bar' and 'moments' -- and until now
+-- derived the shelf from the product's category and name. The owner can now pick the shelf when
+-- adding or editing a product. The backend stores only those three lower-case keys (anything else
+-- is refused with POS_SECTION_INVALID before it reaches this column). NULL means automatic: the
+-- shelf is still derived exactly as before, so every existing row keeps its current shelf.
+--
+-- ## Why this file exists
+--
+-- The statement is declared in `initializeDatabase()` and `ensureProductEntrySchema()`, and the
+-- startup bootstrap is switched off on a hosted deployment. Without this file the column never
+-- reaches the cloud, `verifyDeclaredSchema` refuses to start the backend, and every product create
+-- or edit would 500 on the missing column once it did -- the shape of gap 014 and 018-022 were
+-- each written to close.
+--
+-- Additive only: no row is inserted, updated or deleted. No CHECK constraint, deliberately: the
+-- route is the one place the allowed values are decided, and a constraint here would make adding
+-- a shelf a second migration. Forward-only. Never edit this file once it has been applied anywhere.
+
+-- Exactly the statement from the startup bootstrap, so the two paths cannot drift. IF NOT EXISTS
+-- keeps this safe to re-run (the runner replays the whole list every time) and safe on a database
+-- that was bootstrapped locally and already has it.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS pos_section VARCHAR(20);

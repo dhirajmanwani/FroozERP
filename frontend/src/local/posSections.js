@@ -1,15 +1,19 @@
 // The POS counter's three shelves: Frooz Retail (loose fruit), Frooz Bar (juices, bottles, lunch
 // boxes, fruit chaat) and Frooz Moments (baskets, gifting, occasions).
 //
-// There is no "section" field on a product, and adding one would mean a column in Postgres, a
-// cloud migration, a SQLite migration and the Rust snapshot, all before a single tile moved. The
-// product's category already exists everywhere a product does, so it decides first: a category
-// named "Frooz Bar" (or anything with Bar, Juice, Chaat... in it) puts every product in it on the
-// Bar shelf, and one named "Frooz Retail" keeps its products on Retail whatever they are called. Only a product left in a plain category such as the default "Fruit" is placed by its
-// own name, so "Mango Shake" and "Fruit Chaat" land on the Bar shelf without anyone re-filing
-// them. Everything else is Retail, which is what the counter sold before there were sections.
+// A product can carry a chosen shelf, `pos_section` ("retail", "bar" or "moments"), set in Product
+// Master. A choice always wins: it is how the owner moves a product the automatic placement got
+// wrong, a Frooz Retail product that landed on Frooz Bar or the other way round. A product with no
+// choice (null, absent, or a value that is not a shelf) is placed automatically, as before:
 //
-// The owner moves a product by changing its category in Product Master. Nothing here writes.
+// The category decides first: a category named "Frooz Bar" (or anything with Bar, Juice, Chaat...
+// in it) puts every product in it on the Bar shelf, and one named "Frooz Retail" keeps its
+// products on Retail whatever they are called. Only a product left in a plain category such as
+// the default "Fruit" is placed by its own name, so "Mango Shake" and "Fruit Chaat" land on the
+// Bar shelf without anyone re-filing them. Everything else is Retail, which is what the counter
+// sold before there were sections.
+//
+// Nothing here writes; the choice is saved with the product.
 
 import { tintFor } from "./catalogueExport.js";
 
@@ -45,10 +49,10 @@ const sectionOfText = (text, barWords) => {
 };
 
 /**
- * Which shelf a product sits on, and why: `basis` is "category", "name" or "default", so the
- * screen can say where a surprising placement came from.
+ * The shelf a product's category and name give it, ignoring any chosen shelf: what "Automatic"
+ * means in Product Master. `basis` is "category", "name" or "default".
  */
-export function posSectionFor(product) {
+export function posSectionAutomatic(product) {
   const category = String(product?.category_name || product?.category || "").trim();
   // A category that names the Retail shelf keeps a "Mango Shake" there on purpose.
   const byCategory = sectionOfText(category, BAR_CATEGORY_WORDS) || (hasAny(category, ["retail"]) ? "retail" : null);
@@ -56,6 +60,26 @@ export function posSectionFor(product) {
   const byName = sectionOfText(product?.product_name, BAR_ITEM_WORDS);
   if (byName) return { key: byName, basis: "name", category };
   return { key: DEFAULT_POS_SECTION, basis: "default", category };
+}
+
+/**
+ * A product's chosen shelf key, or null when it has none. Unlike normalizePosSection this never
+ * turns an unknown value into Retail: an unknown value is "no choice", so the product is placed
+ * automatically rather than pinned to Retail.
+ */
+export function chosenPosSection(product) {
+  const key = String(product?.pos_section ?? "").trim().toLowerCase();
+  return SECTION_KEYS.has(key) ? key : null;
+}
+
+/**
+ * Which shelf a product sits on, and why: `basis` is "chosen", "category", "name" or "default",
+ * so the screen can say where a surprising placement came from.
+ */
+export function posSectionFor(product) {
+  const chosen = chosenPosSection(product);
+  if (chosen) return { key: chosen, basis: "chosen", category: String(product?.category_name || product?.category || "").trim() };
+  return posSectionAutomatic(product);
 }
 
 export function posSectionLabel(key) {

@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager};
 use crate::entitlement::{self, EntitlementState};
 use crate::machine_identity::{self, AnchorOutcome, AnchorWritePolicy, MachineContext};
 
-const CURRENT_SCHEMA_VERSION: &str = "026_sync_outbox_entity_and_deferred_lots";
+const CURRENT_SCHEMA_VERSION: &str = "027_product_pos_section";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -36,6 +36,7 @@ const MIGRATION_023: &str = include_str!("../migrations/sqlite/023_customer_orde
 const MIGRATION_024: &str = include_str!("../migrations/sqlite/024_other_charges.sql");
 const MIGRATION_025: &str = include_str!("../migrations/sqlite/025_device_machine_fingerprint.sql");
 const MIGRATION_026: &str = include_str!("../migrations/sqlite/026_sync_outbox_entity_and_deferred_lots.sql");
+const MIGRATION_027: &str = include_str!("../migrations/sqlite/027_product_pos_section.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -3697,6 +3698,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "024_other_charges", MIGRATION_024)?;
     apply_migration(&mut conn, "025_device_machine_fingerprint", MIGRATION_025)?;
     apply_migration(&mut conn, "026_sync_outbox_entity_and_deferred_lots", MIGRATION_026)?;
+    apply_migration(&mut conn, "027_product_pos_section", MIGRATION_027)?;
     if first_open_in_this_process(path) {
         release_interrupted_syncing_at(&conn)?;
     }
@@ -4354,6 +4356,18 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
     // foreign keys are enforced on this connection (the bundled SQLite defaults them on), and
     // `local_purchase_intent_lines.product_id` is ON DELETE RESTRICT. They are refreshed in place
     // below by the same upserts that insert the rest.
+    // The shelf each product is on now, read before the delete below drops it. A product source
+    // that omits `pos_section` (an older server's `/products`) must not put every product back on
+    // automatic; an explicit null in the snapshot still does.
+    let stored_pos_sections: HashMap<String, String> = {
+        let mut statement = tx
+            .prepare("SELECT id, pos_section FROM local_products WHERE pos_section IS NOT NULL")
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(to_error)?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(to_error)?
+    };
     tx.execute(
         "DELETE FROM local_products
          WHERE COALESCE(branch_id, '1') = ?1
@@ -4454,8 +4468,8 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                 "INSERT INTO local_products (
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit, barcode,
                     sale_rate, minimum_stock, active, remarks, created_at, updated_at, version, sync_status,
-                    deleted_at, company_id
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', ?15, ?16)
+                    deleted_at, company_id, pos_section
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', ?15, ?16, ?17)
                  ON CONFLICT(id) DO UPDATE SET
                     branch_id = excluded.branch_id,
                     product_name = excluded.product_name,
@@ -4471,7 +4485,8 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     version = excluded.version,
                     sync_status = 'synced',
                     deleted_at = excluded.deleted_at,
-                    company_id = excluded.company_id",
+                    company_id = excluded.company_id,
+                    pos_section = excluded.pos_section",
                 params![
                     product_id,
                     branch_id,
@@ -4490,6 +4505,8 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     optional_text(product, "deleted_at"),
                     optional_text(product, "company_id")
                         .or_else(|| canonical_scope.as_ref().map(|scope| scope.0.clone())),
+                    payload_pos_section(product)
+                        .unwrap_or_else(|| stored_pos_sections.get(&product_id).cloned()),
                 ],
             )
             .map_err(to_error)?;
@@ -5121,12 +5138,14 @@ fn load_reference_snapshot_at(
                     p.id, p.product_name, p.category_id, p.category_name, p.unit, p.barcode,
                     p.sale_rate, p.minimum_stock, p.active, p.remarks, p.updated_at, p.version,
                     COALESCE(SUM(CASE WHEN l.deleted_at IS NULL AND UPPER(COALESCE(l.status, 'ACTIVE')) <> 'CANCELLED' THEN l.balance_qty ELSE 0 END), 0) AS current_stock,
-                    COUNT(CASE WHEN l.deleted_at IS NULL AND UPPER(COALESCE(l.status, 'ACTIVE')) <> 'CANCELLED' THEN 1 END) AS lot_count
+                    COUNT(CASE WHEN l.deleted_at IS NULL AND UPPER(COALESCE(l.status, 'ACTIVE')) <> 'CANCELLED' THEN 1 END) AS lot_count,
+                    p.pos_section
                  FROM local_products p
                  LEFT JOIN local_inventory_lots l ON l.product_id = p.id
                  WHERE p.deleted_at IS NULL
                  GROUP BY p.id, p.product_name, p.category_id, p.category_name, p.unit, p.barcode,
-                          p.sale_rate, p.minimum_stock, p.active, p.remarks, p.updated_at, p.version
+                          p.sale_rate, p.minimum_stock, p.active, p.remarks, p.updated_at, p.version,
+                          p.pos_section
                  ORDER BY p.product_name",
             )
             .map_err(to_error)?;
@@ -5153,6 +5172,8 @@ fn load_reference_snapshot_at(
                     // from `inventory_lots`, which now carries scope) — never from here.
                     "current_stock": row.get::<_, f64>(12)?,
                     "lot_count": row.get::<_, i64>(13)?,
+                    // The owner's POS shelf: 'retail' | 'bar' | 'moments', or null for automatic.
+                    "pos_section": row.get::<_, Option<String>>(14)?,
                 }))
             })
             .map_err(to_error)?;
@@ -6598,6 +6619,18 @@ fn required_text(value: &serde_json::Value, key: &str) -> Result<String, String>
     optional_text(value, key).ok_or_else(|| format!("{key} is required"))
 }
 
+/// The POS shelf a product payload carries, distinguishing "said nothing" from "said automatic".
+///
+/// `None` — the payload has no `pos_section` key, so whatever is stored must be kept: a
+/// `sale_rate` change can be a partial product row, and an older server's rows omit the field.
+/// `Some(None)` — the key is present and null (or blank): the owner chose automatic.
+/// `Some(Some(shelf))` — the owner's shelf, trimmed. Not checked against 'retail' | 'bar' |
+/// 'moments' here: the frontend decides what an unknown shelf means, and dropping it to NULL in
+/// this layer would make a newer server's value look like "automatic".
+fn payload_pos_section(payload: &serde_json::Value) -> Option<Option<String>> {
+    payload.get("pos_section").map(|_| optional_text(payload, "pos_section"))
+}
+
 fn optional_text(value: &serde_json::Value, key: &str) -> Option<String> {
     match value.get(key) {
         Some(serde_json::Value::String(text)) => {
@@ -7635,6 +7668,15 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 ],
             )
             .map_err(to_error)?;
+            // Only when the payload names it: an absent key keeps the stored shelf, an explicit
+            // null puts the product back on automatic.
+            if let Some(pos_section) = payload_pos_section(&change.payload) {
+                tx.execute(
+                    "UPDATE local_products SET pos_section = ?2 WHERE id = ?1",
+                    params![change.entity_id, pos_section],
+                )
+                .map_err(to_error)?;
+            }
         }
         "supplier" => {
             upsert_supplier_reference_with_tx(
@@ -8066,7 +8108,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 25;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 26;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -14872,6 +14914,159 @@ mod tests {
             lots,
             vec![("502".to_string(), 3.0), ("offline-lot-op-grn-dbl-1".to_string(), 1.5)],
             "the GRN's first lot is counted once, in the row its sale points at"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_027_adds_pos_section_once_and_survives_a_restart() {
+        let path = sync_fix_path("migration-027");
+        initialize_at(&path).expect("initialize");
+        seed_pull_product(&path, "product-shelf");
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE local_products SET pos_section = 'bar' WHERE id = 'product-shelf'", [])
+            .unwrap();
+        simulate_restart(&path);
+        initialize_at(&path).expect("restart with the upgraded profile");
+        let conn = Connection::open(&path).unwrap();
+        let (applied, total): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE version = '027_product_pos_section'),
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((applied, total), (1, EXPECTED_APPLIED_MIGRATIONS));
+        let shelf: Option<String> = conn
+            .query_row("SELECT pos_section FROM local_products WHERE id = 'product-shelf'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(shelf.as_deref(), Some("bar"), "a restart leaves the chosen shelf alone");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    fn stored_pos_section(path: &Path, product: &str) -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT pos_section FROM local_products WHERE id = ?1", [product], |row| row.get(0))
+            .expect("read pos_section")
+    }
+
+    fn pulled_product(entity_type: &str, product: &str, payload: serde_json::Value) -> PulledChange {
+        PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(1),
+            entity_type: entity_type.to_string(),
+            entity_id: product.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(2),
+            payload,
+            updated_at: Some("2026-10-09T10:00:00.000Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn pulled_pos_section_is_written_only_when_the_payload_names_it() {
+        let path = sync_fix_path("pull-pos-section");
+        initialize_at(&path).expect("initialize");
+        let base = serde_json::json!({ "branch_id": 1, "product_name": "Apples", "sale_rate": "120.00" });
+
+        let mut with_shelf = base.clone();
+        with_shelf["pos_section"] = serde_json::json!("moments");
+        pull(&path, &pulled_product("product", "product-pos", with_shelf));
+        assert_eq!(stored_pos_section(&path, "product-pos").as_deref(), Some("moments"));
+
+        // A partial sale_rate row and a full product row from an older server: neither says
+        // anything about the shelf, so neither may move it.
+        pull(&path, &pulled_product("sale_rate", "product-pos", base.clone()));
+        assert_eq!(stored_pos_section(&path, "product-pos").as_deref(), Some("moments"));
+        pull(&path, &pulled_product("product", "product-pos", base.clone()));
+        assert_eq!(stored_pos_section(&path, "product-pos").as_deref(), Some("moments"));
+
+        let mut retail = base.clone();
+        retail["pos_section"] = serde_json::json!("retail");
+        pull(&path, &pulled_product("sale_rate", "product-pos", retail));
+        assert_eq!(stored_pos_section(&path, "product-pos").as_deref(), Some("retail"));
+
+        // An explicit null is the owner choosing automatic.
+        let mut automatic = base.clone();
+        automatic["pos_section"] = serde_json::Value::Null;
+        pull(&path, &pulled_product("product", "product-pos", automatic));
+        assert_eq!(stored_pos_section(&path, "product-pos"), None);
+
+        // A product first seen without the key starts on automatic.
+        pull(&path, &pulled_product("product", "product-new", base));
+        assert_eq!(stored_pos_section(&path, "product-new"), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sign_in_cache_and_snapshot_carry_pos_section() {
+        let path = sync_fix_path("cache-pos-section");
+        initialize_at(&path).expect("initialize");
+        let snapshot = |products: serde_json::Value| {
+            serde_json::json!({
+                "branch_context": { "branch_id": "1" },
+                "device_identity": { "device_id": "device-test" },
+                "categories": [],
+                "products": products,
+                "inventory_lots": [],
+                "customers": [],
+                "settings_bundle": {}
+            })
+        };
+        let shelves = |path: &Path| -> Vec<(String, serde_json::Value)> {
+            let loaded = load_reference_snapshot_at(path, None, Some("device-test")).expect("load snapshot");
+            loaded["products"]
+                .as_array()
+                .expect("products")
+                .iter()
+                .map(|product| {
+                    assert!(product.get("pos_section").is_some(), "every product carries the key: {product}");
+                    (product["id"].as_str().unwrap().to_string(), product["pos_section"].clone())
+                })
+                .collect()
+        };
+
+        cache_reference_snapshot_at(
+            &path,
+            &snapshot(serde_json::json!([
+                { "global_id": "product-a", "product_name": "Apples", "pos_section": "bar" },
+                { "global_id": "product-b", "product_name": "Bananas", "pos_section": null },
+                { "global_id": "product-c", "product_name": "Cherries", "pos_section": "moments" }
+            ])),
+        )
+        .expect("cache with shelves");
+        assert_eq!(
+            shelves(&path),
+            vec![
+                ("product-a".to_string(), serde_json::json!("bar")),
+                ("product-b".to_string(), serde_json::Value::Null),
+                ("product-c".to_string(), serde_json::json!("moments")),
+            ]
+        );
+
+        // A source that omits the key keeps every shelf (these products have no lots, so the
+        // cache deletes and re-inserts them); an explicit null still clears one.
+        cache_reference_snapshot_at(
+            &path,
+            &snapshot(serde_json::json!([
+                { "global_id": "product-a", "product_name": "Apples" },
+                { "global_id": "product-b", "product_name": "Bananas" },
+                { "global_id": "product-c", "product_name": "Cherries", "pos_section": null }
+            ])),
+        )
+        .expect("cache without the key");
+        assert_eq!(
+            shelves(&path),
+            vec![
+                ("product-a".to_string(), serde_json::json!("bar")),
+                ("product-b".to_string(), serde_json::Value::Null),
+                ("product-c".to_string(), serde_json::Value::Null),
+            ]
         );
         let _ = fs::remove_file(&path);
     }
