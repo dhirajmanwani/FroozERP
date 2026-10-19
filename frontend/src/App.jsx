@@ -173,6 +173,7 @@ import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
 import { findDuplicateProductName, isSameProduct, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
+import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { POS_SECTIONS, chosenPosSection, posSectionAutomatic, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -1978,14 +1979,31 @@ const defaultDeviceControlSettings = {
   updated_at: "",
 };
 
-function BrandLogo({ compact = false, invoice = false, splash = false }) {
+/**
+ * The name and logo on every screen and bill, from Settings > Business Identity (see
+ * local/brandIdentity.js). One store for the whole app: several logos are drawn outside the part of
+ * the tree that holds the settings (start-up, sign-in, printed bills), and those show the identity
+ * this computer last saw.
+ */
+const brandIdentityStore = createBrandIdentityStore((() => {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage;
+  } catch {
+    return null;
+  }
+})());
+const getServerBrandIdentity = () => DEFAULT_BRAND_IDENTITY;
+
+function BrandLogo({ compact = false, invoice = false, splash = false, identity: identityOverride = null }) {
+  const storedIdentity = useSyncExternalStore(brandIdentityStore.subscribe, brandIdentityStore.getSnapshot, getServerBrandIdentity);
+  const identity = identityOverride || storedIdentity;
   const assetBase = import.meta.env.BASE_URL || "/";
   const assetPath = (path) => `${assetBase}${path}`.replace(/([^:]\/)\/+/g, "$1");
   // The mark is a square crop of the official lockup, which is what fits the badge.
   // Screen chrome is dark, so it takes the reversed (cream) cut; an invoice prints on
   // white paper, so it takes the green cut. Both are generated from one vector source
   // by tools/build-brand-assets.mjs - do not point this at a hand-made file.
-  const alt = compact ? "Frooz" : "Feel the Freakin' Frooz";
+  const alt = identity.title;
   return (
     <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""} ${splash ? "brand-lockup-splash" : ""}`}>
       {/*
@@ -2003,7 +2021,10 @@ function BrandLogo({ compact = false, invoice = false, splash = false }) {
         would disappear in one theme.
       */}
       <span aria-label={alt} className="brand-monogram" role="img">
-        {invoice ? (
+        {identity.logo ? (
+          // The owner's own logo: one picture, drawn as it is on every ground.
+          <img alt="" aria-hidden="true" className="brand-custom-logo" src={identity.logo} />
+        ) : invoice ? (
           <img alt="" aria-hidden="true" src={assetPath("branding/frooz-mark.svg")} />
         ) : (
           <>
@@ -2014,8 +2035,8 @@ function BrandLogo({ compact = false, invoice = false, splash = false }) {
       </span>
       {!compact && (
         <span className="brand-copy">
-          <strong>FroozERP</strong>
-          <small>Feel the Freakin&apos; Frooz - by SRT Company</small>
+          <strong>{identity.title}</strong>
+          {identity.tagline && <small>{identity.tagline}</small>}
         </span>
       )}
     </div>
@@ -2467,6 +2488,14 @@ function App() {
     systemInfo: {},
     canManageSettings: false,
   });
+  // The name and logo at the top follow Business Identity once the shop's settings have actually
+  // arrived. Before that, and when a load returned no business settings (the defaults merged over
+  // nothing carry no row id or timestamp), the logos keep what this computer last saw.
+  useEffect(() => {
+    const business = settingsData.businessSettings;
+    if (business === defaultBusinessSettings || !(business?.updated_at || business?.id)) return;
+    brandIdentityStore.set(resolveBrandIdentity(business));
+  }, [settingsData.businessSettings]);
   const [discountRules, setDiscountRules] = useState([]);
   const [lotDiscounts, setLotDiscounts] = useState([]);
   const [customerPendingBills, setCustomerPendingBills] = useState({ summary: [], invoices: [] });
@@ -20800,9 +20829,43 @@ const settleSettingsSave = async (onReload, resetDraft) => {
 
 function BusinessSettingsSection({ businessSettings, canManage, onReload, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(businessSettings, defaultBusinessSettings);
+  const [logoMessage, setLogoMessage] = useState("");
+  // What the top of the app will look like after Save, drawn from the unsaved values.
+  const previewIdentity = useMemo(() => resolveBrandIdentity(draft), [draft]);
+  const unusableLogo = hasUnusableLogo(draft);
+  const takeLogo = async (file, emptyMessage) => {
+    if (!file) {
+      setLogoMessage(emptyMessage || "No picture found.");
+      return;
+    }
+    try {
+      setLogoMessage("Preparing logo...");
+      const dataUrl = await shrinkBrandLogo(file, {
+        createImageBitmap: (blob) => window.createImageBitmap(blob),
+        createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
+      });
+      const check = checkBrandLogo(dataUrl);
+      if (!check.ok) {
+        setLogoMessage(check.message);
+        return;
+      }
+      updateDraft("logo_url", dataUrl);
+      setLogoMessage(`Logo ready (${Math.ceil(check.bytes / 1024)} KB). It is saved when you press Save.`);
+    } catch (error) {
+      setLogoMessage(error?.message || "That picture could not be used.");
+    }
+  };
+  const pasteLogo = (event) => {
+    if (!canManage) return;
+    const found = imageFromTransfer(event.clipboardData || event.dataTransfer);
+    if (!found.file && !found.message) return;
+    event.preventDefault();
+    takeLogo(found.file, found.message);
+  };
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
+      setLogoMessage("");
       await settleSettingsSave(onReload, resetDraft);
       alert("Business settings updated");
     } catch (error) {
@@ -20811,14 +20874,59 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
   };
 
   return (
-    <ModuleCard eyebrow="Business Settings" title="Business Identity" subtitle="Invoice and application identity details for the retail operation.">
+    <ModuleCard eyebrow="Business Settings" title="Business Identity" subtitle="The name and logo at the top of every screen and on bills, and the shop's invoice details.">
+      <div className="brand-identity-editor">
+        <div className="brand-identity-preview">
+          <span className="product-photo-label">How the top of the app will look</span>
+          <div className="brand-identity-preview-bar">
+            <BrandLogo identity={previewIdentity} />
+          </div>
+        </div>
+        <div className="product-photo-field">
+          <span className="product-photo-label">Logo</span>
+          <div className="product-photo-row">
+            {/* Paste lands here: right-click a picture, "Copy image", then click this box and press Ctrl+V. */}
+            <div
+              aria-label="Logo. Click, then press Ctrl+V to paste a copied picture."
+              className={previewIdentity.logo ? "product-photo-drop product-photo-drop-filled" : "product-photo-drop"}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={pasteLogo}
+              onPaste={pasteLogo}
+              role="button"
+              tabIndex={0}
+            >
+              {previewIdentity.logo
+                ? <img alt="" src={previewIdentity.logo} />
+                : <span>Frooz mark (no logo chosen)</span>}
+            </div>
+            <div className="product-photo-actions">
+              <p>Choose your logo picture (PNG with a clear background looks best), or copy it and press Ctrl+V on the box. With no logo chosen, the Frooz mark is shown.</p>
+              <div className="button-row">
+                <label className="secondary-button product-photo-file">
+                  Choose logo
+                  <input
+                    accept="image/png,image/jpeg,image/webp"
+                    disabled={!canManage}
+                    onChange={(event) => { takeLogo(event.target.files?.[0] || null, "No file chosen."); event.target.value = ""; }}
+                    type="file"
+                  />
+                </label>
+                {(previewIdentity.logo || unusableLogo) && (
+                  <button className="danger-text-button" disabled={!canManage} onClick={() => { updateDraft("logo_url", ""); setLogoMessage("The Frooz mark comes back when you press Save."); }} type="button">Use the Frooz mark</button>
+                )}
+              </div>
+              {unusableLogo && <small className="product-photo-message product-photo-message-error">The saved logo is a file path or web address, which cannot be shown. Choose a logo picture instead.</small>}
+              {logoMessage && <small className="product-photo-message" role="status">{logoMessage}</small>}
+            </div>
+          </div>
+        </div>
+      </div>
       <div className="form-grid supplier-form-grid">
-        <Field label="Business Name"><input disabled={!canManage} value={draft.business_name || ""} onChange={(event) => updateDraft("business_name", event.target.value)} /></Field>
-        <Field label="Brand Name"><input disabled={!canManage} value={draft.brand_name || ""} onChange={(event) => updateDraft("brand_name", event.target.value)} /></Field>
-        <Field label="Company Name"><input disabled={!canManage} value={draft.company_name || ""} onChange={(event) => updateDraft("company_name", event.target.value)} /></Field>
+        <Field label="Business Name (big name at the top and on bills)"><input disabled={!canManage} value={draft.business_name || ""} onChange={(event) => updateDraft("business_name", event.target.value)} /></Field>
+        <Field label="Brand Name (small line under it)"><input disabled={!canManage} value={draft.brand_name || ""} onChange={(event) => updateDraft("brand_name", event.target.value)} /></Field>
+        <Field label="Company Name (after &quot;by&quot;)"><input disabled={!canManage} value={draft.company_name || ""} onChange={(event) => updateDraft("company_name", event.target.value)} /></Field>
         <Field label="Phone Number"><input disabled={!canManage} value={draft.phone_number || ""} onChange={(event) => updateDraft("phone_number", event.target.value)} /></Field>
         <Field label="GST Number"><input disabled={!canManage} value={draft.gst_number || ""} onChange={(event) => updateDraft("gst_number", event.target.value)} /></Field>
-        <Field label="Logo URL / Path"><input disabled={!canManage} value={draft.logo_url || ""} onChange={(event) => updateDraft("logo_url", event.target.value)} /></Field>
         <Field label="Compact Logo Text"><input disabled={!canManage} value={draft.compact_logo_text || ""} onChange={(event) => updateDraft("compact_logo_text", event.target.value)} /></Field>
         <Field label="Default Printer Type">
           <select disabled={!canManage} value={draft.default_printer_type || "THERMAL"} onChange={(event) => updateDraft("default_printer_type", event.target.value)}>
