@@ -10243,3 +10243,8 @@ button.shortcut-sheet-row:focus-visible {
   border-radius: var(--radius-md, 10px);
   background: var(--panel);
 }
+
+/* A logo is often wide; the photo box's `cover` crop would cut it. Show it whole. */
+.brand-identity-editor .product-photo-drop img {
+  object-fit: contain;
+}
