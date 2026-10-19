@@ -80,6 +80,7 @@ const {
 const { normaliseLicenceRequest } = require("./activationLicenceRequest");
 const { validateProductPhoto } = require("./productPhoto");
 const { parsePosSection } = require("./productPosSection");
+const { parseBusinessLogo } = require("./businessLogo");
 const saleChangeApproval = require("./saleChangeApproval");
 const {
   effectiveLotRate,
@@ -8367,6 +8368,9 @@ app.put("/settings/business", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage business settings" });
+    const stored = await pool.query("SELECT logo_url FROM business_settings WHERE id = 1");
+    const logo = parseBusinessLogo(req.body.logo_url, stored.rows[0]?.logo_url ?? null);
+    if (!logo.ok) return res.status(400).json({ code: logo.code, message: logo.message });
     const result = await pool.query(
       `
       UPDATE business_settings
@@ -8402,7 +8406,7 @@ app.put("/settings/business", async (req, res) => {
         nullableText(req.body.address),
         nullableText(req.body.phone_number),
         nullableText(req.body.gst_number),
-        nullableText(req.body.logo_url),
+        logo.value,
         nullableText(req.body.compact_logo_text) || "FTF",
         nullableText(req.body.invoice_footer_text) || "Thank you for shopping with FEEL THE FREAKIN' FROOZ.",
         cleanText(req.body.default_printer_type).toUpperCase() === "A4" ? "A4" : "THERMAL",

@@ -10220,3 +10220,26 @@ button.shortcut-sheet-row:focus-visible {
 .password-field > .password-eye:disabled {
   opacity: 0.4;
 }
+
+/* Business Identity: the logo picker reuses Product Master's photo field; above it, the top of the
+   app as it will look after Save, drawn on the same ground as the real top bar. */
+.brand-identity-editor {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.brand-identity-preview {
+  display: grid;
+  gap: 6px;
+}
+
+.brand-identity-preview-bar {
+  display: flex;
+  align-items: center;
+  max-width: 420px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 10px);
+  background: var(--panel);
+}
