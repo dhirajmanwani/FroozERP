@@ -87,8 +87,12 @@ const INDIRECT_ACTORS = [
  * is retired (426); its revoke and `POST /settings/branches` are Owner-only (`getOwnerUser`);
  * `PUT /settings/devices/:deviceId`, `POST /settings/counters` and the three backup routes now read
  * the `device_management`, `branch_settings` and `backup_restore` toggles (`getStaffPermissionUser`).
+ *
+ * 57 -> 58 on 2026-10-21: the Combos & Offers master (`POST /api/v3/combos` and
+ * `PUT /api/v3/combos/:id`, one shared handler) checks `requireRateManager(req.auth.userId, client)`.
+ * A combo's price is a price, so the same Owner/Admin check as products and charge types.
  */
-const SESSION_DERIVED_RATE_MANAGER_CALLS = 57;
+const SESSION_DERIVED_RATE_MANAGER_CALLS = 58;
 
 /** Every `requireRateManager(` occurrence in the file, session-derived or listed above. */
 const TOTAL_RATE_MANAGER_CALLS = SESSION_DERIVED_RATE_MANAGER_CALLS + INDIRECT_ACTORS.length;

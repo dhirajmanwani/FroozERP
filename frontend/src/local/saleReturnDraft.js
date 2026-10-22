@@ -11,6 +11,7 @@
 // ---------------------------------------------------------------------------------------------
 
 import { canonicalInventoryId } from "./stockInventory.js";
+import { COMBO_RETURN_REFUSAL, isComboLine } from "./combos.js";
 
 export const RETURN_INVOICE_LIST_LIMIT = 50;
 
@@ -66,6 +67,13 @@ export const buildSaleReturnDraft = ({ invoiceId = "", items = [], quantities = 
     const wanted = quantityToThousandths(typed);
     if (wanted === null || wanted === 0) continue;
     const name = item?.product_name || "This item";
+    // Combo items were cut, juiced or packed for this customer (v1: not returnable one by one; the
+    // server refuses with COMBO_LINE_NOT_RETURNABLE). Said here before anything is sent.
+    if (isComboLine(item)) {
+      lineProblems[key] = COMBO_RETURN_REFUSAL;
+      problems.push(`${name}: ${COMBO_RETURN_REFUSAL}`);
+      continue;
+    }
     if (Number.isNaN(wanted)) {
       lineProblems[key] = "Enter a number with up to 3 decimals.";
       problems.push(`${name}: enter a number with up to 3 decimals.`);

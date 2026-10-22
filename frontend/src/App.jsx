@@ -110,7 +110,7 @@ import { resolveShellStatus } from "./local/shellStatus";
 import { plainServerMessage } from "./local/plainServerMessage";
 import { describeReport } from "./local/reportDescriptions";
 import { labelFor, toneFor } from "./local/displayLabels";
-import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, MANUAL_BILL_DISCOUNT_MODE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, billDiscountRuleName, describeBillApprovalLine, describePosDiscountApprovalReason, posDiscountApproval, readBillDiscountTooLarge, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, resolveDiscountApprovalRoute, resolveDiscountAvailability, resolveManualBillDiscount, roundMoney as roundDiscountMoney, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
+import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, MANUAL_BILL_DISCOUNT_MODE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, billDiscountRuleName, describeBillApprovalLine, lineGross, describePosDiscountApprovalReason, posDiscountApproval, readBillDiscountTooLarge, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, slabBase, resolveDiscountApprovalRoute, resolveDiscountAvailability, resolveManualBillDiscount, roundMoney as roundDiscountMoney, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
 import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, describeSaveResult, filterSaleRateRows, marginOnCost, parseTargetMargin, rateTone, resolveSaleRateAvailability, suggestedDrafts } from "./local/saleRateUpdate";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
@@ -174,7 +174,8 @@ import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProdu
 import { findDuplicateProductName, isSameProduct, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
-import { POS_SECTIONS, chosenPosSection, posSectionAutomatic, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
+import { POS_SECTIONS, chosenPosSection, posSectionAutomatic, posSectionCounts, posSectionFor, posSectionLabel, posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
+import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -1186,6 +1187,7 @@ const icons = {
   waste: "alert",
   sales: "receipt",
   discounts: "wallet",
+  combos: "gift",
   expenses: "wallet",
   accounts: "users",
   reports: "chart",
@@ -1208,6 +1210,7 @@ const navigationItems = [
   ["waste", "Waste Management"],
   ["sales", "POS Billing"],
   ["discounts", "Discounts"],
+  ["combos", "Combos & Offers"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["orders", "Orders"],
@@ -1218,8 +1221,11 @@ const navigationItems = [
   ["settings", "Settings"],
 ];
 
+// Screens only an Owner or Admin opens, whatever a role's module permissions say: prices are theirs.
+const RATE_MANAGER_VIEWS = Object.freeze(["sale-rates", "combos"]);
+
 const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings", "orders"]);
-const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses", "all-shops"]);
+const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "combos", "sale-rates", "expenses", "all-shops"]);
 
 const getErrorMessage = (error, fallback) =>
   plainServerMessage(error.response?.data?.message) || fallback;
@@ -2159,6 +2165,7 @@ function Icon({ name, size = 18 }) {
     eyeOff: <><path d="M3 3l18 18" /><path d="M10.6 5.1A10.6 10.6 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.1" /><path d="M6.6 6.6A17.4 17.4 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 5.4-1.6" /><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" /></>,
     parcel: <><path d="M3 8h18v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 8l2-4h14l2 4" /><path d="M12 4v17" /></>,
     add: <><path d="M12 5v14M5 12h14" /></>,
+    gift: <><rect x="3" y="8" width="18" height="4" rx="1" /><path d="M12 8v13M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7" /><path d="M7.5 8a2.5 2.5 0 0 1 0-5C10 3 12 8 12 8s2-5 4.5-5a2.5 2.5 0 0 1 0 5" /></>,
     refresh: <><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" /></>,
   };
 
@@ -2444,6 +2451,10 @@ function App() {
   // cashier saw, and the shelf kept emptying itself a minute after it was filled. Only
   // `refreshPosInventoryFromSQLite` and a completed sale write this, so nothing else can empty it.
   const [posShelf, setPosShelf] = useState({ loaded: false, products: [], inventoryLots: [] });
+  // The combos POS sells (local/combos.js), read from the same SQLite snapshot by the same refresh
+  // and by nothing else, for the same reason as the shelf above. `missing` until it has been read:
+  // a counter that has not been told its combos must not say it has none.
+  const [posCombos, setPosCombos] = useState({ status: "missing", combos: [] });
   // Which shop this machine is standing in, as the local snapshot reports it.
   //
   // Selling binds to the machine, not to the login -- see docs/stock-distribution-decision.md. So
@@ -4392,7 +4403,7 @@ function App() {
       "Inventory Manager": ["reports", "products", "waste"],
     };
     const candidates = [...(preferredByRole[roleName] || []), ...navigationItems.map(([view]) => view)];
-    return candidates.find((view) => hasModuleAccess(view) && (roleName === "Owner" || roleName === "Admin" || view !== "sale-rates")) || "sales";
+    return candidates.find((view) => hasModuleAccess(view) && (roleName === "Owner" || roleName === "Admin" || !RATE_MANAGER_VIEWS.includes(view))) || "sales";
   };
 
   useEffect(() => {
@@ -4710,6 +4721,7 @@ function App() {
     // POS keeps selling from whatever list it happened to be holding, possibly another shop's,
     // fetched over HTTP while an Owner was viewing that shop. So the scope failure clears the list
     // and says why, rather than throwing.
+    setPosCombos(readCombos(snapshot));
     if (!counterMaySell(selected)) {
       setProducts(selected.products);
       setInventory([]);
@@ -4747,6 +4759,7 @@ function App() {
   // A different person or machine is a different shelf: never show one sign-in's stock to the next.
   useEffect(() => {
     setPosShelf({ loaded: false, products: [], inventoryLots: [] });
+    setPosCombos({ status: "missing", combos: [] });
   }, [user?.id, deviceInfo.device_id]);
 
   useEffect(() => {
@@ -8664,10 +8677,20 @@ function App() {
     try {
       if (isTauriRuntime() && (offlineMode || String(saleId || "").startsWith("invoice-") || String(saleId || "").startsWith("pos-invoice-"))) {
         const snapshot = await loadLocalPosSale(saleId);
-        setEditingSale(localSnapshotToInvoice(snapshot));
+        const localSale = localSnapshotToInvoice(snapshot);
+        // A combo bill cannot be edited (the server and this computer refuse it too): say so here.
+        if (saleHasCombos(localSale)) {
+          setSaleEditError(COMBO_EDIT_REFUSAL);
+          return;
+        }
+        setEditingSale(localSale);
         return;
       }
       const response = await axios.get(`${API_URL}/sales/${saleId}`);
+      if (saleHasCombos(response.data)) {
+        setSaleEditError(COMBO_EDIT_REFUSAL);
+        return;
+      }
       setEditingSale(response.data);
     } catch (error) {
       const message = getErrorMessage(error, "Error Loading Invoice");
@@ -9506,6 +9529,11 @@ function App() {
     offline: offlineMode,
     noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
   });
+  const comboUnavailableReason = resolveComboAvailability({
+    localOnly: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
+    offline: offlineMode,
+    noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
+  });
   const userDisplayName = getUserDisplayName(user);
   const userRoleLabel = getUserRoleLabel(user);
   const canEditSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("sale_edit");
@@ -9681,7 +9709,7 @@ function App() {
   const paletteShowsOwnerSections = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
   const commandIndex = commandPaletteOpen
     ? buildCommandIndex(navigationRegistry
-      .filter((item) => hasModuleAccess(item.id) && (canManageRates || item.id !== "sale-rates"))
+      .filter((item) => hasModuleAccess(item.id) && (canManageRates || !RATE_MANAGER_VIEWS.includes(item.id)))
       // A section the screen will not draw for this person or this machine is not offered either:
       // the licence card is the Owner's, and a phone has no screen lock.
       .map((item) => ({
@@ -9779,7 +9807,7 @@ function App() {
   });
 
   // What the sidebar shows this person, computed once so the shortcut list names the same screens.
-  const visibleNavigationItems = navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates"));
+  const visibleNavigationItems = navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || !RATE_MANAGER_VIEWS.includes(view)));
 
   return (
     <main className="erp-shell">
@@ -10955,6 +10983,8 @@ function App() {
               onWorkChange={handlePosWorkChange}
               productPhotoIndex={productPhotoIndex}
               chargeTypes={chargeTypes}
+              // Combos are sold from the counter app only (v1); the browser POS shows no combo tabs.
+              combos={isTauriRuntime() ? posCombos : null}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
               seedCart={posSeedCart}
@@ -10993,10 +11023,14 @@ function App() {
                 }
                 if (result?.localSale) {
                   setSalesHistory((rows) => [result.localSale, ...rows]);
+                  // Every line drawn from a lot, not the first: a combo's item and a loose sale of the
+                  // same fruit often share one lot, and `.find` left the shelf showing the second.
                   const takeSold = (rows) => rows.map((lot) => {
-                    const movement = result.localSale.items.find((item) => String(item.inventory_batch_id) === String(lot.id));
-                    return movement
-                      ? { ...lot, remaining_qty: Math.max(Number(lot.remaining_qty || 0) - Number(movement.quantity || 0), 0) }
+                    const sold = result.localSale.items
+                      .filter((item) => inventoryIdsEqual(item.inventory_batch_id, lot.id))
+                      .reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+                    return sold > 0
+                      ? { ...lot, remaining_qty: Math.max(Number(lot.remaining_qty || 0) - sold, 0) }
                       : lot;
                   });
                   setInventory(takeSold);
@@ -11036,6 +11070,20 @@ function App() {
             />
           )}
 
+          {activeView === "combos" && (
+            <CombosModule
+              canManage={canManageRates}
+              desiredMargin={saleDesiredMargin}
+              onSaved={() => {
+                // A desktop's POS sells combos from its SQLite snapshot; a sync brings the change
+                // there. Local Only refuses inside runSyncNow. Not awaited.
+                if (isTauriRuntime()) runSyncNow({ force: true }).catch(() => null);
+              }}
+              saleRateSettings={settingsData.saleRateSettings}
+              unavailableReason={comboUnavailableReason}
+            />
+          )}
+
           {activeView === "sale-rates" && canManageRates && (
             <>
               <SaleRateManager
@@ -11071,6 +11119,16 @@ function App() {
               {/* Right after the rates are set is when the website's copy of them is
                   wrong, so the export lives here rather than somewhere it has to be
                   remembered. */}
+              <SaleRateCombos
+                desiredMargin={saleDesiredMargin}
+                onSaved={() => {
+                  if (isTauriRuntime()) runSyncNow({ force: true }).catch(() => null);
+                }}
+                products={products}
+                rates={saleRates}
+                saleRateSettings={settingsData.saleRateSettings}
+                unavailableReason={comboUnavailableReason}
+              />
               <WebsiteCatalogueExport
                 products={products}
                 lots={inventory}
@@ -11259,7 +11317,8 @@ function App() {
         <InvoiceModal
           autoPrintMode={selectedInvoicePrintMode}
           canCancel={canCancelSales && selectedInvoice.sale_status !== "CANCELLED"}
-          canEdit={canEditSales && selectedInvoice.sale_status !== "CANCELLED"}
+          canEdit={canEditSales && selectedInvoice.sale_status !== "CANCELLED" && !saleHasCombos(selectedInvoice)}
+          editRefusal={canEditSales && selectedInvoice.sale_status !== "CANCELLED" && saleHasCombos(selectedInvoice) ? COMBO_EDIT_REFUSAL : null}
           canWhatsappSend={canWhatsappSend}
           invoice={selectedInvoice}
           onCancel={async () => {
@@ -11298,7 +11357,7 @@ function App() {
             <div className="invoice-toolbar">
               <div>
                 <span className="eyebrow">Edit Bill</span>
-                <strong>Unable to load invoice</strong>
+                <strong>{saleEditError === COMBO_EDIT_REFUSAL ? "This bill can't be edited" : "Unable to load invoice"}</strong>
               </div>
               <button className="remove-button" onClick={() => setSaleEditError("")}><Icon name="close" /></button>
             </div>
@@ -15228,6 +15287,448 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
  * nothing. Every rule it applies -- what a discount is worth, when it is running, what is refused --
  * comes from local/discounts.js, which POS and the server share.
  */
+/**
+ * Combos & Offers: the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
+ * either a fixed set of items at one price or the customer's choice priced from the items' rates.
+ * Kept on the server (`/api/v3/combos`); a desktop's POS gets them through its SQLite snapshot.
+ */
+function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRateSettings = {}, unavailableReason = null }) {
+  const [load, setLoad] = useState({ status: "idle", message: "" });
+  const [combos, setCombos] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [costs, setCosts] = useState({ status: "idle", rows: [] });
+  const [draft, setDraft] = useState(null);
+  const [marginTouched, setMarginTouched] = useState(false);
+  const [attempted, setAttempted] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [notice, setNotice] = useState(null);
+  const roundingRule = saleRateSettings?.rounding_rule || "NEAREST_RUPEE";
+  const targetMargin = parseTargetMargin(desiredMargin, saleRateSettings?.desired_margin_percent);
+
+  const loadCombos = async () => {
+    setLoad((current) => ({ ...current, status: "loading", message: "" }));
+    const [comboResult, productResult, costResult] = await Promise.allSettled([
+      axios.get(`${API_URL}/api/v3/combos`),
+      axios.get(`${API_URL}/products`),
+      axios.get(`${API_URL}/sale-rates`, { params: { desired_margin: targetMargin } }),
+    ]);
+    const failure = [comboResult, productResult].find((result) => result.status !== "fulfilled" || !Array.isArray(result.value.data));
+    if (failure) {
+      const reason = failure.status === "fulfilled" ? "the server sent something that is not a list" : getErrorMessage(failure.reason, "no answer from the server");
+      setLoad({ status: "failed", message: `Combos could not be loaded (${reason}). Nothing on this screen is current.` });
+      return false;
+    }
+    setCombos(readCombos(comboResult.value.data).combos);
+    setProducts(productResult.value.data);
+    // Costs only feed the price suggestion: without them the suggestion says so, the list still works.
+    setCosts(costResult.status === "fulfilled" && Array.isArray(costResult.value.data)
+      ? { status: "ready", rows: costResult.value.data }
+      : { status: "failed", rows: [] });
+    setLoad({ status: "ready", message: "" });
+    return true;
+  };
+
+  useEffect(() => {
+    if (unavailableReason) return;
+    loadCombos();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unavailableReason]);
+
+  const failed = load.status === "failed";
+  const firstLoad = (load.status === "idle" || load.status === "loading") && combos.length === 0;
+  const disabled = !canManage || Boolean(unavailableReason) || failed;
+  const sorted = sortCombos(combos);
+  const productChoices = products
+    .filter((product) => product && product.active !== false && !product.deleted_at)
+    .sort((left, right) => String(left.product_name || "").localeCompare(String(right.product_name || ""), "en-IN", { sensitivity: "base" }));
+  const fixed = draft?.combo_type === "FIXED";
+  const check = draft ? validateComboDraft(draft, { products }) : { ok: true, errors: [] };
+  const itemsValue = draft && fixed ? comboItemsValue(draft.items, products) : null;
+  const suggestion = draft && fixed
+    ? suggestComboPrice({ items: draft.items, rates: costs.rows, products, marginPercent: draft.margin_percent, targetMargin, roundingRule })
+    : null;
+
+  const startNew = () => {
+    setDraft(newComboDraft({ kind: "COMBO_OFFER", desiredMargin: targetMargin }));
+    setMarginTouched(false);
+    setAttempted(false);
+    setSaveError("");
+    setNotice(null);
+  };
+
+  const startEdit = (combo) => {
+    setDraft(comboDraftFrom(combo));
+    setMarginTouched(true);
+    setAttempted(false);
+    setSaveError("");
+    setNotice(null);
+  };
+
+  const updateDraft = (field, value) => {
+    setSaveError("");
+    setDraft((current) => {
+      if (!current) return current;
+      const next = { ...current, [field]: value };
+      // A new combo's margin follows its kind until the owner types one.
+      if (field === "kind" && !current.ref && !marginTouched) next.margin_percent = String(defaultComboMargin(value, targetMargin));
+      if (field === "combo_type" && value === "CUSTOM") next.price = "";
+      if (field === "combo_type" && value === "FIXED") {
+        next.extra_charge = "0";
+        if (next.items.length === 0) next.items = [{ product_id: "", product_name: "", unit: "", quantity: "" }];
+      }
+      return next;
+    });
+    if (field === "margin_percent") setMarginTouched(true);
+  };
+
+  const updateItem = (index, field, value) => {
+    setSaveError("");
+    setDraft((current) => {
+      if (!current) return current;
+      const items = current.items.map((item, position) => {
+        if (position !== index) return item;
+        if (field !== "product_id") return { ...item, [field]: value };
+        const product = productChoices.find((choice) => inventoryIdsEqual(choice.id, value)) || null;
+        return { ...item, product_id: value, product_name: product?.product_name || "", unit: product?.unit || "" };
+      });
+      return { ...current, items };
+    });
+  };
+
+  const addItemRow = () => setDraft((current) => (current
+    ? { ...current, items: [...current.items, { product_id: "", product_name: "", unit: "", quantity: "" }] }
+    : current));
+
+  const removeItemRow = (index) => setDraft((current) => (current
+    ? { ...current, items: current.items.filter((_, position) => position !== index) }
+    : current));
+
+  const saveCombo = async () => {
+    setAttempted(true);
+    setSaveError("");
+    setNotice(null);
+    if (!draft || !check.ok || saving || disabled) return;
+    setSaving(true);
+    const payload = buildComboPayload(draft);
+    let response;
+    try {
+      // No identity in the body: the server records who did it from the signed session.
+      response = draft.ref
+        ? await axios.put(`${API_URL}/api/v3/combos/${encodeURIComponent(String(draft.ref))}`, payload)
+        : await axios.post(`${API_URL}/api/v3/combos`, payload);
+    } catch (error) {
+      setSaveError(getErrorMessage(error, "The combo could not be saved. Nothing was changed."));
+      setSaving(false);
+      return;
+    }
+    setSaving(false);
+    const savedName = response?.data?.combo?.name || payload.name;
+    const wasNew = !draft.ref;
+    setDraft(null);
+    setAttempted(false);
+    const reloaded = await loadCombos();
+    onSaved?.();
+    const said = `${wasNew ? "Added" : "Saved"} ${savedName}. Counters get it at their next sync.`;
+    setNotice(reloaded
+      ? { tone: "success", text: said }
+      : { tone: "warning", text: `${said} The list could not be refreshed, so it may not show it yet.` });
+  };
+
+  const pricingText = (combo) => (combo.combo_type === "FIXED"
+    ? (combo.price === null ? MISSING_VALUE : currency.format(combo.price))
+    : `${describeCustomPricing({ marginPercent: combo.margin_percent, extraCharge: combo.extra_charge }, (value) => currency.format(value))}, rounded`);
+
+  const itemsText = (combo) => (combo.combo_type === "FIXED"
+    ? combo.items.map((item) => `${item.product_name || "A product"} ${item.quantity ?? MISSING_VALUE}${item.unit ? ` ${item.unit}` : ""}`).join(", ") || MISSING_VALUE
+    : "The customer picks at the counter");
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard
+        eyebrow="Pricing"
+        title="Combos & Offers"
+        subtitle="Juices, The Cutting, gift baskets and combo offers, sold at one price in the desktop POS."
+        actions={canManage && !unavailableReason && !failed && !draft
+          ? <button className="primary-button" disabled={firstLoad} type="button" onClick={startNew}><Icon name="add" size={16} />Add combo</button>
+          : null}
+      >
+        {unavailableReason ? (
+          <div className="warning-note" role="status">{unavailableReason}</div>
+        ) : (
+          <>
+            {failed && (
+              <div className="error-banner discount-load-error" role="alert">
+                {load.message}{" "}
+                <button className="secondary-button compact-button" type="button" onClick={() => loadCombos()}>Try again</button>
+              </div>
+            )}
+            {!canManage && !failed && (
+              <p className="form-note">Only the Owner or an Admin can add or change combos. You can see what is set up.</p>
+            )}
+            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+            {draft && !failed && (
+              <div className="discount-block combo-form">
+                <h3>{draft.ref ? `Edit ${draft.name || "combo"}` : "New combo"}</h3>
+                <div className="discount-form">
+                  <Field label="Name">
+                    <input disabled={disabled} maxLength={120} value={draft.name} onChange={(event) => updateDraft("name", event.target.value)} />
+                  </Field>
+                  <Field label="Kind">
+                    <select disabled={disabled} value={draft.kind} onChange={(event) => updateDraft("kind", event.target.value)}>
+                      {COMBO_KINDS.map((kind) => <option key={kind} value={kind}>{COMBO_KIND_LABELS[kind]}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Type">
+                    <select disabled={disabled} value={draft.combo_type} onChange={(event) => updateDraft("combo_type", event.target.value)}>
+                      {COMBO_TYPES.map((type) => <option key={type} value={type}>{COMBO_TYPE_LABELS[type]}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Margin %">
+                    <input disabled={disabled} inputMode="decimal" min="0" max="1000" step="0.5" type="number" value={draft.margin_percent} onChange={(event) => updateDraft("margin_percent", event.target.value)} />
+                  </Field>
+                  {fixed ? (
+                    <>
+                      <p className="form-note">The margin is what the suggested price is worked out from. Empty uses the Sale Rate desired margin ({targetMargin}%).</p>
+                      <fieldset className="combo-items" disabled={disabled}>
+                        <legend>Items in one combo</legend>
+                        {draft.items.map((item, index) => (
+                          <div className="combo-item-row" key={`item-${index}`}>
+                            <select aria-label={`Item ${index + 1} product`} value={String(item.product_id || "")} onChange={(event) => updateItem(index, "product_id", event.target.value)}>
+                              <option value="">Choose a product</option>
+                              {item.product_id && !productChoices.some((choice) => inventoryIdsEqual(choice.id, item.product_id)) && (
+                                <option value={String(item.product_id)}>{`${item.product_name || "A product"} (not on sale)`}</option>
+                              )}
+                              {productChoices.map((product) => (
+                                <option key={String(product.id)} value={String(product.id)}>{product.product_name}{product.unit ? ` (${product.unit})` : ""}</option>
+                              ))}
+                            </select>
+                            <input aria-label={`Item ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={item.quantity} onChange={(event) => updateItem(index, "quantity", event.target.value)} />
+                            <button aria-label={`Remove item ${index + 1}`} className="remove-button" disabled={draft.items.length <= 1} type="button" onClick={() => removeItemRow(index)}><Icon name="trash" size={16} /></button>
+                          </div>
+                        ))}
+                        <button className="secondary-button compact-button" type="button" onClick={addItemRow}><Icon name="add" size={14} />Add item</button>
+                      </fieldset>
+                      <Field label="Combo price (₹)">
+                        <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.price} onChange={(event) => updateDraft("price", event.target.value)} />
+                      </Field>
+                      <p className="form-note combo-price-check">
+                        {`Items at today's rates ${itemsValue?.known ? currency.format(itemsValue.value) : MISSING_VALUE} vs combo price ${String(draft.price).trim() === "" ? MISSING_VALUE : currency.format(Number(draft.price) || 0)}`}
+                        {/* Only about a product actually chosen: a blank row is not "no sale rate". */}
+                        {draft.items.some((item) => String(item.product_id || "").trim() !== "" && productListRate(findComboProduct(products, item)) === null) ? " (an item has no sale rate yet)" : ""}
+                      </p>
+                      <p className="form-note combo-price-check">
+                        {`Cost today ${suggestion?.cost === null || suggestion?.cost === undefined ? MISSING_VALUE : currency.format(suggestion.cost)} · Suggested ${suggestion?.suggested === null || suggestion?.suggested === undefined ? MISSING_VALUE : currency.format(suggestion.suggested)}`}
+                        {suggestion?.suggested !== null && suggestion?.suggested !== undefined ? ` (at ${suggestion.margin}% margin)` : ""}{" "}
+                        <button
+                          className="secondary-button compact-button"
+                          disabled={disabled || suggestion?.suggested === null || suggestion?.suggested === undefined}
+                          type="button"
+                          onClick={() => updateDraft("price", String(suggestion.suggested))}
+                        >
+                          Use suggested
+                        </button>
+                      </p>
+                      {costs.status === "failed" && <p className="warning-note" role="status">Purchase costs could not be loaded, so there is no suggested price. The combo can still be saved.</p>}
+                      {costs.status === "ready" && suggestion?.cost === null && draft.items.some((item) => String(item.product_id || "") !== "") && (
+                        <p className="form-note">No suggestion: an item has no purchase cost yet.</p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="form-note">The margin is added on top of the items' sale rates. Empty means 0%.</p>
+                      <Field label="Extra charge per combo (₹)">
+                        <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.extra_charge} onChange={(event) => updateDraft("extra_charge", event.target.value)} />
+                      </Field>
+                      <p className="form-note combo-price-check">
+                        {`At the counter the cashier adds the customer's items and the bill shows one price: ${describeCustomPricing({ marginPercent: draft.margin_percent, extraCharge: draft.extra_charge }, (value) => currency.format(value))}, rounded. For example, ₹500 of fruit bills at ${(() => {
+                          const example = customComboPrice({ itemsValue: 500, marginPercent: draft.margin_percent, extraCharge: draft.extra_charge, roundingRule });
+                          return example === null ? MISSING_VALUE : currency.format(example);
+                        })()}.`}
+                      </p>
+                    </>
+                  )}
+                  <Field label="Description (optional)">
+                    <input disabled={disabled} maxLength={500} value={draft.description} onChange={(event) => updateDraft("description", event.target.value)} />
+                  </Field>
+                  <Field label="Order in POS">
+                    <input disabled={disabled} inputMode="numeric" step="1" type="number" value={draft.sort_order} onChange={(event) => updateDraft("sort_order", event.target.value)} />
+                  </Field>
+                  <label className="check-field">
+                    <input checked={draft.active !== false} disabled={disabled} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} />
+                    <span>On sale in POS</span>
+                  </label>
+                  {attempted && !check.ok && (
+                    <div className="inline-error" role="alert">
+                      {check.errors.map((error) => <div key={`${error.code}-${error.message}`}>{error.message}</div>)}
+                    </div>
+                  )}
+                  {saveError && <div className="inline-error" role="alert">{saveError}</div>}
+                  <div className="button-row">
+                    <button className="primary-button" disabled={disabled || saving} type="button" onClick={saveCombo}>{saving ? "Saving…" : "Save combo"}</button>
+                    <button className="secondary-button" disabled={saving} type="button" onClick={() => { setDraft(null); setSaveError(""); setAttempted(false); }}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            )}
+            {!failed && COMBO_KINDS.map((kind) => {
+              const rows = sorted.filter((combo) => combo.kind === kind);
+              return (
+                <div className="discount-block" key={kind}>
+                  <div className="discount-block-head">
+                    <h3>{COMBO_KIND_LABELS[kind]}</h3>
+                  </div>
+                  <DataTable className="pm-table combo-table" headers={["Combo", "Price", "Items", "Status", ""]}>
+                    {firstLoad && <tr><td className="empty-cell" colSpan={5}>Loading combos…</td></tr>}
+                    {!firstLoad && rows.length === 0 && (
+                      <tr><td className="empty-cell" colSpan={5}>{`No ${COMBO_KIND_LABELS[kind]} combos yet.`}</td></tr>
+                    )}
+                    {rows.map((combo) => {
+                      const offSale = comboProductsNotOnSale(combo, products);
+                      return (
+                        <tr className={combo.active ? "" : "discount-row-past"} key={combo.global_id || combo.id}>
+                          <td className="primary-cell">
+                            {combo.name}
+                            <small className="cell-note">{COMBO_TYPE_LABELS[combo.combo_type] || combo.combo_type}{combo.margin_percent !== null ? ` · margin ${combo.margin_percent}%` : ""}</small>
+                          </td>
+                          <td data-label="Price">{pricingText(combo)}</td>
+                          <td data-label="Items">
+                            {itemsText(combo)}
+                            {offSale.length > 0 && <small className="cell-note inline-error">{offSale.map((name) => `${name} is not on sale.`).join(" ")} POS will not sell this combo until it is.</small>}
+                          </td>
+                          <td data-label="Status">{combo.active ? "On sale" : "Switched off"}</td>
+                          <td className="discount-actions-cell">
+                            {canManage && (
+                              <button className="secondary-button compact-button" disabled={Boolean(draft) || disabled} type="button" onClick={() => startEdit(combo)}>Edit</button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </DataTable>
+                </div>
+              );
+            })}
+          </>
+        )}
+      </ModuleCard>
+    </section>
+  );
+}
+
+/**
+ * Sale Rate Update's "Combos" section: each fixed combo's cost today, the price its margin
+ * suggests, and its current price, with a box to set a new one. Saving sends the whole combo back
+ * (`PUT /api/v3/combos/:id`), changed only in price. Customer's-choice combos price themselves.
+ */
+function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = [], saleRateSettings = {}, unavailableReason = null }) {
+  const [load, setLoad] = useState({ status: "idle", message: "" });
+  const [combos, setCombos] = useState([]);
+  const [drafts, setDrafts] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [result, setResult] = useState(null);
+  const roundingRule = saleRateSettings?.rounding_rule || "NEAREST_RUPEE";
+  const targetMargin = parseTargetMargin(desiredMargin, saleRateSettings?.desired_margin_percent);
+
+  const loadFixedCombos = async () => {
+    setLoad({ status: "loading", message: "" });
+    try {
+      const response = await axios.get(`${API_URL}/api/v3/combos`);
+      const read = readCombos(response.data);
+      if (read.status !== "ready") throw new Error("the server sent something that is not a list");
+      setCombos(read.combos);
+      setLoad({ status: "ready", message: "" });
+    } catch (error) {
+      setLoad({ status: "failed", message: `Combos could not be loaded (${getErrorMessage(error, error?.message || "no answer from the server")}).` });
+    }
+  };
+
+  useEffect(() => {
+    if (unavailableReason) return;
+    loadFixedCombos();
+  }, [unavailableReason]);
+
+  if (unavailableReason) return null;
+  const rows = sortCombos(combos)
+    .filter((combo) => combo.combo_type === "FIXED" && combo.active)
+    .map((combo) => ({
+      combo,
+      key: combo.global_id || combo.id,
+      ...suggestComboPrice({ items: combo.items, rates, products, marginPercent: combo.margin_percent, targetMargin, roundingRule }),
+    }));
+  const changes = rows
+    .map((row) => ({ row, typed: String(drafts[row.key] ?? "").trim() }))
+    .filter(({ typed }) => typed !== "");
+  const invalid = changes.filter(({ typed }) => !/^\d+(\.\d{1,2})?$/.test(typed) || !(Number(typed) > 0));
+
+  const saveCombos = async () => {
+    if (saving || changes.length === 0 || invalid.length > 0) return;
+    setSaving(true);
+    setResult(null);
+    const failures = [];
+    const failedKeys = new Set();
+    let saved = 0;
+    for (const { row, typed } of changes) {
+      try {
+        await axios.put(`${API_URL}/api/v3/combos/${encodeURIComponent(String(row.key))}`, buildComboPayload({ ...comboDraftFrom(row.combo), price: typed }));
+        saved += 1;
+      } catch (error) {
+        failedKeys.add(row.key);
+        failures.push(`${row.combo.name}: ${getErrorMessage(error, "not saved")}`);
+      }
+    }
+    setSaving(false);
+    // A price that did not save stays in its box; the saved ones clear.
+    setDrafts((current) => Object.fromEntries(Object.entries(current).filter(([key]) => failedKeys.has(key))));
+    setResult({ saved, failures });
+    await loadFixedCombos();
+    if (saved > 0) onSaved?.();
+  };
+
+  return (
+    <ModuleCard eyebrow="Pricing" title="Combos" subtitle="Fixed combos at one price. Customer's-choice combos are priced from their items at the counter.">
+      {load.status === "failed" && (
+        <div className="error-banner" role="alert">
+          {load.message}{" "}
+          <button className="secondary-button compact-button" type="button" onClick={() => loadFixedCombos()}>Try again</button>
+        </div>
+      )}
+      {load.status !== "failed" && (
+        <DataTable className="pm-table combo-table" headers={["Combo", "Margin", "Cost today", "Suggested", "Current price", "New price"]}>
+          {load.status !== "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>Loading combos…</td></tr>}
+          {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in Combos & Offers.</td></tr>}
+          {rows.map((row) => (
+            <tr key={row.key}>
+              <td className="primary-cell">{row.combo.name}<small className="cell-note">{COMBO_KIND_LABELS[row.combo.kind] || row.combo.kind}</small></td>
+              <td data-label="Margin">{`${row.margin}%`}{row.combo.margin_percent === null ? <small className="cell-note">desired margin</small> : null}</td>
+              <td data-label="Cost today">{row.cost === null ? MISSING_VALUE : currency.format(row.cost)}</td>
+              <td data-label="Suggested">
+                {row.suggested === null ? MISSING_VALUE : (
+                  <button className="table-action" type="button" onClick={() => setDrafts((current) => ({ ...current, [row.key]: String(row.suggested) }))}>{currency.format(row.suggested)}</button>
+                )}
+              </td>
+              <td data-label="Current price">{row.combo.price === null ? MISSING_VALUE : currency.format(row.combo.price)}</td>
+              <td data-label="New price">
+                <input aria-label={`New price for ${row.combo.name}`} inputMode="decimal" min="0" step="0.01" type="number" value={drafts[row.key] ?? ""} onChange={(event) => setDrafts((current) => ({ ...current, [row.key]: event.target.value }))} />
+              </td>
+            </tr>
+          ))}
+        </DataTable>
+      )}
+      {invalid.length > 0 && <div className="inline-error" role="alert">{`Enter a price above ₹0, with at most 2 decimals, for ${invalid.map(({ row }) => row.combo.name).join(", ")}.`}</div>}
+      {result && result.failures.length > 0 && (
+        <div className="inline-error" role="alert">{`Saved ${result.saved} of ${result.saved + result.failures.length}. ${result.failures.join(" ")}`}</div>
+      )}
+      {result && result.failures.length === 0 && result.saved > 0 && <p className="form-note stock-ok" role="status">{`Saved ${result.saved} combo price${result.saved === 1 ? "" : "s"}. Counters get them at their next sync.`}</p>}
+      {rows.length > 0 && (
+        <div className="button-row">
+          <button className="primary-button" disabled={saving || changes.length === 0 || invalid.length > 0} type="button" onClick={saveCombos}>{saving ? "Saving…" : "Save combo prices"}</button>
+        </div>
+      )}
+    </ModuleCard>
+  );
+}
+
 function DiscountManagementModule({ canManage = false, onDiscountsLoaded, onSaved, unavailableReason = null }) {
   const today = toDateKey(new Date());
   const [load, setLoad] = useState({ status: "idle", message: "" });
@@ -18694,24 +19195,36 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
         {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items...</p>}
         {returnOptions.status === "error" && <p className="return-note return-note-error" role="alert">{returnOptions.message}</p>}
         <DataTable headers={["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Refund per unit", "Return Value"]}>
-          {returnOptions.items.map((item) => {
+          {returnOptions.items.map((item, index) => {
             const key = canonicalInventoryId(item.sale_item_id);
             const line = draft.lines.find((entry) => canonicalInventoryId(entry.sale_item_id) === key);
             const perUnit = refundPerUnit(item);
             const lineProblem = draft.lineProblems[key];
+            const inCombo = isComboLine(item);
+            // The refusal is said once, on its own full-width row under a combo's last line, so it
+            // never widens the Return Quantity column.
+            const next = returnOptions.items[index + 1];
+            const endsCombo = inCombo && !(next && isComboLine(next) && canonicalInventoryId(next.combo_line_key) === canonicalInventoryId(item.combo_line_key));
             return (
-              <tr key={key}>
-                <td className="primary-cell">{item.product_name}<small className="cell-note">{labelFor("unit", item.unit)}</small></td>
+              <React.Fragment key={key}>
+              <tr className={inCombo ? "return-combo-line" : undefined}>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{inCombo ? `${labelFor("unit", item.unit)} · in ${item.combo_name || "a combo"}` : labelFor("unit", item.unit)}</small></td>
                 <td>{Number(item.sold_quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                 <td>{Number(item.returned_quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                 <td>{Number(item.returnable_quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                 <td>
-                  <input aria-invalid={Boolean(lineProblem)} className="table-input" disabled={saving || Number(item.returnable_quantity) <= 0} inputMode="decimal" min="0" max={Number(item.returnable_quantity || 0)} step="0.001" type="number" value={quantities[key] || ""} onChange={(event) => setQuantities({ ...quantities, [key]: event.target.value })} />
+                  <input aria-invalid={Boolean(lineProblem)} className="table-input" disabled={saving || inCombo || Number(item.returnable_quantity) <= 0} inputMode="decimal" min="0" max={Number(item.returnable_quantity || 0)} step="0.001" type="number" value={quantities[key] || ""} onChange={(event) => setQuantities({ ...quantities, [key]: event.target.value })} />
                   {lineProblem && <small className="cell-note return-line-problem">{lineProblem}</small>}
                 </td>
                 <td>{perUnit === null ? "Unknown" : currency.format(perUnit)}</td>
                 <td>{line ? (line.value === null ? "Unknown" : currency.format(line.value)) : "-"}</td>
               </tr>
+              {endsCombo && (
+                <tr className="return-combo-note">
+                  <td colSpan="7"><small className="cell-note return-line-problem">{`${item.combo_name || "Combo"}: `}{COMBO_RETURN_REFUSAL}</small></td>
+                </tr>
+              )}
+              </React.Fragment>
             );
           })}
           {returnOptions.status === "ready" && returnOptions.items.length === 0 && (
@@ -24464,7 +24977,7 @@ const newCartLineId = () => {
   return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
-function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -24474,11 +24987,20 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    */
   const [chargeSelections, setChargeSelections] = useState([]);
   const [search, setSearch] = useState("");
-  // Which shelf the counter is looking at. Remembered per machine, so the juice counter opens
+  // Combos are sold where the app hands POS a combo list (the counter app); `null` is the browser,
+  // which shows no combo tabs at all (v1).
+  const combosEnabled = combos !== null && combos !== undefined;
+  // Which tab the counter is looking at. Remembered per machine, so the juice counter opens
   // on Frooz Bar every morning. Reading storage can throw (site data blocked); Retail then.
   const [posSection, setPosSection] = useState(() => {
-    try { return readPosSection(window.localStorage); } catch { return readPosSection(null); }
+    try { return readPosTab(window.localStorage, { combosEnabled }); } catch { return readPosTab(null); }
   });
+  // A FIXED combo waiting for "how many?" ({ combo, qty, error }), or null.
+  const [comboAsk, setComboAsk] = useState(null);
+  // A CUSTOM combo being filled ({ key, combo }): while it is open, every product added joins it.
+  const [customBuild, setCustomBuild] = useState(null);
+  // Why a combo tile could not be used, said on the screen rather than in a browser box.
+  const [comboNotice, setComboNotice] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [lotSelectorProduct, setLotSelectorProduct] = useState(null);
@@ -24732,6 +25254,28 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   // wants the mango, not an empty screen. With no search the chosen shelf is shown whole.
   const posSearching = Boolean(search.trim());
   const posShelfCounts = useMemo(() => posSectionCounts(posMatches.map((option) => option.product)), [posMatches]);
+  const posTabs = posTabsFor({ combosEnabled });
+  /**
+   * The combos this counter sells (local/combos.js), each with the tab it sits on and whether the
+   * shelf can make one right now. A FIXED combo short of an item stays on screen, disabled, saying
+   * which ("Not enough Orange") -- hidden, it would read as "this shop has no juices".
+   */
+  const comboOptions = useMemo(() => {
+    if (!combosEnabled || combos?.status !== "ready" || !shelf.usable) return [];
+    const query = search.trim().toLowerCase();
+    return sortCombos(combos.combos)
+      .filter((combo) => combo.active !== false && COMBO_TAB_FOR_KIND[combo.kind] && COMBO_TYPES.includes(combo.combo_type))
+      .filter((combo) => !query || [combo.name, COMBO_KIND_LABELS[combo.kind], combo.description].some((value) => String(value || "").toLowerCase().includes(query)))
+      .map((combo) => ({
+        key: `combo-${combo.global_id}`,
+        combo,
+        tab: COMBO_TAB_FOR_KIND[combo.kind],
+        availability: combo.combo_type === "FIXED"
+          ? comboAvailability({ combo, products, lots: inventory, cart, scope: counterScope, reservedFor: (productId) => reservedForProduct(reservedIndex, productId) })
+          : { ok: true, message: "" },
+      }));
+  }, [cart, combos, combosEnabled, counterScope, inventory, products, reservedIndex, search, shelf.usable]);
+  const comboTabCounts = useMemo(() => comboOptions.reduce((counts, option) => ({ ...counts, [option.tab]: (counts[option.tab] || 0) + 1 }), {}), [comboOptions]);
   // With nothing sellable anywhere, say which kind of nothing it is, with the counts behind it.
   const posEmptyReason = useMemo(
     () => (shelf.usable && shelf.products.length === 0
@@ -24739,15 +25283,21 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       : ""),
     [counterScope, inventory, products, shelf],
   );
-  const searchResults = useMemo(
-    () => (posSearching ? posMatches.slice(0, 24) : posMatches.filter((option) => option.section.key === posSection)),
-    [posMatches, posSearching, posSection],
-  );
+  // A tab shows its combos first, then the products placed on it; the combos tab, combos only. While
+  // a customer's-choice combo is being filled, every sellable product is offered, whatever its tab.
+  const searchResults = useMemo(() => {
+    if (customBuild) return posSearching ? posMatches.slice(0, 24) : posMatches;
+    if (posSearching) return [...comboOptions, ...posMatches].slice(0, 24);
+    return [
+      ...comboOptions.filter((option) => option.tab === posSection),
+      ...(posTabFor(posSection).products ? posMatches.filter((option) => option.section.key === posSection) : []),
+    ];
+  }, [comboOptions, customBuild, posMatches, posSearching, posSection]);
   const choosePosSection = (key) => {
     setPosSection(key);
     setSearch("");
     setHighlightedIndex(0);
-    try { writePosSection(window.localStorage, key); } catch { /* remembered for this run only */ }
+    try { writePosTab(window.localStorage, key); } catch { /* remembered for this run only */ }
   };
 
   const salesMandiTaxBasisLabel = {
@@ -24762,20 +25312,26 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const itemDiscount = cart.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
     const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
     // One matching rule shared with the server (local/discounts.js): measured on the bill before
-    // item discounts, capped at the bill after them, the most money off wins.
+    // item discounts, capped at the bill after them, the most money off wins. A FIXED combo is
+    // already an offer at its own price, so its lines are left out of both (`slabBase`).
+    const slabMeasure = slabBase(cart);
     const { rule: discountRule, amount: slabDiscountAmount } = matchBillSlab(discountRules, {
-      gross,
-      subtotalAfterItems: subtotalAfterItemDiscounts,
+      gross: slabMeasure.gross,
+      subtotalAfterItems: slabMeasure.subtotalAfterItems,
       // As the server reads it from the payments: Mixed with one amount is that one mode.
       paymentMode: slabPaymentMode(paymentMode, mixedPayments),
       enabled: saleRateSettings.bill_level_slab_discount_enabled !== false,
     });
     // The cashier's own bill discount, on top of the slab and never more than what is left. An
     // entry that cannot be billed is an error (and blocks checkout), never a quiet ₹0.
+    // Loose items only: a combo already has its price, and the server leaves combo lines out of
+    // the bill discount's base, its 5% rule and its share per line (`slabBase` is that subtotal).
+    // A bill of combos only has nothing for it to come off, so a value left in the box counts as none.
+    const comboOnlyBill = cart.length > 0 && cart.every(isComboLine);
     const manualBill = resolveManualBillDiscount({
       mode: billDiscountInput.mode,
-      value: billDiscountInput.value,
-      itemsSubtotal: subtotalAfterItemDiscounts,
+      value: comboOnlyBill ? "" : billDiscountInput.value,
+      itemsSubtotal: slabMeasure.subtotalAfterItems,
       slabAmount: slabDiscountAmount,
     });
     const manualBillDiscount = manualBill.error ? 0 : manualBill.amount;
@@ -24829,7 +25385,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       otherChargesAmount: withCharges.otherChargesAmount,
       netBeforeCharges,
       total: withCharges.totalAmount,
-      itemCount: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
+      // Each combo counts once and each loose line once -- not kilos, not a combo's own lines.
+      itemCount: cartItemCount(cart),
       discountRule,
     };
   }, [billDiscountInput.mode, billDiscountInput.value, cart, chargeSelections, chargeTypes, customer.account_id, customer.system_account, discountRules, mixedPayments, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
@@ -24964,10 +25521,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }
     const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
-    const lotDiscount = lotDiscountFor(lot?.id);
+    // While a customer's-choice combo is open, the product joins it (local/combos.js): priced by the
+    // combo, so no lot discount. A combo's line and a loose line of the same lot never merge.
+    const comboTag = customBuild ? { ...customComboTag(customBuild.combo, customBuild.key, { roundingRule: saleRateSettings.rounding_rule }), combo_base_rate: defaultRate } : null;
+    const lotDiscount = comboTag ? null : lotDiscountFor(lot?.id);
     const discounted = applyLotDiscount(defaultRate, 1, lotDiscount);
-    const cartIdentity = buildCartIdentity({ product, lot, unit: lot.unit || product.unit, sellingRate: discounted.sellingRate });
-    const currentItem = cart.find((item) => item.cart_identity === cartIdentity);
+    const comboKey = comboTag?.combo_line_key || "";
+    const cartIdentity = `${buildCartIdentity({ product, lot, unit: lot.unit || product.unit, sellingRate: discounted.sellingRate })}${comboKey ? `|combo:${comboKey}` : ""}`;
+    const currentItem = cart.find((item) => item.cart_identity === cartIdentity && String(item.combo_line_key || "") === comboKey);
     const nextQuantity = Number(currentItem?.quantity || 0) + 1;
     const nextLotQuantity = getCartQuantityForLot(lot.id) + 1;
     if (availableStock < nextLotQuantity) {
@@ -24978,7 +25539,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const lineId = currentItem?.line_id || newCartLineId();
     const nextDiscounted = applyLotDiscount(defaultRate, nextQuantity, lotDiscount);
 
-    setCart((items) => currentItem
+    const priceCombo = (items) => (comboKey ? repriceCustomCombo(items, comboKey) : items);
+    setCart((items) => priceCombo(currentItem
       ? items.map((item) => item.line_id === currentItem.line_id ? { ...item, quantity: nextQuantity, discount_amount: roundUi(Number(item.lot_discount_per_unit || 0) * nextQuantity) } : item)
       : [...items, {
         line_id: lineId,
@@ -24999,8 +25561,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         lot_discount_type: lotDiscount?.discount_type || null,
         lot_discount_value: lotDiscount ? Number(lotDiscount.discount_value || 0) : 0,
         lot_discount_per_unit: nextDiscounted.discountPerUnit,
+        ...(comboTag || {}),
       }]
-    );
+    ));
     setSearch("");
     setHighlightedIndex(0);
     closeLotSelector();
@@ -25012,6 +25575,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   };
 
   const updateCartItem = (lineId, field, value) => {
+    // A combo's lines are priced by the combo: nothing on a fixed combo's line is typed over, and on
+    // a customer's-choice combo only the quantity is, after which the combo is priced again.
+    const comboLine = cart.find((item) => item.line_id === lineId);
+    if (isFixedComboLine(comboLine)) return;
+    if (isComboLine(comboLine) && field !== "quantity") return;
     const number = Number(value);
     if (!Number.isFinite(number) || number < 0) return;
     if (field === "selling_rate" && !canManualRateOverride) {
@@ -25039,7 +25607,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       alert(currentItem.inventory_batch_id ? `Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${currentItem.lot_name || currentItem.inventory_batch_id}.` : `Only ${currentItem.available_qty || 0} units are available.`);
       return;
     }
-    setCart((items) => items.map((item) => {
+    const repriceAfter = (items) => (isComboLine(comboLine) ? repriceCustomCombo(items, comboLine.combo_line_key) : items);
+    setCart((items) => repriceAfter(items.map((item) => {
       if (item.line_id !== lineId) return item;
       if (field === "quantity" && item.lot_discount_id) {
         return { ...item, quantity: value, discount_amount: roundUi(Number(item.lot_discount_per_unit || 0) * number) };
@@ -25054,7 +25623,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         });
       }
       return updated;
-    }));
+    })));
   };
 
   const completeQuantityEntry = (event) => {
@@ -25065,8 +25634,81 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     searchRef.current?.focus();
   };
 
+  /** A combo leaves the bill whole: every one of its lines. */
+  const removeCombo = (comboKey) => {
+    const key = String(comboKey || "");
+    if (!key) return;
+    setCart((items) => items.filter((item) => String(item.combo_line_key || "") !== key));
+    setCustomBuild((current) => (current?.key === key ? null : current));
+  };
+
   const removeCartItem = (lineId) => {
-    setCart((items) => items.filter((item) => item.line_id !== lineId));
+    const line = cart.find((item) => item.line_id === lineId);
+    if (isFixedComboLine(line)) {
+      removeCombo(line.combo_line_key);
+      return;
+    }
+    // An item taken out of a customer's-choice combo re-prices what is left of it.
+    const key = isComboLine(line) ? line.combo_line_key : "";
+    setCart((items) => {
+      const left = items.filter((item) => item.line_id !== lineId);
+      return key ? repriceCustomCombo(left, key) : left;
+    });
+  };
+
+  /** Close the customer's-choice combo being filled. */
+  const finishCustomBuild = () => {
+    setCustomBuild(null);
+    setSearch("");
+    searchRef.current?.focus();
+  };
+
+  /**
+   * A combo tile pressed. FIXED asks how many, then takes its items off the shelf; CUSTOM opens it
+   * for the cashier to add what the customer wants, priced as those items plus its extra charge.
+   */
+  const chooseCombo = (option) => {
+    const { combo, availability } = option;
+    setComboNotice("");
+    if (combo.combo_type === "FIXED") {
+      if (!availability?.ok) {
+        setComboNotice(`${combo.name}: ${availability?.message || "it cannot be made from this counter's stock right now."}`);
+        return;
+      }
+      setComboAsk({ combo, qty: "1", error: "" });
+      return;
+    }
+    if (customBuild) finishCustomBuild();
+    setCustomBuild({ key: newCartLineId(), combo });
+    setSearch("");
+    setHighlightedIndex(0);
+    searchRef.current?.focus();
+  };
+
+  const addFixedCombo = () => {
+    if (!comboAsk) return;
+    const typed = String(comboAsk.qty || "").trim();
+    const comboQty = /^\d+$/.test(typed) ? Number(typed) : Number.NaN;
+    const result = expandFixedCombo({
+      combo: comboAsk.combo,
+      comboQty,
+      comboLineKey: newCartLineId(),
+      newLineId: newCartLineId,
+      products,
+      lots: inventory,
+      cart,
+      scope: counterScope,
+      reservedFor: (productId) => reservedForProduct(reservedIndex, productId),
+    });
+    if (!result.ok) {
+      setComboAsk((current) => (current ? { ...current, error: result.message } : current));
+      return;
+    }
+    setCart((items) => [...items, ...result.lines]);
+    setComboAsk(null);
+    setSearch("");
+    setHighlightedIndex(0);
+    searchRef.current?.focus();
   };
 
   const scanBarcode = () => {
@@ -25178,7 +25820,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       sync_status: "pending",
       entity_version: 1,
       date_override_reason: dateOverrideReason,
-      items: cart.map((item) => {
+      items: cart.map((item, index) => {
         const itemGlobalId = newSyncId("line");
         const stockMovementId = newSyncId("stock");
         return {
@@ -25193,7 +25835,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           unit: item.unit || "",
           rate: Number(item.selling_rate),
           discount: Number(item.discount_amount || 0),
-          amount: roundUi(Number(item.quantity) * Number(item.selling_rate) - Number(item.discount_amount || 0)),
+          // A combo line exactly as the allocation and the server price it (`lineGross`); others as before.
+          amount: isComboLine(item)
+            ? roundUi(lineGross(item) - Number(item.discount_amount || 0))
+            : roundUi(Number(item.quantity) * Number(item.selling_rate) - Number(item.discount_amount || 0)),
           stock_movement_id: stockMovementId,
           available_qty: Number(item.available_qty || 0),
           selling_rate: Number(item.selling_rate),
@@ -25202,6 +25847,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           lot_discount_id: item.lot_discount_id || null,
           lot_discount_type: item.lot_discount_type || null,
           lot_discount_value: Number(item.lot_discount_value || 0),
+          // The eight combo fields, on every line (null on a loose one); `line_index` is its place.
+          ...comboLineFields(item, index),
         };
       }),
       payments: payments.map((payment) => ({
@@ -25328,9 +25975,23 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       }
       if (!window.confirm("No saved customer selected. Assign this credit sale to Walk-in Customer Credit?")) return;
     }
+    // A customer's-choice combo still open would take the next product into it; and every combo must
+    // still add up to its price.
+    if (customBuild) {
+      setDiscountNotice(`Finish ${customBuild.combo.name} first: press Done when its items are in.`);
+      return;
+    }
+    const comboProblems = validateComboCart(cart);
+    if (comboProblems.length) {
+      setDiscountNotice(comboProblems[0]);
+      return;
+    }
     let zeroRateConfirmed = confirmations.zero_rate_confirmed === true;
     let belowCostConfirmed = confirmations.below_cost_confirmed === true;
     for (const item of cart) {
+      // A combo's line is priced by the combo, not by its rate: no rate permission, zero-rate or
+      // below-cost question applies to it (the server keeps the same exemption).
+      if (isComboLine(item)) continue;
       const rate = Number(item.selling_rate);
       const defaultRate = Number(item.default_selling_rate ?? item.selling_rate);
       const rateChanged = roundUi(rate) !== roundUi(defaultRate);
@@ -25462,7 +26123,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             unit: item.unit,
             quantity: item.quantity,
             selling_rate: item.rate,
-            inventory_batch_id: item.inventory_batch_id,
+            // The lot as the device names it: `inventory_batch_id` above went through Number() for the
+            // outbox, which turns a "lot-…" id into nothing and left the shelf update matching no lot.
+            inventory_batch_id: item.lot_id || item.inventory_batch_id,
             lot_name: item.lot_name,
             lot_size: item.lot_size,
             amount: item.amount,
@@ -25471,10 +26134,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             // "Discount 10%" and "Special price" on the printed bill, as on the browser's.
             lot_discount_type: item.lot_discount_type,
             lot_discount_value: item.lot_discount_value,
+            // So the bill printed now groups its combos the way the bill reopened later does.
+            ...comboLineFields(item),
           })),
           payments: localSale.payments,
         };
         setCart([]);
+        setCustomBuild(null);
         setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
         setPaymentMode("CASH");
         setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
@@ -25497,7 +26163,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         return;
       }
       const saleWrite = createOperationalWrite(user, {
-        items: cart.map((item) => ({
+        // The browser POS has no combos (the server refuses combo fields from it), so a line here
+        // carries only its place on the bill.
+        items: cart.map((item, index) => ({
           product_id: item.product_id,
           inventory_batch_id: item.inventory_batch_id,
           quantity: Number(item.quantity),
@@ -25506,6 +26174,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           lot_discount_id: item.lot_discount_id || null,
           lot_discount_type: item.lot_discount_type || null,
           lot_discount_value: Number(item.lot_discount_value || 0),
+          line_index: index,
         })),
         customer,
         invoice_discount: Number(totals.invoiceDiscount || 0),
@@ -25546,6 +26215,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // Confirmed: the next checkout is a new bill with a new key.
       pendingCheckoutRef.current = null;
       setCart([]);
+      setCustomBuild(null);
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
       setPaymentMode("CASH");
       setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
@@ -25645,7 +26315,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     if (event.key === "Enter" && searchResults[highlightedIndex]) {
       event.preventDefault();
       const selected = searchResults[highlightedIndex];
-      openLotSelector(selected.product);
+      if (selected.combo) chooseCombo(selected);
+      else openLotSelector(selected.product);
     }
   };
 
@@ -25733,6 +26404,91 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     setTimeout(() => window.print(), 250);
   };
 
+  /**
+   * One cart row. A combo's item shows its quantity and lot but no price of its own (the combo's
+   * price is on its heading row); a fixed combo's item cannot be changed or removed on its own.
+   */
+  const cartColumnCount = printSettings.show_item_discount_column_pos !== false ? 7 : 6;
+
+  // A combo's item: one compact row across the table, so a name never breaks mid-word in a narrow
+  // column. Only a customer's-choice item has a quantity box and a remove button.
+  const renderComboItemRow = (item) => {
+    const fixedCombo = isFixedComboLine(item);
+    const lot = [item.lot_name, item.lot_size].filter(Boolean).join(" / ");
+    const quantityText = `${Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} ${item.unit || ""}`.trim();
+    return (
+      <tr className="cart-combo-item" key={item.line_id}>
+        <td colSpan={cartColumnCount}>
+          <div className="cart-combo-item-line">
+            <span className="cart-combo-item-text">
+              {`· ${item.product_name}${lot ? ` · lot ${lot}` : ""}${fixedCombo ? ` · ${quantityText}` : ""}`}
+            </span>
+            {!fixedCombo && (
+              <span className="cart-combo-item-controls">
+                <input
+                  aria-label={`Quantity of ${item.product_name}`}
+                  className="table-input"
+                  min="0.001"
+                  ref={(node) => { quantityRefs.current[item.line_id] = node; }}
+                  step="0.001"
+                  type="number"
+                  value={item.quantity}
+                  onChange={(event) => updateCartItem(item.line_id, "quantity", event.target.value)}
+                  onKeyDown={completeQuantityEntry}
+                />
+                <span className="cell-note">{item.unit || ""}</span>
+                <button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button>
+              </span>
+            )}
+          </div>
+        </td>
+      </tr>
+    );
+  };
+
+  const renderCartRow = (item) => {
+    if (isComboLine(item)) return renderComboItemRow(item);
+    return (
+      <tr key={item.line_id}>
+        <td className="primary-cell">
+          {item.product_name}
+          <small className="cell-note">{item.available_qty || stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
+          {/* Said before the operator tries, not only when they are refused. A
+              refusal at the till happens with a customer standing there. */}
+          {reservedNote(reservedIndex, item.product_id, item.unit) && (
+            <small className="cell-note">{reservedNote(reservedIndex, item.product_id, item.unit)}</small>
+          )}
+        </td>
+        <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
+        <td>
+          <input
+            className="table-input"
+            min="0"
+            readOnly={!canManualRateOverride}
+            step="0.01"
+            title={canManualRateOverride ? "Owner/Admin can override POS sale rate" : "You do not have permission to change sale rate"}
+            type="number"
+            value={item.selling_rate}
+            onChange={(event) => updateCartItem(item.line_id, "selling_rate", event.target.value)}
+          />
+        </td>
+        <td>
+          <input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.line_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.line_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} />
+        </td>
+        {printSettings.show_item_discount_column_pos !== false && (
+          <td>
+            <input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} />
+            {discountApprovalCheck.lines.some((entry) => entry.lineId === item.line_id) && (
+              <small className="cell-note stock-low pos-discount-over-note">Over 5%: needs Owner/Admin approval</small>
+            )}
+          </td>
+        )}
+        <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
+        <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
+      </tr>
+    );
+  };
+
   return (
     <section className="pos-layout" onKeyDown={handleShortcuts}>
       <div className="mobile-pos-note">
@@ -25783,23 +26539,73 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             </label>
           </div>
           <div className="pos-sections" role="tablist" aria-label="POS sections">
-            {POS_SECTIONS.map((section) => (
+            {posTabs.map((section) => (
               <button
-                aria-selected={!posSearching && posSection === section.key}
-                className={!posSearching && posSection === section.key ? "pos-section pos-section-active" : "pos-section"}
+                aria-selected={!posSearching && !customBuild && posSection === section.key}
+                className={!posSearching && !customBuild && posSection === section.key ? "pos-section pos-section-active" : "pos-section"}
+                disabled={Boolean(customBuild)}
                 key={section.key}
                 onClick={() => choosePosSection(section.key)}
                 role="tab"
                 title={section.blurb}
               >
                 <strong>{section.label}</strong>
-                <span>{posShelfCounts[section.key]}</span>
+                <span>{(section.products ? posShelfCounts[section.key] || 0 : 0) + (comboTabCounts[section.key] || 0)}</span>
               </button>
             ))}
-            {posSearching && <small className="pos-sections-note">Searching all sections</small>}
+            {posSearching && !customBuild && <small className="pos-sections-note">Searching all sections</small>}
           </div>
+          {customBuild && (
+            <div className="pos-combo-build" role="status">
+              <span>
+                <strong>Adding to {customBuild.combo.name}</strong>
+                {" "}Tap the products the customer wants, then set each quantity in the cart. The price is worked out for you as one price: {describeCustomPricing({ marginPercent: customBuild.combo.margin_percent, extraCharge: customBuild.combo.extra_charge }, (value) => currency.format(value))}, rounded. Press Done when it is complete.
+              </span>
+              <button className="primary-button compact-button" type="button" onClick={finishCustomBuild}>Done</button>
+            </div>
+          )}
+          {comboNotice && (
+            <div className="warning-note pos-discount-notice" role="alert">
+              {comboNotice}
+              <button className="secondary-button compact-button" type="button" onClick={() => setComboNotice("")}>OK</button>
+            </div>
+          )}
+          {combosEnabled && combos?.status !== "ready" && (
+            <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Frooz Bar, Frooz Moments and Combos &amp; Offers tabs show products only. Press Sync now, then open POS again.</p>
+          )}
           <div className="product-results">
             {searchResults.map((option, index) => {
+              if (option.combo) {
+                const { combo, availability } = option;
+                const badge = posTileBadge(combo.name);
+                const fixed = combo.combo_type === "FIXED";
+                return (
+                  <button
+                    aria-disabled={!availability.ok}
+                    className={[
+                      "product-result",
+                      "product-result-combo",
+                      index === highlightedIndex ? "product-result-active" : "",
+                      availability.ok ? "" : "product-result-unavailable",
+                    ].filter(Boolean).join(" ")}
+                    key={option.key}
+                    onClick={() => chooseCombo(option)}
+                    title={fixed ? `Add ${combo.name}` : `Start ${combo.name} and add the customer's items`}
+                  >
+                    <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>
+                    <span className="product-result-main">
+                      <strong>{combo.name}</strong>
+                      <span className="product-result-meta">
+                        <span>{COMBO_KIND_LABELS[combo.kind]}</span>
+                        <span>{fixed ? `${combo.items.length} item${combo.items.length === 1 ? "" : "s"}` : "Customer's choice"}</span>
+                        {posSearching && <span className="product-result-section">{posTabFor(option.tab).label}</span>}
+                      </span>
+                      <small>{fixed ? `${currency.format(combo.price)} each` : `One price: ${describeCustomPricing({ marginPercent: combo.margin_percent, extraCharge: combo.extra_charge }, (value) => currency.format(value))}`}</small>
+                    </span>
+                    <em className={availability.ok ? "stock-ok" : "stock-low"}>{availability.ok ? (fixed ? "Ready" : "Build") : availability.message}</em>
+                  </button>
+                );
+              }
               const { product } = option;
               const lots = lotsByProduct.get(product.id) || [];
               const activeLots = lots.filter(isSelectableLot);
@@ -25845,7 +26651,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                   ? posEmptyReason
                   : posSection === "retail"
                     ? "Nothing in Frooz Retail has stock right now."
-                    : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its POS section is ${posSectionLabel(posSection)} (choose it in Product Master, Edit) and it has a lot in stock.`}
+                    : posSection === "combos"
+                      ? "No Combos & Offers are set up yet. The Owner or an Admin adds them in Combos & Offers."
+                      : combosEnabled
+                        ? `Nothing on ${posSectionLabel(posSection)} right now. ${posSection === "bar" ? "Juices and The Cutting" : "Gift baskets"} are set up in Combos & Offers; a product also appears here when its POS section is ${posSectionLabel(posSection)} (choose it in Product Master, Edit) and it has a lot in stock.`
+                        : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its POS section is ${posSectionLabel(posSection)} (choose it in Product Master, Edit) and it has a lot in stock.`}
               </div>
             )}
             {searchResults.length === 0 && (posSearching || !shelf.usable) && (
@@ -25865,7 +26675,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <span className="eyebrow">Current Invoice</span>
               <h2>Shopping Cart</h2>
             </div>
-            <span className="cart-count">{totals.itemCount} items</span>
+            <span className="cart-count">{totals.itemCount === 1 ? "1 item" : `${totals.itemCount} items`}</span>
           </div>
           {cart.length === 0 ? (
             <div className="cart-empty">Search or scan a product to begin billing.</div>
@@ -25874,43 +26684,26 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <table>
                 <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount{!discountExempt && <small className="cell-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}</small>}</th>}<th>Total</th><th /></tr></thead>
                 <tbody>
-                  {cart.map((item) => (
-                    <tr key={item.line_id}>
-                      <td className="primary-cell">
-                        {item.product_name}
-                        <small className="cell-note">{item.available_qty || stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
-                        {/* Said before the operator tries, not only when they are refused. A
-                            refusal at the till happens with a customer standing there. */}
-                        {reservedNote(reservedIndex, item.product_id, item.unit) && (
-                          <small className="cell-note">{reservedNote(reservedIndex, item.product_id, item.unit)}</small>
-                        )}
-                      </td>
-                      <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
-                      <td>
-                        <input
-                          className="table-input"
-                          min="0"
-                          readOnly={!canManualRateOverride}
-                          step="0.01"
-                          title={canManualRateOverride ? "Owner/Admin can override POS sale rate" : "You do not have permission to change sale rate"}
-                          type="number"
-                          value={item.selling_rate}
-                          onChange={(event) => updateCartItem(item.line_id, "selling_rate", event.target.value)}
-                        />
-                      </td>
-                      <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.line_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.line_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
-                      {printSettings.show_item_discount_column_pos !== false && (
-                        <td>
-                          <input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} />
-                          {discountApprovalCheck.lines.some((entry) => entry.lineId === item.line_id) && (
-                            <small className="cell-note stock-low pos-discount-over-note">Over 5%: needs Owner/Admin approval</small>
-                          )}
-                        </td>
-                      )}
-                      <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
-                      <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
-                    </tr>
-                  ))}
+                  {groupComboLines(cart).map((group) => (group.kind === "line"
+                    ? renderCartRow(group.line)
+                    : (
+                      <React.Fragment key={`combo-${group.key}`}>
+                        <tr className="cart-combo-head">
+                          <td className="primary-cell" colSpan={cartColumnCount - 2}>
+                            {comboGroupTitle(group)}
+                            <small className="cell-note">
+                              {group.comboType === "FIXED"
+                                ? `${COMBO_KIND_LABELS[group.comboKind] || "Combo"} · ${currency.format(Number(group.comboPrice || 0))} each`
+                                : `${COMBO_KIND_LABELS[group.comboKind] || "Combo"} · customer's choice: ${describeCustomPricing({ marginPercent: group.lines[0]?.combo_margin_percent, extraCharge: group.lines[0]?.combo_extra_charge }, (value) => currency.format(value))}`}
+                              {customBuild?.key === group.key ? " · still adding items" : ""}
+                            </small>
+                          </td>
+                          <td className="primary-cell">{group.comboPrice === null ? MISSING_VALUE : currency.format(comboGroupTotal(group) ?? 0)}</td>
+                          <td><button aria-label={`Remove ${group.name}`} className="remove-button" onClick={() => removeCombo(group.key)}><Icon name="trash" size={16} /></button></td>
+                        </tr>
+                        {group.lines.map(renderCartRow)}
+                      </React.Fragment>
+                    )))}
                 </tbody>
               </table>
             </div>
@@ -26040,10 +26833,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         />
         <PosBillDiscountBox
           approvalNeeded={Boolean(discountApprovalCheck.bill)}
-          disabled={cart.length === 0 || saving}
+          comboNote={cart.some(isComboLine)}
+          disabled={cart.length === 0 || saving || cart.every(isComboLine)}
           error={totals.manualBillError}
           exempt={discountExempt}
-          input={billDiscountInput}
+          input={cart.length > 0 && cart.every(isComboLine) ? { ...billDiscountInput, value: "" } : billDiscountInput}
           manualAmount={totals.manualBillDiscount}
           onChange={setBillDiscountInput}
         />
@@ -26186,6 +26980,59 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           onConfirm={confirmDiscountApproval}
         />
       )}
+      {comboAsk && (
+        <div className="modal-backdrop">
+          <section
+            aria-label={`How many ${comboAsk.combo.name}`}
+            aria-modal="true"
+            className="invoice-modal pos-combo-ask"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.stopPropagation();
+                setComboAsk(null);
+                searchRef.current?.focus();
+              }
+            }}
+            role="dialog"
+          >
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">{COMBO_KIND_LABELS[comboAsk.combo.kind] || "Combo"}</span>
+                <strong>{comboAsk.combo.name}</strong>
+              </div>
+              <button aria-label="Close" className="remove-button" type="button" onClick={() => { setComboAsk(null); searchRef.current?.focus(); }}><Icon name="close" /></button>
+            </div>
+            <form
+              className="sale-edit-body pos-combo-ask-body"
+              onSubmit={(event) => {
+                event.preventDefault();
+                addFixedCombo();
+              }}
+            >
+              <p className="cell-note">
+                {currency.format(Number(comboAsk.combo.price || 0))} each. Its items come from stock oldest lot first:{" "}
+                {comboAsk.combo.items.map((item) => `${item.product_name || "item"} ${item.quantity}${item.unit ? ` ${item.unit}` : ""}`).join(", ")}.
+              </p>
+              <Field label="How many?">
+                <input
+                  autoFocus
+                  inputMode="numeric"
+                  min="1"
+                  step="1"
+                  type="number"
+                  value={comboAsk.qty}
+                  onChange={(event) => setComboAsk((current) => (current ? { ...current, qty: event.target.value, error: "" } : current))}
+                />
+              </Field>
+              {comboAsk.error && <div className="error-banner" role="alert">{comboAsk.error}</div>}
+              <div className="button-row">
+                <button className="secondary-button" type="button" onClick={() => { setComboAsk(null); searchRef.current?.focus(); }}>Cancel</button>
+                <button className="primary-button" type="submit">Add to bill</button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
       {paymentConfirm && (
         <PosPaymentConfirmModal
           draft={paymentConfirm}
@@ -26203,7 +27050,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
  * left after item discounts and the slab. Empty by default. The amount it gives is shown under a
  * percentage; an entry that cannot be billed says why here instead of becoming ₹0.
  */
-function PosBillDiscountBox({ approvalNeeded = false, disabled = false, error = null, exempt = false, input, manualAmount = 0, onChange }) {
+function PosBillDiscountBox({ approvalNeeded = false, comboNote = false, disabled = false, error = null, exempt = false, input, manualAmount = 0, onChange }) {
   const percentMode = input?.mode === MANUAL_BILL_DISCOUNT_MODE.PERCENT;
   const typed = String(input?.value ?? "").trim() !== "";
   return (
@@ -26245,6 +27092,7 @@ function PosBillDiscountBox({ approvalNeeded = false, disabled = false, error = 
           ? <small className="form-note stock-low" role="alert">{error}</small>
           : percentMode && typed && <small className="form-note">{currency.format(manualAmount)} off the bill</small>}
         {approvalNeeded && !error && <small className="form-note stock-low">Over 5% of the bill in all: needs Owner/Admin approval</small>}
+        {comboNote && <small className="form-note pos-bill-discount-combo-note">Bill discount is for loose items; combos already have their price.</small>}
         {!exempt && <small className="form-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}, items and bill together</small>}
       </div>
     </div>
@@ -26708,6 +27556,10 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
   };
   const saveChange = async () => {
     if (saving) return;
+    if (saleHasCombos(invoice)) {
+      setChangeError(COMBO_EDIT_REFUSAL);
+      return;
+    }
     const composed = composeSaleChangeReason({ code: changeForm.reasonCode, otherText: changeForm.otherText });
     if (!composed.ok) {
       setChangeError(composed.message);
@@ -27308,7 +28160,36 @@ function InvoiceBill({ layout, stacked = false, upi = null }) {
             </tr>
           )}
         </thead>
-        {lines.map((line) => (
+        {(Array.isArray(layout.blocks) ? layout.blocks : lines.map((line) => ({ kind: "line", key: `line-${line.key}`, line }))).map((block) => (block.kind === "combo" ? (
+          // A combo prints once, at its one price; its items follow by name and quantity only.
+          <tbody className="bill-line bill-combo" key={block.key}>
+            {stacked ? (
+              <>
+                <tr className="bill-line-name">{productCell({ product: block.title }, 4)}</tr>
+                <tr className="bill-line-figures">{figureCells({ qtyText: block.qtyText, unit: "", rateText: block.rateText, amountText: block.amountText })}</tr>
+              </>
+            ) : (
+              <tr className="bill-line-main">{productCell({ product: block.title })}{figureCells({ qtyText: block.qtyText, unit: "", rateText: block.rateText, amountText: block.amountText })}</tr>
+            )}
+            {block.components.map((part) => (
+              <tr className="bill-combo-item" key={part.key}>
+                {stacked ? (
+                  <td className="bill-product" colSpan={4}>{`· ${part.product} ${part.qtyText} ${part.unit || ""}`.trim()}</td>
+                ) : (
+                  <>
+                    <td className="bill-product">{`· ${part.product}`}</td>
+                    <td className="bill-num">{part.qtyText}</td>
+                    <td className="bill-unit">{part.unit}</td>
+                    <td className="bill-num" />
+                    <td className="bill-num bill-amount" />
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        ) : (() => {
+          const { line } = block;
+          return (
           <tbody className="bill-line" key={line.key}>
             {stacked ? (
               <>
@@ -27322,7 +28203,8 @@ function InvoiceBill({ layout, stacked = false, upi = null }) {
               <tr className="bill-line-discount"><td colSpan={stacked ? 4 : 5}>{line.discount.text}</td></tr>
             )}
           </tbody>
-        ))}
+          );
+        })()))}
       </table>
       <section className="bill-totals">
         {totals.rows.map((row) => (
@@ -27354,7 +28236,7 @@ function InvoiceBill({ layout, stacked = false, upi = null }) {
   );
 }
 
-function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
+function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, editRefusal = null, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
@@ -27478,6 +28360,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
           </div>
           <div className="invoice-actions invoice-actions-bill">
             {canEdit && <button className="primary-button" onClick={onEdit}>Edit Bill</button>}
+            {!canEdit && editRefusal && <span className="form-note invoice-edit-refusal" role="note">{editRefusal}</span>}
             <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
             <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing..." : "View PDF"}</button>

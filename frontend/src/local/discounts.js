@@ -1,6 +1,7 @@
 import { labelFor } from "./displayLabels.js";
 import { finiteOrNull } from "./productMaster.js";
 import { canonicalInventoryId, inventoryIdsEqual } from "./stockInventory.js";
+import { comboLineAmount, isComboLine } from "./combos.js";
 
 /**
  * Discounts: money off a lot at the counter, and money off a bill by its total.
@@ -466,11 +467,35 @@ export const matchBillSlab = (rules, { gross, subtotalAfterItems, paymentMode, e
 };
 
 /**
+ * One line's quantity × rate, to the paisa, as the server bills it: a combo line half up on the
+ * exact paise × thousandths (`comboLineAmount`, the method the allocation priced it with), any
+ * other line `roundMoney` of the float product, as before.
+ */
+export const lineGross = (item) => {
+  const quantity = finiteOrNull(item?.quantity) ?? 0;
+  const rate = finiteOrNull(item?.selling_rate) ?? 0;
+  return isComboLine(item) ? comboLineAmount(quantity, rate) : roundMoney(quantity * rate);
+};
+
+/**
  * The bill total slabs are measured on: each line's quantity × its rate, rounded to 2 dp, summed.
  * A SPECIAL_RATE line's rate is already the special price. The server adds up the same way.
  */
 export const billGross = (cart) => roundMoney((Array.isArray(cart) ? cart : [])
-  .reduce((sum, item) => sum + roundMoney((finiteOrNull(item?.quantity) ?? 0) * (finiteOrNull(item?.selling_rate) ?? 0)), 0));
+  .reduce((sum, item) => sum + lineGross(item), 0));
+
+/**
+ * What the bill-total slab is measured on and capped at: the bill without its combo lines. A
+ * combo is sold at its own price (21 Oct 2026, the owner), so the slab does not take more off it;
+ * loose items count as before.
+ * `gross` is `billGross` of those lines; `subtotalAfterItems` is that less their item discounts.
+ */
+export const slabBase = (cart) => {
+  const lines = (Array.isArray(cart) ? cart : []).filter((item) => !isComboLine(item));
+  const gross = billGross(lines);
+  const itemDiscount = roundMoney(lines.reduce((sum, item) => sum + (finiteOrNull(item?.discount_amount) ?? 0), 0));
+  return { gross, subtotalAfterItems: roundMoney(Math.max(gross - itemDiscount, 0)) };
+};
 
 /**
  * The payment mode a bill is matched on, as the server reads it from the payments: one payment is
@@ -715,6 +740,13 @@ export const lineLotDiscountPart = (line) => {
  * waved through: with any discount on it at all, it needs approval (`unreadable: true`).
  */
 export const lineManualDiscount = (line) => {
+  // A combo's lines carry the paise that make them add up to the combo price as a discount. That
+  // is the combo's own price, not money a cashier gave away, so it is never the 5% rule's -- and a
+  // combo is not part of what the 5% is measured on either (base 0), as on the server
+  // (`manualDiscountLinesOf` leaves combo lines out). The bill discount is for loose items only.
+  if (isComboLine(line)) {
+    return { lotPart: 0, base: 0, manualPart: 0, freeLimit: 0, percent: 0, needsApproval: false, unreadable: false };
+  }
   const quantity = finiteOrNull(line?.quantity);
   const rate = finiteOrNull(line?.selling_rate);
   const discount = text(line?.discount_amount) === "" ? 0 : finiteOrNull(line?.discount_amount);

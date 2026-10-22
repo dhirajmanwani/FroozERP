@@ -113,3 +113,15 @@ test("a Cashier's return asks the Owner or an Admin first, with the same check a
   assert.match(body, /approval_id: pendingWrite\.current\.approvalId/);
   assert.match(app, /<SaleReturnModule\s+approvalRoute=\{resolveSaleChangeRoute\(\{ user, offlineMode, connectivityMode \}\)\}/);
 });
+
+test("a combo item cannot be returned one by one", () => {
+  const draft = buildSaleReturnDraft({
+    invoiceId: "s1",
+    items: [{ sale_item_id: "i1", product_name: "Orange", sold_quantity: 1, returnable_quantity: 1, net_amount: 50, combo_line_key: "K" }],
+    quantities: { i1: "1" },
+    reason: "Spoilt",
+  });
+  assert.equal(draft.canSave, false);
+  assert.match(draft.lineProblems.i1, /Combo items can't be returned one by one/);
+  assert.equal(draft.lines.length, 0);
+});

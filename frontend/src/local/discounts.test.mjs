@@ -63,7 +63,10 @@ import {
   posDiscountApproval,
   readBillDiscountTooLarge,
   resolveManualBillDiscount,
+  slabBase,
+  lineGross,
 } from "./discounts.js";
+import { allocateComboPrice, comboLineAmount } from "./combos.js";
 
 const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
 
@@ -1079,4 +1082,68 @@ test("the till and the server name the bill's rule and bound the box the same wa
       }
     }
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Combos (21 Oct 2026): a FIXED combo is already an offer at its own price
+// ---------------------------------------------------------------------------------------------
+
+test("the bill-total slab is measured without combo lines, of either type", () => {
+  const cart = [
+    { quantity: 2, selling_rate: 100, discount_amount: 10 },
+    { quantity: 3, selling_rate: 16.67, discount_amount: 0.01, combo_line_key: "K", combo_type: "FIXED" },
+    { quantity: 1, selling_rate: 50, discount_amount: 0, combo_line_key: "C", combo_type: "CUSTOM" },
+  ];
+  assert.deepEqual(slabBase(cart), { gross: 200, subtotalAfterItems: 190 });
+  assert.equal(billGross(cart), 300.01);
+});
+
+test("the paise a combo line carries as a discount never need approval", () => {
+  const line = { line_id: "a", product_name: "Orange", quantity: 3, selling_rate: 16.67, discount_amount: 0.01, combo_line_key: "K", combo_type: "FIXED" };
+  const check = lineManualDiscount(line);
+  assert.equal(check.needsApproval, false);
+  assert.equal(check.manualPart, 0);
+  // A combo is not part of what the 5% is measured on (the server's manualDiscountLinesOf drops it).
+  assert.equal(check.base, 0);
+  assert.equal(cartDiscountApproval([line]).needed, false);
+  assert.equal(lineManualDiscount({ ...line, combo_type: "CUSTOM" }).needsApproval, false);
+  // A loose line with the same discount is still asked about.
+  const loose = { line_id: "b", product_name: "Apple", quantity: 1, selling_rate: 100, discount_amount: 60 };
+  assert.equal(lineManualDiscount(loose).needsApproval, true);
+});
+
+test("a combo bill adds up to the paisa the server bills, where the float product fell a paisa short", () => {
+  // The reviewer's "₹349 × 2 bills ₹697.99": 1.5 × 416.03 is exactly 624.045, which the double
+  // reads as 624.04499…; the allocation and the server both make it 624.05.
+  const allocated = allocateComboPrice([{ quantity: 0.8, rate: 40 }, { quantity: 3, rate: 90 }], 698);
+  assert.equal(allocated.ok, true);
+  const cart = allocated.lines.map((line, index) => ({
+    line_id: String(index), quantity: line.quantity, selling_rate: line.selling_rate, discount_amount: line.discount_amount, combo_line_key: "K", combo_type: "FIXED",
+  }));
+  const serverGross = Math.round(cart.reduce((sum, item) => sum + comboLineAmount(item.quantity, item.selling_rate), 0) * 100) / 100;
+  assert.equal(billGross(cart), serverGross);
+  const discount = cart.reduce((sum, item) => sum + item.discount_amount, 0);
+  assert.equal(Math.round((billGross(cart) - discount) * 100) / 100, 698);
+  // 0.7 × 140.85: a combo line half up on the exact product, a loose line as before.
+  assert.equal(lineGross({ quantity: 0.7, selling_rate: 140.85, combo_line_key: "K" }), 98.6);
+  assert.equal(lineGross({ quantity: 0.7, selling_rate: 140.85 }), Math.round((0.7 * 140.85 + Number.EPSILON) * 100) / 100);
+  assert.equal(billGross([{ quantity: 0.7, selling_rate: 140.85, combo_line_key: "K" }, { quantity: 1, selling_rate: 10 }]), 108.6);
+  // Combo lines are out of the slab base entirely.
+  assert.deepEqual(slabBase([...cart, { quantity: 1, selling_rate: 100, discount_amount: 0 }]), { gross: 100, subtotalAfterItems: 100 });
+});
+
+test("the bill discount is for loose items only: combos neither widen its room nor its 5%", () => {
+  const combo = { line_id: "c", quantity: 1, selling_rate: 500, discount_amount: 0, combo_line_key: "K", combo_type: "FIXED" };
+  const loose = { line_id: "l", quantity: 1, selling_rate: 200, discount_amount: 0 };
+  // Combo-only: nothing for a bill discount to come off, and any amount needs approval, as the server sees it.
+  const comboOnly = slabBase([combo]);
+  assert.equal(comboOnly.subtotalAfterItems, 0);
+  assert.match(resolveManualBillDiscount({ value: "20", itemsSubtotal: comboOnly.subtotalAfterItems }).error, /cannot be more than what is left of the bill/);
+  assert.equal(assessBillManualDiscount({ lines: [combo], manualBill: 20 }).needsApproval, true);
+  // With loose items, the room and the 5% are the loose items' alone: ₹10 of ₹200 is 5%, ₹11 is over.
+  const mixed = slabBase([combo, loose]);
+  assert.equal(resolveManualBillDiscount({ value: "250", itemsSubtotal: mixed.subtotalAfterItems }).error !== null, true);
+  assert.equal(assessBillManualDiscount({ lines: [combo, loose], manualBill: 10 }).needsApproval, false);
+  assert.equal(assessBillManualDiscount({ lines: [combo, loose], manualBill: 11 }).needsApproval, true);
+  assert.equal(assessBillManualDiscount({ lines: [combo, loose], manualBill: 11 }).base, 200);
 });

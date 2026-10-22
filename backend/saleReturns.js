@@ -26,8 +26,11 @@
  * are not in any line. The customer paid `net - share of bill discount + share of tax` for a line,
  * so that is what a returned unit refunds. Other charges (delivery, crate, labour) are services
  * that were rendered whether or not the fruit comes back, so they are not refunded by default --
- * see `includeOtherCharges`.
+ * see `includeOtherCharges`. The bill discount is shared over the loose (non-combo) lines only,
+ * as it was earned and booked (`combos.js`).
  */
+
+const { isComboLine } = require("./combos");
 
 const QUANTITY_SCALE = 1000;
 
@@ -141,6 +144,12 @@ const linePaidAmount = ({ line, saleLines, sale, includeOtherCharges = false }) 
   const lineNet = lineNetAmount(line);
   const subtotal = lines.reduce((sum, row) => sum + lineNetAmount(row), 0);
   const netShare = subtotal > 0 ? lineNet / subtotal : 0;
+  // The bill discount was earned by the loose lines only: a combo is already priced, so the slab
+  // base and each line's profit share (server.js, invoiceDiscountShareOf) leave combo lines out.
+  // Sharing it over them too would refund a loose line more than the customer paid for it. Tax and
+  // charges were levied on every line, so they still share over all of them.
+  const discountSubtotal = lines.reduce((sum, row) => sum + (isComboLine(row) ? 0 : lineNetAmount(row)), 0);
+  const discountShare = !isComboLine(line) && discountSubtotal > 0 ? lineNet / discountSubtotal : 0;
 
   const invoiceDiscount = finiteOrNull(sale?.invoice_discount_amount) ?? 0;
   const taxAmount = finiteOrNull(sale?.tax_amount) ?? 0;
@@ -153,7 +162,7 @@ const linePaidAmount = ({ line, saleLines, sale, includeOtherCharges = false }) 
     taxShare = grossTotal > 0 ? grossOf(line) / grossTotal : 0;
   }
   const charges = includeOtherCharges ? (finiteOrNull(sale?.other_charges_amount) ?? 0) * netShare : 0;
-  return Math.max(lineNet - invoiceDiscount * netShare + taxAmount * taxShare + charges, 0);
+  return Math.max(lineNet - invoiceDiscount * discountShare + taxAmount * taxShare + charges, 0);
 };
 
 /**

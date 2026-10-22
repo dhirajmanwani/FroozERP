@@ -5,17 +5,22 @@ import {
   DEFAULT_POS_SECTION,
   POS_SECTIONS,
   POS_SECTION_STORAGE_KEY,
+  POS_TABS,
   TILE_INK_DARK,
   TILE_INK_LIGHT,
   chosenPosSection,
   normalizePosSection,
+  normalizePosTab,
   posSectionAutomatic,
   posSectionCounts,
   posSectionFor,
   posSectionLabel,
   posTileBadge,
+  posTabsFor,
   readPosSection,
+  readPosTab,
   writePosSection,
+  writePosTab,
 } from "./posSections.js";
 
 const product = (product_name, category_name = "Fruit") => ({ product_name, category_name });
@@ -155,4 +160,34 @@ test("saving a product on the desktop pulls it at once, so POS shows the new sec
   const after = app.slice(start, start + 900);
   assert.match(after, /shouldSyncAfterPurchaseSave\(\{ tauriRuntime: isTauriRuntime\(\), queuedOffline: false \}\)/);
   assert.match(after, /runSyncNow\(\{ force: true \}\)\.catch/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// POS tabs (Combos & Offers, 21 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+test("the counter app shows four tabs; the browser keeps the three shelves", () => {
+  assert.deepEqual(POS_TABS.map((tab) => tab.label), ["Frooz Retail", "Frooz Bar", "Frooz Moments", "Combos & Offers"]);
+  assert.deepEqual(posTabsFor({ combosEnabled: true }).map((tab) => tab.key), ["retail", "bar", "moments", "combos"]);
+  assert.deepEqual(posTabsFor({ combosEnabled: false }).map((tab) => tab.key), ["retail", "bar", "moments"]);
+  assert.deepEqual(POS_TABS.find((tab) => tab.key === "bar").comboKinds, ["JUICE", "THE_CUTTING"]);
+  assert.deepEqual(POS_TABS.find((tab) => tab.key === "moments").comboKinds, ["GIFTING"]);
+  assert.equal(POS_TABS.find((tab) => tab.key === "combos").products, false);
+});
+
+test("a product can never be filed on the combos tab", () => {
+  assert.equal(chosenPosSection({ pos_section: "combos" }), null);
+  assert.equal(normalizePosSection("combos"), "retail");
+});
+
+test("the combos tab is remembered only where combos are sold", () => {
+  assert.equal(normalizePosTab("combos", { combosEnabled: true }), "combos");
+  assert.equal(normalizePosTab("combos", { combosEnabled: false }), "retail");
+  assert.equal(normalizePosTab("bar"), "bar");
+  const store = new Map();
+  const storage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) };
+  writePosTab(storage, "combos");
+  assert.equal(readPosTab(storage, { combosEnabled: true }), "combos");
+  assert.equal(readPosTab(storage, { combosEnabled: false }), "retail");
+  assert.equal(readPosTab({ getItem: () => { throw new Error("blocked"); } }), "retail");
 });

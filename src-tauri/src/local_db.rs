@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager};
 use crate::entitlement::{self, EntitlementState};
 use crate::machine_identity::{self, AnchorOutcome, AnchorWritePolicy, MachineContext};
 
-const CURRENT_SCHEMA_VERSION: &str = "027_product_pos_section";
+const CURRENT_SCHEMA_VERSION: &str = "028_combos";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -37,6 +37,7 @@ const MIGRATION_024: &str = include_str!("../migrations/sqlite/024_other_charges
 const MIGRATION_025: &str = include_str!("../migrations/sqlite/025_device_machine_fingerprint.sql");
 const MIGRATION_026: &str = include_str!("../migrations/sqlite/026_sync_outbox_entity_and_deferred_lots.sql");
 const MIGRATION_027: &str = include_str!("../migrations/sqlite/027_product_pos_section.sql");
+const MIGRATION_028: &str = include_str!("../migrations/sqlite/028_combos.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -135,6 +136,13 @@ pub struct ReferenceBootstrap {
     pub device_assignment: serde_json::Value,
     pub location_products: Vec<serde_json::Value>,
     pub records: Vec<PulledChange>,
+    /// The company's combos, each with its `items[]`, for filling a rebuilt device.
+    ///
+    /// `#[serde(default)]` because an older server sends no such key, and a bootstrap without it
+    /// must still apply. Without this field serde would silently DROP a `combos` array the server
+    /// did send — which is exactly what happens today to the bootstrap's top-level `charge_types`.
+    #[serde(default)]
+    pub combos: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -462,6 +470,7 @@ pub fn database_audit(app: &AppHandle) -> Result<serde_json::Value, String> {
         "customers": count("local_customers")?,
         "invoices": count("local_pos_invoices")?,
         "invoice_items": count("local_pos_invoice_items")?,
+        "combos": count("local_combos")?,
         "payments": count("local_payment_postings")?,
         "stock_movements": count("local_stock_movements")?,
         "outbox": count("sync_outbox")?,
@@ -857,6 +866,40 @@ fn apply_reference_bootstrap_at(
             }
         }
         apply_change_with_tx(&tx, change)?;
+    }
+
+    // Combos travel as their own top-level array, each with its `items[]`. They go through the
+    // same `combo` arm the pull feed uses, so one rule stores a combo whichever way it arrived and
+    // a combo that cannot be stored is kept as an unapplied change rather than failing the fill.
+    for combo in &bootstrap.combos {
+        let combo_id = combo_identity(combo, None)
+            .ok_or_else(|| "Reference bootstrap combo has no identity".to_string())?;
+        let change = PulledChange {
+            change_id: serde_json::Value::Null,
+            branch_id: Some(bootstrap.branch_id),
+            entity_type: "combo".to_string(),
+            entity_id: combo_id,
+            operation_type: "UPSERT".to_string(),
+            version: combo
+                .get("entity_version")
+                .or_else(|| combo.get("version"))
+                .and_then(|value| value.as_i64()),
+            payload: combo.clone(),
+            updated_at: optional_text(combo, "updated_at"),
+        };
+        // A combo of another company is never stored. Like a foreign lot on the pull path it is
+        // recorded rather than thrown: a server scoping bug must not stop a device being filled.
+        let payload_company = combo.get("company_id").and_then(json_number).map(|value| value as i64);
+        if payload_company.is_some() && payload_company != Some(bootstrap.company_id) {
+            record_unapplied_change(
+                &tx,
+                &change,
+                "COMBO_OUTSIDE_COMPANY_SCOPE",
+                Some(format!("combo belongs to company {:?}, this device to {}", payload_company, bootstrap.company_id)),
+            )?;
+            continue;
+        }
+        apply_change_with_tx(&tx, &change)?;
     }
 
     for location_product in &bootstrap.location_products {
@@ -1564,6 +1607,12 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     if net_total < 0.0 || gross_total < 0.0 {
         return Err("POS sale totals must be non-negative".to_string());
     }
+    // Read and checked before the first write, so a line whose combo fields cannot be stored
+    // honestly refuses the bill without leaving half of it behind.
+    let item_combos = items
+        .iter()
+        .map(sale_line_combo)
+        .collect::<Result<Vec<SaleLineCombo>, String>>()?;
 
     tx.execute(
         "INSERT INTO local_pos_invoices (
@@ -1600,7 +1649,7 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     )
     .map_err(to_error)?;
 
-    for item in items {
+    for (item, combo) in items.iter().zip(item_combos.iter()) {
         let item_id = required_text(item, "item_global_id")?;
         let product_id = required_text(item, "product_id")?;
         let lot_id = required_text(item, "lot_id")?;
@@ -1615,6 +1664,11 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
         if rate < 0.0 || discount < 0.0 || amount < 0.0 {
             return Err("POS item rate, discount and amount must be non-negative".to_string());
         }
+        // A combo line's rate is its share of the combo's price, not the product's price: ₹47.37 a
+        // kilo for apples inside a basket says nothing about loose apples. Writing it back as the
+        // product's (or a new lot's) counter rate would reprice loose apples after the first
+        // basket sold, so a combo line leaves the stored rate exactly as it was.
+        let counter_rate: Option<f64> = if combo.is_combo_line() { None } else { Some(rate) };
 
         let existing_balance: Option<f64> = tx
             .query_row(
@@ -1629,7 +1683,8 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
             .optional()
             .map_err(to_error)?;
         let starting_balance = existing_balance.unwrap_or_else(|| number_or_zero(item, "available_qty"));
-        if starting_balance < quantity {
+        // Compared in thousandths: see `stock_thousandths`.
+        if stock_thousandths(starting_balance) < stock_thousandths(quantity) {
             return Err(format!(
                 "Selected lot does not have enough local stock for {}",
                 optional_text(item, "product_name").unwrap_or_else(|| product_id.clone())
@@ -1649,7 +1704,7 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
                 branch_id,
                 optional_text(item, "product_name").unwrap_or_else(|| "Unnamed Product".to_string()),
                 optional_text(item, "unit"),
-                rate,
+                counter_rate,
             ],
         )
         .map_err(to_error)?;
@@ -1669,21 +1724,23 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
                 optional_text(item, "lot_name"),
                 optional_text(item, "lot_size"),
                 starting_balance,
-                rate,
+                counter_rate,
             ],
         )
         .map_err(to_error)?;
 
         tx.execute(
+            // Quantities carry 3 decimals. The check and the new balance are both taken in
+            // thousandths, so 4.3 - 0.7 (3.5999999999999996 in a REAL) still sells 3.6.
             "UPDATE local_inventory_lots
-             SET sold_qty = sold_qty + ?2,
-                 balance_qty = balance_qty - ?2,
+             SET sold_qty = ROUND(sold_qty + ?2, 3),
+                 balance_qty = CASE WHEN ROUND(balance_qty - ?2, 3) <= 0 THEN 0 ELSE ROUND(balance_qty - ?2, 3) END,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  sync_status = CASE WHEN LOWER(sync_status) = 'pending' THEN sync_status ELSE 'synced' END
              WHERE id = ?1
                AND deleted_at IS NULL
                AND UPPER(COALESCE(status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
-               AND balance_qty >= ?2",
+               AND ROUND(balance_qty * 1000) >= ROUND(?2 * 1000)",
             params![lot_id, quantity],
         )
         .map_err(to_error)?;
@@ -1694,8 +1751,11 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
         tx.execute(
             "INSERT INTO local_pos_invoice_items (
                 id, invoice_id, product_id, product_name, lot_id, lot_name, lot_size,
-                quantity, unit, rate, discount, amount, stock_movement_id, entity_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                quantity, unit, rate, discount, amount, stock_movement_id, entity_version,
+                combo_line_key, combo_id, combo_name, combo_kind, combo_type, combo_qty,
+                combo_price, line_index
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 item_id,
                 invoice_id,
@@ -1711,6 +1771,14 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
                 amount,
                 stock_movement_id,
                 entity_version,
+                combo.combo_line_key,
+                combo.combo_id,
+                combo.combo_name,
+                combo.combo_kind,
+                combo.combo_type,
+                combo.combo_qty,
+                combo.combo_price,
+                combo.line_index,
             ],
         )
         .map_err(to_error)?;
@@ -1813,12 +1881,33 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     })
 }
 
+/// A stock quantity in whole thousandths (quantities carry 3 decimals by convention).
+///
+/// Lot balances are REAL, so a lot of 4.3 kg that sold 0.7 holds 3.5999999999999996, and comparing
+/// that raw against 3.6 refused a sale of the last 3.6 kg — the POS, which counts in thousandths,
+/// had offered it. Both sides of every sufficiency check go through this, the same rounding the SQL
+/// side does with `ROUND(x * 1000)`.
+fn stock_thousandths(value: f64) -> i64 {
+    (value * 1000.0).round() as i64
+}
+
+/// Per-process sequence mixed into `unique_local_id`, so two ids minted in the same millisecond
+/// differ. The clock alone did not: cancelling a bill with two lines writes two reversal movements
+/// inside one transaction, well within a millisecond, and both got the same id — the cancel failed
+/// on `UNIQUE constraint failed: local_stock_movements.id`. Combo bills always have several lines.
+static LOCAL_ID_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn unique_local_id(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("{prefix}-{millis}-{}", checksum(&format!("{prefix}-{millis}"))[..8].to_string())
+    let sequence = LOCAL_ID_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Same shape as before (`prefix-millis-8hex`); only the hashed input gained the sequence.
+    format!(
+        "{prefix}-{millis}-{}",
+        checksum(&format!("{prefix}-{millis}-{sequence}"))[..8].to_string()
+    )
 }
 
 /// A trimmed string field from a JSON object, or None when absent or blank.
@@ -2984,6 +3073,453 @@ fn snapshot_charge_types(snapshot: &serde_json::Value) -> Option<&Vec<serde_json
     })
 }
 
+/// The identity a combo is stored under on this device: its cloud `global_id` (`combo-<id>`).
+///
+/// Preference: the payload's `global_id`, then the change's own `entity_id`, then the payload's
+/// `id`. A bare run of digits is the cloud's numeric id and is spelled the way the cloud mints the
+/// global id (`'combo-' || id`), as text — never parsed as a number, so `"004"` stays `"004"`.
+fn combo_identity(payload: &serde_json::Value, entity_id: Option<&str>) -> Option<String> {
+    let raw = optional_text(payload, "global_id")
+        .or_else(|| optional_text(payload, "combo_global_id"))
+        .or_else(|| {
+            entity_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| optional_text(payload, "id"))?;
+    if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(format!("combo-{raw}"))
+    } else {
+        Some(raw)
+    }
+}
+
+/// One component of a combo, validated and ready to store.
+struct ComboItemRow {
+    product_global_id: String,
+    product_name: Option<String>,
+    unit: Option<String>,
+    quantity: f64,
+    sort_order: i64,
+}
+
+/// Store one combo and, when the payload carries `items`, replace its components wholesale.
+///
+/// **Every check runs before the first write**, for the same reason as `upsert_charge_type_with_tx`:
+/// this runs inside the pull transaction, and a refusal must leave nothing behind, so the caller
+/// can record the change as unapplied and the rest of the page still lands.
+///
+/// What is NOT checked here: which kinds and types exist, and whether a FIXED combo has a price
+/// above 0. The cloud route owns those rules (see migration 028); refusing a newer server's value
+/// here would turn it into a combo that silently never reaches the counter. Storage refuses only
+/// what cannot be stored honestly: no name, no kind or type, a price that is not a number or is
+/// negative, and a component with no product or no usable quantity.
+///
+/// `product_ids`, when given, maps the spellings a reference snapshot used for a product to the
+/// local product id (`product_id_map` in `cache_reference_snapshot_at`), so a component points at
+/// the same row the POS sells from. Unmapped ids are stored exactly as they arrived.
+fn upsert_combo_with_tx(
+    tx: &rusqlite::Transaction<'_>,
+    combo_id: &str,
+    payload: &serde_json::Value,
+    updated_at: Option<String>,
+    version: i64,
+    deleted: bool,
+    product_ids: Option<&HashMap<String, String>>,
+) -> Result<(), String> {
+    if deleted {
+        // A removal needs no name, price or items: it only hides the combo. The cloud has no
+        // DELETE for combos (active=false hides one), so this is for a server that grows one.
+        tx.execute(
+            "UPDATE local_combos
+             SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                 sync_status = 'synced'
+             WHERE id = ?1",
+            params![combo_id, updated_at],
+        )
+        .map_err(to_error)?;
+        return Ok(());
+    }
+
+    let name = optional_text(payload, "name")
+        .or_else(|| optional_text(payload, "combo_name"))
+        .ok_or_else(|| format!("Combo {combo_id} has no name"))?;
+    let kind = optional_text(payload, "kind")
+        .or_else(|| optional_text(payload, "combo_kind"))
+        .map(|value| value.to_uppercase())
+        .ok_or_else(|| format!("{name} has no kind"))?;
+    let combo_type = optional_text(payload, "combo_type")
+        .or_else(|| optional_text(payload, "type"))
+        .map(|value| value.to_uppercase())
+        .ok_or_else(|| format!("{name} has no type (FIXED or CUSTOM)"))?;
+    // NULL stays NULL: a CUSTOM combo has no price, and a FIXED one whose price never arrived must
+    // reach the POS as "not priced", never as free.
+    let price = match payload.get("price") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => None,
+        Some(value) => {
+            let price = json_number(value)
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| format!("{name} has a price that is not a number"))?;
+            if price < 0.0 {
+                return Err(format!("{name} has a negative price ({price})"));
+            }
+            Some(price)
+        }
+    };
+    let items: Option<Vec<ComboItemRow>> = match payload.get("items") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(rows)) => {
+            let mut parsed = Vec::with_capacity(rows.len());
+            for (index, item) in rows.iter().enumerate() {
+                let raw_product = optional_text(item, "product_global_id")
+                    .or_else(|| optional_text(item, "product_id"))
+                    .ok_or_else(|| format!("{name}: component {} does not say which product it is", index + 1))?;
+                let product_global_id = product_ids
+                    .and_then(|map| map.get(&raw_product).cloned())
+                    .unwrap_or(raw_product);
+                let quantity = item
+                    .get("quantity")
+                    .and_then(json_number)
+                    .filter(|quantity| quantity.is_finite() && *quantity > 0.0)
+                    .ok_or_else(|| format!("{name}: {product_global_id} has no usable quantity"))?;
+                let sort_order = item
+                    .get("sort_order")
+                    .and_then(json_number)
+                    .filter(|value| value.is_finite())
+                    .map(|value| value as i64)
+                    .unwrap_or(index as i64);
+                parsed.push(ComboItemRow {
+                    product_global_id,
+                    product_name: optional_text(item, "product_name"),
+                    unit: optional_text(item, "unit"),
+                    quantity,
+                    sort_order,
+                });
+            }
+            Some(parsed)
+        }
+        Some(_) => return Err(format!("{name}: items is not a list")),
+    };
+    // A CUSTOM combo's own charge (making, basket), per combo. The cloud column is NOT NULL
+    // DEFAULT 0, so an absent or null value from an older server is the cloud's own 0; what is
+    // refused is a value that is there and is not a usable amount.
+    let extra_charge = match payload.get("extra_charge") {
+        None | Some(serde_json::Value::Null) => 0.0,
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => 0.0,
+        Some(value) => {
+            let charge = json_number(value)
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| format!("{name} has an extra charge that is not a number"))?;
+            if charge < 0.0 {
+                return Err(format!("{name} has a negative extra charge ({charge})"));
+            }
+            charge
+        }
+    };
+    // NULL stays NULL ("not set": the POS falls back), and 0 stays 0 — they are different answers.
+    let margin_percent = match payload.get("margin_percent") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => None,
+        Some(value) => {
+            let margin = json_number(value)
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| format!("{name} has a margin that is not a number"))?;
+            // The cloud's bounds (COMBO_MARGIN_INVALID), so a value it would refuse is never priced.
+            if !(0.0..=1000.0).contains(&margin) {
+                return Err(format!("{name} has a margin outside 0 to 1000% ({margin}%)"));
+            }
+            Some(margin)
+        }
+    };
+    let sort_order = payload
+        .get("sort_order")
+        .and_then(json_number)
+        .filter(|value| value.is_finite())
+        .map(|value| value as i64)
+        .unwrap_or(0);
+
+    tx.execute(
+        "INSERT INTO local_combos (
+            id, cloud_id, company_id, name, kind, combo_type, price, extra_charge, description,
+            active, sort_order, created_at, updated_at, version, sync_status, deleted_at,
+            margin_percent
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', NULL, ?15
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           cloud_id = COALESCE(excluded.cloud_id, local_combos.cloud_id),
+           company_id = COALESCE(excluded.company_id, local_combos.company_id),
+           name = excluded.name,
+           kind = excluded.kind,
+           combo_type = excluded.combo_type,
+           price = excluded.price,
+           extra_charge = excluded.extra_charge,
+           margin_percent = excluded.margin_percent,
+           description = excluded.description,
+           active = excluded.active,
+           sort_order = excluded.sort_order,
+           updated_at = excluded.updated_at,
+           version = excluded.version,
+           sync_status = 'synced',
+           deleted_at = NULL",
+        params![
+            combo_id,
+            optional_text(payload, "id"),
+            optional_text(payload, "company_id"),
+            name,
+            kind,
+            combo_type,
+            price,
+            extra_charge,
+            optional_text(payload, "description"),
+            if json_flag(payload, "active", true) { 1 } else { 0 },
+            sort_order,
+            optional_text(payload, "created_at"),
+            updated_at.clone(),
+            version,
+            margin_percent,
+        ],
+    )
+    .map_err(to_error)?;
+
+    if let Some(items) = items {
+        tx.execute("DELETE FROM local_combo_items WHERE combo_id = ?1", [combo_id])
+            .map_err(to_error)?;
+        for (index, item) in items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO local_combo_items (
+                    id, combo_id, product_global_id, product_name, unit, quantity, sort_order, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))",
+                params![
+                    // Derived from the combo and the position, so replaying the same change
+                    // rewrites the same rows instead of piling up a second set of components.
+                    format!("{combo_id}::item::{}", index + 1),
+                    combo_id,
+                    item.product_global_id,
+                    item.product_name,
+                    item.unit,
+                    item.quantity,
+                    item.sort_order,
+                    updated_at.clone(),
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// Every combo this device knows, active and inactive, each with its components.
+///
+/// Inactive combos are emitted on purpose, as charge types are: the POS decides what to show, and
+/// filtering here would turn "this combo was switched off" into silence. A component's name and
+/// unit come from the product on this counter when there is one, else from what the cloud sent;
+/// `product_on_device` says which, so the POS can refuse "<product> is not on sale" instead of
+/// pricing a component it has never heard of.
+fn read_combos(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut items_by_combo: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT i.id, i.combo_id, i.product_global_id,
+                        COALESCE(p.product_name, i.product_name),
+                        COALESCE(p.unit, i.unit),
+                        i.quantity, i.sort_order,
+                        CASE WHEN p.id IS NULL THEN 0 ELSE 1 END
+                 FROM local_combo_items i
+                 LEFT JOIN local_products p ON p.id = i.product_global_id AND p.deleted_at IS NULL
+                 ORDER BY i.combo_id, i.sort_order, i.id",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    serde_json::json!({
+                        "id": row.get::<_, String>(0)?,
+                        "combo_id": row.get::<_, String>(1)?,
+                        "product_global_id": row.get::<_, String>(2)?,
+                        "product_name": row.get::<_, Option<String>>(3)?,
+                        "unit": row.get::<_, Option<String>>(4)?,
+                        "quantity": row.get::<_, f64>(5)?,
+                        "sort_order": row.get::<_, i64>(6)?,
+                        "product_on_device": row.get::<_, i64>(7)? == 1,
+                    }),
+                ))
+            })
+            .map_err(to_error)?;
+        for row in rows {
+            let (combo_id, item) = row.map_err(to_error)?;
+            items_by_combo.entry(combo_id).or_default().push(item);
+        }
+    }
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, cloud_id, company_id, name, kind, combo_type, price, extra_charge,
+                    description, active, sort_order, created_at, updated_at, version, margin_percent
+             FROM local_combos
+             WHERE deleted_at IS NULL
+             ORDER BY sort_order, name, id",
+        )
+        .map_err(to_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                // `id` is the cloud global id (`combo-<id>`), the value a sale line carries as
+                // `combo_id`. `global_id` is the same column under the name the cloud's API uses, so
+                // the POS reads one name in both modes and never rebuilds it from `cloud_id` (which
+                // produced "combo-combo-12"). `cloud_id` is the cloud's numeric row id, as text.
+                "id": row.get::<_, String>(0)?,
+                "global_id": row.get::<_, String>(0)?,
+                "cloud_id": row.get::<_, Option<String>>(1)?,
+                "company_id": row.get::<_, Option<String>>(2)?,
+                "name": row.get::<_, String>(3)?,
+                "kind": row.get::<_, String>(4)?,
+                "combo_type": row.get::<_, String>(5)?,
+                // Null when nobody set one (always, for CUSTOM: the POS works a CUSTOM combo's
+                // price out from its items plus `extra_charge`). Never turned into 0.
+                "price": row.get::<_, Option<f64>>(6)?,
+                // 0 when the combo has none; always 0 on a FIXED combo.
+                "extra_charge": row.get::<_, f64>(7)?,
+                "description": row.get::<_, Option<String>>(8)?,
+                "active": row.get::<_, i64>(9)? == 1,
+                "sort_order": row.get::<_, i64>(10)?,
+                "created_at": row.get::<_, Option<String>>(11)?,
+                "updated_at": row.get::<_, Option<String>>(12)?,
+                "entity_version": row.get::<_, i64>(13)?,
+                // Null when the owner never set one (the POS falls back); 0 is a real margin.
+                "margin_percent": row.get::<_, Option<f64>>(14)?,
+            }))
+        })
+        .map_err(to_error)?;
+    let mut combos = Vec::new();
+    for row in rows {
+        let mut combo = row.map_err(to_error)?;
+        let id = optional_text(&combo, "id").unwrap_or_default();
+        let items = items_by_combo.remove(&id).unwrap_or_default();
+        if let Some(object) = combo.as_object_mut() {
+            object.insert("items".to_string(), serde_json::Value::Array(items));
+        }
+        combos.push(combo);
+    }
+    Ok(combos)
+}
+
+/// The combos carried by an online reference snapshot.
+fn snapshot_combos(snapshot: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if let Some(rows) = snapshot.get("combos").and_then(|value| value.as_array()) {
+        return Some(rows);
+    }
+    snapshot
+        .get("settings_bundle")
+        .and_then(|bundle| bundle.get("combos"))
+        .and_then(|value| value.as_array())
+}
+
+/// Shown when a local edit touches a bill with combo lines. A combo's lines carry a price spread
+/// across them; editing one line would break the offer's total, so the bill is cancelled and
+/// billed again instead. The code in brackets matches the cloud's 409 for the same refusal.
+const COMBO_BILL_EDIT_REFUSAL: &str =
+    "This bill has combo items, and a bill with combos cannot be edited. Cancel the bill and bill it again. (COMBO_BILL_EDIT_UNSUPPORTED)";
+
+/// The combo a sale line belongs to, and the line's place in the cart. All `None` on a loose line
+/// of a bill made before migration 028.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct SaleLineCombo {
+    combo_line_key: Option<String>,
+    combo_id: Option<String>,
+    combo_name: Option<String>,
+    combo_kind: Option<String>,
+    combo_type: Option<String>,
+    combo_qty: Option<f64>,
+    combo_price: Option<f64>,
+    line_index: Option<i64>,
+}
+
+impl SaleLineCombo {
+    /// A line is part of a combo when it carries the key that ties a combo's lines together.
+    fn is_combo_line(&self) -> bool {
+        self.combo_line_key.is_some()
+    }
+}
+
+/// A finite number under `key`, or None when absent, null, blank or not a number.
+fn optional_finite_number(item: &serde_json::Value, key: &str) -> Option<f64> {
+    item.get(key).and_then(json_number).filter(|number| number.is_finite())
+}
+
+/// True when `key` holds something that is not a usable number (absent, null and blank are fine).
+fn holds_non_number(item: &serde_json::Value, key: &str) -> bool {
+    match item.get(key) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => false,
+        Some(_) => optional_finite_number(item, key).is_none(),
+    }
+}
+
+/// The combo fields of a sale line as stored, without judging them. Used where a line must never
+/// be refused — a bill pulled from the cloud already happened.
+fn read_sale_line_combo(item: &serde_json::Value) -> SaleLineCombo {
+    SaleLineCombo {
+        combo_line_key: optional_text(item, "combo_line_key"),
+        combo_id: optional_text(item, "combo_id"),
+        combo_name: optional_text(item, "combo_name"),
+        combo_kind: optional_text(item, "combo_kind"),
+        combo_type: optional_text(item, "combo_type"),
+        combo_qty: optional_finite_number(item, "combo_qty"),
+        combo_price: optional_finite_number(item, "combo_price"),
+        line_index: optional_finite_number(item, "line_index")
+            .filter(|value| *value >= 0.0 && value.fract() == 0.0)
+            .map(|value| value as i64),
+    }
+}
+
+/// The combo fields of a sale line being billed on this counter, checked before anything is
+/// written. Pricing is not checked here — the allocation rule lives in `frontend/src/local/combos.js`
+/// and is pinned by its tests; restating it in Rust would give the shop two implementations of one
+/// price. What is refused is a line that could not be read back honestly: a combo line with no key
+/// to group it by, and numbers that are not numbers.
+fn sale_line_combo(item: &serde_json::Value) -> Result<SaleLineCombo, String> {
+    let label = optional_text(item, "product_name")
+        .or_else(|| optional_text(item, "product_id"))
+        .unwrap_or_else(|| "A sale line".to_string());
+    for key in ["combo_qty", "combo_price", "line_index"] {
+        if holds_non_number(item, key) {
+            return Err(format!("{label}: {key} must be a number"));
+        }
+    }
+    let line = read_sale_line_combo(item);
+    if optional_finite_number(item, "line_index").is_some() && line.line_index.is_none() {
+        return Err(format!("{label}: line_index must be a whole number from 0"));
+    }
+    let names_a_combo = line.combo_id.is_some()
+        || line.combo_name.is_some()
+        || line.combo_kind.is_some()
+        || line.combo_type.is_some()
+        || line.combo_qty.is_some()
+        || line.combo_price.is_some();
+    if names_a_combo && line.combo_line_key.is_none() {
+        return Err(format!(
+            "{label} is marked as part of a combo but has no combo_line_key, so it cannot be grouped with the rest of its combo"
+        ));
+    }
+    if let Some(quantity) = line.combo_qty {
+        if quantity <= 0.0 {
+            return Err(format!("{label}: the number of combos must be above 0"));
+        }
+    }
+    if let Some(price) = line.combo_price {
+        if price < 0.0 {
+            return Err(format!("{label}: the combo price cannot be negative"));
+        }
+    }
+    Ok(line)
+}
+
 fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_json::Value, String> {
     let invoice = conn
         .query_row(
@@ -3045,9 +3581,14 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
     let items = {
         let mut stmt = conn
             .prepare(
+                // Cart order first (`line_index`, written since migration 028); a bill from before
+                // then has none and keeps the order it always had.
                 "SELECT id, product_id, product_name, lot_id, lot_name, lot_size, quantity,
-                        unit, rate, discount, amount, stock_movement_id, entity_version
-                 FROM local_pos_invoice_items WHERE invoice_id = ?1 ORDER BY id",
+                        unit, rate, discount, amount, stock_movement_id, entity_version,
+                        combo_line_key, combo_id, combo_name, combo_kind, combo_type, combo_qty,
+                        combo_price, line_index
+                 FROM local_pos_invoice_items WHERE invoice_id = ?1
+                 ORDER BY CASE WHEN line_index IS NULL THEN 1 ELSE 0 END, line_index, id",
             )
             .map_err(to_error)?;
         let rows = stmt
@@ -3071,6 +3612,16 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
                     "net_amount": row.get::<_, f64>(10)?,
                     "stock_movement_id": row.get::<_, String>(11)?,
                     "entity_version": row.get::<_, i64>(12)?,
+                    // Null on a loose line. The edit and cancel outbox payloads are built from
+                    // this snapshot, so a field left out here would be stripped in the cloud.
+                    "combo_line_key": row.get::<_, Option<String>>(13)?,
+                    "combo_id": row.get::<_, Option<String>>(14)?,
+                    "combo_name": row.get::<_, Option<String>>(15)?,
+                    "combo_kind": row.get::<_, Option<String>>(16)?,
+                    "combo_type": row.get::<_, Option<String>>(17)?,
+                    "combo_qty": row.get::<_, Option<f64>>(18)?,
+                    "combo_price": row.get::<_, Option<f64>>(19)?,
+                    "line_index": row.get::<_, Option<i64>>(20)?,
                 }))
             })
             .map_err(to_error)?;
@@ -3143,8 +3694,8 @@ fn restore_invoice_stock(tx: &rusqlite::Transaction<'_>, invoice_id: &str, devic
         let lot_id = live_lot_id_for(tx, &lot_id)?;
         tx.execute(
             "UPDATE local_inventory_lots
-             SET sold_qty = MAX(sold_qty - ?2, 0),
-                 balance_qty = balance_qty + ?2,
+             SET sold_qty = MAX(ROUND(sold_qty - ?2, 3), 0),
+                 balance_qty = ROUND(balance_qty + ?2, 3),
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![lot_id, quantity],
@@ -3222,14 +3773,15 @@ fn insert_local_sale_items_and_stock(
             return Err("POS item rate, discount and amount must be non-negative".to_string());
         }
         tx.execute(
+            // In thousandths, exactly as at checkout.
             "UPDATE local_inventory_lots
-             SET sold_qty = sold_qty + ?2,
-                 balance_qty = balance_qty - ?2,
+             SET sold_qty = ROUND(sold_qty + ?2, 3),
+                 balance_qty = CASE WHEN ROUND(balance_qty - ?2, 3) <= 0 THEN 0 ELSE ROUND(balance_qty - ?2, 3) END,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1
                AND deleted_at IS NULL
                AND UPPER(COALESCE(status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
-               AND balance_qty >= ?2",
+               AND ROUND(balance_qty * 1000) >= ROUND(?2 * 1000)",
             params![lot_id, quantity],
         )
         .map_err(to_error)?;
@@ -3240,11 +3792,18 @@ fn insert_local_sale_items_and_stock(
             ));
         }
         let stock_movement_id = optional_text(item, "stock_movement_id").unwrap_or_else(|| unique_local_id("stock-out"));
+        // The edit path refuses combo lines before it gets here (`COMBO_BILL_EDIT_REFUSAL`), so in
+        // practice only `line_index` is ever set; the columns are written anyway so that this
+        // insert and the checkout's can never drift apart.
+        let combo = sale_line_combo(item)?;
         tx.execute(
             "INSERT INTO local_pos_invoice_items (
                 id, invoice_id, product_id, product_name, lot_id, lot_name, lot_size,
-                quantity, unit, rate, discount, amount, stock_movement_id, entity_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                quantity, unit, rate, discount, amount, stock_movement_id, entity_version,
+                combo_line_key, combo_id, combo_name, combo_kind, combo_type, combo_qty,
+                combo_price, line_index
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 item_id,
                 invoice_id,
@@ -3260,6 +3819,14 @@ fn insert_local_sale_items_and_stock(
                 amount,
                 stock_movement_id,
                 entity_version,
+                combo.combo_line_key,
+                combo.combo_id,
+                combo.combo_name,
+                combo.combo_kind,
+                combo.combo_type,
+                combo.combo_qty,
+                combo.combo_price,
+                combo.line_index,
             ],
         )
         .map_err(to_error)?;
@@ -3384,6 +3951,16 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
     if old_snapshot["invoice"]["status"].as_str().unwrap_or("") == "CANCELLED" {
         return Err("Cancelled sale cannot be edited".to_string());
     }
+    // A combo's price is spread across its lines; changing one line would quietly break the offer's
+    // total. Such a bill is cancelled and billed again instead — the cloud refuses the same edit
+    // with COMBO_BILL_EDIT_UNSUPPORTED. Checked before anything is written.
+    let old_bill_has_combo = old_snapshot["items"]
+        .as_array()
+        .map(|rows| rows.iter().any(|row| optional_text(row, "combo_line_key").is_some()))
+        .unwrap_or(false);
+    if old_bill_has_combo {
+        return Err(COMBO_BILL_EDIT_REFUSAL.to_string());
+    }
     let old_version = old_snapshot["invoice"]["entity_version"].as_i64().unwrap_or(1);
     let new_version = old_version + 1;
     let branch_id = required_text(&edit, "branch_id").or_else(|_| required_text(&old_snapshot["invoice"], "branch_id"))?;
@@ -3408,6 +3985,13 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
     let items = edit.get("items").and_then(|value| value.as_array()).ok_or_else(|| "Edited sale requires items".to_string())?;
     if items.is_empty() {
         return Err("Invoice must contain at least one item".to_string());
+    }
+    // Nor can an edit turn a plain bill into one with combos: the same refusal, the same reason.
+    if items
+        .iter()
+        .any(|item| optional_text(item, "combo_line_key").is_some() || optional_text(item, "combo_id").is_some())
+    {
+        return Err(COMBO_BILL_EDIT_REFUSAL.to_string());
     }
     let payments = edit.get("payments").and_then(|value| value.as_array()).ok_or_else(|| "Edited sale requires payment postings".to_string())?;
     if payments.is_empty() {
@@ -3699,6 +4283,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "025_device_machine_fingerprint", MIGRATION_025)?;
     apply_migration(&mut conn, "026_sync_outbox_entity_and_deferred_lots", MIGRATION_026)?;
     apply_migration(&mut conn, "027_product_pos_section", MIGRATION_027)?;
+    apply_migration(&mut conn, "028_combos", MIGRATION_028)?;
     if first_open_in_this_process(path) {
         release_interrupted_syncing_at(&conn)?;
     }
@@ -4837,6 +5422,45 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
         }
     }
 
+    // The owner's combos, cached so a counter with no internet can still sell a juice or a gift
+    // basket. As with charge types, a combo absent from the snapshot is NOT deleted: a snapshot is
+    // a refresh, not a census. Unlike charge types, one unusable combo does not fail the whole
+    // refresh — a refresh also carries this counter's stock, and a misconfigured gift basket must
+    // not stop the shelf from updating. It is kept as an unapplied change instead: named, counted,
+    // and replayable. Component products are resolved through `product_id_map`, so a component
+    // points at the same product row the POS sells.
+    if let Some(combos) = snapshot_combos(snapshot) {
+        for combo in combos {
+            let combo_id = combo_identity(combo, None)
+                .ok_or_else(|| "Combo has no canonical identity".to_string())?;
+            let version = combo
+                .get("entity_version")
+                .or_else(|| combo.get("version"))
+                .and_then(|value| value.as_i64());
+            if let Err(detail) = upsert_combo_with_tx(
+                &tx,
+                &combo_id,
+                combo,
+                optional_text(combo, "updated_at"),
+                version.unwrap_or(1),
+                optional_text(combo, "deleted_at").is_some(),
+                Some(&product_id_map),
+            ) {
+                let change = PulledChange {
+                    change_id: serde_json::Value::Null,
+                    branch_id: None,
+                    entity_type: "combo".to_string(),
+                    entity_id: combo_id,
+                    operation_type: "UPSERT".to_string(),
+                    version,
+                    payload: combo.clone(),
+                    updated_at: optional_text(combo, "updated_at"),
+                };
+                record_unapplied_change(&tx, &change, "COMBO_NOT_USABLE", Some(detail))?;
+            }
+        }
+    }
+
     if let Some(settings_bundle) = snapshot.get("settings_bundle").and_then(|value| value.as_object()) {
         for (key, value) in settings_bundle {
             if key == "offlineSuppliers" {
@@ -5392,6 +6016,9 @@ fn load_reference_snapshot_at(
     // already live so a caller that reads settings finds it. Both come from `read_charge_types`, so
     // they cannot disagree — which is the whole reason it is one derivation and not two queries.
     let charge_types = read_charge_types(&conn)?;
+    // Top-level only. Not copied into `settings_bundle`: every key there is written back into
+    // `local_settings` by the next snapshot cache, which would give combos a second store.
+    let combos = read_combos(&conn)?;
     if let Some(bundle) = settings_bundle.as_object_mut() {
         bundle.insert("offlinePurchases".to_string(), serde_json::Value::Array(offline_purchases.clone()));
         bundle.insert("offlineSuppliers".to_string(), serde_json::Value::Array(offline_suppliers));
@@ -5469,6 +6096,7 @@ fn load_reference_snapshot_at(
         "inventory_lots": inventory_lots,
         "customers": customers,
         "charge_types": charge_types,
+        "combos": combos,
         "settings_bundle": settings_bundle,
         "offline_purchases": offline_purchases,
         "sales_history": sales_history,
@@ -7110,11 +7738,17 @@ fn apply_pulled_pos_sale_with_tx(
             if quantity <= 0.0 {
                 continue;
             }
+            // Read without judging: this bill already happened somewhere else, and a pulled bill
+            // is never refused over its combo fields. Absent fields stay NULL.
+            let combo = read_sale_line_combo(item);
             tx.execute(
                 "INSERT INTO local_pos_invoice_items (
                     id, invoice_id, product_id, product_name, lot_id, lot_name, lot_size,
-                    quantity, unit, rate, discount, amount, stock_movement_id, entity_version
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    quantity, unit, rate, discount, amount, stock_movement_id, entity_version,
+                    combo_line_key, combo_id, combo_name, combo_kind, combo_type, combo_qty,
+                    combo_price, line_index
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                           ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
                  ON CONFLICT(id) DO NOTHING",
                 params![
                     item_id,
@@ -7132,6 +7766,14 @@ fn apply_pulled_pos_sale_with_tx(
                     optional_text(item, "stock_movement_id")
                         .unwrap_or_else(|| format!("remote-stock-{}-{}", change.entity_id, index + 1)),
                     incoming_version,
+                    combo.combo_line_key,
+                    combo.combo_id,
+                    combo.combo_name,
+                    combo.combo_kind,
+                    combo.combo_type,
+                    combo.combo_qty,
+                    combo.combo_price,
+                    combo.line_index,
                 ],
             )
             .map_err(to_error)?;
@@ -7964,6 +8606,26 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 }
             }
         }
+        // A combo the owner set up: a FIXED offer with its components, or a CUSTOM one the cashier
+        // fills. Its components travel nested inside it and replace the stored set, because a
+        // FIXED combo is only ever priced with all of its components in hand.
+        "combo" => {
+            let combo_id = combo_identity(&change.payload, Some(change.entity_id.as_str()))
+                .unwrap_or_else(|| change.entity_id.clone());
+            if let Err(detail) = upsert_combo_with_tx(
+                tx,
+                &combo_id,
+                &change.payload,
+                change.updated_at.clone(),
+                change.version.unwrap_or(1),
+                operation == "DELETE",
+                None,
+            ) {
+                // Nothing was written (every check runs first), so the change is kept, named and
+                // replayable while the rest of the pull lands.
+                record_unapplied_change(tx, change, "COMBO_NOT_USABLE", Some(detail))?;
+            }
+        }
         "sync_test" => {
             tx.execute(
                 "INSERT INTO local_sync_test_entities (id, branch_id, device_id, value, server_version, sync_status, updated_at, deleted_at)
@@ -8108,7 +8770,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 26;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 27;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -8309,6 +8971,7 @@ mod tests {
                     updated_at: Some("2026-07-27T10:00:00.000Z".to_string()),
                 },
             ],
+            combos: Vec::new(),
         }
     }
 
@@ -15068,6 +15731,732 @@ mod tests {
                 ("product-c".to_string(), serde_json::Value::Null),
             ]
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Combos & Offers (migration 028)
+    // ---------------------------------------------------------------------------------------------
+
+    /// A pulled `combo` change, shaped the way the cloud publishes one: the whole row with `items`.
+    fn pulled_combo(entity_id: &str, payload: serde_json::Value) -> PulledChange {
+        PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(1),
+            entity_type: "combo".to_string(),
+            entity_id: entity_id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload,
+            updated_at: Some("2026-10-21T10:00:00.000Z".to_string()),
+        }
+    }
+
+    fn combo_snapshot_by_id(path: &Path, device_id: &str) -> HashMap<String, serde_json::Value> {
+        let loaded = load_reference_snapshot_at(path, Some("offline-user"), Some(device_id))
+            .expect("load the counter's snapshot");
+        loaded["combos"]
+            .as_array()
+            .expect("combos are emitted, even when there are none")
+            .iter()
+            .map(|combo| (combo["id"].as_str().expect("combo id").to_string(), combo.clone()))
+            .collect()
+    }
+
+    fn unapplied_reason(path: &Path, entity_id: &str) -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT reason FROM local_unapplied_changes WHERE entity_id = ?1",
+                [entity_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Two lines of one FIXED combo (out of cart order) and one loose line, as the POS sends them.
+    fn combo_sale_payload(invoice: &str) -> serde_json::Value {
+        let mut sale = test_sale_payload(invoice, &format!("op-{invoice}"), 1.0, 70.0);
+        sale["offline_invoice_ref"] = serde_json::json!(format!("OFF-{invoice}"));
+        sale["payments"][0]["posting_id"] = serde_json::json!(format!("posting-{invoice}"));
+        sale["items"] = serde_json::json!([
+            {
+                // Second in the cart, but its id sorts first: `line_index` must win.
+                "item_global_id": format!("line-a-{invoice}"),
+                "product_id": "product-combo-milk",
+                "product_name": "Milk",
+                "lot_id": format!("lot-milk-{invoice}"),
+                "quantity": 0.2,
+                "unit": "L",
+                "rate": 30.0,
+                "discount": 0.0,
+                "amount": 6.0,
+                "stock_movement_id": format!("stock-a-{invoice}"),
+                "available_qty": 5.0,
+                "combo_line_key": "combo-line-1",
+                "combo_id": "combo-12",
+                "combo_name": "Mango Shake",
+                "combo_kind": "JUICE",
+                "combo_type": "FIXED",
+                "combo_qty": 1,
+                "combo_price": 60,
+                "line_index": 1
+            },
+            {
+                "item_global_id": format!("line-b-{invoice}"),
+                "product_id": "product-combo-mango",
+                "product_name": "Langda",
+                "lot_id": format!("lot-mango-{invoice}"),
+                "quantity": 0.25,
+                // The mango's share of the shake: ₹216 a kilo, nothing like loose mango's ₹120.
+                "rate": 216.0,
+                "discount": 0.0,
+                "amount": 54.0,
+                "stock_movement_id": format!("stock-b-{invoice}"),
+                "available_qty": 5.0,
+                "combo_line_key": "combo-line-1",
+                "combo_id": "combo-12",
+                "combo_name": "Mango Shake",
+                "combo_kind": "JUICE",
+                "combo_type": "FIXED",
+                "combo_qty": 1,
+                "combo_price": 60,
+                "line_index": 0
+            },
+            {
+                "item_global_id": format!("line-c-{invoice}"),
+                "product_id": "product-combo-loose",
+                "product_name": "Kinnow",
+                "lot_id": format!("lot-loose-{invoice}"),
+                "quantity": 1.0,
+                "rate": 10.0,
+                "discount": 0.0,
+                "amount": 10.0,
+                "stock_movement_id": format!("stock-c-{invoice}"),
+                "available_qty": 5.0,
+                "line_index": 2
+            }
+        ]);
+        sale
+    }
+
+    /// Migration 028 upgrades a real 027 profile once, and a restart changes nothing.
+    ///
+    /// The gate in `apply_migration` is what makes an ALTER-bearing file idempotent; this proves it
+    /// for 028, proves the new tables and the eight sale-line columns exist, and proves a bill line
+    /// written before the migration reads back exactly as it was, with every combo field null.
+    #[test]
+    fn migration_028_adds_combos_once_and_survives_a_restart() {
+        let path = sync_fix_path("migration-028");
+        {
+            let mut conn = Connection::open(&path).expect("open pre-028 database");
+            apply_migrations_through_023(&mut conn);
+            for (version, sql) in [
+                ("024_other_charges", MIGRATION_024),
+                ("025_device_machine_fingerprint", MIGRATION_025),
+                ("026_sync_outbox_entity_and_deferred_lots", MIGRATION_026),
+                ("027_product_pos_section", MIGRATION_027),
+            ] {
+                apply_migration(&mut conn, version, sql).expect("apply pre-028 migration");
+            }
+            conn.execute(
+                "INSERT INTO local_pos_invoices (
+                    id, offline_invoice_ref, branch_id, device_id, bill_date, bill_datetime,
+                    payment_mode, gross_total, net_total
+                 ) VALUES ('bill-pre-028', 'OFF-PRE-028', '1', 'device-a', '2026-10-01',
+                           '2026-10-01T10:00', 'CASH', 50, 50)",
+                [],
+            )
+            .expect("write a pre-028 bill");
+            conn.execute(
+                "INSERT INTO local_pos_invoice_items (
+                    id, invoice_id, product_id, product_name, lot_id, quantity, rate, discount,
+                    amount, stock_movement_id
+                 ) VALUES ('line-pre-028', 'bill-pre-028', 'product-a', 'Apples', 'lot-a', 1, 50, 0,
+                           50, 'stock-pre-028')",
+                [],
+            )
+            .expect("write a pre-028 bill line");
+        }
+
+        initialize_at(&path).expect("upgrade to 028");
+        simulate_restart(&path);
+        initialize_at(&path).expect("restart with the upgraded profile");
+        initialize_at(&path).expect("and again");
+
+        let conn = Connection::open(&path).unwrap();
+        let (applied, total): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE version = '028_combos'),
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((applied, total), (1, EXPECTED_APPLIED_MIGRATIONS));
+        for table in ["local_combos", "local_combo_items"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{table} must exist after the upgrade");
+        }
+        let item_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(local_pos_invoice_items)").unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        for column in [
+            "combo_line_key", "combo_id", "combo_name", "combo_kind", "combo_type", "combo_qty",
+            "combo_price", "line_index",
+        ] {
+            assert!(item_columns.iter().any(|name| name == column), "local_pos_invoice_items lacks {column}");
+        }
+
+        let bill = load_invoice_snapshot(&conn, "bill-pre-028").expect("read the pre-028 bill");
+        let line = &bill["items"][0];
+        assert_eq!(line["id"], "line-pre-028");
+        assert_eq!(line["amount"], 50.0, "the line keeps the amount it always had");
+        for key in [
+            "combo_line_key", "combo_id", "combo_name", "combo_kind", "combo_type", "combo_qty",
+            "combo_price", "line_index",
+        ] {
+            assert!(line[key].is_null(), "a pre-028 line must read {key} as null, got {}", line[key]);
+        }
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A combo pulled from the cloud lands, replaces its components on the next change, and comes
+    /// back out of the snapshot with everything the POS needs — including an inactive one and a
+    /// component this counter does not stock.
+    #[test]
+    fn pulled_combos_round_trip_through_the_snapshot() {
+        let path = sync_fix_path("combo-pull");
+        initialize_at(&path).expect("initialize");
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO local_products (id, product_name, unit, sale_rate) VALUES ('product-276', 'Langda', 'KG', 120)",
+                [],
+            )
+            .unwrap();
+
+        let shake = serde_json::json!({
+            "id": 12,
+            "global_id": "combo-12",
+            "company_id": 1,
+            "name": "Mango Shake",
+            "kind": "juice",
+            "combo_type": "FIXED",
+            // node-postgres sends NUMERIC as text.
+            "price": "60.00",
+            "extra_charge": "0.00",
+            "margin_percent": "30.00",
+            "description": "Fresh, no sugar",
+            "active": true,
+            "sort_order": 2,
+            "entity_version": 1,
+            "items": [
+                { "product_global_id": "product-276", "product_name": "Langda", "quantity": "0.250", "sort_order": 0 },
+                { "product_global_id": "product-milk", "product_name": "Milk", "unit": "L", "quantity": 0.2, "sort_order": 1 }
+            ]
+        });
+        pull(&path, &pulled_combo("combo-12", shake.clone()));
+        pull(&path, &pulled_combo("combo-12", shake.clone()));
+        pull(
+            &path,
+            &pulled_combo(
+                "combo-13",
+                serde_json::json!({
+                    "id": 13,
+                    "global_id": "combo-13",
+                    "company_id": 1,
+                    "name": "Gift Basket",
+                    "kind": "GIFTING",
+                    "combo_type": "CUSTOM",
+                    "price": null,
+                    "extra_charge": "25.00",
+                    "margin_percent": 0,
+                    "active": false,
+                    "sort_order": 1,
+                    "items": []
+                }),
+            ),
+        );
+
+        let combos = combo_snapshot_by_id(&path, "device-combo");
+        assert_eq!(combos.len(), 2, "pulling a combo twice must not duplicate it");
+        let shake_out = &combos["combo-12"];
+        assert_eq!(shake_out["name"], "Mango Shake");
+        assert_eq!(shake_out["global_id"], "combo-12", "the snapshot names the global id the way the API does");
+        assert_eq!(shake_out["kind"], "JUICE");
+        assert_eq!(shake_out["combo_type"], "FIXED");
+        assert_eq!(shake_out["price"], 60.0);
+        assert_eq!(shake_out["cloud_id"], "12");
+        assert_eq!(shake_out["active"], true);
+        let shake_out_extra_charge = shake_out["extra_charge"].as_f64().expect("extra_charge is always a number");
+        let items = shake_out["items"].as_array().expect("components");
+        assert_eq!(items.len(), 2, "pulling a combo twice must not duplicate a component");
+        assert_eq!(items[0]["product_global_id"], "product-276");
+        assert_eq!(items[0]["quantity"], 0.25);
+        assert_eq!(items[0]["product_on_device"], true);
+        assert_eq!(items[0]["unit"], "KG", "the counter's own product supplies the unit");
+        assert_eq!(items[1]["product_global_id"], "product-milk");
+        assert_eq!(items[1]["product_name"], "Milk", "the name the cloud sent names a missing product");
+        assert_eq!(items[1]["product_on_device"], false);
+
+        let basket = &combos["combo-13"];
+        assert!(basket["price"].is_null(), "a CUSTOM combo has no price, and it is never read as 0");
+        assert_eq!(basket["active"], false, "an inactive combo is still emitted for the POS to explain");
+        assert_eq!(basket["extra_charge"], 25.0, "the basket charge arrives as text and is stored as money");
+        assert_eq!(shake_out["margin_percent"], 30.0, "the margin arrives as text and is stored as a number");
+        assert_eq!(basket["margin_percent"], 0.0, "a margin of 0 is a margin, not 'not set'");
+        assert_eq!(shake_out_extra_charge, 0.0, "a FIXED combo has no extra charge");
+        assert_eq!(basket["items"].as_array().map(|rows| rows.len()), Some(0));
+
+        // The next change replaces the components wholesale.
+        let mut smaller = shake.clone();
+        smaller["items"] = serde_json::json!([{ "product_global_id": "product-276", "quantity": 0.3 }]);
+        pull(&path, &pulled_combo("combo-12", smaller));
+        let combos = combo_snapshot_by_id(&path, "device-combo");
+        let items = combos["combo-12"]["items"].as_array().expect("components");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["quantity"], 0.3);
+
+        // A change without `items` says nothing about the components, so they stay.
+        let mut renamed = shake.clone();
+        renamed.as_object_mut().unwrap().remove("items");
+        renamed["name"] = serde_json::json!("Mango Lassi");
+        pull(&path, &pulled_combo("combo-12", renamed));
+        let combos = combo_snapshot_by_id(&path, "device-combo");
+        assert_eq!(combos["combo-12"]["name"], "Mango Lassi");
+        assert_eq!(combos["combo-12"]["items"].as_array().map(|rows| rows.len()), Some(1));
+
+        // A combo that cannot be stored is kept, named, and stores nothing.
+        pull(
+            &path,
+            &pulled_combo(
+                "combo-99",
+                serde_json::json!({
+                    "global_id": "combo-99",
+                    "kind": "COMBO_OFFER",
+                    "combo_type": "FIXED",
+                    "price": 100,
+                    "items": [{ "product_global_id": "product-276", "quantity": 1 }]
+                }),
+            ),
+        );
+        assert_eq!(unapplied_reason(&path, "combo-99").as_deref(), Some("COMBO_NOT_USABLE"));
+        let stored: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM local_combos WHERE id = 'combo-99'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, 0, "a refused combo writes nothing");
+
+        // A negative extra charge is refused the same way, and the stored basket is untouched.
+        pull(
+            &path,
+            &pulled_combo(
+                "combo-13",
+                serde_json::json!({
+                    "global_id": "combo-13",
+                    "name": "Gift Basket",
+                    "kind": "GIFTING",
+                    "combo_type": "CUSTOM",
+                    "extra_charge": -5,
+                    "items": []
+                }),
+            ),
+        );
+        assert_eq!(unapplied_reason(&path, "combo-13").as_deref(), Some("COMBO_NOT_USABLE"));
+        let combos = combo_snapshot_by_id(&path, "device-combo");
+        assert_eq!(combos["combo-13"]["extra_charge"], 25.0);
+
+        // Margins outside 0..=1000, or not a number, are refused the same way; the stored shake keeps
+        // its 30%.
+        for (entity_id, margin) in [
+            ("combo-12", serde_json::json!(-1)),
+            ("combo-12", serde_json::json!("1000.01")),
+            ("combo-12", serde_json::json!("a lot")),
+        ] {
+            let mut bad = shake.clone();
+            bad["margin_percent"] = margin;
+            pull(&path, &pulled_combo(entity_id, bad));
+            assert_eq!(unapplied_reason(&path, entity_id).as_deref(), Some("COMBO_NOT_USABLE"));
+        }
+        let mut edge = shake.clone();
+        edge["margin_percent"] = serde_json::json!(1000);
+        edge["name"] = serde_json::json!("Mango Lassi");
+        pull(&path, &pulled_combo("combo-12", edge));
+        let combos = combo_snapshot_by_id(&path, "device-combo");
+        assert_eq!(combos["combo-12"]["margin_percent"], 1000.0, "1000% is the top of the range, not past it");
+
+        // An explicit null clears the margin back to "not set".
+        let mut unset = shake.clone();
+        unset["margin_percent"] = serde_json::Value::Null;
+        pull(&path, &pulled_combo("combo-12", unset));
+        let combos = combo_snapshot_by_id(&path, "device-combo");
+        assert!(combos["combo-12"]["margin_percent"].is_null());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The sign-in snapshot and the reference bootstrap both fill combos, and a component named by
+    /// the cloud's numeric product id is stored under the counter's own product id.
+    #[test]
+    fn snapshot_cache_and_bootstrap_fill_combos() {
+        let path = sync_fix_path("combo-cache");
+        initialize_at(&path).expect("initialize");
+        let mut snapshot = crate_and_delivery_snapshot("device-combo-cache");
+        snapshot["products"] = serde_json::json!([
+            { "id": 276, "global_id": "product-276", "product_name": "Langda", "unit": "KG", "selling_rate": 120 }
+        ]);
+        snapshot["combos"] = serde_json::json!([
+            {
+                "id": 14,
+                "global_id": "combo-14",
+                "company_id": 1,
+                "margin_percent": 35.5,
+                "name": "Fruit Plate",
+                "kind": "THE_CUTTING",
+                "combo_type": "FIXED",
+                "price": 80,
+                "active": true,
+                "items": [{ "product_id": 276, "quantity": 0.5 }]
+            },
+            {
+                // Unusable: no type. It must not stop the rest of the refresh.
+                "id": 15,
+                "global_id": "combo-15",
+                "name": "Broken",
+                "kind": "COMBO_OFFER",
+                "items": []
+            }
+        ]);
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache the snapshot");
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache it again");
+
+        let combos = combo_snapshot_by_id(&path, "device-combo-cache");
+        assert_eq!(combos.len(), 1);
+        let plate = &combos["combo-14"];
+        let items = plate["items"].as_array().expect("components");
+        assert_eq!(items.len(), 1, "caching twice must not duplicate a component");
+        assert_eq!(items[0]["product_global_id"], "product-276", "numeric 276 is mapped to the counter's product id");
+        assert_eq!(items[0]["product_on_device"], true);
+        assert_eq!(plate["margin_percent"], 35.5, "the snapshot cache keeps the combo's margin");
+        assert_eq!(unapplied_reason(&path, "combo-15").as_deref(), Some("COMBO_NOT_USABLE"));
+        let _ = fs::remove_file(&path);
+
+        let path = sync_fix_path("combo-bootstrap");
+        initialize_at(&path).expect("initialize");
+        let mut bootstrap = test_reference_bootstrap("device-combo-bootstrap", 1001);
+        bootstrap.combos = vec![
+            serde_json::json!({
+                "id": 21,
+                "global_id": "combo-21",
+                "company_id": 1,
+                "name": "Langda Box",
+                "kind": "GIFTING",
+                "combo_type": "FIXED",
+                "price": "450.00",
+                "active": true,
+                "entity_version": 3,
+                "items": [{ "product_global_id": "product-276", "product_name": "Langda", "quantity": 3 }]
+            }),
+            serde_json::json!({
+                "id": 22,
+                "global_id": "combo-22",
+                "company_id": 2,
+                "name": "Another company's combo",
+                "kind": "GIFTING",
+                "combo_type": "CUSTOM",
+                "items": []
+            }),
+        ];
+        apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-combo-bootstrap",
+            Some("2026-10-21T08:00:00.000Z".to_string()),
+        )
+        .expect("bootstrap with combos");
+        let combos = combo_snapshot_by_id(&path, "device-combo-bootstrap");
+        assert_eq!(combos.len(), 1, "another company's combo is never stored");
+        assert_eq!(combos["combo-21"]["price"], 450.0);
+        assert_eq!(combos["combo-21"]["entity_version"], 3);
+        assert_eq!(combos["combo-21"]["extra_charge"], 0.0, "an older server's combo without the field has none");
+        assert!(combos["combo-21"]["margin_percent"].is_null(), "an unset margin stays unset, never 0");
+        assert_eq!(combos["combo-21"]["items"][0]["product_on_device"], true);
+        assert_eq!(unapplied_reason(&path, "combo-22").as_deref(), Some("COMBO_OUTSIDE_COMPANY_SCOPE"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A bill with a combo stores and reads back every combo field, in cart order, and hands the
+    /// cloud the fields untouched.
+    #[test]
+    fn a_sale_with_combo_lines_stores_and_reads_back_its_combo_fields_in_cart_order() {
+        let path = sync_fix_path("combo-sale");
+        initialize_at(&path).expect("initialize");
+        complete_local_pos_sale_at(&path, combo_sale_payload("inv-combo-1")).expect("bill a combo");
+
+        let conn = Connection::open(&path).unwrap();
+        let bill = load_invoice_snapshot(&conn, "inv-combo-1").expect("read the bill");
+        let lines = bill["items"].as_array().expect("lines");
+        assert_eq!(
+            lines.iter().map(|line| line["id"].as_str().unwrap().to_string()).collect::<Vec<_>>(),
+            vec!["line-b-inv-combo-1", "line-a-inv-combo-1", "line-c-inv-combo-1"],
+            "lines come back in cart order, not id order"
+        );
+        let mango = &lines[0];
+        assert_eq!(mango["combo_line_key"], "combo-line-1");
+        assert_eq!(mango["combo_id"], "combo-12");
+        assert_eq!(mango["combo_name"], "Mango Shake");
+        assert_eq!(mango["combo_kind"], "JUICE");
+        assert_eq!(mango["combo_type"], "FIXED");
+        assert_eq!(mango["combo_qty"], 1.0);
+        assert_eq!(mango["combo_price"], 60.0);
+        assert_eq!(mango["line_index"], 0);
+        assert_eq!(mango["amount"], 54.0, "the allocated share is stored as billed");
+        let loose = &lines[2];
+        assert!(loose["combo_line_key"].is_null());
+        assert!(loose["combo_id"].is_null());
+        assert_eq!(loose["line_index"], 2);
+
+        // The outbox carries the sale as billed, combo fields included.
+        let payload: String = conn
+            .query_row("SELECT payload FROM sync_outbox WHERE operation_id = 'op-inv-combo-1'", [], |row| row.get(0))
+            .expect("outbox payload");
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["items"][1]["combo_line_key"], "combo-line-1");
+        assert_eq!(payload["items"][1]["combo_price"], 60);
+
+        // Every list path reads through the same snapshot.
+        let listed = list_local_pos_sales_between_at(&path, "2026-06-16", "2026-06-16").expect("list the day");
+        let listed_bill = listed
+            .iter()
+            .find(|row| row["invoice"]["id"] == "inv-combo-1")
+            .expect("the combo bill is listed");
+        assert_eq!(listed_bill["items"][0]["combo_id"], "combo-12");
+        drop(conn);
+
+        // A pulled cloud bill carries the fields too, and is never refused over them.
+        let mut remote = combo_sale_payload("inv-combo-remote");
+        remote["items"][2]["combo_qty"] = serde_json::json!("not a number");
+        let mut conn = Connection::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        apply_pulled_pos_sale_with_tx(
+            &tx,
+            &PulledChange {
+                change_id: serde_json::json!(1),
+                branch_id: Some(1),
+                entity_type: "pos_sale".to_string(),
+                entity_id: "inv-combo-remote".to_string(),
+                operation_type: "UPSERT".to_string(),
+                version: Some(1),
+                payload: remote,
+                updated_at: Some("2026-10-21T10:00:00.000Z".to_string()),
+            },
+        )
+        .expect("apply a pulled combo bill");
+        tx.commit().unwrap();
+        let pulled = load_invoice_snapshot(&conn, "inv-combo-remote").expect("read the pulled bill");
+        assert_eq!(pulled["items"][0]["combo_line_key"], "combo-line-1");
+        assert_eq!(pulled["items"][0]["line_index"], 0);
+        assert!(pulled["items"][2]["combo_qty"].is_null(), "an unreadable number is stored as nothing, not refused");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Ids minted back to back — inside one millisecond — never repeat. A multi-line cancel writes
+    /// one reversal movement per line in a single transaction, and used to fail on a duplicate id.
+    #[test]
+    fn local_ids_minted_in_the_same_millisecond_are_distinct() {
+        let ids: std::collections::HashSet<String> =
+            (0..2000).map(|_| unique_local_id("stock-reversal")).collect();
+        assert_eq!(ids.len(), 2000);
+    }
+
+    /// 4.3 kg less 0.7 kg is 3.5999999999999996 in a REAL. The last 3.6 kg must still sell, and the
+    /// lot must then read exactly 0 — not -0.0000000000000004, not 0.0000000000000004.
+    #[test]
+    fn a_lot_balance_with_float_noise_still_sells_its_last_thousandths() {
+        let path = sync_fix_path("lot-thousandths");
+        initialize_at(&path).expect("initialize");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for product in ["product-frac", "product-noise"] {
+                conn.execute("INSERT INTO local_products (id, product_name) VALUES (?1, 'Apples')", [product]).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO local_inventory_lots (id, cloud_id, branch_id, product_id, opening_qty, balance_qty)
+                 VALUES ('lot-frac', 'lot-frac', '1', 'product-frac', 4.3, 4.3)",
+                [],
+            )
+            .unwrap();
+            // The noisy figure itself, as a pull or an older build could have left it.
+            conn.execute(
+                "INSERT INTO local_inventory_lots (id, cloud_id, branch_id, product_id, opening_qty, balance_qty)
+                 VALUES ('lot-noise', 'lot-noise', '1', 'product-noise', 4.3, ?1)",
+                [4.3_f64 - 0.7_f64],
+            )
+            .unwrap();
+        }
+        let balance = |lot: &str| -> f64 {
+            Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT balance_qty FROM local_inventory_lots WHERE id = ?1", [lot], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(balance("lot-noise") < 3.6, "the seed really is the noisy figure");
+
+        complete_local_pos_sale_at(&path, sale_on_lot("inv-frac-1", "lot-frac", "product-frac", 0.7, "2026-10-01"))
+            .expect("sell 0.7 of 4.3");
+        assert_eq!(balance("lot-frac"), 3.6, "the new balance is written in thousandths");
+        complete_local_pos_sale_at(&path, sale_on_lot("inv-frac-2", "lot-frac", "product-frac", 3.6, "2026-10-01"))
+            .expect("sell the last 3.6");
+        assert_eq!(balance("lot-frac"), 0.0);
+
+        complete_local_pos_sale_at(&path, sale_on_lot("inv-noise-1", "lot-noise", "product-noise", 3.6, "2026-10-01"))
+            .expect("3.5999999999999996 is 3.600 in thousandths, and 3.6 sells");
+        assert_eq!(balance("lot-noise"), 0.0, "an empty lot reads exactly 0");
+        assert!(balance("lot-noise").is_sign_positive(), "never -0");
+
+        let error = complete_local_pos_sale_at(&path, sale_on_lot("inv-noise-2", "lot-noise", "product-noise", 0.001, "2026-10-01"))
+            .expect_err("a thousandth more than the lot holds is still refused");
+        assert!(error.contains("enough local stock"), "{error}");
+
+        // Giving the stock back keeps thousandths too.
+        cancel_local_pos_sale_at(
+            &path,
+            serde_json::json!({ "invoice_global_id": "inv-frac-2", "reason": "test", "operation_id": "op-cancel-frac" }),
+        )
+        .expect("cancel the 3.6 sale");
+        assert_eq!(balance("lot-frac"), 3.6);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A combo line is refused before anything is written when it cannot be grouped.
+    #[test]
+    fn a_combo_line_without_a_line_key_refuses_the_bill_and_writes_nothing() {
+        let path = sync_fix_path("combo-no-key");
+        initialize_at(&path).expect("initialize");
+        let mut sale = combo_sale_payload("inv-combo-nokey");
+        sale["items"][0].as_object_mut().unwrap().remove("combo_line_key");
+        let error = complete_local_pos_sale_at(&path, sale).expect_err("an ungroupable combo line is refused");
+        assert!(error.contains("combo_line_key"), "{error}");
+        let invoices: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM local_pos_invoices", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(invoices, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A combo line's rate is its share of the combo's price. It must never become the product's
+    /// counter price (or a new lot's) — loose mango stays at the owner's ₹120.
+    #[test]
+    fn a_combo_line_never_overwrites_the_products_counter_rate() {
+        let path = sync_fix_path("combo-rate");
+        initialize_at(&path).expect("initialize");
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO local_products (id, product_name, unit, sale_rate)
+                 VALUES ('product-combo-mango', 'Langda', 'KG', 120)",
+                [],
+            )
+            .unwrap();
+        complete_local_pos_sale_at(&path, combo_sale_payload("inv-combo-rate")).expect("bill a combo");
+
+        let conn = Connection::open(&path).unwrap();
+        let product_rate: Option<f64> = conn
+            .query_row("SELECT sale_rate FROM local_products WHERE id = 'product-combo-mango'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(product_rate, Some(120.0), "the ₹216 combo share is not loose mango's price");
+        let lot_rate: Option<f64> = conn
+            .query_row("SELECT sale_rate FROM local_inventory_lots WHERE id = 'lot-mango-inv-combo-rate'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(lot_rate, None, "a lot first seen on a combo line gets no price from it");
+        let milk_rate: Option<f64> = conn
+            .query_row("SELECT sale_rate FROM local_products WHERE id = 'product-combo-milk'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(milk_rate, None, "a product first seen on a combo line gets no price from it");
+        // A loose line keeps the behaviour it always had.
+        let loose_rate: Option<f64> = conn
+            .query_row("SELECT sale_rate FROM local_products WHERE id = 'product-combo-loose'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(loose_rate, Some(10.0));
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A bill with combo lines cannot be edited locally — and nor can an edit add a combo to a
+    /// plain bill. Either refusal leaves the bill, its stock and the outbox exactly as they were.
+    #[test]
+    fn a_local_edit_of_a_bill_with_combo_lines_is_refused_and_changes_nothing() {
+        let path = sync_fix_path("combo-edit");
+        initialize_at(&path).expect("initialize");
+        complete_local_pos_sale_at(&path, combo_sale_payload("inv-combo-edit")).expect("bill a combo");
+        let balance_before: f64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT balance_qty FROM local_inventory_lots WHERE id = 'lot-mango-inv-combo-edit'", [], |row| row.get(0))
+            .unwrap();
+
+        let mut edit = combo_sale_payload("inv-combo-edit");
+        edit["reason"] = serde_json::json!("customer changed mind");
+        edit["operation_id"] = serde_json::json!("op-edit-combo");
+        // Even an edit that drops the combo entirely is refused: the bill as stored has one.
+        let loose_line = edit["items"][2].clone();
+        edit["items"] = serde_json::json!([loose_line]);
+        let error = edit_local_pos_sale_at(&path, edit).expect_err("a combo bill cannot be edited");
+        assert_eq!(error, COMBO_BILL_EDIT_REFUSAL);
+
+        let conn = Connection::open(&path).unwrap();
+        let (status, lines, edits, balance_after): (String, i64, i64, f64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT status FROM local_pos_invoices WHERE id = 'inv-combo-edit'),
+                    (SELECT COUNT(*) FROM local_pos_invoice_items WHERE invoice_id = 'inv-combo-edit'),
+                    (SELECT COUNT(*) FROM sync_outbox WHERE operation_id = 'op-edit-combo'),
+                    (SELECT balance_qty FROM local_inventory_lots WHERE id = 'lot-mango-inv-combo-edit')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "COMPLETED");
+        assert_eq!(lines, 3);
+        assert_eq!(edits, 0, "a refused edit queues nothing for the cloud");
+        assert_eq!(balance_after, balance_before, "a refused edit gives no stock back");
+        drop(conn);
+
+        // A plain bill cannot be turned into a combo bill by an edit either.
+        complete_local_pos_sale_at(&path, test_sale_payload("inv-plain-edit", "op-plain-create", 1.0, 10.0))
+            .expect("bill a plain sale");
+        let mut edit = combo_sale_payload("inv-plain-edit");
+        edit["reason"] = serde_json::json!("add a shake");
+        let error = edit_local_pos_sale_at(&path, edit).expect_err("an edit cannot add a combo");
+        assert_eq!(error, COMBO_BILL_EDIT_REFUSAL);
+        let status: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT status FROM local_pos_invoices WHERE id = 'inv-plain-edit'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "COMPLETED");
+
+        // Cancelling a combo bill is still allowed.
+        cancel_local_pos_sale_at(
+            &path,
+            serde_json::json!({
+                "invoice_global_id": "inv-combo-edit",
+                "reason": "cancel and re-bill",
+                "operation_id": "op-cancel-combo"
+            }),
+        )
+        .expect("a combo bill can be cancelled");
         let _ = fs::remove_file(&path);
     }
 }

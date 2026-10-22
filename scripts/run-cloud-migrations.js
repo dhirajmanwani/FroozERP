@@ -93,6 +93,12 @@ const migrationFiles = [
   // does not exist there -- `verifyDeclaredSchema` refuses to start, and every product create or
   // edit would 500 on it once it did.
   "backend/migrations/cloud/023_product_pos_section.sql",
+  // 024 creates `combos` and `combo_items` (the Combos & Offers master) and adds the eight combo
+  // columns to `sale_items`. All of it is declared in `initializeDatabase()`, which never runs on a
+  // hosted deployment, so without this file none of it exists there -- `verifyDeclaredSchema`
+  // refuses to start, and once it did every desktop bill carrying a combo would fail to sync and
+  // the reference bootstrap would answer 500 on the missing table.
+  "backend/migrations/cloud/024_combos.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

@@ -137,7 +137,7 @@ test("reference and report startup loads are isolated and retain SQLite fallback
 });
 
 test("degraded mode keeps every main module and POS render path reachable", () => {
-  for (const view of ["dashboard", "products", "purchase", "pending-bills", "accounts", "returns", "waste", "sales", "discounts", "sale-rates", "expenses", "reports", "settings"]) {
+  for (const view of ["dashboard", "products", "purchase", "pending-bills", "accounts", "returns", "waste", "sales", "discounts", "combos", "sale-rates", "expenses", "reports", "settings"]) {
     assert.match(appSource, new RegExp(`activeView === \\"${view}\\"`));
   }
   assert.match(appSource, /<PosBilling/);

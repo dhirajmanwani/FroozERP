@@ -30,3 +30,11 @@ test("the browser checkout keeps the key until the save is confirmed", () => {
   assert.ok(post > 0);
   assert.match(app.slice(post, post + 300), /pendingCheckoutRef\.current = null;/);
 });
+
+test("a cart billed as a combo is a different bill from the same lines billed loose", () => {
+  const line = { product_id: "p", inventory_batch_id: "1", quantity: 1, selling_rate: 10, discount_amount: 0 };
+  assert.notEqual(
+    checkoutFingerprint({ cart: [line] }),
+    checkoutFingerprint({ cart: [{ ...line, combo_line_key: "K", combo_id: "combo-1" }] }),
+  );
+});

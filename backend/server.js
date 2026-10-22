@@ -80,6 +80,7 @@ const {
 const { normaliseLicenceRequest } = require("./activationLicenceRequest");
 const { validateProductPhoto } = require("./productPhoto");
 const { parsePosSection } = require("./productPosSection");
+const comboRules = require("./combos");
 const { parseBusinessLogo } = require("./businessLogo");
 const saleChangeApproval = require("./saleChangeApproval");
 const {
@@ -2478,6 +2479,46 @@ const initializeDatabase = async () => {
     CREATE INDEX IF NOT EXISTS charge_rate_slabs_type_idx
       ON charge_rate_slabs (charge_type_id, upto_value);
 
+    -- Combos & Offers (backend/combos.js). A combo is master data, like a product: company-wide,
+    -- published to every branch, filled into a rebuilt device by the reference bootstrap. Kind and
+    -- type carry no CHECK on purpose -- the route decides the allowed values, as for
+    -- products.pos_section -- so a new kind is not a second migration. extra_charge is a
+    -- CUSTOM combo's making/basket charge per combo, added into its price at the counter;
+    -- margin_percent is the combo's own margin (FIXED: the price suggestion's; CUSTOM: the extra %
+    -- on the items' sale rates), stored and never priced from by the server. Cloud
+    -- migration 024 carries exactly these statements; keep the two identical.
+    CREATE TABLE IF NOT EXISTS combos (
+      id SERIAL PRIMARY KEY,
+      global_id VARCHAR(80) UNIQUE,
+      company_id INTEGER,
+      name VARCHAR(120) NOT NULL,
+      kind VARCHAR(20) NOT NULL,
+      combo_type VARCHAR(10) NOT NULL,
+      price NUMERIC(14, 2),
+      extra_charge NUMERIC(14, 2) NOT NULL DEFAULT 0,
+      margin_percent NUMERIC(6, 2),
+      description TEXT,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      created_by INTEGER,
+      updated_by INTEGER,
+      created_at TIMESTAMP DEFAULT now(),
+      updated_at TIMESTAMP DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS combos_company_name_key
+      ON combos (COALESCE(company_id, 0), LOWER(name))
+      WHERE active;
+    CREATE TABLE IF NOT EXISTS combo_items (
+      id SERIAL PRIMARY KEY,
+      combo_id INTEGER NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      quantity NUMERIC(14, 3) NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS combo_items_combo_idx
+      ON combo_items (combo_id, sort_order);
+
     CREATE TABLE IF NOT EXISTS rebate_rules (
       id SERIAL PRIMARY KEY,
       rule_name VARCHAR(120) NOT NULL,
@@ -3987,6 +4028,17 @@ const initializeDatabase = async () => {
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS lot_discount_id INTEGER REFERENCES lot_discounts(id);
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS lot_discount_type VARCHAR(30);
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS lot_discount_value NUMERIC(14, 2) DEFAULT 0;
+    -- A line sold as part of a combo (backend/combos.js). combo_id is the combo's global id as the
+    -- counter sent it, not a foreign key: the line is a record of what was sold, and must survive
+    -- the combo being changed or switched off. line_index is cart order, on every line.
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS combo_line_key VARCHAR(80);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS combo_id VARCHAR(80);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS combo_name VARCHAR(120);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS combo_kind VARCHAR(20);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS combo_type VARCHAR(10);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS combo_qty NUMERIC(14, 3);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS combo_price NUMERIC(14, 2);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS line_index INTEGER;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS due_date DATE;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS credit_remarks TEXT;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS credit_status VARCHAR(30) DEFAULT 'PAID';
@@ -6239,8 +6291,14 @@ const getManualDiscountActor = async (userId, client = pool) => {
   return result.rows[0] || null;
 };
 
-/** A new bill's lines, as the 5% rule reads them (`discounts.assessManualDiscounts`). */
-const manualDiscountLinesOf = (invoiceItems) => (invoiceItems || []).map((item) => ({
+/**
+ * A new bill's lines, as the 5% rule reads them (`discounts.assessManualDiscounts`).
+ *
+ * A combo's lines (FIXED or CUSTOM) are left out: their price is the offer's, spread over the lines, and the
+ * paisa of rounding each one carries as `discount_amount` is not a cashier's discount
+ * (`combos.allocateFixedComboLines`).
+ */
+const manualDiscountLinesOf = (invoiceItems) => (invoiceItems || []).filter((item) => !comboRules.isComboPricedLine(item)).map((item) => ({
   productId: item.productId,
   inventoryBatchId: item.inventoryBatchId,
   quantity: item.quantity,
@@ -6333,6 +6391,73 @@ const recordManualDiscountDecision = async (client, { saleId, decision, assessme
     ]
   );
 };
+
+/**
+ * After a desktop bill is written: compare each combo on it with the combo master and record any
+ * difference on the bill's audit trail. Never refuses -- the bill is in the customer's hands, and a
+ * combo re-priced or switched off while the counter was offline was still sold at the price on the
+ * bill (`combos.checkComboGroups`). `COMBO_MISMATCH_ACCEPTED` when the master differs or the lines
+ * do not add up to the offer; `COMBO_UNKNOWN_ACCEPTED` when this company has no such combo.
+ *
+ * A bill with no combo line issues no query at all: every existing sale suite scripts its
+ * statements by position.
+ */
+const recordComboFindings = async (client, { saleId, invoiceItems, companyId, actorId }) => {
+  const comboItems = (invoiceItems || []).filter((item) => item?.combo);
+  if (comboItems.length === 0) return [];
+  const comboIds = [...new Set(comboItems.map((item) => item.combo.comboId).filter(Boolean))];
+  const masters = new Map();
+  if (comboIds.length > 0) {
+    const result = await client.query(comboRules.COMBOS_WITH_ITEMS_SQL, [parsePositiveInteger(companyId) || null, null, comboIds]);
+    for (const row of result.rows) masters.set(String(row.global_id), row);
+  }
+  const { findings } = comboRules.checkComboGroups(comboItems, masters);
+  for (const finding of findings) {
+    await client.query(
+      `
+      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
+      VALUES ($1, $2, 'combo', $3::jsonb, $4::jsonb, $5, $6)
+      `,
+      [
+        saleId,
+        finding.code,
+        JSON.stringify(finding.master),
+        JSON.stringify({ combo_line_key: finding.combo_line_key, combo_id: finding.combo_id, combo_name: finding.combo_name, reasons: finding.reasons, ...finding.billed }),
+        finding.code === comboRules.CODES.UNKNOWN_ACCEPTED
+          ? `Combo ${finding.combo_name || finding.combo_id || ""} is not in this shop's combos; accepted as billed`.replace(/\s+/g, " ")
+          : `Combo ${finding.combo_name || finding.combo_id || ""} did not match its master (${finding.reasons.join(", ")}); accepted as billed`.replace(/\s+/g, " "),
+        actorId || null,
+      ]
+    );
+  }
+  return findings;
+};
+
+/**
+ * A line's share of the bill discount, for its stored profit. Unchanged for a bill without a
+ * combo. With one, the offer's lines take none of it -- the bill-total slab does not apply to a
+ * combo that is already priced -- and the rest share it on their net, as before.
+ */
+const invoiceDiscountShareOf = (salePayload, item) => {
+  const invoiceItems = salePayload.invoiceItems || [];
+  if (!invoiceItems.some((entry) => comboRules.isComboPricedLine(entry))) {
+    const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
+    return subtotalAfterItemDiscounts === 0
+      ? 0
+      : roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / subtotalAfterItemDiscounts));
+  }
+  if (comboRules.isComboPricedLine(item)) return 0;
+  const base = roundCurrency(invoiceItems
+    .filter((entry) => !comboRules.isComboPricedLine(entry))
+    .reduce((sum, entry) => sum + Number(entry.netAmount || 0), 0));
+  return base > 0 ? roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / base)) : 0;
+};
+
+/** The refusal for an edit of a bill that has combo lines: cancel and re-bill instead. */
+const COMBO_BILL_EDIT_REFUSAL = Object.freeze({
+  code: comboRules.CODES.BILL_EDIT_UNSUPPORTED,
+  message: comboRules.MESSAGES.BILL_EDIT_UNSUPPORTED,
+});
 
 /** The browser path's refusal: roll back and answer 403 with the binding's code and reason. */
 const rejectSaleChange = async (client, res, approval) => {
@@ -6904,6 +7029,9 @@ const buildSalePayload = async (
     lotDiscountId: parsePositiveInteger(item.lot_discount_id),
     lotDiscountType: item.lot_discount_type ? String(item.lot_discount_type).trim().toUpperCase() : null,
     lotDiscountValue: parseNonNegativeNumber(item.lot_discount_value),
+    // The line's combo fields (null for a plain line) and its cart position, recorded as billed.
+    combo: comboRules.readSaleLineCombo(item),
+    lineIndex: comboRules.readLineIndex(item.line_index),
   }));
   const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
   const customerMobile = customer?.mobile?.trim() || null;
@@ -6916,7 +7044,10 @@ const buildSalePayload = async (
   ) {
     return { error: { status: 400, message: "Add valid products and quantities before checkout" } };
   }
-  const itemKeys = parsedItems.map((item) => `${item.productId}-${item.inventoryBatchId || "FIFO"}`);
+  // A combo line is exempt: two combos can draw on the same lot, or a combo and a loose kilo of the
+  // same fruit. Each line still takes its stock under its own FOR UPDATE below, so the lot is never
+  // drawn past what it holds.
+  const itemKeys = parsedItems.filter((item) => !item.combo).map((item) => `${item.productId}-${item.inventoryBatchId || "FIFO"}`);
   if (new Set(itemKeys).size !== itemKeys.length) {
     return { error: { status: 400, message: "Combine duplicate product lots into one cart item" } };
   }
@@ -7040,15 +7171,22 @@ const buildSalePayload = async (
         && roundCurrency(prior.selling_rate) === roundCurrency(sellingRate))
       : undefined;
     const keptBilledRate = Boolean(keptBilledLine);
-    const manualRateOverride = keptBilledRate
-      ? keptBilledLine.manual_rate_override === true
-      : hasRequestedRate
-        && !verifiedSpecialRate
-        && roundCurrency(sellingRate) !== roundCurrency(defaultSellingRate);
+    // A combo's line (FIXED or CUSTOM) is priced by the offer (`combos.allocateFixedComboLines`), not typed by
+    // the cashier: its rate is not an override, needs no override permission, and a component the
+    // offer gives away at 0 is not a zero-rate line. What it billed is checked as a group and
+    // audited by the caller (`checkComboGroups`), never refused here.
+    const comboPricedLine = comboRules.isComboPricedLine(requestedItem);
+    const manualRateOverride = comboPricedLine
+      ? false
+      : keptBilledRate
+        ? keptBilledLine.manual_rate_override === true
+        : hasRequestedRate
+          && !verifiedSpecialRate
+          && roundCurrency(sellingRate) !== roundCurrency(defaultSellingRate);
     if (!Number.isFinite(sellingRate) || sellingRate < 0) {
       return { error: { status: 400, message: `${product.product_name} does not have a valid selling rate` } };
     }
-    if (sellingRate === 0 && !(hasRequestedRate && (allowZeroRate || keptBilledRate || verifiedSpecialRate))) {
+    if (sellingRate === 0 && !(hasRequestedRate && (allowZeroRate || keptBilledRate || verifiedSpecialRate || comboPricedLine))) {
       return {
         error: {
           status: 400,
@@ -7062,7 +7200,12 @@ const buildSalePayload = async (
       return { error: { status: 403, message: "You do not have permission to change sale rate" } };
     }
 
-    const itemGross = roundCurrency(requestedItem.quantity * sellingRate);
+    // A combo line's amount is half up on the exact qty x rate (`combos.comboLineAmount`), as the
+    // allocation priced it; the float product misreads an exact half paisa and leaves the line a
+    // paisa off its share. A plain line is unchanged.
+    const itemGross = comboPricedLine
+      ? comboRules.comboLineAmount(requestedItem.quantity, sellingRate)
+      : roundCurrency(requestedItem.quantity * sellingRate);
     if (requestedItem.discountAmount > itemGross) {
       return { error: { status: 400, message: `Discount cannot exceed the value of ${product.product_name}` } };
     }
@@ -7177,9 +7320,12 @@ const buildSalePayload = async (
     device_id: cleanText(payment.device_id),
   }));
   const paidAmount = roundCurrency(parsedPayments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
+  // Compared in whole paise, keeping the one-paisa tolerance. As floats, 98.58 vs 98.59 is
+  // 0.010000000000005 > 0.01, and on the sync path that 400 is a permanent VALIDATION_ERROR for a
+  // bill the customer already has.
   if (
     parsedPayments.some((payment) => !allowedPaymentModes.has(payment.mode) || !payment.amount) ||
-    Math.abs(paidAmount - totalAmount) > 0.01
+    Math.abs(Math.round(paidAmount * 100) - Math.round(totalAmount * 100)) > 1
   ) {
     return { error: { status: 400, message: "Payment amounts must match the invoice total" } };
   }
@@ -10689,6 +10835,177 @@ app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res)
   }
 });
 
+// ---------------------------------------------------------------------------------------------
+// Combos & Offers: the master (backend/combos.js holds the rules).
+//
+// Reading needs only a session: the counter sells from it. Writing is Owner/Admin through
+// `requireRateManager`, like charge types and products -- a combo's price is a price. There is no
+// DELETE: `active: false` takes a combo off the POS and keeps every bill that sold it readable.
+//
+// Every create and update republishes the whole combo, items nested, with
+// `logMasterDataSyncChange` (one change row per branch, so every branch's counters hear it) as
+// entity type `combo`, which is in COMPANY_REFERENCE_ENTITY_TYPES. The reference bootstrap carries
+// the same shape under `combos`, so a rebuilt device is filled exactly as a running one is updated.
+//
+// The company is always `req.auth.companyId`; the actor is always `req.auth.userId`.
+// ---------------------------------------------------------------------------------------------
+
+const comboRefusal = (res, status, code, message) => res.status(status).json({ code, message });
+
+/** A combo row as the API, the sync change and the bootstrap hand it out. */
+const presentCombo = (row) => ({ ...row, unavailable_products: comboRules.unavailableProductsOf(row) });
+
+const loadCombosWithItems = async (client, { companyId, comboIds = null }) => {
+  const result = await client.query(comboRules.COMBOS_WITH_ITEMS_SQL, [companyId || null, comboIds, null]);
+  return result.rows.map(presentCombo);
+};
+
+const listCombosHandler = async (req, res) => {
+  try {
+    return res.json(await loadCombosWithItems(pool, { companyId: parsePositiveInteger(req.auth.companyId) }));
+  } catch (error) {
+    console.error("Loading combos failed", { code: error?.code, message: error?.message });
+    if (error?.code === "42P01") {
+      return comboRefusal(res, 500, "COMBO_STORAGE_MISSING", "Combos are not set up on this server yet. Ask the administrator to update the database.");
+    }
+    return comboRefusal(res, 500, "COMBO_LOAD_FAILED", "Combos could not be loaded.");
+  }
+};
+
+/** Create (POST, no `:id`) or replace (PUT `:id`, a numeric id or the global id) one combo, items and all. */
+const saveComboHandler = async (req, res) => {
+  const updating = req.params.id !== undefined;
+  const client = await pool.connect();
+  let began = false;
+  try {
+    const manager = await requireRateManager(req.auth.userId, client);
+    if (!manager) return comboRefusal(res, 403, comboRules.CODES.PERMISSION_REQUIRED, "Only the Owner or an Admin can manage combos and offers.");
+    const parsed = comboRules.validateComboInput(req.body);
+    if (!parsed.ok) return comboRefusal(res, 400, parsed.code, parsed.message);
+    const combo = parsed.value;
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    const rawComboRef = updating ? cleanText(String(req.params.id || "")) : "";
+    if (updating && !rawComboRef) return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
+
+    await client.query("BEGIN");
+    began = true;
+    let comboId = null;
+    if (updating) {
+      const existing = await client.query(
+        `SELECT id FROM combos
+         WHERE (($1::INTEGER IS NOT NULL AND id = $1) OR global_id = $2)
+           AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
+         FOR UPDATE`,
+        [/^\d+$/.test(rawComboRef) ? parsePositiveInteger(rawComboRef) : null, rawComboRef, companyId]
+      );
+      comboId = parsePositiveInteger(existing.rows[0]?.id);
+      if (!comboId) {
+        await client.query("ROLLBACK");
+        return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
+      }
+    }
+
+    // Each item's product, as the server knows it, and only from this company.
+    const productIds = [];
+    for (const item of combo.items) {
+      const productId = await resolveProductId(client, item.product_ref);
+      if (!productId) {
+        await client.query("ROLLBACK");
+        return comboRefusal(res, 400, comboRules.CODES.ITEM_INVALID, "A product in this combo was not found. Pick it again.");
+      }
+      productIds.push(productId);
+    }
+    if (new Set(productIds).size !== productIds.length) {
+      await client.query("ROLLBACK");
+      return comboRefusal(res, 400, comboRules.CODES.ITEM_INVALID, "A product appears twice in this combo. Put it once, with the total quantity.");
+    }
+    if (productIds.length > 0) {
+      const found = await client.query(
+        `SELECT id FROM products
+         WHERE id = ANY($1::INTEGER[])
+           AND deleted_at IS NULL
+           AND ($2::INTEGER IS NULL OR company_id IS NULL OR company_id = $2)`,
+        [productIds, companyId]
+      );
+      if (found.rows.length !== productIds.length) {
+        await client.query("ROLLBACK");
+        return comboRefusal(res, 400, comboRules.CODES.ITEM_INVALID, "A product in this combo was not found. Pick it again.");
+      }
+    }
+
+    if (updating) {
+      await client.query(
+        `UPDATE combos
+         SET name = $1, kind = $2, combo_type = $3, price = $4, extra_charge = $5, description = $6,
+             active = $7, sort_order = $8, updated_by = $9, updated_at = CURRENT_TIMESTAMP,
+             entity_version = COALESCE(entity_version, 1) + 1,
+             global_id = COALESCE(global_id, 'combo-' || id::TEXT),
+             margin_percent = $11
+         WHERE id = $10`,
+        [
+          combo.name, combo.kind, combo.combo_type, combo.price, combo.extra_charge, combo.description,
+          combo.active, combo.sort_order, manager.id, comboId, combo.margin_percent,
+        ]
+      );
+      await client.query("DELETE FROM combo_items WHERE combo_id = $1", [comboId]);
+    } else {
+      const created = await client.query(
+        `INSERT INTO combos (
+           company_id, name, kind, combo_type, price, extra_charge, description, active, sort_order,
+           created_by, updated_by, margin_percent
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING id`,
+        [
+          companyId, combo.name, combo.kind, combo.combo_type, combo.price, combo.extra_charge,
+          combo.description, combo.active, combo.sort_order, manager.id, manager.id, combo.margin_percent,
+        ]
+      );
+      comboId = parsePositiveInteger(created.rows[0]?.id);
+      await client.query("UPDATE combos SET global_id = 'combo-' || id::TEXT WHERE id = $1 AND global_id IS NULL", [comboId]);
+    }
+    for (const [index, item] of combo.items.entries()) {
+      await client.query(
+        "INSERT INTO combo_items (combo_id, product_id, quantity, sort_order) VALUES ($1, $2, $3, $4)",
+        [comboId, productIds[index], item.quantity, item.sort_order]
+      );
+    }
+
+    const [saved] = await loadCombosWithItems(client, { companyId, comboIds: [comboId] });
+    if (!saved) throw new Error("The combo just written could not be read back");
+    await logMasterDataSyncChange(client, {
+      branchId: parsePositiveInteger(req.auth.branchId) || 1,
+      entityType: "combo",
+      entityId: saved.global_id,
+      operationType: "UPSERT",
+      version: Number(saved.entity_version || 1),
+      payload: saved,
+    });
+    await client.query("COMMIT");
+    began = false;
+    return res.status(updating ? 200 : 201).json({ success: true, combo: saved });
+  } catch (error) {
+    if (began) await client.query("ROLLBACK").catch(() => null);
+    console.error("Saving a combo failed", { code: error?.code, message: error?.message, constraint: error?.constraint });
+    if (error?.code === "23505") {
+      return comboRefusal(res, 409, comboRules.CODES.NAME_TAKEN, "Another active combo already has this name. Choose a different name.");
+    }
+    if (error?.code === "23503") {
+      return comboRefusal(res, 400, comboRules.CODES.ITEM_INVALID, "A product in this combo was not found. Pick it again.");
+    }
+    if (error?.code === "42P01") {
+      return comboRefusal(res, 500, "COMBO_STORAGE_MISSING", "Combos are not set up on this server yet. Ask the administrator to update the database.");
+    }
+    return comboRefusal(res, 500, "COMBO_SAVE_FAILED", "The combo could not be saved.");
+  } finally {
+    client.release();
+  }
+};
+
+app.get("/api/v3/combos", listCombosHandler);
+app.post("/api/v3/combos", saveComboHandler);
+app.put("/api/v3/combos/:id", saveComboHandler);
+
 app.post("/settings/rebate-rules", async (req, res) => {
   try {
     const { rule_name, pay_within_days, rebate_percent, active } = req.body;
@@ -11527,6 +11844,9 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       lot_discount_id: item.lot_discount_id || null,
       lot_discount_type: item.lot_discount_type || null,
       lot_discount_value: item.lot_discount_value || 0,
+      // A combo's lines carry its fields (combos.js) and every line its cart position. Left off this
+      // list, they were dropped here and a combo reached the books as loose fruit at odd rates.
+      ...Object.fromEntries(comboRules.SALE_ITEM_COMBO_COLUMNS.map((field) => [field, item[field]])),
     })),
     branchId: context.branchId,
     createdBy: context.user.id,
@@ -11687,21 +12007,28 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     assessment: manualDiscountAssessment,
     actorId: context.user.id,
   });
+  // Combos are recorded as billed; any difference from the master goes on the audit trail.
+  await recordComboFindings(client, {
+    saleId: sale.id,
+    invoiceItems: salePayload.invoiceItems,
+    companyId: context.companyId,
+    actorId: context.user.id,
+  });
 
   for (const item of salePayload.invoiceItems) {
-    const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
-    const invoiceDiscountShare = subtotalAfterItemDiscounts === 0
-      ? 0
-      : roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / subtotalAfterItemDiscounts));
+    const invoiceDiscountShare = invoiceDiscountShareOf(salePayload, item);
     const itemProfit = roundCurrency(item.netAmount - invoiceDiscountShare - item.costAmount);
+    const comboOf = comboRules.comboFieldsOf(item);
     const saleItemResult = await client.query(
       `
       INSERT INTO sale_items (
         sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
         cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
-        lot_discount_id, lot_discount_type, lot_discount_value
+        lot_discount_id, lot_discount_type, lot_discount_value,
+        combo_line_key, combo_id, combo_name, combo_kind, combo_type, combo_qty, combo_price, line_index
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+              $16, $17, $18, $19, $20, $21, $22, $23)
       RETURNING id
       `,
       [
@@ -11720,6 +12047,14 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
         item.lotDiscountId || null,
         item.lotDiscountType || null,
         item.lotDiscountValue || 0,
+        comboOf.combo_line_key,
+        comboOf.combo_id,
+        comboOf.combo_name,
+        comboOf.combo_kind,
+        comboOf.combo_type,
+        comboOf.combo_qty,
+        comboOf.combo_price,
+        comboOf.line_index,
       ]
     );
     const saleItemId = saleItemResult.rows[0].id;
@@ -11877,6 +12212,16 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     : toDateKey(currentSale.sale_date);
   const editedInvoiceNo = `FZ-${requestedSaleDate.replaceAll("-", "")}-${String(currentSale.id).padStart(6, "0")}`;
   const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
+  // A bill with a combo is never edited, here or at the counter: cancel and re-bill instead. A
+  // combo's lines are an offer spread over fruit, and rebuilding them line by line is how an
+  // edit would quietly re-price it. Refused before anything is touched; a conflict, like a bill
+  // with returns, so the outbox shows it to a person rather than retrying it.
+  if (comboRules.anyComboLine(oldSnapshot.items) || comboRules.anyComboLine(sale.items || payload.items)) {
+    return {
+      ...rejectOperation(operation, COMBO_BILL_EDIT_REFUSAL.code, COMBO_BILL_EDIT_REFUSAL.message),
+      status: "conflict",
+    };
+  }
   await restoreSaleInventory(client, currentSale.id, editor.id, "Offline edit reversal for invoice", "IN");
   await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [currentSale.id]);
   await client.query("DELETE FROM sale_items WHERE sale_id = $1", [currentSale.id]);
@@ -12002,9 +12347,9 @@ const processPosSaleEditOperation = async (client, operation, context) => {
       INSERT INTO sale_items (
         sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
         cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
-        lot_discount_id, lot_discount_type, lot_discount_value
+        lot_discount_id, lot_discount_type, lot_discount_value, line_index
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       RETURNING id
       `,
       [
@@ -12012,6 +12357,8 @@ const processPosSaleEditOperation = async (client, operation, context) => {
         item.discountAmount, item.netAmount, item.costAmount, itemProfit,
         item.costStatus, item.defaultSellingRate, item.manualRateOverride,
         item.lotDiscountId || null, item.lotDiscountType || null, item.lotDiscountValue || 0,
+        // An edit never carries a combo (refused above); only the cart position is kept.
+        item.lineIndex ?? null,
       ]
     );
     const saleItemId = saleItemResult.rows[0].id;
@@ -21078,7 +21425,15 @@ app.get("/reports/summary", async (req, res) => {
                 'manual_rate_override', COALESCE(si.manual_rate_override, FALSE),
                 'lot_discount_id', si.lot_discount_id,
                 'lot_discount_type', si.lot_discount_type,
-                'lot_discount_value', COALESCE(si.lot_discount_value, 0)
+                'lot_discount_value', COALESCE(si.lot_discount_value, 0),
+                'combo_line_key', si.combo_line_key,
+                'combo_id', si.combo_id,
+                'combo_name', si.combo_name,
+                'combo_kind', si.combo_kind,
+                'combo_type', si.combo_type,
+                'combo_qty', si.combo_qty,
+                'combo_price', si.combo_price,
+                'line_index', si.line_index
               )
               ORDER BY si.id, sba.id
             ) FILTER (WHERE si.id IS NOT NULL),
@@ -22364,8 +22719,14 @@ const recalculateSalesForBatch = async (client, batchId) => {
         WHERE si.sale_id = $1
         GROUP BY si.id
       ),
+      -- The bill discount is shared over the loose lines only, as the bill booked it
+      -- (invoiceDiscountShareOf): a combo's lines are already priced and take none of it. A bill
+      -- with no combo is unchanged. Summed with CASE rather than filtered, so a combo-only bill
+      -- still has its row here and its lines' cost and profit are still updated.
       sale_subtotal AS (
-        SELECT sale_id, SUM(COALESCE(net_amount, amount)) AS subtotal
+        SELECT sale_id,
+               SUM(CASE WHEN COALESCE(combo_line_key, combo_id, combo_type) IS NULL
+                        THEN COALESCE(net_amount, amount) ELSE 0 END) AS subtotal
         FROM sale_items
         WHERE sale_id = $1
         GROUP BY sale_id
@@ -22377,7 +22738,7 @@ const recalculateSalesForBatch = async (client, batchId) => {
         profit = ROUND((
           COALESCE(si.net_amount, si.amount)
           - CASE
-              WHEN sale_subtotal.subtotal > 0
+              WHEN sale_subtotal.subtotal > 0 AND COALESCE(si.combo_line_key, si.combo_id, si.combo_type) IS NULL
               THEN COALESCE(s.invoice_discount_amount, 0) * (COALESCE(si.net_amount, si.amount) / sale_subtotal.subtotal)
               ELSE 0
             END
@@ -24098,6 +24459,12 @@ const createSaleHandler = async (req, res) => {
     if (!(await getStaffPermissionUser(req.auth.userId, "billing", client))) {
       return res.status(403).json({ code: "BILLING_PERMISSION_REQUIRED", message: "You do not have permission to create bills." });
     }
+    // Combos are sold from the counter app only (v1). This path has no combo pricing, so a combo
+    // line here would be billed as loose fruit at whatever rate it carried -- refused by name,
+    // before anything is opened.
+    if (comboRules.anyComboLine(req.body.items)) {
+      return res.status(400).json({ code: comboRules.CODES.COUNTER_ONLY, message: comboRules.MESSAGES.COUNTER_ONLY });
+    }
     const {
       product_id,
       quantity,
@@ -24166,6 +24533,7 @@ const createSaleHandler = async (req, res) => {
       requestedRate: item.selling_rate !== undefined && item.selling_rate !== null && String(item.selling_rate).trim() !== ""
         ? parseNonNegativeNumber(item.selling_rate)
         : null,
+      lineIndex: comboRules.readLineIndex(item.line_index),
     }));
     const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
     const customerMobile = customer?.mobile?.trim() || null;
@@ -24548,9 +24916,10 @@ const createSaleHandler = async (req, res) => {
       device_id: cleanText(payment.device_id),
     }));
     const paidAmount = roundCurrency(parsedPayments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
+    // Whole paise, one paisa of tolerance: as floats a 0.01 gap can read as 0.010000000000005.
     if (
       parsedPayments.some((payment) => !allowedPaymentModes.has(payment.mode) || !payment.amount) ||
-      Math.abs(paidAmount - totalAmount) > 0.01
+      Math.abs(Math.round(paidAmount * 100) - Math.round(totalAmount * 100)) > 1
     ) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Payment amounts must match the invoice total" });
@@ -24627,9 +24996,9 @@ const createSaleHandler = async (req, res) => {
         INSERT INTO sale_items (
           sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
           cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
-          lot_discount_id, lot_discount_type, lot_discount_value
+          lot_discount_id, lot_discount_type, lot_discount_value, line_index
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         RETURNING id
         `,
         [
@@ -24639,6 +25008,8 @@ const createSaleHandler = async (req, res) => {
           item.lotDiscountId || null,
           item.lotDiscountType || null,
           item.lotDiscountValue || 0,
+          // This path refuses combos (COMBO_COUNTER_ONLY); only the cart position is kept.
+          item.lineIndex ?? null,
         ]
       );
       const saleItemId = saleItemResult.rows[0].id;
@@ -24747,6 +25118,8 @@ const createSaleHandler = async (req, res) => {
           lot_discount_id: item.lotDiscountId || null,
           lot_discount_type: item.lotDiscountType || null,
           lot_discount_value: item.lotDiscountValue || 0,
+          // Every read returns the combo fields; a browser bill never has a combo, so they are null.
+          ...comboRules.comboFieldsOf(item),
         })),
         payments: parsedPayments,
         // The lines as they were written, not as Settings will describe them later.
@@ -24888,7 +25261,9 @@ const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, fla
       ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS cost_amount,
       ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS profit,
       si.cost_status,
-      COALESCE(si.manual_rate_override, FALSE) AS manual_rate_override
+      COALESCE(si.manual_rate_override, FALSE) AS manual_rate_override,
+      si.combo_line_key, si.combo_id, si.combo_name, si.combo_kind, si.combo_type,
+      si.combo_qty, si.combo_price, si.line_index
     FROM sales s
     LEFT JOIN customers c ON c.id = s.customer_id
     LEFT JOIN sale_items si ON si.sale_id = s.id
@@ -24940,7 +25315,15 @@ const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, fla
             'cost_amount', ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
             'profit', ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
             'cost_status', si.cost_status,
-            'manual_rate_override', COALESCE(si.manual_rate_override, FALSE)
+            'manual_rate_override', COALESCE(si.manual_rate_override, FALSE),
+            'combo_line_key', si.combo_line_key,
+            'combo_id', si.combo_id,
+            'combo_name', si.combo_name,
+            'combo_kind', si.combo_kind,
+            'combo_type', si.combo_type,
+            'combo_qty', si.combo_qty,
+            'combo_price', si.combo_price,
+            'line_index', si.line_index
           )
           ORDER BY si.id, sba.id
         ) FILTER (WHERE si.id IS NOT NULL),
@@ -25209,7 +25592,9 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
           COALESCE(returned.returned_quantity, 0) AS returned_quantity,
           si.selling_rate,
           COALESCE(si.net_amount, si.amount) AS net_amount,
-          si.cost_amount
+          si.cost_amount,
+          si.combo_line_key, si.combo_id, si.combo_name, si.combo_kind, si.combo_type,
+          si.combo_qty, si.combo_price, si.line_index
         FROM sale_items si
         JOIN sales s ON s.id = si.sale_id AND s.branch_id = $2
         JOIN products p ON p.id = si.product_id
@@ -25231,9 +25616,14 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
     // per unit (bill discount and Mandi Tax shared in -- see saleReturns.js), and
     // returnable_quantity is counted in whole thousandths, as the save checks it.
     const saleLines = itemsResult.rows.map((row) => ({ ...row, net_amount: row.line_net_amount }));
+    // A combo's line is shown (the screen groups it under its combo) but is not returnable: the
+    // save refuses it with COMBO_LINE_NOT_RETURNABLE, so the preview says 0 and names the reason.
     const items = itemsResult.rows.map(({ line_net_amount, quantity, amount, discount_amount, ...row }, index) => ({
       ...row,
-      returnable_quantity: saleReturnRules.returnableQuantity(row.sold_quantity, row.returned_quantity),
+      returnable_quantity: comboRules.isComboLine(row)
+        ? 0
+        : saleReturnRules.returnableQuantity(row.sold_quantity, row.returned_quantity),
+      not_returnable_code: comboRules.isComboLine(row) ? comboRules.CODES.LINE_NOT_RETURNABLE : null,
       refund_per_unit: saleReturnRules.refundPerUnit({ line: saleLines[index], saleLines, sale }),
     }));
     return res.json({ sale, items });
@@ -25334,7 +25724,10 @@ const createSaleReturnHandler = async (req, res) => {
     }
     // Every line of the bill, for its share of the bill discount and Mandi Tax.
     const saleLinesResult = await client.query(
-      "SELECT id, quantity, amount, discount_amount, net_amount FROM sale_items WHERE sale_id = $1 ORDER BY id",
+      // The combo fields too: a combo line takes no share of the bill discount (saleReturns.js).
+      `SELECT id, quantity, amount, discount_amount, net_amount,
+              combo_line_key, combo_id, combo_name, combo_kind, combo_type, combo_qty, combo_price
+       FROM sale_items WHERE sale_id = $1 ORDER BY id`,
       [saleId]
     );
     const saleLines = saleLinesResult.rows;
@@ -25391,6 +25784,12 @@ const createSaleReturnHandler = async (req, res) => {
         [saleItemId, saleId]
       );
       const saleItem = itemResult.rows[0];
+      // A combo's lines are not returned one by one (v1): the fruit was cut, juiced or packed into
+      // the offer, and its price is the offer's. Cancelling the whole bill is still allowed.
+      if (saleItem && comboRules.isComboLine(saleItem)) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ code: comboRules.CODES.LINE_NOT_RETURNABLE, message: comboRules.MESSAGES.LINE_NOT_RETURNABLE });
+      }
       const returnable = saleItem
         ? saleReturnRules.returnableThousandths(saleItem.quantity, saleItem.returned_quantity)
         : 0;
@@ -25711,6 +26110,8 @@ const updateSaleHandler = async (req, res) => {
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
     if (!reason) return res.status(400).json({ message: "Edit reason is required" });
     if (!editor) return res.status(403).json({ message: "You do not have permission to edit completed sales" });
+    // An edit cannot add a combo either; refused before anything is opened.
+    if (comboRules.anyComboLine(req.body.items)) return res.status(409).json({ ...COMBO_BILL_EDIT_REFUSAL });
 
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "pos_sale");
@@ -25781,6 +26182,11 @@ const updateSaleHandler = async (req, res) => {
     const editedInvoiceNo = `FZ-${requestedSaleDate.replaceAll("-", "")}-${String(saleId).padStart(6, "0")}`;
 
     const oldSnapshot = await getSaleSnapshot(client, saleId);
+    // A bill with a combo is never edited: cancel and re-bill instead (see the offline edit).
+    if (comboRules.anyComboLine(oldSnapshot.items)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ...COMBO_BILL_EDIT_REFUSAL });
+    }
     await restoreSaleInventory(client, saleId, editor.id, "Edit reversal for invoice", "IN");
     await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [saleId]);
     await client.query("DELETE FROM sale_items WHERE sale_id = $1", [saleId]);
@@ -25901,9 +26307,9 @@ const updateSaleHandler = async (req, res) => {
         INSERT INTO sale_items (
           sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
           cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
-          lot_discount_id, lot_discount_type, lot_discount_value
+          lot_discount_id, lot_discount_type, lot_discount_value, line_index
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         RETURNING id
         `,
         [
@@ -25911,6 +26317,8 @@ const updateSaleHandler = async (req, res) => {
           item.discountAmount, item.netAmount, item.costAmount, itemProfit,
           item.costStatus, item.defaultSellingRate, item.manualRateOverride,
           item.lotDiscountId || null, item.lotDiscountType || null, item.lotDiscountValue || 0,
+          // An edit never carries a combo (refused above); only the cart position is kept.
+          item.lineIndex ?? null,
         ]
       );
       const saleItemId = saleItemResult.rows[0].id;
@@ -26372,7 +26780,9 @@ app.get("/sales/:id", async (req, res) => {
           ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS cost_amount,
           ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS profit,
           si.cost_status, si.default_selling_rate, si.manual_rate_override,
-          si.lot_discount_id, si.lot_discount_type, si.lot_discount_value
+          si.lot_discount_id, si.lot_discount_type, si.lot_discount_value,
+          si.combo_line_key, si.combo_id, si.combo_name, si.combo_kind, si.combo_type,
+          si.combo_qty, si.combo_price, si.line_index
         FROM sale_items si
         JOIN products p ON p.id = si.product_id
         LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
@@ -26733,6 +27143,9 @@ module.exports = {
   // Exported so `saleReturns.test.js` can run the reversal against a real Postgres (PGlite) and see
   // that stock a return already put back is not put back again.
   restoreSaleInventory,
+  // Exported so `combos.test.js` can run the cost/profit re-share against PGlite and see that a
+  // combo's lines take no share of the bill discount there either.
+  recalculateSalesForBatch,
   // Exported so `salesSyncIntegrity.test.js` can drive how a desktop's product or lot id becomes
   // the server's, and the memo that keeps product-schema DDL off every request.
   resolveServerEntityId,

@@ -73,10 +73,27 @@ test("bootstrap captures canonical scope and reference records without writing c
         { id: 12, charge_type_id: 7, upto_value: "15.000", rate: "150.00", active: false },
       ],
     }] },
+    { rows: [
+      {
+        id: 3, global_id: "combo-3", company_id: 1, name: "Fruit Bowl", kind: "COMBO_OFFER", combo_type: "FIXED",
+        price: "199.00", extra_charge: "0.00", margin_percent: "35.00", active: true, entity_version: 2,
+        items: [
+          { product_id: 276, product_global_id: "product-276", product_name: "Apple", unit: "KG", product_active: true, quantity: 0.5, sort_order: 0 },
+          { product_id: 277, product_global_id: "product-277", product_name: "Kiwi", unit: "PCS", product_active: false, quantity: 2, sort_order: 1 },
+        ],
+      },
+      // Switched off, and still sent: "withdrawn" must be distinguishable from "never arrived".
+      {
+        id: 4, global_id: "combo-4", company_id: 1, name: "Diwali Gift Box", kind: "GIFTING", combo_type: "CUSTOM",
+        price: null, extra_charge: "50.00", margin_percent: "60.00", active: false, entity_version: 1, items: [],
+      },
+    ] },
   ];
+  const parameters = [];
   const client = {
-    query: async (sql) => {
+    query: async (sql, params) => {
       statements.push(sql);
+      parameters.push(params);
       return responses.shift();
     },
   };
@@ -104,6 +121,19 @@ test("bootstrap captures canonical scope and reference records without writing c
     true,
     "a price list is company-wide, so a re-priced charge must reach every counter, not just one branch",
   );
+
+  // Combos travel whole on the bootstrap, inactive ones too, items nested, in the shape
+  // `GET /api/v3/combos` and the `combo` sync change use -- read with the same SQL, company-scoped.
+  const comboStatement = statements.find((sql) => /FROM combos c/.test(sql));
+  assert.ok(comboStatement, "the combos were read");
+  assert.deepEqual(parameters[statements.indexOf(comboStatement)], [1, null, null], "this company, every combo");
+  assert.deepEqual(snapshot.combos.map((combo) => [combo.global_id, combo.active]), [["combo-3", true], ["combo-4", false]]);
+  assert.equal(snapshot.combos[0].items.length, 2);
+  assert.equal(snapshot.combos[0].items[0].product_global_id, "product-276");
+  assert.deepEqual(snapshot.combos[0].unavailable_products, ["Kiwi"], "a component that is off sale is named");
+  assert.equal(snapshot.combos[1].extra_charge, "50.00");
+  assert.equal(snapshot.combos[1].margin_percent, "60.00");
+  assert.equal(COMPANY_REFERENCE_ENTITY_TYPES.includes("combo"), true, "a combo is company-wide master data");
 });
 
 test("bootstrap boundary locks assignment and change-log writers", async () => {

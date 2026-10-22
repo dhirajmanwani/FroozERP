@@ -101,6 +101,54 @@ export function normalizePosSection(value) {
 
 export const POS_SECTION_STORAGE_KEY = "froozerp_pos_section";
 
+/**
+ * The tabs the POS counter shows, which are not quite the shelves above (21 Oct 2026, the owner).
+ *
+ * Frooz Bar and Frooz Moments sell things *made from* products — a juice, a cut-fruit bowl, a gift
+ * basket — so each shows its combos (local/combos.js) first and then any product still placed on
+ * that shelf. A fourth tab, Combos & Offers, holds the offer combos and **never products**: a
+ * product's chosen shelf is still one of `POS_SECTIONS`, so nothing can be filed there.
+ *
+ * `combosOnly` tabs exist only where combos are sold (the counter app); the browser POS hides them.
+ */
+export const POS_TABS = Object.freeze([
+  Object.freeze({ key: "retail", label: "Frooz Retail", blurb: "Loose fruit by weight or piece", products: true, comboKinds: Object.freeze([]), combosOnly: false }),
+  Object.freeze({ key: "bar", label: "Frooz Bar", blurb: "Juices, The Cutting, bottles, fruit chaat", products: true, comboKinds: Object.freeze(["JUICE", "THE_CUTTING"]), combosOnly: false }),
+  Object.freeze({ key: "moments", label: "Frooz Moments", blurb: "Gift baskets, gifting, occasions", products: true, comboKinds: Object.freeze(["GIFTING"]), combosOnly: false }),
+  Object.freeze({ key: "combos", label: "Combos & Offers", blurb: "Combo offers at one price", products: false, comboKinds: Object.freeze(["COMBO_OFFER"]), combosOnly: true }),
+]);
+
+const TAB_KEYS = new Set(POS_TABS.map((tab) => tab.key));
+
+/** The tabs this counter shows: all four where combos are sold, the three shelves elsewhere. */
+export const posTabsFor = ({ combosEnabled = false } = {}) => POS_TABS.filter((tab) => combosEnabled || !tab.combosOnly);
+
+export const posTabFor = (key) => POS_TABS.find((tab) => tab.key === key) || POS_TABS[0];
+
+/** A remembered tab, or Retail; the combos tab only where combos are sold. */
+export function normalizePosTab(value, { combosEnabled = false } = {}) {
+  const key = String(value ?? "").trim().toLowerCase();
+  if (!TAB_KEYS.has(key)) return DEFAULT_POS_SECTION;
+  if (posTabFor(key).combosOnly && !combosEnabled) return DEFAULT_POS_SECTION;
+  return key;
+}
+
+export function readPosTab(storage, options) {
+  try {
+    return normalizePosTab(storage?.getItem?.(POS_SECTION_STORAGE_KEY), options);
+  } catch {
+    return DEFAULT_POS_SECTION;
+  }
+}
+
+export function writePosTab(storage, key) {
+  try {
+    storage?.setItem?.(POS_SECTION_STORAGE_KEY, normalizePosTab(key, { combosEnabled: true }));
+  } catch {
+    // A counter with storage switched off still works; it just opens on Retail next time.
+  }
+}
+
 export function readPosSection(storage) {
   try {
     return normalizePosSection(storage?.getItem?.(POS_SECTION_STORAGE_KEY));
