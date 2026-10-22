@@ -8513,10 +8513,10 @@ button.shortcut-sheet-row:focus-visible {
 }
 
 .pos-sections-note {
-  flex: 0 0 auto;
+  display: block;
+  margin-top: 4px;
   color: var(--ink-muted);
   font-size: 12px;
-  white-space: nowrap;
 }
 
 .product-results .product-result {

@@ -8,12 +8,8 @@ import {
   POS_TABS,
   TILE_INK_DARK,
   TILE_INK_LIGHT,
-  chosenPosSection,
   normalizePosSection,
   normalizePosTab,
-  posSectionAutomatic,
-  posSectionCounts,
-  posSectionFor,
   posSectionLabel,
   posTileBadge,
   posTabsFor,
@@ -23,98 +19,62 @@ import {
   writePosTab,
 } from "./posSections.js";
 
-const product = (product_name, category_name = "Fruit") => ({ product_name, category_name });
+const app = () => readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
 
 test("the three shelves are the owner's names, in his order", () => {
   assert.deepEqual(POS_SECTIONS.map((section) => section.label), ["Frooz Retail", "Frooz Bar", "Frooz Moments"]);
   assert.equal(DEFAULT_POS_SECTION, "retail");
 });
 
-test("a category named after a shelf puts every product in it on that shelf", () => {
-  assert.deepEqual(posSectionFor(product("Alphonso Mango", "Frooz Bar")), { key: "bar", basis: "category", category: "Frooz Bar" });
-  assert.equal(posSectionFor(product("Alphonso Mango", "Frooz Moments")).key, "moments");
-  assert.equal(posSectionFor(product("Kesar Mango", "Juices")).key, "bar");
-  assert.equal(posSectionFor(product("Premium Box", "Gift Baskets")).key, "moments");
-  assert.equal(posSectionFor(product("Apple", "Frooz Retail")).key, "retail");
+// ---------------------------------------------------------------------------------------------
+// Fruits purchased -> Retail, Juices, Gift hampers, Offers (the owner, 22 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+test("only Frooz Retail lists products; the other tabs list combos of their kinds", () => {
+  assert.deepEqual(POS_TABS.map((tab) => tab.label), ["Frooz Retail", "Frooz Bar", "Frooz Moments", "Combos & Offers"]);
+  assert.deepEqual(POS_TABS.filter((tab) => tab.products).map((tab) => tab.key), ["retail"]);
+  assert.deepEqual(POS_TABS.find((tab) => tab.key === "retail").comboKinds, []);
+  assert.deepEqual(POS_TABS.find((tab) => tab.key === "bar").comboKinds, ["JUICE", "THE_CUTTING"]);
+  assert.deepEqual(POS_TABS.find((tab) => tab.key === "moments").comboKinds, ["GIFTING"]);
+  assert.deepEqual(POS_TABS.find((tab) => tab.key === "combos").comboKinds, ["COMBO_OFFER"]);
 });
 
-test("the category wins over the name, so the owner can always move a product", () => {
-  // Under the default "Fruit" category the name decides; a category naming a shelf overrides it.
-  assert.equal(posSectionFor(product("Mango Juice", "Fruit")).key, "bar");
-  assert.equal(posSectionFor(product("Mango Juice", "Frooz Retail")).key, "retail");
-  assert.equal(posSectionFor(product("Fruit Chaat Cup", "Frooz Moments")).key, "moments");
+test("the counter app shows four tabs; the browser, which cannot sell combos, shows Retail alone", () => {
+  assert.deepEqual(posTabsFor({ combosEnabled: true }).map((tab) => tab.key), ["retail", "bar", "moments", "combos"]);
+  assert.deepEqual(posTabsFor({ combosEnabled: false }).map((tab) => tab.key), ["retail"]);
 });
 
-test("a product in a plain category is placed by its own name", () => {
-  assert.equal(posSectionFor(product("Fruit Chaat")).key, "bar");
-  assert.equal(posSectionFor(product("Watermelon Juice 300ml Bottle")).key, "bar");
-  assert.equal(posSectionFor(product("Kids Lunch Box")).key, "bar");
-  assert.equal(posSectionFor(product("Diwali Gift Hamper")).key, "moments");
-  assert.equal(posSectionFor(product("Fruit Basket Large")).key, "moments");
-  assert.equal(posSectionFor(product("Juice Gift Hamper")).key, "moments", "a gift of juice is a gift");
-  assert.deepEqual(posSectionFor(product("Alphonso Mango")), { key: "retail", basis: "default", category: "Fruit" });
+test("POS puts every sellable product on Retail, whatever its stored pos_section, name or category", () => {
+  const source = app();
+  const results = source.slice(source.indexOf("const searchResults = useMemo("), source.indexOf("const choosePosSection ="));
+  assert.match(results, /posTabFor\(posSection\)\.products \? posMatches : \[\]/);
+  // The placement rules that filed a product on Bar or Moments are gone, not just unused.
+  assert.doesNotMatch(source, /posSectionFor|posSectionAutomatic|chosenPosSection|posSectionCounts|option\.section/);
+  assert.match(source, /posTileBadge\(product\.product_name\)/);
+  // The shelf is still cut from the counter-scoped sellable list, never from raw products.
+  const memo = source.slice(source.indexOf("const posMatches = useMemo("), source.indexOf("const posSearching ="));
+  assert.match(memo, /filterSellableProducts\(products, inventory, new Date\(\), counterScope\)/);
 });
 
-test("only whole words count, so fruit names never trip a shelf", () => {
-  assert.equal(posSectionFor(product("Barbados Cherry")).key, "retail");
-  assert.equal(posSectionFor(product("Custard Apple")).key, "retail");
-  assert.equal(posSectionFor(product("Cupid Grapes")).key, "retail");
-  assert.equal(posSectionFor(product("Bar Mango")).key, "retail", "\"bar\" names a shelf in a category, not an item in a name");
-  assert.equal(posSectionFor(product("Lunch Special Box")).key, "retail", "\"lunch box\" is a phrase, not two loose words");
+test("Product Master no longer offers a POS section, and a save no longer sends one", () => {
+  const source = app();
+  assert.doesNotMatch(source, /<Field label="POS section">/);
+  assert.doesNotMatch(source, /productPosSection/);
+  const save = source.slice(source.indexOf("const addProduct = async () =>"), source.indexOf("const resetProductForm = () =>"));
+  // Left out entirely, so the server keeps whatever an older build stored (PUT without the key).
+  assert.doesNotMatch(save, /pos_section/);
+  assert.match(source, /Every product is sold on the Frooz Retail tab\./);
 });
 
-test("the category may arrive as category or category_name", () => {
-  assert.equal(posSectionFor({ product_name: "Apple", category: "Frooz Bar" }).key, "bar");
-  assert.equal(posSectionFor({ product_name: "Apple" }).key, "retail");
-  assert.equal(posSectionFor(null).key, "retail");
+test("an empty combo tab points at Combos & Offers, never at a product setting", () => {
+  const source = app();
+  assert.doesNotMatch(source, /its POS section is/);
+  assert.match(source, /are set up yet\. The Owner or an Admin adds them in Combos & Offers\./);
 });
 
-test("a chosen POS section beats both the category and the name", () => {
-  // A Retail product that landed on Bar by its name, moved back by the owner, and the reverse.
-  assert.deepEqual(posSectionFor({ ...product("Mango Juice", "Fruit"), pos_section: "retail" }), { key: "retail", basis: "chosen", category: "Fruit" });
-  assert.equal(posSectionFor({ ...product("Alphonso Mango", "Frooz Retail"), pos_section: "bar" }).key, "bar");
-  assert.equal(posSectionFor({ ...product("Fruit Chaat", "Frooz Bar"), pos_section: "moments" }).key, "moments");
-  assert.equal(posSectionFor({ product_name: "Apple", category: "Juices", pos_section: "retail" }).category, "Juices");
-  // Automatic ignores the choice: it is what the form offers as "Automatic (now: ...)".
-  assert.deepEqual(posSectionAutomatic({ ...product("Mango Juice", "Fruit"), pos_section: "retail" }), { key: "bar", basis: "name", category: "Fruit" });
-  assert.deepEqual(
-    posSectionCounts([{ ...product("Mango Juice"), pos_section: "retail" }, product("Apple")]),
-    { retail: 2, bar: 0, moments: 0 },
-  );
-});
-
-test("the chosen section is case-insensitive, and an invalid or empty one falls through to automatic", () => {
-  assert.equal(posSectionFor({ ...product("Apple"), pos_section: " BAR " }).key, "bar");
-  assert.equal(posSectionFor({ ...product("Apple"), pos_section: "Moments" }).basis, "chosen");
-  for (const value of [null, undefined, "", "   ", "juices", "automatic", 0]) {
-    // Not pinned to Retail the way normalizePosSection would: the name still decides.
-    assert.deepEqual(posSectionFor({ ...product("Fruit Chaat"), pos_section: value }), { key: "bar", basis: "name", category: "Fruit" }, String(value));
-    assert.equal(chosenPosSection({ pos_section: value }), null);
-  }
-  assert.equal(chosenPosSection(null), null);
-  assert.equal(chosenPosSection({ pos_section: "Retail" }), "retail");
-});
-
-test("Product Master lets the owner choose the POS section and sends it with the product", () => {
-  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
-  const save = app.slice(app.indexOf("const addProduct = async () =>"), app.indexOf("const resetProductForm = () =>"));
-  assert.match(save, /pos_section: productPosSection \|\| null/);
-  const reset = app.slice(app.indexOf("const resetProductForm = () =>"), app.indexOf("const saveProductCategory = async () =>"));
-  assert.match(reset, /setProductPosSection\(""\)/);
-  const edit = app.slice(app.indexOf("const editProduct = (product) =>"), app.indexOf("const cancelProductEdit = () =>"));
-  assert.match(edit, /setProductPosSection\(chosenPosSection\(product\) \|\| ""\)/);
-  assert.match(app, /<Field label="POS section">\s*<select value=\{productPosSection\}/);
-  assert.match(app, /Automatic \(now: \$\{posSectionLabel\(posSectionAutomatic\(/);
-  // The empty-shelf hint no longer tells the owner to rename a category to move a product.
-  assert.doesNotMatch(app, /its category is named/);
-});
-
-test("counts carry every shelf, zero included", () => {
-  assert.deepEqual(posSectionCounts([]), { retail: 0, bar: 0, moments: 0 });
-  assert.deepEqual(
-    posSectionCounts([product("Apple"), product("Mango"), product("Fruit Chaat"), product("Gift Basket")]),
-    { retail: 2, bar: 1, moments: 1 },
-  );
+test("a stored shelf that is not Retail is just a remembered value; normalising never invents one", () => {
+  assert.equal(normalizePosSection("combos"), "retail");
+  assert.equal(normalizePosSection(" MOMENTS "), "moments");
 });
 
 test("the remembered shelf survives bad or missing storage", () => {
@@ -142,17 +102,6 @@ test("a tile shows the fruit's colour and first letter, readable on either", () 
   assert.equal(posTileBadge("").letter, "?");
 });
 
-test("POS wires the shelves in without widening the counter's stock scope", () => {
-  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
-  assert.match(app, /from "\.\/local\/posSections"/);
-  assert.match(app, /POS_SECTIONS\.map\(\(section\) =>/);
-  assert.match(app, /posMatches\.filter\(\(option\) => option\.section\.key === posSection\)/);
-  assert.match(app, /posTileBadge\(product\.product_name\)/);
-  // The shelf is still cut from the counter-scoped sellable list, never from raw products.
-  const memo = app.slice(app.indexOf("const posMatches = useMemo("), app.indexOf("const posSearching ="));
-  assert.match(memo, /filterSellableProducts\(products, inventory, new Date\(\), counterScope\)/);
-});
-
 test("saving a product on the desktop pulls it at once, so POS shows the new section", () => {
   const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
   const start = app.indexOf('const savedMessage = wasEditing ? "Product Updated" : "Product Added";');
@@ -162,28 +111,12 @@ test("saving a product on the desktop pulls it at once, so POS shows the new sec
   assert.match(after, /runSyncNow\(\{ force: true \}\)\.catch/);
 });
 
-// ---------------------------------------------------------------------------------------------
-// POS tabs (Combos & Offers, 21 Oct 2026)
-// ---------------------------------------------------------------------------------------------
-
-test("the counter app shows four tabs; the browser keeps the three shelves", () => {
-  assert.deepEqual(POS_TABS.map((tab) => tab.label), ["Frooz Retail", "Frooz Bar", "Frooz Moments", "Combos & Offers"]);
-  assert.deepEqual(posTabsFor({ combosEnabled: true }).map((tab) => tab.key), ["retail", "bar", "moments", "combos"]);
-  assert.deepEqual(posTabsFor({ combosEnabled: false }).map((tab) => tab.key), ["retail", "bar", "moments"]);
-  assert.deepEqual(POS_TABS.find((tab) => tab.key === "bar").comboKinds, ["JUICE", "THE_CUTTING"]);
-  assert.deepEqual(POS_TABS.find((tab) => tab.key === "moments").comboKinds, ["GIFTING"]);
-  assert.equal(POS_TABS.find((tab) => tab.key === "combos").products, false);
-});
-
-test("a product can never be filed on the combos tab", () => {
-  assert.equal(chosenPosSection({ pos_section: "combos" }), null);
-  assert.equal(normalizePosSection("combos"), "retail");
-});
-
-test("the combos tab is remembered only where combos are sold", () => {
+test("a combos-only tab is remembered only where combos are sold", () => {
   assert.equal(normalizePosTab("combos", { combosEnabled: true }), "combos");
   assert.equal(normalizePosTab("combos", { combosEnabled: false }), "retail");
-  assert.equal(normalizePosTab("bar"), "bar");
+  assert.equal(normalizePosTab("bar", { combosEnabled: true }), "bar");
+  assert.equal(normalizePosTab("bar"), "retail", "the browser has no Bar tab: it sells no combos");
+  assert.equal(normalizePosTab("moments", { combosEnabled: false }), "retail");
   const store = new Map();
   const storage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) };
   writePosTab(storage, "combos");

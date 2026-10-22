@@ -174,7 +174,7 @@ import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProdu
 import { findDuplicateProductName, isSameProduct, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
-import { POS_SECTIONS, chosenPosSection, posSectionAutomatic, posSectionCounts, posSectionFor, posSectionLabel, posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
+import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
 import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -2718,8 +2718,6 @@ function App() {
   // The POS shelf chosen for the product: "" is Automatic (placed by category and name). The
   // second flag is false only while editing a product whose loaded record did not say what its
   // shelf is (an older snapshot); the save then leaves the stored choice alone unless it is changed.
-  const [productPosSection, setProductPosSection] = useState("");
-  const [productPosSectionKnown, setProductPosSectionKnown] = useState(true);
   const [addOpeningStock, setAddOpeningStock] = useState(false);
   const [openingStockLots, setOpeningStockLots] = useState([]);
   const [openingStockDraft, setOpeningStockDraft] = useState({
@@ -7809,9 +7807,6 @@ function App() {
         created_by: user.id,
         updated_by: user.id,
         opening_stock_lots: !editingProductId ? normalizedOpeningStockLots : [],
-        // null is Automatic. Left out only when an edit never learned the stored choice, so a
-        // save from an older snapshot cannot quietly reset a shelf the owner chose.
-        ...(productPosSectionKnown ? { pos_section: productPosSection || null } : {}),
       };
       let savedProductId = null;
       let savedProductGlobalId = null;
@@ -7893,8 +7888,6 @@ function App() {
     setProductMinimumStock("");
     setProductActive(true);
     setProductRemarks("");
-    setProductPosSection("");
-    setProductPosSectionKnown(true);
     setAddOpeningStock(false);
     setOpeningStockLots([]);
     setOpeningStockDraft({
@@ -8886,8 +8879,6 @@ function App() {
     setProductMinimumStock(product.minimum_stock || "");
     setProductActive(product.active !== false);
     setProductRemarks(product.remarks || "");
-    setProductPosSection(chosenPosSection(product) || "");
-    setProductPosSectionKnown(Object.prototype.hasOwnProperty.call(product, "pos_section"));
     setAddOpeningStock(false);
     setOpeningStockLots([]);
     setShowOpeningLotForm(false);
@@ -9595,9 +9586,6 @@ function App() {
   const productEditingName = editingProductId
     ? (products.find((product) => isSameProduct(product, editingProductKeys))?.product_name || productName.trim() || "product")
     : "";
-  // The category the form would save, so "Automatic (now: ...)" tracks the form as it is filled in.
-  const productCategoryFormName = productCategories.find((category) => String(category.id) === String(productCategoryId))?.category_name
-    || newProductCategoryName.trim() || productCategory.trim();
   const lotPanelAcceptsNewLot = lotPanelMatchesEdit({ editingProductId, editingProductKeys, lotPanelProduct });
   const productMoreColumnHeaders = showMoreProductColumns ? ["Barcode", "Origin", "Low-stock alert at", "Lots"] : [];
   const lotSearchText = lotListSearch.trim().toLowerCase();
@@ -10354,7 +10342,7 @@ function App() {
                         const lowStock = isLowStock(product);
                         const unitName = unitDisplayName(product.unit);
                         const stockText = formatOptionalQuantity(product.current_stock);
-                        const productNote = [productCategoryLabel(product), posSectionLabel(posSectionFor(product).key), String(product.remarks || "").trim()].filter(Boolean).join(" · ");
+                        const productNote = [productCategoryLabel(product), String(product.remarks || "").trim()].filter(Boolean).join(" · ");
                         return (
                           <tr key={product.id}>
                             <td>
@@ -10435,14 +10423,8 @@ function App() {
                             {PRODUCT_UNITS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                           </select>
                         </Field>
-                        <Field label="POS section">
-                          <select value={productPosSection} onChange={(event) => { setProductPosSection(event.target.value); setProductPosSectionKnown(true); }}>
-                            <option value="">{`Automatic (now: ${posSectionLabel(posSectionAutomatic({ product_name: productName, category: productCategoryFormName }).key)})`}</option>
-                            {POS_SECTIONS.map((section) => <option key={section.key} value={section.key}>{section.label}</option>)}
-                          </select>
-                        </Field>
                       </div>
-                      <p className="pm-hint">POS section decides which POS tab the product shows on. Automatic places it by its category and name; choose a section to move it.</p>
+                      <p className="pm-hint">Every product is sold on the Frooz Retail tab. Juices, The Cutting, gift hampers and offers are made from products in Combos &amp; Offers.</p>
                       <div className="product-photo-field">
                         <span className="product-photo-label">Photo</span>
                         <div className="product-photo-row">
@@ -25247,13 +25229,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         key: `product-${product.id}`,
         product,
         lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length,
-        section: posSectionFor(product),
       }));
   }, [counterScope, inventory, lotsByProduct, products, search]);
-  // A search looks across all three shelves, because a cashier typing "mango" on the Bar shelf
-  // wants the mango, not an empty screen. With no search the chosen shelf is shown whole.
+  // A search looks across every tab, because a cashier typing "mango" on the Bar tab wants the
+  // mango, not an empty screen. With no search the chosen tab is shown whole.
   const posSearching = Boolean(search.trim());
-  const posShelfCounts = useMemo(() => posSectionCounts(posMatches.map((option) => option.product)), [posMatches]);
   const posTabs = posTabsFor({ combosEnabled });
   /**
    * The combos this counter sells (local/combos.js), each with the tab it sits on and whether the
@@ -25283,14 +25263,15 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       : ""),
     [counterScope, inventory, products, shelf],
   );
-  // A tab shows its combos first, then the products placed on it; the combos tab, combos only. While
-  // a customer's-choice combo is being filled, every sellable product is offered, whatever its tab.
+  // Frooz Retail shows every sellable product; the other tabs show only combos of their kinds
+  // (local/posSections.js). While a customer's-choice combo is being filled, every sellable product
+  // is offered, whatever the tab.
   const searchResults = useMemo(() => {
     if (customBuild) return posSearching ? posMatches.slice(0, 24) : posMatches;
     if (posSearching) return [...comboOptions, ...posMatches].slice(0, 24);
     return [
       ...comboOptions.filter((option) => option.tab === posSection),
-      ...(posTabFor(posSection).products ? posMatches.filter((option) => option.section.key === posSection) : []),
+      ...(posTabFor(posSection).products ? posMatches : []),
     ];
   }, [comboOptions, customBuild, posMatches, posSearching, posSection]);
   const choosePosSection = (key) => {
@@ -26550,11 +26531,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 title={section.blurb}
               >
                 <strong>{section.label}</strong>
-                <span>{(section.products ? posShelfCounts[section.key] || 0 : 0) + (comboTabCounts[section.key] || 0)}</span>
+                <span>{(section.products ? posMatches.length : 0) + (comboTabCounts[section.key] || 0)}</span>
               </button>
             ))}
-            {posSearching && !customBuild && <small className="pos-sections-note">Searching all sections</small>}
           </div>
+          {/* Its own line: inside the tab strip it was clipped once four tabs filled the row. With one
+              tab (the browser) there is nothing else to search, so neither it nor the tile chips show. */}
+          {posSearching && !customBuild && posTabs.length > 1 && <small className="pos-sections-note">Searching all sections</small>}
           {customBuild && (
             <div className="pos-combo-build" role="status">
               <span>
@@ -26571,7 +26554,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             </div>
           )}
           {combosEnabled && combos?.status !== "ready" && (
-            <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Frooz Bar, Frooz Moments and Combos &amp; Offers tabs show products only. Press Sync now, then open POS again.</p>
+            <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Frooz Bar, Frooz Moments and Combos &amp; Offers tabs are empty. Press Sync now, then open POS again.</p>
           )}
           <div className="product-results">
             {searchResults.map((option, index) => {
@@ -26598,7 +26581,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                       <span className="product-result-meta">
                         <span>{COMBO_KIND_LABELS[combo.kind]}</span>
                         <span>{fixed ? `${combo.items.length} item${combo.items.length === 1 ? "" : "s"}` : "Customer's choice"}</span>
-                        {posSearching && <span className="product-result-section">{posTabFor(option.tab).label}</span>}
+                        {posSearching && posTabs.length > 1 && <span className="product-result-section">{posTabFor(option.tab).label}</span>}
                       </span>
                       <small>{fixed ? `${currency.format(combo.price)} each` : `One price: ${describeCustomPricing({ marginPercent: combo.margin_percent, extraCharge: combo.extra_charge }, (value) => currency.format(value))}`}</small>
                     </span>
@@ -26636,7 +26619,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                       <span>{activeLots.length} available lot{activeLots.length === 1 ? "" : "s"}</span>
                       <span>Stock: {stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span>
                       <span>Unit: {product.unit || "Unit"}</span>
-                      {posSearching && <span className="product-result-section">{posSectionLabel(option.section.key)}</span>}
+                      {posSearching && posTabs.length > 1 && <span className="product-result-section">{posTabFor("retail").label}</span>}
                     </span>
                     <small>Rate: {rateLabel}{discountedCount ? ` - ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
                   </span>
@@ -26647,15 +26630,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             {searchResults.length === 0 && !posSearching && shelf.usable && (
               // An empty shelf is not an empty shop: say how a product gets onto it.
               <div className="cart-empty">
-                {posEmptyReason
-                  ? posEmptyReason
-                  : posSection === "retail"
-                    ? "Nothing in Frooz Retail has stock right now."
-                    : posSection === "combos"
-                      ? "No Combos & Offers are set up yet. The Owner or an Admin adds them in Combos & Offers."
-                      : combosEnabled
-                        ? `Nothing on ${posSectionLabel(posSection)} right now. ${posSection === "bar" ? "Juices and The Cutting" : "Gift baskets"} are set up in Combos & Offers; a product also appears here when its POS section is ${posSectionLabel(posSection)} (choose it in Product Master, Edit) and it has a lot in stock.`
-                        : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its POS section is ${posSectionLabel(posSection)} (choose it in Product Master, Edit) and it has a lot in stock.`}
+                {posSection === "retail"
+                  ? (posEmptyReason || "Nothing in Frooz Retail has stock right now.")
+                  : `No ${posSection === "bar" ? "juices or The Cutting" : posSection === "moments" ? "gift hampers" : "combo offers"} are set up yet. The Owner or an Admin adds them in Combos & Offers.`}
               </div>
             )}
             {searchResults.length === 0 && (posSearching || !shelf.usable) && (
