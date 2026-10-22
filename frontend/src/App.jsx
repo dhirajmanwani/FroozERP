@@ -15756,8 +15756,8 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const emptyText = view.level === "types"
     ? "No packing set up yet. Add a packing type (for example Gift Box, Basket, Bottle or Bowl) to start."
     : view.level === "designs"
-      ? `No designs under ${view.type?.name || "this type"} yet. Add one.`
-      : `No sizes under ${view.design?.name || "this design"} yet. Add Petite, Classic, Grand or Royal.`;
+      ? `No designs under ${view.type?.name || "this type"} yet. Press "Add design" below.`
+      : `No sizes under ${view.design?.name || "this design"} yet. Press "Add size" below and pick Petite, Classic, Grand or Royal.`;
 
   return (
     <section className="settings-layout">
@@ -15945,6 +15945,12 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                       </li>
                     ))}
                   </ul>
+                )}
+                {canManage && !firstLoad && (
+                  // The header button is easy to miss, and an empty level is exactly when it is needed.
+                  <button className="secondary-button compact-button packing-add-here" disabled={busy || disabled} type="button" onClick={() => startNode(levelKind)}>
+                    <Icon name="add" size={14} />{`Add ${PACK_NODE_WORDS[levelKind]}${view.level !== "types" && view.crumbs.length > 1 ? ` in ${view.crumbs[view.crumbs.length - 1].label}` : ""}`}
+                  </button>
                 )}
                 <small className="form-note">→ opens, ← goes back, ↑ ↓ move. Counts are this branch's.</small>
               </div>
