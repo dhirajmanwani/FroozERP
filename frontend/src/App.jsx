@@ -26534,8 +26534,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 <span>{(section.products ? posMatches.length : 0) + (comboTabCounts[section.key] || 0)}</span>
               </button>
             ))}
-            {posSearching && !customBuild && <small className="pos-sections-note">Searching all sections</small>}
           </div>
+          {/* Its own line: inside the tab strip it was clipped once four tabs filled the row. With one
+              tab (the browser) there is nothing else to search, so neither it nor the tile chips show. */}
+          {posSearching && !customBuild && posTabs.length > 1 && <small className="pos-sections-note">Searching all sections</small>}
           {customBuild && (
             <div className="pos-combo-build" role="status">
               <span>
@@ -26579,7 +26581,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                       <span className="product-result-meta">
                         <span>{COMBO_KIND_LABELS[combo.kind]}</span>
                         <span>{fixed ? `${combo.items.length} item${combo.items.length === 1 ? "" : "s"}` : "Customer's choice"}</span>
-                        {posSearching && <span className="product-result-section">{posTabFor(option.tab).label}</span>}
+                        {posSearching && posTabs.length > 1 && <span className="product-result-section">{posTabFor(option.tab).label}</span>}
                       </span>
                       <small>{fixed ? `${currency.format(combo.price)} each` : `One price: ${describeCustomPricing({ marginPercent: combo.margin_percent, extraCharge: combo.extra_charge }, (value) => currency.format(value))}`}</small>
                     </span>
@@ -26617,7 +26619,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                       <span>{activeLots.length} available lot{activeLots.length === 1 ? "" : "s"}</span>
                       <span>Stock: {stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span>
                       <span>Unit: {product.unit || "Unit"}</span>
-                      {posSearching && <span className="product-result-section">{posTabFor("retail").label}</span>}
+                      {posSearching && posTabs.length > 1 && <span className="product-result-section">{posTabFor("retail").label}</span>}
                     </span>
                     <small>Rate: {rateLabel}{discountedCount ? ` - ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
                   </span>
