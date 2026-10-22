@@ -10973,8 +10973,21 @@ const saveComboHandler = async (req, res) => {
 
     const [saved] = await loadCombosWithItems(client, { companyId, comboIds: [comboId] });
     if (!saved) throw new Error("The combo just written could not be read back");
+    // Anchored on a branch of the combo's own company: `logMasterDataSyncChange` takes the company
+    // from the anchor and fans out to that company's other branches, so an anchor in another
+    // company (a session with no branch fell back to branch 1) would publish the combo to devices
+    // that cannot use it and to none of the ones that sell it.
+    const anchor = companyId
+      ? await client.query(
+        `SELECT id FROM branches
+         WHERE company_id = $1
+         ORDER BY (id = $2) DESC, (active IS DISTINCT FROM FALSE) DESC, id
+         LIMIT 1`,
+        [companyId, parsePositiveInteger(req.auth.branchId)]
+      )
+      : { rows: [] };
     await logMasterDataSyncChange(client, {
-      branchId: parsePositiveInteger(req.auth.branchId) || 1,
+      branchId: parsePositiveInteger(anchor.rows[0]?.id) || parsePositiveInteger(req.auth.branchId) || 1,
       entityType: "combo",
       entityId: saved.global_id,
       operationType: "UPSERT",

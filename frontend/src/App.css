@@ -8519,6 +8519,11 @@ button.shortcut-sheet-row:focus-visible {
   font-size: 12px;
 }
 
+/* A combo whose fruit is gone: named above the tiles with what stops it (owner, 22 Oct 2026). */
+.pos-combo-problems svg {
+  vertical-align: -2px;
+}
+
 .product-results .product-result {
   grid-template-columns: 64px minmax(0, 1fr) auto;
 }

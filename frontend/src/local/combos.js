@@ -510,6 +510,19 @@ const cartThousandthsFor = (cart, matches) => (Array.isArray(cart) ? cart : [])
 const formatQuantity = (thousandths) => fromThousandths(thousandths).toLocaleString("en-IN", { maximumFractionDigits: 3 });
 
 /**
+ * A product's lots on this counter's shelf that can be sold now, oldest first. A lot kept in
+ * another unit cannot make up a quantity written in the product's unit, so it is left out.
+ */
+const productShelfLots = (shelfLots, product, now) => {
+  const unit = text(product?.unit).toLowerCase();
+  return shelfLots
+    .filter((lot) => inventoryIdsEqual(lot?.product_id, product?.id))
+    .filter((lot) => !text(lot?.unit) || !unit || text(lot.unit).toLowerCase() === unit)
+    .filter((lot) => lotAvailableQuantity(lot, now) > 0)
+    .sort(fifoLotOrder);
+};
+
+/**
  * Take `combo × comboQty` from the shelf, oldest lot first, without touching anything.
  *
  * `lots` are the POS shelf's lots (already this counter's), narrowed by `scope` again here as POS
@@ -542,13 +555,7 @@ export const pickFixedCombo = ({ combo, comboQty = 1, products = [], lots = [], 
       return { ok: false, code: "COMBO_ITEMS_REQUIRED", message: `${combo.name || "This combo"} has an item with no quantity.` };
     }
     let need = perCombo * count;
-    const unit = text(product.unit).toLowerCase();
-    const productLots = shelfLots
-      .filter((lot) => inventoryIdsEqual(lot?.product_id, product.id))
-      // A lot kept in another unit cannot make up a quantity written in the product's unit.
-      .filter((lot) => !text(lot?.unit) || !unit || text(lot.unit).toLowerCase() === unit)
-      .filter((lot) => lotAvailableQuantity(lot, now) > 0)
-      .sort(fifoLotOrder);
+    const productLots = productShelfLots(shelfLots, product, now);
     const inCartForProduct = cartThousandthsFor(cart, (line) => inventoryIdsEqual(line?.product_id, product.id));
     const onShelf = productLots.reduce((sum, lot) => sum + floorThousandths(lotAvailableQuantity(lot, now)), 0);
     const reserved = Math.max(toThousandths(typeof reservedFor === "function" ? reservedFor(product.id) : 0) || 0, 0);
@@ -854,7 +861,7 @@ export const combosForTab = (combos, tabKey) => sortCombos(
 );
 
 /**
- * Why the Combos & Offers screen cannot load or save here, or null. Combos are kept on the server
+ * Why the Frooz Menu screen cannot load or save here, or null. Combos are kept on the server
  * (like discounts and sale rates), so Local Only, no cloud and offline each say so instead of
  * trying; POS keeps selling the combos its snapshot already has.
  */
@@ -869,4 +876,106 @@ export const resolveComboAvailability = ({ localOnly = false, offline = false, n
     return "This computer is offline. Combos are kept on the server, so they cannot be loaded or changed until the connection is back. POS keeps selling the combos it already has.";
   }
   return null;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Combos whose fruit is missing (the owner, 22 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The products the combo form offers: on sale and with stock in this shop (`current_stock` from
+ * `GET /products`). A fruit with nothing on the shelf cannot go into a juice or a gift, so it is not
+ * offered (owner, 22 Oct 2026). An unreadable stock figure is not "zero": the product is kept, so a
+ * missing column cannot empty the list.
+ */
+export const comboPickableProducts = (products) => (Array.isArray(products) ? products : [])
+  .filter((product) => product && product.active !== false && !product.deleted_at)
+  .filter((product) => {
+    const stock = finiteOrNull(product.current_stock);
+    return stock === null || stock > 0;
+  })
+  .sort((left, right) => text(left.product_name).localeCompare(text(right.product_name), "en-IN", { sensitivity: "base" }));
+
+/**
+ * Why an item already in a combo is not in `comboPickableProducts`, for its line in the form:
+ * "(not on sale)" or "(no stock)". Empty when it is offered as usual.
+ */
+export const comboItemProductNote = (products, item) => {
+  const product = findComboProduct(products, item);
+  if (!product || product.active === false || product.deleted_at) return "not on sale";
+  const stock = finiteOrNull(product.current_stock);
+  return stock !== null && stock <= 0 ? "no stock" : "";
+};
+
+/**
+ * Every FIXED combo this counter cannot make even one of right now, with each item that stops it:
+ * a product that is not on sale, or one whose stock on this shelf is less than one combo takes.
+ * The cart is not counted: this is about the shelf, not about what a cashier is holding.
+ *
+ * Switched-off combos and customer's-choice combos (no items of their own) are never reported.
+ * Each problem has a stable `key`, so the bell can raise it once and retract it when it clears.
+ */
+export const comboStockProblems = ({ combos = [], products = [], lots = [], scope = null, now = new Date() } = {}) => {
+  const shelfLots = filterLotsForScope(Array.isArray(lots) ? lots : [], scope);
+  const problems = [];
+  for (const combo of sortCombos(combos)) {
+    if (!combo || combo.active === false || combo.combo_type !== "FIXED") continue;
+    const items = Array.isArray(combo.items) ? combo.items : [];
+    if (items.length === 0) continue;
+    const missing = [];
+    for (const item of items) {
+      const product = findComboProduct(products, item);
+      const name = text(product?.product_name) || text(item?.product_name) || "A product";
+      if (!product || product.active === false || product.deleted_at) {
+        missing.push({ productName: name, reason: "NOT_ON_SALE" });
+        continue;
+      }
+      const perCombo = toThousandths(item.quantity);
+      if (perCombo === null || perCombo <= 0) continue;
+      const onShelf = productShelfLots(shelfLots, product, now)
+        .reduce((sum, lot) => sum + floorThousandths(lotAvailableQuantity(lot, now)), 0);
+      if (onShelf < perCombo) missing.push({ productName: name, reason: onShelf > 0 ? "NOT_ENOUGH" : "OUT_OF_STOCK" });
+    }
+    if (missing.length === 0) continue;
+    const comboKey = canonicalInventoryId(combo.global_id || combo.id) || text(combo.name);
+    problems.push({ key: `combo-stock:${comboKey}`, comboName: text(combo.name) || "A combo", kind: combo.kind, missing });
+  }
+  return problems;
+};
+
+const MISSING_REASON_WORDS = Object.freeze({
+  NOT_ON_SALE: "is not on sale",
+  OUT_OF_STOCK: "is out of stock",
+  NOT_ENOUGH: "is too low for one",
+});
+
+/** One sentence naming what stops a combo: "Alphonso Mango is out of stock, Kiwi is too low for one". */
+export const describeComboStockProblem = (problem) => (problem?.missing || [])
+  .map((entry) => `${entry.productName} ${MISSING_REASON_WORDS[entry.reason] || "is not available"}`)
+  .join(", ");
+
+/**
+ * The bell's rows for `comboStockProblems`: a warning per combo, telling the owner what to do.
+ * Keys are the problems' own, so a combo that is fixed (stock added or the combo edited) drops out.
+ */
+export const comboStockNotifications = (problems) => (Array.isArray(problems) ? problems : []).map((problem) => ({
+  severity: "warning",
+  title: `Edit combo: ${problem.comboName}`,
+  message: `${describeComboStockProblem(problem)}. Edit ${problem.comboName} in Frooz Menu, or add stock, before selling it.`,
+  source: "Frooz Menu",
+  dedupeKey: problem.key,
+}));
+
+/**
+ * What an empty combo tab says. With combos on other tabs it names them, so a combo saved under
+ * another kind is found rather than taken for lost; with none on this computer at all it says how a
+ * combo just saved arrives here (a sync).
+ */
+export const emptyComboTabMessage = ({ nothingHere = "", elsewhere = [] } = {}) => {
+  const others = (Array.isArray(elsewhere) ? elsewhere : []).filter((entry) => entry && entry.count > 0);
+  if (others.length > 0) {
+    const where = others.map((entry) => `${entry.label} (${entry.names.join(", ")})`).join("; ");
+    return `${nothingHere} Combos on this computer are on other tabs: ${where}.`;
+  }
+  return `${nothingHere} The Owner or an Admin adds them in Frooz Menu. One just saved reaches this computer with the next sync: press Sync now, then open POS again.`;
 };

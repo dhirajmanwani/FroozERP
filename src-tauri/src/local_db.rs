@@ -723,7 +723,7 @@ fn apply_pull_changes_at(
                 continue;
             }
         }
-        apply_change_with_tx(&tx, change)?;
+        apply_pulled_change_or_record(&tx, change)?;
     }
     apply_settled_deferred_lot_quantities(&tx)?;
     let state_device = device_id.unwrap_or_else(|| "default".to_string());
@@ -742,6 +742,48 @@ fn apply_pull_changes_at(
     )
     .map_err(to_error)?;
     tx.commit().map_err(to_error)
+}
+
+/// One pulled change, inside its own savepoint, so a change this device cannot store is set aside
+/// instead of taking the page down with it.
+///
+/// Before this, any error from one change - a FOREIGN KEY failure, a payload missing a field -
+/// rolled back the whole page, the cursor never moved, and the same page failed again on every
+/// cycle. A counter went weeks receiving nothing from the cloud that way.
+/// The change is kept whole in `local_unapplied_changes` with the error as its detail (the same
+/// record the scope refusals above use) and the rest of the page lands. Errors that say the
+/// database itself is unwell are still thrown: those are not about the change, and recording it
+/// as unusable would lose it for a reason that passes.
+fn apply_pulled_change_or_record(tx: &rusqlite::Transaction, change: &PulledChange) -> Result<(), String> {
+    tx.execute_batch("SAVEPOINT pulled_change").map_err(to_error)?;
+    match apply_change_with_tx(tx, change) {
+        Ok(()) => tx.execute_batch("RELEASE pulled_change").map_err(to_error),
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO pulled_change; RELEASE pulled_change")
+                .map_err(to_error)?;
+            if is_storage_failure(&error) {
+                return Err(error);
+            }
+            record_unapplied_change(tx, change, "CHANGE_NOT_APPLICABLE", Some(error))
+        }
+    }
+}
+
+fn is_storage_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "database is locked",
+        "database table is locked",
+        "disk i/o error",
+        "database or disk is full",
+        "database disk image is malformed",
+        "unable to open database",
+        "attempt to write a readonly database",
+        "out of memory",
+        "interrupted",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 pub fn apply_reference_bootstrap(
@@ -8209,6 +8251,79 @@ fn apply_pulled_customer_order_with_tx(
     Ok(())
 }
 
+/// The local category a pulled product belongs to, or none.
+///
+/// `local_products.category_id` is a foreign key, and a product change used to write
+/// `category-<cloud integer id>` there blindly. That only names a real row for the old categories
+/// whose global id was backfilled as `category-<id>`; every category created since is
+/// `category-<uuid>`, so the first product saved with one failed the FOREIGN KEY check, rolled back
+/// the whole pull page and wedged the cursor - nothing after it (stock, rates, combos) ever reached
+/// the counter. The candidates are tried against what is actually stored, then the category's name
+/// (the product row carries it), and a category this device does not have is left empty rather
+/// than invented. The second value says whether the payload named a category at all, so an
+/// unresolvable one keeps the category the product already had instead of wiping it.
+fn resolve_pulled_product_category(
+    tx: &rusqlite::Transaction,
+    payload: &serde_json::Value,
+) -> Result<(Option<String>, bool), String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(global_id) = optional_text(payload, "category_global_id").filter(|value| !value.is_empty()) {
+        candidates.push(global_id);
+    }
+    if let Some(raw) = payload.get("category_id").filter(|value| !value.is_null()) {
+        let raw = raw
+            .as_str()
+            .map(|value| value.trim().to_string())
+            .or_else(|| raw.as_i64().map(|value| value.to_string()))
+            .unwrap_or_default();
+        if !raw.is_empty() {
+            if raw.starts_with("category-") {
+                candidates.push(raw);
+            } else {
+                candidates.push(format!("category-{raw}"));
+                candidates.push(raw);
+            }
+        }
+    }
+    let name = payload
+        .get("category")
+        .or_else(|| payload.get("category_name"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let named = !candidates.is_empty() || name.is_some();
+    for candidate in &candidates {
+        let found: Option<String> = tx
+            .query_row(
+                "SELECT id FROM local_categories WHERE id = ?1 OR cloud_id = ?1 LIMIT 1",
+                [candidate],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_error)?;
+        if found.is_some() {
+            return Ok((found, named));
+        }
+    }
+    if let Some(name) = name {
+        let found: Option<String> = tx
+            .query_row(
+                "SELECT id FROM local_categories
+                 WHERE LOWER(TRIM(name)) = LOWER(?1)
+                 ORDER BY (deleted_at IS NULL) DESC, active DESC, updated_at DESC, id
+                 LIMIT 1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_error)?;
+        if found.is_some() {
+            return Ok((found, named));
+        }
+    }
+    Ok((None, named))
+}
+
 fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Result<(), String> {
     let _change_id = &change.change_id;
     let operation = change.operation_type.to_uppercase();
@@ -8244,25 +8359,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             }
         }
         "product" | "sale_rate" => {
-            let category_id = if change.payload.get("category_global_id").is_some() {
-                change
-                    .payload
-                    .get("category_global_id")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string())
-            } else {
-                change.payload.get("category_id").and_then(|value| {
-                    if let Some(raw) = value.as_str() {
-                        Some(if raw.starts_with("category-") {
-                            raw.to_string()
-                        } else {
-                            format!("category-{raw}")
-                        })
-                    } else {
-                        value.as_i64().map(|id| format!("category-{id}"))
-                    }
-                })
-            };
+            let (category_id, category_named) = resolve_pulled_product_category(tx, &change.payload)?;
             tx.execute(
                 "INSERT INTO local_products (
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit,
@@ -8270,7 +8367,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                  ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?13, 'synced', NULL)
                  ON CONFLICT(id) DO UPDATE SET
                    product_name = excluded.product_name,
-                   category_id = excluded.category_id,
+                   category_id = CASE WHEN ?14 THEN COALESCE(excluded.category_id, local_products.category_id) ELSE excluded.category_id END,
                    category_name = excluded.category_name,
                    unit = excluded.unit,
                    barcode = excluded.barcode,
@@ -8299,6 +8396,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                     change.payload.get("remarks").and_then(|v| v.as_str()),
                     change.updated_at,
                     change.version.unwrap_or(1),
+                    category_named,
                 ],
             )
             .map_err(to_error)?;
@@ -15629,6 +15727,143 @@ mod tests {
             payload,
             updated_at: Some("2026-10-09T10:00:00.000Z".to_string()),
         }
+    }
+
+    fn product_category_of(path: &Path, product: &str) -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT category_id FROM local_products WHERE id = ?1", [product], |row| row.get(0))
+            .expect("read category_id")
+    }
+
+    fn pulled_cursor(path: &Path) -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT last_server_cursor FROM sync_state WHERE device_id = 'device-test'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_product_saved_with_a_new_category_lands_under_that_category_and_the_cursor_moves() {
+        // What wedged a real counter: the cloud row names its category by integer id, the category
+        // itself arrives under `category-<uuid>`, and `category-12` named nothing - FOREIGN KEY.
+        let path = sync_fix_path("pull-new-category");
+        initialize_at(&path).expect("initialize");
+        let category = PulledChange {
+            change_id: serde_json::json!(88),
+            branch_id: Some(1),
+            entity_type: "product_category".to_string(),
+            entity_id: "category-6f1c2a".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({ "id": 12, "global_id": "category-6f1c2a", "category_name": "Exotic", "active": true }),
+            updated_at: Some("2026-09-25T15:06:00.000Z".to_string()),
+        };
+        let product = pulled_product(
+            "product",
+            "product-dragon",
+            serde_json::json!({
+                "branch_id": 1, "product_name": "Dragon Fruit", "selling_rate": "250.00",
+                "category_id": 12, "category": "Exotic"
+            }),
+        );
+        pull_page(&path, &[category, product]);
+        assert_eq!(product_category_of(&path, "product-dragon").as_deref(), Some("category-6f1c2a"));
+        assert_eq!(pulled_cursor(&path).as_deref(), Some("cursor"), "the page committed");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_product_whose_category_this_device_lacks_is_stored_without_one() {
+        let path = sync_fix_path("pull-unknown-category");
+        initialize_at(&path).expect("initialize");
+        pull_page(
+            &path,
+            &[pulled_product(
+                "product",
+                "product-kiwi",
+                serde_json::json!({ "branch_id": 1, "product_name": "Kiwi", "category_id": 77, "category": "Nowhere" }),
+            )],
+        );
+        assert_eq!(product_category_of(&path, "product-kiwi"), None);
+        assert_eq!(pulled_cursor(&path).as_deref(), Some("cursor"));
+
+        // A legacy category whose global id was backfilled as `category-<id>` still matches by id.
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO local_categories (id, cloud_id, name, sync_status) VALUES ('category-5', 'category-5', 'Citrus', 'synced')",
+                [],
+            )
+            .unwrap();
+        pull_page(
+            &path,
+            &[pulled_product(
+                "product",
+                "product-kiwi",
+                serde_json::json!({ "branch_id": 1, "product_name": "Kiwi", "category_id": 5, "category": "Citrus" }),
+            )],
+        );
+        assert_eq!(product_category_of(&path, "product-kiwi").as_deref(), Some("category-5"));
+
+        // Named but unresolvable keeps what the product had; no category at all clears it.
+        pull_page(
+            &path,
+            &[pulled_product(
+                "product",
+                "product-kiwi",
+                serde_json::json!({ "branch_id": 1, "product_name": "Kiwi", "category_id": 99, "category": "Gone" }),
+            )],
+        );
+        assert_eq!(product_category_of(&path, "product-kiwi").as_deref(), Some("category-5"));
+        pull_page(
+            &path,
+            &[pulled_product("product", "product-kiwi", serde_json::json!({ "branch_id": 1, "product_name": "Kiwi", "category_id": null }))],
+        );
+        assert_eq!(product_category_of(&path, "product-kiwi"), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_change_this_device_cannot_store_is_set_aside_and_the_rest_of_the_page_lands() {
+        let path = sync_fix_path("pull-set-aside");
+        initialize_at(&path).expect("initialize");
+        seed_pull_product(&path, "product-here");
+        // A lot for a product this device has never received fails its FOREIGN KEY.
+        let orphan = pulled_lot_at(90, "inventory-lot-90", 90, "product-never-arrived", 5.0, 5.0);
+        let fine = pulled_lot_at(91, "inventory-lot-91", 91, "product-here", 4.0, 4.0);
+        pull_page(&path, &[orphan, fine]);
+
+        assert_eq!(live_lots(&path, "product-here"), vec![("inventory-lot-91".to_string(), 4.0)]);
+        assert_eq!(pulled_cursor(&path).as_deref(), Some("cursor"), "the cursor moves past it");
+        let conn = Connection::open(&path).unwrap();
+        let (reason, detail): (String, String) = conn
+            .query_row(
+                "SELECT reason, detail FROM local_unapplied_changes WHERE entity_id = 'inventory-lot-90'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the refused change is kept");
+        assert_eq!(reason, "CHANGE_NOT_APPLICABLE");
+        assert!(detail.contains("FOREIGN KEY"), "{detail}");
+        let orphan_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_inventory_lots WHERE id = 'inventory-lot-90'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphan_rows, 0, "nothing half-written is left behind");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failing_database_still_fails_the_page() {
+        assert!(is_storage_failure("database is locked"));
+        assert!(is_storage_failure("Disk I/O error"));
+        assert!(!is_storage_failure("FOREIGN KEY constraint failed"));
+        assert!(!is_storage_failure("Inventory lot x has no canonical product identity"));
     }
 
     #[test]

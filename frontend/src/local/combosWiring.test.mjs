@@ -95,3 +95,18 @@ test("combo rows read as one line each, and the badge counts combos once", () =>
   assert.match(returns, /<tr className="return-combo-note">\s*<td colSpan="7">/);
   assert.doesNotMatch(returns, /inCombo && !lineProblem/);
 });
+
+test("combos whose fruit is missing ring the bell and are named on POS; the form offers stocked fruit only", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const memo = app.slice(app.indexOf("const comboProblems = useMemo("), app.indexOf("const raisedComboRows"));
+  // Unknown is not "all fine": nothing is judged before the shelf and the combos were read.
+  assert.match(memo, /posCombos\.status !== "ready" \|\| !posShelf\.loaded\) return null/);
+  assert.match(memo, /if \(!shelfState\.usable\) return null/);
+  assert.match(memo, /comboStockProblems\(\{ combos: posCombos\.combos/);
+  const effect = app.slice(app.indexOf("const raisedComboRows"), app.indexOf("Read today's payments"));
+  assert.match(effect, /comboStockNotifications\(comboProblems\)/);
+  assert.match(effect, /clearNotice\(key\)/, "a combo that is fixed drops out of the bell");
+  assert.match(app, /comboProblems=\{comboProblems\}/);
+  assert.match(app, /const productChoices = comboPickableProducts\(products\);/);
+  assert.match(app, /emptyComboTabMessage\(\{/);
+});
