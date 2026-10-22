@@ -460,6 +460,21 @@ const withMaster = async (run, { role = "Owner" } = {}) => {
 };
 
 const post = (body) => probe(app, "POST", "/api/v3/combos", headers, body);
+
+test("routes: a combo is published to its own company's branches even when the session's branch is another company's", async () => {
+  // Branch 3 belongs to company 2. Before 22 Oct 2026 the change was anchored on the session's
+  // branch (or a literal 1), and the fan-out followed the anchor's company, not the combo's.
+  const foreignToken = issueDeviceSession({
+    userId: OWNER_ID, deviceId: DEVICE_ID, companyId: COMPANY_ID, branchId: 3, role: "Owner", secret: TEST_SIGNING_KEY,
+  });
+  await withMaster(async ({ db }) => {
+    const created = await probe(app, "POST", "/api/v3/combos", { ...headers, authorization: `Bearer ${foreignToken}` }, fixedBody());
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const changes = (await db.query("SELECT company_id, branch_id FROM sync_change_log ORDER BY branch_id")).rows;
+    assert.deepEqual(changes.map((row) => [row.company_id, row.branch_id]), [[1, 1], [1, 2]]);
+  });
+});
+
 const put = (id, body) => probe(app, "PUT", `/api/v3/combos/${id}`, headers, body);
 const list = () => probe(app, "GET", "/api/v3/combos", headers);
 
