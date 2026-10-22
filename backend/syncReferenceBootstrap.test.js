@@ -88,6 +88,31 @@ test("bootstrap captures canonical scope and reference records without writing c
         price: null, extra_charge: "50.00", margin_percent: "60.00", active: false, entity_version: 1, items: [],
       },
     ] },
+    // Frooz Pack (22 Oct 2026): the packing tree as flat rows, then every branch's counts.
+    { rows: [
+      {
+        type_id: 1, type_global_id: "packing-type-1", company_id: 1, type_name: "Gift Box", type_active: true,
+        type_sort_order: 0, type_entity_version: 3, design_id: 2, design_global_id: "packing-design-2",
+        design_name: "Window Box", design_active: true, design_sort_order: 0, size_id: 5,
+        size_global_id: "packing-size-5", size_name: "GRAND", capacity: "1 kg", unit_cost: "12.50",
+        size_active: true, size_sort_order: 0, qty_on_hand: null,
+      },
+      {
+        type_id: 1, type_global_id: "packing-type-1", company_id: 1, type_name: "Gift Box", type_active: true,
+        type_sort_order: 0, type_entity_version: 3, design_id: 2, design_global_id: "packing-design-2",
+        design_name: "Window Box", design_active: true, design_sort_order: 0, size_id: 6,
+        size_global_id: "packing-size-6", size_name: "PETITE", capacity: null, unit_cost: "4.00",
+        size_active: false, size_sort_order: 1, qty_on_hand: null,
+      },
+      {
+        type_id: 9, type_global_id: "packing-type-9", company_id: 1, type_name: "Basket", type_active: false,
+        type_sort_order: 1, type_entity_version: 1, design_id: null,
+      },
+    ] },
+    { rows: [
+      { branch_id: 1, size_global_id: "packing-size-5", qty_on_hand: "40.000", entity_version: 4, updated_at: "2026-10-22T00:00:00.000Z" },
+      { branch_id: 2, size_global_id: "packing-size-5", qty_on_hand: "-2.000", entity_version: 2, updated_at: "2026-10-22T00:00:00.000Z" },
+    ] },
   ];
   const parameters = [];
   const client = {
@@ -134,6 +159,32 @@ test("bootstrap captures canonical scope and reference records without writing c
   assert.equal(snapshot.combos[1].extra_charge, "50.00");
   assert.equal(snapshot.combos[1].margin_percent, "60.00");
   assert.equal(COMPANY_REFERENCE_ENTITY_TYPES.includes("combo"), true, "a combo is company-wide master data");
+
+  // Frooz Pack: whole packing trees (inactive entries too) and every branch's counts, company-scoped.
+  const packingStatement = statements.find((sql) => /FROM packing_types t/.test(sql));
+  assert.ok(packingStatement, "the packing tree was read");
+  assert.deepEqual(parameters[statements.indexOf(packingStatement)], [1, null, null]);
+  const stockStatement = statements.find((sql) => /FROM packing_stock stock/.test(sql));
+  assert.deepEqual(parameters[statements.indexOf(stockStatement)], [1]);
+  assert.deepEqual(snapshot.packing_types, [
+    {
+      global_id: "packing-type-1", company_id: 1, name: "Gift Box", active: true, sort_order: 0, entity_version: 3,
+      designs: [{
+        global_id: "packing-design-2", name: "Window Box", active: true, sort_order: 0,
+        sizes: [
+          { global_id: "packing-size-5", size_name: "GRAND", capacity: "1 kg", unit_cost: 12.5, active: true, sort_order: 0 },
+          { global_id: "packing-size-6", size_name: "PETITE", capacity: null, unit_cost: 4, active: false, sort_order: 1 },
+        ],
+      }],
+    },
+    { global_id: "packing-type-9", company_id: 1, name: "Basket", active: false, sort_order: 1, entity_version: 1, designs: [] },
+  ]);
+  assert.deepEqual(snapshot.packing_stock, [
+    { global_id: "packing-stock-1-packing-size-5", branch_id: 1, size_global_id: "packing-size-5", qty_on_hand: 40, entity_version: 4, updated_at: "2026-10-22T00:00:00.000Z" },
+    { global_id: "packing-stock-2-packing-size-5", branch_id: 2, size_global_id: "packing-size-5", qty_on_hand: -2, entity_version: 2, updated_at: "2026-10-22T00:00:00.000Z" },
+  ], "every branch's counts, negative ones too");
+  assert.equal(COMPANY_REFERENCE_ENTITY_TYPES.includes("packing_type"), true);
+  assert.equal(COMPANY_REFERENCE_ENTITY_TYPES.includes("packing_stock"), true);
 });
 
 test("bootstrap boundary locks assignment and change-log writers", async () => {

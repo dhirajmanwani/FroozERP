@@ -69,6 +69,8 @@ const CODES = Object.freeze({
   MISMATCH_ACCEPTED: "COMBO_MISMATCH_ACCEPTED",
   UNKNOWN_ACCEPTED: "COMBO_UNKNOWN_ACCEPTED",
   ALLOCATION_INVALID: "COMBO_ALLOCATION_INVALID",
+  PACKING_FIXED_ONLY: "COMBO_PACKING_FIXED_ONLY",
+  PACKING_INVALID: "COMBO_PACKING_INVALID",
 });
 
 const MESSAGES = Object.freeze({
@@ -229,6 +231,12 @@ const validateComboInput = (body = {}) => {
   if (description.length > DESCRIPTION_MAX) {
     return refuse(CODES.NAME_REQUIRED, `Keep the description under ${DESCRIPTION_MAX} letters.`);
   }
+  // Frooz Pack: the packing one FIXED combo uses (the cashier picks a CUSTOM combo's at the
+  // counter). An absent key keeps what is stored (`packing: null`), [] clears it. A CUSTOM combo
+  // never stores packing, so the route clears it whatever the key says.
+  const packing = readComboPacking(input, comboType);
+  if (!packing.ok) return packing;
+
   const sortOrder = finiteOrNull(input.sort_order);
   return {
     ok: true,
@@ -243,8 +251,42 @@ const validateComboInput = (body = {}) => {
       active: input.active !== false,
       sort_order: sortOrder !== null && Number.isInteger(sortOrder) ? sortOrder : 0,
       items,
+      packing: packing.value,
     },
   };
+};
+
+/**
+ * A combo request's `packing`, checked: null when the key is absent (keep what is stored), else a
+ * list of `{ size_ref, quantity, sort_order }`. Whether each size exists, belongs to this company
+ * and is active needs the database; the route answers COMBO_PACKING_INVALID for those.
+ */
+const readComboPacking = (input, comboType) => {
+  if (!Object.prototype.hasOwnProperty.call(input, "packing") || input.packing === undefined) return { ok: true, value: null };
+  const raw = input.packing === null ? [] : input.packing;
+  if (!Array.isArray(raw)) return refuse(CODES.PACKING_INVALID, "Enter the combo's packing as a list.");
+  if (raw.length > 0 && comboType !== "FIXED") {
+    return refuse(CODES.PACKING_FIXED_ONLY, "Only a fixed combo carries packing. For a customised combo the cashier picks the packing at the counter.");
+  }
+  const value = [];
+  const seen = new Set();
+  for (const [index, entry] of raw.entries()) {
+    const sizeRef = idKey(entry?.packing_size_id ?? entry?.size_id);
+    const quantity = finiteOrNull(entry?.quantity);
+    if (!sizeRef) return refuse(CODES.PACKING_INVALID, "Every packing line needs a packing size.");
+    if (quantity === null || quantity <= 0 || toThousandths(quantity) <= 0 || quantity > PRICE_MAX) {
+      return refuse(CODES.PACKING_INVALID, "Every packing line needs a quantity above zero.");
+    }
+    if (seen.has(sizeRef)) return refuse(CODES.PACKING_INVALID, "A packing size appears twice in this combo. Put it once, with the total quantity.");
+    seen.add(sizeRef);
+    const sortOrder = finiteOrNull(entry?.sort_order);
+    value.push({
+      size_ref: sizeRef,
+      quantity: toThousandths(quantity) / QUANTITY_SCALE,
+      sort_order: sortOrder !== null && Number.isInteger(sortOrder) ? sortOrder : index,
+    });
+  }
+  return { ok: true, value };
 };
 
 /**
@@ -261,6 +303,10 @@ const unavailableProductsOf = (combo) =>
  * `GET /api/v3/combos`, the `combo` sync change and the reference bootstrap alike.
  *
  * $1 company (NULL = any), $2 combo ids (NULL = all), $3 combo global ids (NULL = all).
+ *
+ * `packing` (Frooz Pack, cloud migration 025) is the packing one FIXED combo uses, each line named
+ * by its type, design and size and carrying the size's current `unit_cost`; `size_active` is false
+ * when the size, its design or its type is switched off. Empty for a CUSTOM combo.
  */
 const COMBOS_WITH_ITEMS_SQL = `
   SELECT c.id, c.global_id, c.company_id, c.name, c.kind, c.combo_type, c.price, c.extra_charge, c.margin_percent,
@@ -279,7 +325,25 @@ const COMBOS_WITH_ITEMS_SQL = `
            FROM combo_items ci
            JOIN products p ON p.id = ci.product_id
            WHERE ci.combo_id = c.id
-         ), '[]'::JSONB) AS items
+         ), '[]'::JSONB) AS items,
+         COALESCE((
+           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                    'packing_size_id', COALESCE(ps.global_id, 'packing-size-' || ps.id::TEXT),
+                    'quantity', cp.quantity,
+                    'sort_order', cp.sort_order,
+                    'type_name', pt.name,
+                    'design_name', pd.name,
+                    'size_name', ps.size_name,
+                    'capacity', ps.capacity,
+                    'unit_cost', ps.unit_cost,
+                    'size_active', (ps.active AND pd.active AND pt.active)
+                  ) ORDER BY cp.sort_order, cp.id)
+           FROM combo_packing cp
+           JOIN packing_sizes ps ON ps.id = cp.size_id
+           JOIN packing_designs pd ON pd.id = ps.design_id
+           JOIN packing_types pt ON pt.id = pd.type_id
+           WHERE cp.combo_id = c.id
+         ), '[]'::JSONB) AS packing
   FROM combos c
   WHERE ($1::INTEGER IS NULL OR c.company_id IS NULL OR c.company_id = $1)
     AND ($2::INTEGER[] IS NULL OR c.id = ANY($2::INTEGER[]))

@@ -10415,3 +10415,218 @@ button.shortcut-sheet-row:focus-visible {
 .cart-combo-item-controls .table-input {
   width: 90px;
 }
+
+/* ---------------------------------------------------------------------------------------------
+   Frooz Pack: the Type → Design → Size drill-down (the module, the combo form's picker and POS),
+   the purchase lines, POS's packing step and the Report Center packing panel.
+   --------------------------------------------------------------------------------------------- */
+
+.packing-picker {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--accent-line-strong);
+  border-radius: 8px;
+  background: var(--accent-wash);
+}
+
+.packing-picker-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.packing-drill-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+
+.packing-picker .packing-drill-head {
+  margin-bottom: 0;
+}
+
+.packing-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.packing-crumb-sep {
+  color: var(--ink-muted);
+}
+
+.packing-drill-title {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.packing-picker-qty {
+  max-width: 160px;
+}
+
+.packing-rows {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  outline: none;
+}
+
+.packing-rows:focus-visible {
+  border-radius: 8px;
+  box-shadow: 0 0 0 2px var(--accent-line-strong);
+}
+
+.packing-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--card);
+}
+
+.packing-row-active {
+  border-color: var(--accent-line-strong);
+  box-shadow: inset 3px 0 0 var(--accent-line-strong);
+}
+
+.packing-row > button {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.packing-row > button:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.packing-row-label {
+  display: grid;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.packing-row-label small {
+  color: var(--ink-muted);
+}
+
+.packing-row-go {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.packing-row-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-right: 8px;
+}
+
+.packing-purchase-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px 100px auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.packing-line-pick {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.packing-line-picker {
+  grid-column: 1 / -1;
+}
+
+.packing-path {
+  display: grid;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.pos-combo-build-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pos-combo-packing-note {
+  flex-basis: 100%;
+  color: var(--ink-muted);
+}
+
+.pos-packing-pick {
+  margin: 8px 0;
+}
+
+.cart-combo-packing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  margin-top: 4px;
+  font-weight: 400;
+}
+
+.cart-combo-packing-remove {
+  min-height: 0;
+  margin-left: 4px;
+  padding: 0 2px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pos-packing-short {
+  margin: 0 0 8px;
+}
+
+.packing-stock-panel {
+  margin-top: var(--space-5);
+}
+
+@media (max-width: 640px) {
+  .packing-purchase-line {
+    grid-template-columns: minmax(0, 1fr) 80px 90px auto;
+  }
+
+  .packing-row {
+    flex-wrap: wrap;
+  }
+
+  .packing-row-actions {
+    padding: 0 10px 8px;
+  }
+}

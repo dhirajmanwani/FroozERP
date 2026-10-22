@@ -55,12 +55,13 @@ export const NAVIGATION_LOOKUP = Object.freeze({
  * the start" key and the one most likely to be hit by accident — so it lands on a read-only
  * overview, where a mis-hit costs nothing.
  *
- * There are ten digits and eighteen modules. The eight opened least get a letter instead, named
+ * There are ten digits and nineteen modules. The nine opened least get a letter instead, named
  * after the screen where a letter is free (2 Oct 2026, the owner asked for a key on every screen):
  *
  *   Alt+W  Waste Management       Alt+A  All Shops
  *   Alt+C  Discounts (chhoot)     Alt+B  Branches & Counters
  *   Alt+O  Frooz Menu (juices, cutting, gifts, offers; O for offers)
+ *   Alt+P  Frooz Pack (baskets, gift boxes, bottles, bowls; P for packing)
  *   Alt+X  Expenses               Alt+S  Settings
  *   Alt+T  Stock Distribution (transfer)
  *
@@ -153,6 +154,17 @@ const modules = [
     // O for offers. The owner sets combos up now and then; the counter sells them from POS tabs.
     shortcut: "O",
     keywords: ["menu", "combos & offers", "combo", "offer", "juice", "the cutting", "cut fruit", "gift", "gifting", "basket", "hamper", "frooz bar", "frooz moments"],
+    sections: [],
+  },
+  {
+    id: "frooz-pack",
+    // The packing a combo goes out in, kept as stock (owner, 22 Oct 2026). Beside Frooz Menu
+    // because combos are where packing is used. Owner/Admin only, like Frooz Menu.
+    label: "Frooz Pack",
+    icon: "package",
+    // P for packing. Opened when packing is bought or a count is corrected, not all day.
+    shortcut: "P",
+    keywords: ["packing", "basket", "gift box", "bottle", "bowl", "packaging"],
     sections: [],
   },
   {

@@ -176,6 +176,7 @@ import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMast
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
 import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
+import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildSalePackingUsage, createPackingDrill, enterPackingDrill, packingCostOf, packingDrillView, packingManageView, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -1188,6 +1189,7 @@ const icons = {
   sales: "receipt",
   discounts: "wallet",
   combos: "gift",
+  "frooz-pack": "package",
   expenses: "wallet",
   accounts: "users",
   reports: "chart",
@@ -1211,6 +1213,7 @@ const navigationItems = [
   ["sales", "POS Billing"],
   ["discounts", "Discounts"],
   ["combos", "Frooz Menu"],
+  ["frooz-pack", "Frooz Pack"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["orders", "Orders"],
@@ -1222,10 +1225,10 @@ const navigationItems = [
 ];
 
 // Screens only an Owner or Admin opens, whatever a role's module permissions say: prices are theirs.
-const RATE_MANAGER_VIEWS = Object.freeze(["sale-rates", "combos"]);
+const RATE_MANAGER_VIEWS = Object.freeze(["sale-rates", "combos", "frooz-pack"]);
 
 const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings", "orders"]);
-const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "combos", "sale-rates", "expenses", "all-shops"]);
+const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "combos", "frooz-pack", "sale-rates", "expenses", "all-shops"]);
 
 const getErrorMessage = (error, fallback) =>
   plainServerMessage(error.response?.data?.message) || fallback;
@@ -2165,6 +2168,7 @@ function Icon({ name, size = 18 }) {
     eyeOff: <><path d="M3 3l18 18" /><path d="M10.6 5.1A10.6 10.6 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.1" /><path d="M6.6 6.6A17.4 17.4 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 5.4-1.6" /><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" /></>,
     parcel: <><path d="M3 8h18v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 8l2-4h14l2 4" /><path d="M12 4v17" /></>,
     add: <><path d="M12 5v14M5 12h14" /></>,
+    package: <><path d="M3 7l9-4 9 4v10l-9 4-9-4Z" /><path d="m3 7 9 4 9-4" /><path d="M12 11v10" /><path d="m7.5 5 9 4" /></>,
     gift: <><rect x="3" y="8" width="18" height="4" rx="1" /><path d="M12 8v13M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7" /><path d="M7.5 8a2.5 2.5 0 0 1 0-5C10 3 12 8 12 8s2-5 4.5-5a2.5 2.5 0 0 1 0 5" /></>,
     refresh: <><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" /></>,
   };
@@ -2455,6 +2459,9 @@ function App() {
   // and by nothing else, for the same reason as the shelf above. `missing` until it has been read:
   // a counter that has not been told its combos must not say it has none.
   const [posCombos, setPosCombos] = useState({ status: "missing", combos: [] });
+  // Frooz Pack: the packing this counter knows (counts and costs), from the same snapshot as the
+  // combos. Desktop only; "missing" until the snapshot has been read.
+  const [posPacking, setPosPacking] = useState(() => readPackingCatalogue(null));
   // Which shop this machine is standing in, as the local snapshot reports it.
   //
   // Selling binds to the machine, not to the login -- see docs/stock-distribution-decision.md. So
@@ -4720,6 +4727,7 @@ function App() {
     // fetched over HTTP while an Owner was viewing that shop. So the scope failure clears the list
     // and says why, rather than throwing.
     setPosCombos(readCombos(snapshot));
+    setPosPacking(readPackingCatalogue(snapshot?.packing));
     if (!counterMaySell(selected)) {
       setProducts(selected.products);
       setInventory([]);
@@ -4758,6 +4766,7 @@ function App() {
   useEffect(() => {
     setPosShelf({ loaded: false, products: [], inventoryLots: [] });
     setPosCombos({ status: "missing", combos: [] });
+    setPosPacking(readPackingCatalogue(null));
   }, [user?.id, deviceInfo.device_id]);
 
   useEffect(() => {
@@ -5249,6 +5258,24 @@ function App() {
     return comboStockProblems({ combos: posCombos.combos, products: posShelf.products, lots: posShelf.inventoryLots, scope: counterScope });
   }, [counterScope, posCombos, posShelf]);
   const raisedComboRows = useRef(new Map());
+
+  /**
+   * Report Center → Inventory's packing panel (Frooz Pack), read-only. The desktop reads its own
+   * snapshot and touches no network; a browser asks the server, and in Local Only asks nothing.
+   */
+  const loadPackingStock = useCallback(async () => {
+    if (isTauriRuntime()) {
+      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+      return readPackingCatalogue(snapshot?.packing);
+    }
+    if (connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY) {
+      return { status: "unavailable", types: [], message: "Packing stock is kept on the server. This computer is in Local Only mode, so it was not asked." };
+    }
+    const response = await axios.get(`${API_URL}/api/v3/packing`);
+    const read = readPackingCatalogue(response.data);
+    // From the server, an answer with no list is a broken answer, not "none yet".
+    return read.status === "missing" ? { status: "invalid", types: [], message: "Packing stock could not be read: the server did not send a packing list." } : read;
+  }, [connectivityMode, deviceInfo.device_id, user?.username]);
 
   useEffect(() => {
     if (comboProblems === null) return;
@@ -9558,6 +9585,13 @@ function App() {
     offline: offlineMode,
     noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
   });
+  // Frooz Pack keeps its packing on the server: Local Only, offline or no cloud say so and send nothing.
+  const packUnavailableReason = resolvePackAvailability({
+    connectivityMode,
+    online: !offlineMode,
+    isTauri: isTauriRuntime(),
+    cloudConfigured: CLOUD_CONFIGURED,
+  });
   const userDisplayName = getUserDisplayName(user);
   const userRoleLabel = getUserRoleLabel(user);
   const canEditSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("sale_edit");
@@ -11001,6 +11035,9 @@ function App() {
               // Combos are sold from the counter app only (v1); the browser POS shows no combo tabs.
               combos={isTauriRuntime() ? posCombos : null}
               comboProblems={comboProblems}
+              // Frooz Pack: the counter's packing counts, from the snapshot; none in the browser.
+              packing={isTauriRuntime() ? posPacking : null}
+              onPackingShortages={(rows) => rows.forEach((row) => notify(row))}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
               seedCart={posSeedCart}
@@ -11097,6 +11134,20 @@ function App() {
               }}
               saleRateSettings={settingsData.saleRateSettings}
               unavailableReason={comboUnavailableReason}
+            />
+          )}
+
+          {activeView === "frooz-pack" && canManageRates && (
+            <FroozPackModule
+              canManage={canManageRates}
+              onSaved={() => {
+                // POS counts packing from its SQLite snapshot; a sync brings the change there.
+                // Local Only refuses inside runSyncNow. Not awaited.
+                if (isTauriRuntime()) runSyncNow({ force: true }).catch(() => null);
+                // A purchase also wrote an expense; the Expenses list is held in this component.
+                loadExpenses().catch(() => null);
+              }}
+              unavailableReason={packUnavailableReason}
             />
           )}
 
@@ -11242,6 +11293,7 @@ function App() {
               onOpenLotAction={openLotAction}
               onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
+              loadPackingStock={loadPackingStock}
               appliedParams={reportAppliedParams}
               suppliers={suppliers}
               user={user}
@@ -15303,6 +15355,700 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
  * nothing. Every rule it applies -- what a discount is worth, when it is running, what is refused --
  * comes from local/discounts.js, which POS and the server share.
  */
+// ---------------------------------------------------------------------------------------------
+// Frooz Pack: packing (baskets, gift boxes, bottles, bowls) as stock. Every rule lives in
+// local/froozPack.js; these components only show it and send what it builds.
+// ---------------------------------------------------------------------------------------------
+
+const formatPackCount = (value) => (Number.isFinite(value)
+  ? value.toLocaleString("en-IN", { maximumFractionDigits: 3 })
+  : MISSING_VALUE);
+// ok is fine, low is "buy soon", out is the danger tone, unknown is a neutral fact (never "out").
+const PACK_STOCK_TONE = Object.freeze({ ok: "stock-ok", low: "origin-rate", out: "stock-low", unknown: "tag" });
+const packCountText = (row) => (Number.isFinite(row?.qty_on_hand) ? `${formatPackCount(row.qty_on_hand)} on hand` : "Count not known");
+const packGroupText = (state) => (state === "out" ? "All out" : state === "low" ? "Running low" : "");
+const PACK_PAYMENT_LABELS = Object.freeze({ CASH: "Cash", UPI: "UPI", BANK_TRANSFER: "Bank transfer", CHEQUE: "Cheque" });
+const PACK_NODE_WORDS = Object.freeze({ type: "packing type", design: "design", size: "size" });
+const PACK_LEVEL_KIND = Object.freeze({ types: "type", designs: "design", sizes: "size" });
+/** The id a write names a node by: its global id, which the server accepts as well as its own. */
+const packNodeRef = (node) => String(node?.global_id || node?.id || "");
+/** Where a breadcrumb goes back to. The last crumb is where the picker already is. */
+const packCrumbState = (crumb) => (crumb?.level === "designs" && crumb.id
+  ? { level: "designs", typeId: crumb.id, designId: null }
+  : createPackingDrill());
+const formatPackWhen = (value) => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? MISSING_VALUE
+    : date.toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+};
+
+/**
+ * The drill-down's keys: → or Enter goes in (Enter on a size picks it), ← or Backspace goes back
+ * up, ↑ ↓ move, Escape closes. Handled keys stop here so no screen shortcut also acts on them.
+ */
+const handlePackDrillKeys = (event, { rows, active, setHighlight, goIn, goBack, pick, onClose }) => {
+  const row = rows[active];
+  let handled = true;
+  if (event.key === "ArrowDown") setHighlight(Math.min(active + 1, Math.max(rows.length - 1, 0)));
+  else if (event.key === "ArrowUp") setHighlight(Math.max(active - 1, 0));
+  else if (event.key === "ArrowRight") { if (row && !row.leaf) goIn(row); }
+  else if (event.key === "Enter") { if (row) (row.leaf ? pick?.(row) : goIn(row)); }
+  else if (event.key === "ArrowLeft" || event.key === "Backspace") goBack();
+  else if (event.key === "Escape" && onClose) onClose();
+  else handled = false;
+  if (handled) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+};
+
+/** The ← button and the breadcrumb, at the top of every drill-down. */
+function PackDrillHeader({ crumbs = [], level, onBack, onCrumb, title }) {
+  return (
+    <div className="packing-drill-head">
+      <button aria-label="Back one level" className="secondary-button compact-button" disabled={level === "types"} type="button" onClick={onBack}>← Back</button>
+      <nav aria-label="Where you are" className="packing-crumbs">
+        {crumbs.map((crumb, index) => (
+          <React.Fragment key={`${crumb.level}-${crumb.id || "root"}`}>
+            {index > 0 && <span aria-hidden="true" className="packing-crumb-sep">›</span>}
+            {index === crumbs.length - 1
+              ? <strong>{crumb.label}</strong>
+              : <button className="table-link-button" type="button" onClick={() => onCrumb(crumb)}>{crumb.label}</button>}
+          </React.Fragment>
+        ))}
+      </nav>
+      {title && <span className="packing-drill-title">{title}</span>}
+    </div>
+  );
+}
+
+/**
+ * Frooz Pack's picker: Type → Design → Size, one level at a time, the way the owner thinks of it
+ * ("Gift Box › Window Box › Grand · 1 kg"). Only what is switched on and has a size is shown.
+ * `onPick(sizeRow, quantity)`; with `quantity`, a "How many" box rides along. Used by the Frooz
+ * Pack purchase form, the combo form in Frooz Menu and POS.
+ */
+function PackingDrillPicker({ catalogue, onClose, onPick, quantity = false, title = "" }) {
+  const [drill, setDrill] = useState(() => createPackingDrill());
+  const [highlight, setHighlight] = useState(0);
+  const [qty, setQty] = useState("1");
+  const [qtyError, setQtyError] = useState("");
+  const listRef = useRef(null);
+  const status = catalogue?.status || "missing";
+  const view = packingDrillView(catalogue, drill);
+  const rows = view.rows;
+  const active = Math.min(highlight, Math.max(rows.length - 1, 0));
+
+  useEffect(() => {
+    listRef.current?.focus();
+  }, [view.level, drill.typeId, drill.designId]);
+
+  const goIn = (row) => {
+    if (!row || row.leaf) return;
+    setDrill((current) => enterPackingDrill(current, row.id, catalogue));
+    setHighlight(0);
+  };
+  const goBack = () => {
+    setDrill((current) => backPackingDrill(current));
+    setHighlight(0);
+  };
+  const pick = (row) => {
+    let amount = 1;
+    if (quantity) {
+      const typed = String(qty).trim();
+      if (!/^\d+(\.\d{1,3})?$/.test(typed) || Number(typed) <= 0) {
+        setQtyError("Enter how many, above 0, with at most 3 decimals.");
+        return;
+      }
+      amount = Number(typed);
+    }
+    setQtyError("");
+    onPick?.(row, amount);
+  };
+
+  return (
+    <div aria-label={title || "Choose packing"} className="packing-picker" role="group">
+      <div className="packing-picker-top">
+        <PackDrillHeader
+          crumbs={view.crumbs}
+          level={view.level}
+          title={title}
+          onBack={goBack}
+          onCrumb={(crumb) => { setDrill(packCrumbState(crumb)); setHighlight(0); }}
+        />
+        {onClose && <button className="secondary-button compact-button" type="button" onClick={onClose}>Close</button>}
+      </div>
+      {quantity && status === "ready" && (
+        <label className="packing-picker-qty">
+          <span>How many</span>
+          <input inputMode="decimal" min="0" step="0.001" type="number" value={qty} onChange={(event) => { setQty(event.target.value); setQtyError(""); }} />
+        </label>
+      )}
+      {qtyError && <div className="inline-error" role="alert">{qtyError}</div>}
+      {status === "invalid" ? (
+        <div className="inline-error" role="alert">{catalogue?.message || "The packing list could not be read."}</div>
+      ) : status !== "ready" ? (
+        <p className="warning-note" role="status">{catalogue?.message || "The packing list has not reached this computer yet."}</p>
+      ) : rows.length === 0 ? (
+        <p className="form-note">No packing set up yet. The Owner or an Admin adds it in Frooz Pack.</p>
+      ) : (
+        <ul
+          aria-label={view.title}
+          className="packing-rows"
+          ref={listRef}
+          role="listbox"
+          tabIndex={0}
+          onKeyDown={(event) => handlePackDrillKeys(event, { rows, active, setHighlight, goIn, goBack, pick, onClose })}
+        >
+          {rows.map((row, index) => (
+            <li aria-selected={index === active} className={index === active ? "packing-row packing-row-active" : "packing-row"} key={row.id} role="option">
+              <button tabIndex={-1} type="button" onClick={() => { setHighlight(index); if (row.leaf) pick(row); else goIn(row); }}>
+                <span className="packing-row-label">
+                  <strong>{row.label}</strong>
+                  <small>{row.sublabel}</small>
+                </span>
+                {row.leaf
+                  ? <span className={PACK_STOCK_TONE[row.stockState] || "tag"}>{packCountText(row)}</span>
+                  : (
+                    <span className="packing-row-go">
+                      {packGroupText(row.stockState) && <span className={PACK_STOCK_TONE[row.stockState]}>{packGroupText(row.stockState)}</span>}
+                      <span aria-hidden="true">→</span>
+                    </span>
+                  )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <small className="form-note">→ opens, ← goes back, ↑ ↓ move, Enter picks a size.</small>
+    </div>
+  );
+}
+
+/**
+ * Frooz Pack: the Owner's or an Admin's packing, kept on the server (`/api/v3/packing`). The tree
+ * (Type → Design → Size, each editable), each size's count at this branch and its unit cost, the
+ * purchase form (which also books the expense under Packing Material) and count corrections.
+ * Local Only, offline and no cloud each say so and send nothing.
+ */
+function FroozPackModule({ canManage = false, onSaved, unavailableReason = null }) {
+  const [load, setLoad] = useState({ status: "idle", message: "" });
+  const [catalogue, setCatalogue] = useState(() => readPackingCatalogue(null));
+  const [movements, setMovements] = useState({ status: "idle", rows: [], message: "" });
+  const [drill, setDrill] = useState(() => createPackingDrill());
+  const [highlight, setHighlight] = useState(0);
+  // { kind, ref, draft, error, saving }: ref is empty for a new one.
+  const [nodeForm, setNodeForm] = useState(null);
+  // { draft, pickingLine, error, saving }
+  const [purchase, setPurchase] = useState(null);
+  // { row, draft: { quantity, reason }, error, saving }
+  const [adjust, setAdjust] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const lineSeq = useRef(0);
+  const listRef = useRef(null);
+
+  const loadPacking = async () => {
+    setLoad((current) => ({ ...current, status: "loading", message: "" }));
+    const [packResult, movementResult] = await Promise.allSettled([
+      axios.get(`${API_URL}/api/v3/packing`),
+      axios.get(`${API_URL}/api/v3/packing/movements`, { params: { limit: 30 } }),
+    ]);
+    if (packResult.status !== "fulfilled") {
+      setLoad({ status: "failed", message: `Packing could not be loaded (${getErrorMessage(packResult.reason, "no answer from the server")}). Nothing on this screen is current.` });
+      return false;
+    }
+    const read = readPackingCatalogue(packResult.value.data);
+    if (read.status !== "ready") {
+      // From the server, "missing" is not "none yet": an answer with no list is a broken answer.
+      setLoad({ status: "failed", message: `${read.status === "invalid" ? read.message : "The server did not send a packing list."} Nothing on this screen is current.` });
+      return false;
+    }
+    setCatalogue(read);
+    const body = movementResult.status === "fulfilled" ? movementResult.value.data : null;
+    const movementRows = Array.isArray(body?.movements) ? body.movements : Array.isArray(body) ? body : null;
+    setMovements(movementRows
+      ? { status: "ready", rows: movementRows, message: "" }
+      : {
+        status: "failed",
+        rows: [],
+        message: movementResult.status === "fulfilled"
+          ? "Recent movements could not be read: the server sent something that is not a list."
+          : `Recent movements could not be loaded (${getErrorMessage(movementResult.reason, "no answer from the server")}).`,
+      });
+    setLoad({ status: "ready", message: "" });
+    return true;
+  };
+
+  useEffect(() => {
+    if (unavailableReason) return;
+    loadPacking();
+  }, [unavailableReason]);
+
+  const failed = load.status === "failed";
+  const firstLoad = (load.status === "idle" || load.status === "loading") && catalogue.status !== "ready";
+  const disabled = !canManage || Boolean(unavailableReason) || failed;
+  const busy = Boolean(nodeForm || purchase || adjust);
+  const view = packingManageView(catalogue, drill);
+  const rows = view.rows;
+  const active = Math.min(highlight, Math.max(rows.length - 1, 0));
+  const levelKind = PACK_LEVEL_KIND[view.level] || "type";
+
+  const goIn = (row) => {
+    if (!row || row.leaf) return;
+    setDrill((current) => enterPackingDrill(current, row.id));
+    setHighlight(0);
+  };
+  const goBack = () => {
+    setDrill((current) => backPackingDrill(current));
+    setHighlight(0);
+  };
+
+  const afterWrite = async (said) => {
+    const reloaded = await loadPacking();
+    onSaved?.();
+    setNotice(reloaded
+      ? { tone: "success", text: said }
+      : { tone: "warning", text: `${said} The list could not be refreshed, so it may not show it yet.` });
+  };
+
+  // --- Type, design and size forms ---------------------------------------------------------
+
+  const startNode = (kind, node = null) => {
+    setNotice(null);
+    const common = { sort_order: node ? String(node.sort_order ?? 0) : "0", active: node ? node.active !== false : true };
+    const draft = kind === "size"
+      ? {
+        ...common,
+        size_name: node?.size_name || "CLASSIC",
+        capacity: node?.capacity || "",
+        unit_cost: node && Number.isFinite(node.unit_cost) && node.unit_cost > 0 ? String(node.unit_cost) : "",
+      }
+      : { ...common, name: node?.name || "" };
+    setNodeForm({ kind, ref: node ? packNodeRef(node) : "", draft, error: "", saving: false });
+  };
+
+  const updateNode = (field, value) => setNodeForm((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, [field]: value } }
+    : current));
+
+  const saveNode = async () => {
+    if (!nodeForm || nodeForm.saving || disabled) return;
+    const parent = nodeForm.kind === "design"
+      ? { type_id: packNodeRef(view.type) }
+      : nodeForm.kind === "size" ? { design_id: packNodeRef(view.design) } : {};
+    const check = validatePackingNode(nodeForm.kind, { ...nodeForm.draft, ...parent });
+    if (!check.ok) {
+      setNodeForm((current) => (current ? { ...current, error: check.message } : current));
+      return;
+    }
+    const path = `${API_URL}/api/v3/packing/${nodeForm.kind}s`;
+    setNodeForm((current) => (current ? { ...current, saving: true, error: "" } : current));
+    try {
+      // No identity in the body: the server records who did it from the signed session.
+      if (nodeForm.ref) await axios.put(`${path}/${encodeURIComponent(nodeForm.ref)}`, check.payload);
+      else await axios.post(path, check.payload);
+    } catch (error) {
+      setNodeForm((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "It could not be saved. Nothing was changed.") } : current));
+      return;
+    }
+    const label = nodeForm.kind === "size" ? packingSizeLabel(check.payload) : check.payload.name;
+    const wasNew = !nodeForm.ref;
+    setNodeForm(null);
+    await afterWrite(`${wasNew ? "Added" : "Saved"} ${label}. Counters get it at their next sync.`);
+  };
+
+  // --- Packing purchase ----------------------------------------------------------------------
+
+  const newPurchaseLine = () => {
+    lineSeq.current += 1;
+    return { key: `pack-line-${lineSeq.current}`, size_id: "", label: "", quantity: "", rate: "" };
+  };
+
+  const startPurchase = () => {
+    setNotice(null);
+    setPurchase({
+      draft: { supplier_name: "", purchase_date: toDateKey(new Date()), payment_mode: "CASH", reference_number: "", remarks: "", lines: [newPurchaseLine()] },
+      pickingLine: null,
+      error: "",
+      saving: false,
+    });
+  };
+
+  const updatePurchase = (field, value) => setPurchase((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, [field]: value } }
+    : current));
+
+  const updatePurchaseLine = (key, field, value) => setPurchase((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, lines: current.draft.lines.map((line) => (line.key === key ? { ...line, [field]: value } : line)) } }
+    : current));
+
+  const pickPurchaseLine = (row) => setPurchase((current) => {
+    if (!current) return current;
+    const lines = current.draft.lines.map((line) => (line.key !== current.pickingLine ? line : {
+      ...line,
+      size_id: row.packing_size_id,
+      label: packingPathLabel(row),
+      // The last rate paid, as a starting point; the bill's own rate replaces it.
+      rate: String(line.rate).trim() !== "" ? line.rate : (Number.isFinite(row.unit_cost) && row.unit_cost > 0 ? String(row.unit_cost) : ""),
+    }));
+    return { ...current, pickingLine: null, error: "", draft: { ...current.draft, lines } };
+  });
+
+  const purchaseCheck = purchase ? buildPackingPurchasePayload(purchase.draft) : null;
+  const purchaseTotal = purchase
+    ? (purchaseCheck?.ok
+      ? purchaseCheck.total
+      : roundUi(purchase.draft.lines.reduce((sum, line) => {
+        const quantity = String(line.quantity).trim() === "" ? Number.NaN : Number(line.quantity);
+        const rate = String(line.rate).trim() === "" ? Number.NaN : Number(line.rate);
+        return Number.isFinite(quantity) && Number.isFinite(rate) ? sum + quantity * rate : sum;
+      }, 0)))
+    : 0;
+
+  const savePurchase = async () => {
+    if (!purchase || purchase.saving || disabled) return;
+    const check = buildPackingPurchasePayload(purchase.draft);
+    if (!check.ok) {
+      setPurchase((current) => (current ? { ...current, error: check.message } : current));
+      return;
+    }
+    setPurchase((current) => (current ? { ...current, saving: true, error: "" } : current));
+    let response;
+    try {
+      response = await axios.post(`${API_URL}/api/v3/packing/purchases`, check.payload);
+    } catch (error) {
+      setPurchase((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "The purchase could not be saved. Nothing was changed.") } : current));
+      return;
+    }
+    const sent = response?.data?.purchase?.amount;
+    const amount = sent !== null && sent !== undefined && String(sent).trim() !== "" && Number.isFinite(Number(sent)) ? Number(sent) : check.total;
+    setPurchase(null);
+    await afterWrite(`Saved. ${currency.format(amount)} added to Expenses → Packing Material.`);
+  };
+
+  // --- Count correction ----------------------------------------------------------------------
+
+  const startAdjust = (row) => {
+    setNotice(null);
+    setAdjust({ row, draft: { quantity: "", reason: "" }, error: "", saving: false });
+  };
+
+  const saveAdjust = async () => {
+    if (!adjust || adjust.saving || disabled) return;
+    const check = buildPackingAdjustmentPayload({ size_id: packNodeRef(adjust.row.node), ...adjust.draft });
+    if (!check.ok) {
+      setAdjust((current) => (current ? { ...current, error: check.message } : current));
+      return;
+    }
+    setAdjust((current) => (current ? { ...current, saving: true, error: "" } : current));
+    try {
+      await axios.post(`${API_URL}/api/v3/packing/adjustments`, check.payload);
+    } catch (error) {
+      setAdjust((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "The count could not be corrected. Nothing was changed.") } : current));
+      return;
+    }
+    const label = adjust.row.label;
+    setAdjust(null);
+    await afterWrite(`${label}: count ${check.payload.quantity > 0 ? "raised" : "lowered"} by ${formatPackCount(Math.abs(check.payload.quantity))}.`);
+  };
+
+  const emptyText = view.level === "types"
+    ? "No packing set up yet. Add a packing type (for example Gift Box, Basket, Bottle or Bowl) to start."
+    : view.level === "designs"
+      ? `No designs under ${view.type?.name || "this type"} yet. Add one.`
+      : `No sizes under ${view.design?.name || "this design"} yet. Add Petite, Classic, Grand or Royal.`;
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard
+        eyebrow="Stock"
+        title="Frooz Pack"
+        subtitle="The baskets, gift boxes, bottles and bowls combos go out in. Each size is counted here; buying it books the expense under Packing Material, and selling a combo takes it off. Running out is only a warning: bills always go through."
+        actions={canManage && !unavailableReason && !failed && !busy
+          ? (
+            <>
+              <button className="secondary-button" disabled={firstLoad || (levelKind !== "type" && !(levelKind === "design" ? view.type : view.design))} type="button" onClick={() => startNode(levelKind)}>
+                <Icon name="add" size={16} />{`Add ${PACK_NODE_WORDS[levelKind]}`}
+              </button>
+              <button className="primary-button" disabled={firstLoad} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
+            </>
+          )
+          : null}
+      >
+        {unavailableReason ? (
+          <div className="warning-note" role="status">{unavailableReason}</div>
+        ) : (
+          <>
+            {failed && (
+              <div className="error-banner discount-load-error" role="alert">
+                {load.message}{" "}
+                <button className="secondary-button compact-button" type="button" onClick={() => loadPacking()}>Try again</button>
+              </div>
+            )}
+            {!canManage && !failed && <p className="form-note">Only the Owner or an Admin can change packing.</p>}
+            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+
+            {nodeForm && !failed && (
+              <div className="discount-block combo-form">
+                <h3>{nodeForm.ref ? `Edit ${PACK_NODE_WORDS[nodeForm.kind]}` : `New ${PACK_NODE_WORDS[nodeForm.kind]}`}{nodeForm.kind !== "type" && view.crumbs.length > 1 ? ` in ${view.crumbs.slice(1).map((crumb) => crumb.label).join(" › ")}` : ""}</h3>
+                <div className="discount-form">
+                  {nodeForm.kind === "size" ? (
+                    <>
+                      <Field label="Size">
+                        <select disabled={disabled} value={nodeForm.draft.size_name} onChange={(event) => updateNode("size_name", event.target.value)}>
+                          {PACKING_SIZE_NAMES.map((name) => <option key={name} value={name}>{PACKING_SIZE_LABELS[name]}</option>)}
+                        </select>
+                      </Field>
+                      <Field label="Actual size (optional)">
+                        <input disabled={disabled} maxLength={40} placeholder="1 kg, 300 ml, 8 inch" value={nodeForm.draft.capacity} onChange={(event) => updateNode("capacity", event.target.value)} />
+                      </Field>
+                      <Field label="Unit cost (₹, optional)">
+                        <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={nodeForm.draft.unit_cost} onChange={(event) => updateNode("unit_cost", event.target.value)} />
+                      </Field>
+                      <p className="form-note">Each purchase sets the unit cost to the rate paid. It is added to a fixed combo's cost and suggested price.</p>
+                    </>
+                  ) : (
+                    <Field label="Name">
+                      <input disabled={disabled} maxLength={80} placeholder={nodeForm.kind === "type" ? "Gift Box, Basket, Bottle" : "Window Box, Round, Kraft"} value={nodeForm.draft.name} onChange={(event) => updateNode("name", event.target.value)} />
+                    </Field>
+                  )}
+                  <Field label="Order">
+                    <input disabled={disabled} inputMode="numeric" step="1" type="number" value={nodeForm.draft.sort_order} onChange={(event) => updateNode("sort_order", event.target.value)} />
+                  </Field>
+                  <label className="check-field">
+                    <input checked={nodeForm.draft.active !== false} disabled={disabled} type="checkbox" onChange={(event) => updateNode("active", event.target.checked)} />
+                    <span>In use (offered when picking packing)</span>
+                  </label>
+                  {nodeForm.error && <div className="inline-error" role="alert">{nodeForm.error}</div>}
+                  <div className="button-row">
+                    <button className="primary-button" disabled={disabled || nodeForm.saving} type="button" onClick={saveNode}>{nodeForm.saving ? "Saving…" : "Save"}</button>
+                    <button className="secondary-button" disabled={nodeForm.saving} type="button" onClick={() => setNodeForm(null)}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {purchase && !failed && (
+              <div className="discount-block combo-form">
+                <h3>Packing purchase</h3>
+                <div className="discount-form">
+                  <Field label="Supplier (optional)">
+                    <input disabled={disabled} maxLength={160} value={purchase.draft.supplier_name} onChange={(event) => updatePurchase("supplier_name", event.target.value)} />
+                  </Field>
+                  <Field label="Date">
+                    <input disabled={disabled} type="date" value={purchase.draft.purchase_date} onChange={(event) => updatePurchase("purchase_date", event.target.value)} />
+                  </Field>
+                  <Field label="Paid by">
+                    <select disabled={disabled} value={purchase.draft.payment_mode} onChange={(event) => updatePurchase("payment_mode", event.target.value)}>
+                      {PACKING_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{PACK_PAYMENT_LABELS[mode] || mode}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Bill / reference number (optional)">
+                    <input disabled={disabled} maxLength={80} value={purchase.draft.reference_number} onChange={(event) => updatePurchase("reference_number", event.target.value)} />
+                  </Field>
+                  <fieldset className="combo-items" disabled={disabled || purchase.saving}>
+                    <legend>What was bought</legend>
+                    {purchase.draft.lines.map((line, index) => (
+                      <div className="packing-purchase-line" key={line.key}>
+                        <button className="secondary-button compact-button packing-line-pick" type="button" onClick={() => setPurchase((current) => (current ? { ...current, pickingLine: current.pickingLine === line.key ? null : line.key } : current))}>
+                          {line.label || "Choose packing"}
+                        </button>
+                        <input aria-label={`Line ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={line.quantity} onChange={(event) => updatePurchaseLine(line.key, "quantity", event.target.value)} />
+                        <input aria-label={`Line ${index + 1} rate`} inputMode="decimal" min="0" placeholder="Rate ₹" step="0.01" type="number" value={line.rate} onChange={(event) => updatePurchaseLine(line.key, "rate", event.target.value)} />
+                        <button aria-label={`Remove line ${index + 1}`} className="remove-button" disabled={purchase.draft.lines.length <= 1} type="button" onClick={() => setPurchase((current) => (current ? { ...current, error: "", draft: { ...current.draft, lines: current.draft.lines.filter((other) => other.key !== line.key) } } : current))}><Icon name="trash" size={16} /></button>
+                        {purchase.pickingLine === line.key && (
+                          <div className="packing-line-picker">
+                            <PackingDrillPicker catalogue={catalogue} title={`Line ${index + 1}`} onClose={() => setPurchase((current) => (current ? { ...current, pickingLine: null } : current))} onPick={(row) => pickPurchaseLine(row)} />
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    <button className="secondary-button compact-button" type="button" onClick={() => setPurchase((current) => (current ? { ...current, draft: { ...current.draft, lines: [...current.draft.lines, newPurchaseLine()] } } : current))}><Icon name="add" size={14} />Add line</button>
+                  </fieldset>
+                  <p className="form-note combo-price-check"><strong>{`Total ${currency.format(purchaseTotal)}`}</strong> · booked as one expense under Packing Material.</p>
+                  <Field label="Remarks (optional)">
+                    <input disabled={disabled} maxLength={500} value={purchase.draft.remarks} onChange={(event) => updatePurchase("remarks", event.target.value)} />
+                  </Field>
+                  {purchase.error && <div className="inline-error" role="alert">{purchase.error}</div>}
+                  <div className="button-row">
+                    <button className="primary-button" disabled={disabled || purchase.saving} type="button" onClick={savePurchase}>{purchase.saving ? "Saving…" : "Save purchase"}</button>
+                    <button className="secondary-button" disabled={purchase.saving} type="button" onClick={() => setPurchase(null)}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {adjust && !failed && (
+              <div className="discount-block combo-form">
+                <h3>{`Correct the count: ${packingPathLabel({ type_name: view.type?.name, design_name: view.design?.name, size_name: adjust.row.node?.size_name, capacity: adjust.row.node?.capacity })}`}</h3>
+                <div className="discount-form">
+                  <p className="form-note">{`Now ${packCountText(adjust.row)}. Enter how many to add, or with a minus how many to take off (for example -3 for torn boxes).`}</p>
+                  <Field label="Change">
+                    <input disabled={disabled} inputMode="decimal" placeholder="+10 or -3" step="0.001" type="number" value={adjust.draft.quantity} onChange={(event) => setAdjust((current) => (current ? { ...current, error: "", draft: { ...current.draft, quantity: event.target.value } } : current))} />
+                  </Field>
+                  <Field label="Reason">
+                    <input disabled={disabled} maxLength={300} placeholder="Counted the shelf, torn, given free" value={adjust.draft.reason} onChange={(event) => setAdjust((current) => (current ? { ...current, error: "", draft: { ...current.draft, reason: event.target.value } } : current))} />
+                  </Field>
+                  {adjust.error && <div className="inline-error" role="alert">{adjust.error}</div>}
+                  <div className="button-row">
+                    <button className="primary-button" disabled={disabled || adjust.saving} type="button" onClick={saveAdjust}>{adjust.saving ? "Saving…" : "Save correction"}</button>
+                    <button className="secondary-button" disabled={adjust.saving} type="button" onClick={() => setAdjust(null)}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {!failed && (
+              <div className="discount-block packing-browser">
+                <PackDrillHeader
+                  crumbs={view.crumbs}
+                  level={view.level}
+                  onBack={goBack}
+                  onCrumb={(crumb) => { setDrill(packCrumbState(crumb)); setHighlight(0); }}
+                />
+                {firstLoad ? (
+                  <p className="form-note" role="status">Loading packing…</p>
+                ) : rows.length === 0 ? (
+                  <p className="cart-empty">{emptyText}</p>
+                ) : (
+                  <ul
+                    aria-label={view.title}
+                    className="packing-rows packing-manage-rows"
+                    ref={listRef}
+                    role="listbox"
+                    tabIndex={0}
+                    onKeyDown={(event) => handlePackDrillKeys(event, { rows, active, setHighlight, goIn, goBack })}
+                  >
+                    {rows.map((row, index) => (
+                      <li aria-selected={index === active} className={`packing-row${index === active ? " packing-row-active" : ""}${row.active ? "" : " discount-row-past"}`} key={row.id} role="option">
+                        <button disabled={row.leaf} tabIndex={-1} type="button" onClick={() => { setHighlight(index); goIn(row); }}>
+                          <span className="packing-row-label">
+                            <strong>{row.label}</strong>
+                            <small>{row.sublabel}{row.active ? "" : " · switched off"}</small>
+                          </span>
+                          {row.leaf
+                            ? <span className={PACK_STOCK_TONE[row.stockState] || "tag"}>{packCountText(row)}</span>
+                            : (
+                              <span className="packing-row-go">
+                                {packGroupText(row.stockState) && <span className={PACK_STOCK_TONE[row.stockState]}>{packGroupText(row.stockState)}</span>}
+                                <span aria-hidden="true">→</span>
+                              </span>
+                            )}
+                        </button>
+                        {canManage && (
+                          <span className="packing-row-actions">
+                            <button className="secondary-button compact-button" disabled={busy || disabled} type="button" onClick={() => startNode(levelKind, row.node)}>Edit</button>
+                            {row.leaf && <button className="secondary-button compact-button" disabled={busy || disabled} type="button" onClick={() => startAdjust(row)}>Correct count</button>}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <small className="form-note">→ opens, ← goes back, ↑ ↓ move. Counts are this branch's.</small>
+              </div>
+            )}
+
+            {!failed && load.status !== "idle" && (
+              <div className="discount-block">
+                <div className="discount-block-head"><h3>Recent movements</h3></div>
+                {movements.status === "failed" ? (
+                  <div className="inline-error" role="alert">{movements.message}</div>
+                ) : (
+                  <DataTable className="pm-table" headers={["When", "Packing", "What", "Qty", "Note"]}>
+                    {movements.status !== "ready" && <tr><td className="empty-cell" colSpan={5}>Loading movements…</td></tr>}
+                    {movements.status === "ready" && movements.rows.length === 0 && <tr><td className="empty-cell" colSpan={5}>Nothing bought, sold or corrected yet.</td></tr>}
+                    {movements.rows.map((row) => {
+                      const quantity = Number(row.quantity);
+                      return (
+                        <tr key={String(row.id)}>
+                          <td data-label="When">{formatPackWhen(row.created_at)}</td>
+                          <td className="primary-cell" data-label="Packing">{packingPathLabel(row) || MISSING_VALUE}</td>
+                          <td data-label="What">{PACKING_MOVEMENT_LABELS[String(row.movement_type || "").toUpperCase()] || row.movement_type || MISSING_VALUE}</td>
+                          <td className={Number.isFinite(quantity) && quantity < 0 ? "stock-low" : "stock-ok"} data-label="Qty">{Number.isFinite(quantity) ? `${quantity > 0 ? "+" : ""}${formatPackCount(quantity)}` : MISSING_VALUE}</td>
+                          <td data-label="Note">{row.reason || (row.sale_id ? `Bill ${row.sale_id}` : row.purchase_id ? `Purchase ${row.purchase_id}` : "")}</td>
+                        </tr>
+                      );
+                    })}
+                  </DataTable>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </ModuleCard>
+    </section>
+  );
+}
+
+/**
+ * Report Center → Inventory: this branch's packing counts, read-only. The desktop reads its own
+ * snapshot (no network); a browser asks the server, never in Local Only. A failure is an error,
+ * never a column of zeros; a packing list that has not arrived says so.
+ */
+function PackingStockPanel({ loadPacking }) {
+  const [state, setState] = useState({ status: "loading", catalogue: null, message: "" });
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => loadPacking())
+      .then((catalogue) => {
+        if (cancelled) return;
+        if (catalogue?.status === "unavailable") setState({ status: "unavailable", catalogue: null, message: catalogue.message });
+        else setState({ status: catalogue?.status || "missing", catalogue, message: catalogue?.message || "" });
+      })
+      .catch((error) => {
+        if (!cancelled) setState({ status: "invalid", catalogue: null, message: `Packing stock could not be loaded (${getErrorMessage(error, error?.message || "no answer")}).` });
+      });
+    return () => { cancelled = true; };
+  }, [loadPacking]);
+
+  const rows = [];
+  if (state.status === "ready") {
+    for (const type of state.catalogue.types) {
+      if (type.active === false) continue;
+      for (const design of type.designs) {
+        if (design.active === false) continue;
+        for (const size of design.sizes) {
+          if (size.active === false) continue;
+          rows.push({ key: size.id, type, design, size, label: packingSizeLabel(size) });
+        }
+      }
+    }
+  }
+
+  return (
+    <div className="discount-block packing-stock-panel">
+      <div className="discount-block-head"><h3>Packing stock</h3></div>
+      {state.status === "loading" ? (
+        <p className="form-note" role="status">Loading packing stock…</p>
+      ) : state.status === "invalid" ? (
+        <div className="inline-error" role="alert">{state.message}</div>
+      ) : state.status === "unavailable" ? (
+        <p className="warning-note" role="status">{state.message}</p>
+      ) : state.status !== "ready" ? (
+        <p className="form-note">No packing on this computer yet. If packing is set up in Frooz Pack, press Sync now.</p>
+      ) : rows.length === 0 ? (
+        <p className="form-note">No packing set up yet.</p>
+      ) : (
+        // Counts only (owner, 22 Oct 2026): packing's money is in Expenses → Packing Material.
+        <DataTable className="pm-table" headers={["Type", "Design", "Size", "On hand"]}>
+          {rows.map((row) => (
+            <tr key={row.key}>
+              <td className="primary-cell" data-label="Type">{row.type.name}</td>
+              <td data-label="Design">{row.design.name}</td>
+              <td data-label="Size">{row.label}</td>
+              <td className={Number.isFinite(row.size.qty_on_hand) ? (row.size.qty_on_hand <= 0 ? "stock-low" : "") : ""} data-label="On hand">{Number.isFinite(row.size.qty_on_hand) ? formatPackCount(row.size.qty_on_hand) : "Not known"}</td>
+            </tr>
+          ))}
+        </DataTable>
+      )}
+    </div>
+  );
+}
+
 /**
  * Frooz Menu (the Combos & Offers module): the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
  * either a fixed set of items at one price or the customer's choice priced from the items' rates.
@@ -15313,6 +16059,9 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
   const [combos, setCombos] = useState([]);
   const [products, setProducts] = useState([]);
   const [costs, setCosts] = useState({ status: "idle", rows: [] });
+  // Frooz Pack's list, for the packing a fixed combo goes out in. Without it the combo still saves.
+  const [packing, setPacking] = useState({ status: "idle", catalogue: null, message: "" });
+  const [packPicking, setPackPicking] = useState(false);
   const [draft, setDraft] = useState(null);
   const [marginTouched, setMarginTouched] = useState(false);
   const [attempted, setAttempted] = useState(false);
@@ -15324,10 +16073,11 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
 
   const loadCombos = async () => {
     setLoad((current) => ({ ...current, status: "loading", message: "" }));
-    const [comboResult, productResult, costResult] = await Promise.allSettled([
+    const [comboResult, productResult, costResult, packingResult] = await Promise.allSettled([
       axios.get(`${API_URL}/api/v3/combos`),
       axios.get(`${API_URL}/products`),
       axios.get(`${API_URL}/sale-rates`, { params: { desired_margin: targetMargin } }),
+      axios.get(`${API_URL}/api/v3/packing`),
     ]);
     const failure = [comboResult, productResult].find((result) => result.status !== "fulfilled" || !Array.isArray(result.value.data));
     if (failure) {
@@ -15341,6 +16091,15 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     setCosts(costResult.status === "fulfilled" && Array.isArray(costResult.value.data)
       ? { status: "ready", rows: costResult.value.data }
       : { status: "failed", rows: [] });
+    // Packing only feeds the packing picker and the cost: a failure is a warning, the combo still saves.
+    const packRead = packingResult.status === "fulfilled" ? readPackingCatalogue(packingResult.value.data) : null;
+    setPacking(packRead?.status === "ready"
+      ? { status: "ready", catalogue: packRead, message: "" }
+      : {
+        status: "failed",
+        catalogue: null,
+        message: packRead ? packRead.message || "the server did not send a packing list" : getErrorMessage(packingResult.reason, "no answer from the server"),
+      });
     setLoad({ status: "ready", message: "" });
     return true;
   };
@@ -15361,12 +16120,16 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
   const fixed = draft?.combo_type === "FIXED";
   const check = draft ? validateComboDraft(draft, { products }) : { ok: true, errors: [] };
   const itemsValue = draft && fixed ? comboItemsValue(draft.items, products) : null;
+  const draftPacking = draft && Array.isArray(draft.packing) ? draft.packing : [];
+  const packCatalogue = packing.status === "ready" ? packing.catalogue : null;
   const suggestion = draft && fixed
-    ? suggestComboPrice({ items: draft.items, rates: costs.rows, products, marginPercent: draft.margin_percent, targetMargin, roundingRule })
+    ? suggestComboPrice({ items: draft.items, rates: costs.rows, products, marginPercent: draft.margin_percent, targetMargin, roundingRule, packing: draftPacking, catalogue: packCatalogue })
     : null;
+  const packingCost = draft && fixed ? packingCostOf(draftPacking, packCatalogue) : null;
 
   const startNew = () => {
     setDraft(newComboDraft({ kind: "COMBO_OFFER", desiredMargin: targetMargin }));
+    setPackPicking(false);
     setMarginTouched(false);
     setAttempted(false);
     setSaveError("");
@@ -15375,6 +16138,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
 
   const startEdit = (combo) => {
     setDraft(comboDraftFrom(combo));
+    setPackPicking(false);
     setMarginTouched(true);
     setAttempted(false);
     setSaveError("");
@@ -15418,6 +16182,46 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
 
   const removeItemRow = (index) => setDraft((current) => (current
     ? { ...current, items: current.items.filter((_, position) => position !== index) }
+    : current));
+
+  /** A size picked in the packing drill-down joins the combo; picked again, its quantity grows. */
+  const addPackingRow = (row, quantity) => {
+    setSaveError("");
+    setDraft((current) => {
+      if (!current) return current;
+      const rows = Array.isArray(current.packing) ? current.packing : [];
+      const existing = rows.findIndex((entry) => inventoryIdsEqual(entry.packing_size_id, row.packing_size_id));
+      if (existing >= 0) {
+        return {
+          ...current,
+          packing: rows.map((entry, position) => (position === existing
+            ? { ...entry, quantity: String(Math.round(((Number(entry.quantity) || 0) + quantity) * 1000) / 1000) }
+            : entry)),
+        };
+      }
+      return {
+        ...current,
+        packing: [...rows, {
+          packing_size_id: row.packing_size_id,
+          quantity: String(quantity),
+          type_name: row.type_name,
+          design_name: row.design_name,
+          size_name: row.size_name,
+          capacity: row.capacity,
+          unit_cost: row.unit_cost,
+          size_active: true,
+        }],
+      };
+    });
+    setPackPicking(false);
+  };
+
+  const updatePackingRow = (index, value) => setDraft((current) => (current && Array.isArray(current.packing)
+    ? { ...current, packing: current.packing.map((entry, position) => (position === index ? { ...entry, quantity: value } : entry)) }
+    : current));
+
+  const removePackingRow = (index) => setDraft((current) => (current && Array.isArray(current.packing)
+    ? { ...current, packing: current.packing.filter((_, position) => position !== index) }
     : current));
 
   const saveCombo = async () => {
@@ -15526,6 +16330,31 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                         <button className="secondary-button compact-button" type="button" onClick={addItemRow}><Icon name="add" size={14} />Add item</button>
                         <p className="form-note">Only fruits with stock are listed. A fruit with no stock appears here again once it arrives.</p>
                       </fieldset>
+                      <fieldset className="combo-items combo-packing" disabled={disabled}>
+                        <legend>Packing (Frooz Pack)</legend>
+                        {!Array.isArray(draft.packing) && (
+                          <p className="form-note">This combo's packing was not sent with it, so saving leaves its packing as it is. Adding packing here replaces it.</p>
+                        )}
+                        {draftPacking.length === 0 && Array.isArray(draft.packing) && <p className="form-note">No packing. Add the box, basket or bottle one combo goes out in, so POS counts it off when it sells.</p>}
+                        {draftPacking.map((entry, index) => (
+                          <div className="combo-item-row" key={`packing-${entry.packing_size_id || index}`}>
+                            <span className="packing-path">
+                              {packingPathLabel(entry) || entry.packing_size_id || MISSING_VALUE}
+                              {entry.size_active === false && <small className="cell-note inline-error">Switched off in Frooz Pack.</small>}
+                            </span>
+                            <input aria-label={`Packing ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={entry.quantity} onChange={(event) => updatePackingRow(index, event.target.value)} />
+                            <button aria-label={`Remove packing ${index + 1}`} className="remove-button" type="button" onClick={() => removePackingRow(index)}><Icon name="trash" size={16} /></button>
+                          </div>
+                        ))}
+                        {packPicking ? (
+                          <PackingDrillPicker catalogue={packCatalogue} quantity title="Add packing" onClose={() => setPackPicking(false)} onPick={addPackingRow} />
+                        ) : (
+                          <button className="secondary-button compact-button" disabled={packing.status !== "ready"} type="button" onClick={() => setPackPicking(true)}><Icon name="add" size={14} />Add packing</button>
+                        )}
+                        {packing.status === "failed" && (
+                          <p className="warning-note" role="status">{`The packing list could not be loaded (${packing.message}), so packing cannot be added now. The combo can still be saved; its packing stays as it is.`}</p>
+                        )}
+                      </fieldset>
                       <Field label="Combo price (₹)">
                         <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.price} onChange={(event) => updateDraft("price", event.target.value)} />
                       </Field>
@@ -15547,13 +16376,21 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                         </button>
                       </p>
                       {costs.status === "failed" && <p className="warning-note" role="status">Purchase costs could not be loaded, so there is no suggested price. The combo can still be saved.</p>}
-                      {costs.status === "ready" && suggestion?.cost === null && draft.items.some((item) => String(item.product_id || "") !== "") && (
+                      {draftPacking.length > 0 && packingCost && (
+                        <p className="form-note">
+                          {packingCost.known
+                            ? `Cost today includes ${currency.format(packingCost.cost)} of packing.`
+                            : "No suggestion: a packing size has no cost yet. Its first purchase in Frooz Pack sets it, or set it there by hand."}
+                        </p>
+                      )}
+                      {costs.status === "ready" && suggestion?.cost === null && packingCost?.known !== false && draft.items.some((item) => String(item.product_id || "") !== "") && (
                         <p className="form-note">No suggestion: an item has no purchase cost yet.</p>
                       )}
                     </>
                   ) : (
                     <>
                       <p className="form-note">The margin is added on top of the items' sale rates. Empty means 0%.</p>
+                      <p className="form-note">Packing for a customer's-choice combo is picked by the cashier at billing, from Frooz Pack.</p>
                       <Field label="Extra charge per combo (₹)">
                         <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.extra_charge} onChange={(event) => updateDraft("extra_charge", event.target.value)} />
                       </Field>
@@ -15611,6 +16448,9 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                           <td data-label="Price">{pricingText(combo)}</td>
                           <td data-label="Items">
                             {itemsText(combo)}
+                            {combo.combo_type === "FIXED" && combo.packing.length > 0 && (
+                              <small className="cell-note">{`Packing: ${combo.packing.map((entry) => `${packingPathLabel(entry) || "a size"} × ${entry.quantity ?? MISSING_VALUE}`).join(", ")}`}</small>
+                            )}
                             {offSale.length > 0 && <small className="cell-note inline-error">{offSale.map((name) => `${name} is not on sale.`).join(" ")} POS will not sell this combo until it is.</small>}
                           </td>
                           <td data-label="Status">{combo.active ? "On sale" : "Switched off"}</td>
@@ -15671,7 +16511,8 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
     .map((combo) => ({
       combo,
       key: combo.global_id || combo.id,
-      ...suggestComboPrice({ items: combo.items, rates, products, marginPercent: combo.margin_percent, targetMargin, roundingRule }),
+      // Its packing (Frooz Pack) is part of its cost; each row carries its own unit cost.
+      ...suggestComboPrice({ items: combo.items, rates, products, marginPercent: combo.margin_percent, targetMargin, roundingRule, packing: combo.packing }),
     }));
   const changes = rows
     .map((row) => ({ row, typed: String(drafts[row.key] ?? "").trim() }))
@@ -16130,7 +16971,7 @@ const REPORT_RANGE_LABELS = Object.freeze({
   custom: "custom dates",
 });
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, appliedParams = null, suppliers = [], user }) {
+function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, appliedParams = null, suppliers = [], user }) {
   // Reopening Report Center shows the range it was last loaded with, not "Today" over a year's data.
   const openingRange = appliedParams?.range || "today";
   const openingCustomRange = openingRange === "custom" && appliedParams?.date_from && appliedParams?.date_to
@@ -18303,7 +19144,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                   onLotAction={onOpenLotAction}
                   products={data.stockReport}
                 />
-              ) : selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
+              ) : null}
+              {selectedReport === "stockInventory" && loadPackingStock && <PackingStockPanel loadPacking={loadPackingStock} />}
+              {selectedReport === "stockInventory" ? null : selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
                 <>
                   <DataTable headers={currentReport.headers}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
@@ -20442,8 +21285,14 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
               <td>{expense.remarks || expense.cancellation_reason || "-"}</td>
               <td>
                 <div className="button-row table-actions-row">
-                  <button className="table-action" disabled={status === "CANCELLED"} onClick={() => editExpense(expense)}>Edit</button>
-                  <button className="remove-button" disabled={status === "CANCELLED" || !canCancel} title={canCancel ? undefined : "Cancelling an expense needs Invoice Cancellation permission."} onClick={() => cancelExpense(expense)}>Cancel</button>
+                  {expense.packing_purchase === true ? (
+                    <span className="tag" title="This expense belongs to a Frooz Pack purchase. Correct the count in Frooz Pack.">Frooz Pack</span>
+                  ) : (
+                    <>
+                      <button className="table-action" disabled={status === "CANCELLED"} onClick={() => editExpense(expense)}>Edit</button>
+                      <button className="remove-button" disabled={status === "CANCELLED" || !canCancel} title={canCancel ? undefined : "Cancelling an expense needs Invoice Cancellation permission."} onClick={() => cancelExpense(expense)}>Cancel</button>
+                    </>
+                  )}
                 </div>
               </td>
             </tr>
@@ -24994,7 +25843,7 @@ const newCartLineId = () => {
   return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
-function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, comboProblems = null, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, comboProblems = null, packing = null, onPackingShortages, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -25016,6 +25865,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const [comboAsk, setComboAsk] = useState(null);
   // A CUSTOM combo being filled ({ key, combo }): while it is open, every product added joins it.
   const [customBuild, setCustomBuild] = useState(null);
+  // Frooz Pack, desktop only (`packing` is null in the browser): what the cashier picked for each
+  // customer's-choice combo ({ [combo_line_key]: rows }), and which combo the picker is open for.
+  const [customPacking, setCustomPacking] = useState({});
+  const [packPickFor, setPackPickFor] = useState(null);
   // Why a combo tile could not be used, said on the screen rather than in a browser box.
   const [comboNotice, setComboNotice] = useState("");
   const [barcode, setBarcode] = useState("");
@@ -25656,6 +26509,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     if (!key) return;
     setCart((items) => items.filter((item) => String(item.combo_line_key || "") !== key));
     setCustomBuild((current) => (current?.key === key ? null : current));
+    setCustomPacking((current) => {
+      if (!Object.hasOwn(current, key)) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+    setPackPickFor((current) => (current === key ? null : current));
   };
 
   const removeCartItem = (lineId) => {
@@ -25675,6 +26535,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   /** Close the customer's-choice combo being filled. */
   const finishCustomBuild = () => {
     setCustomBuild(null);
+    setPackPickFor(null);
     setSearch("");
     searchRef.current?.focus();
   };
@@ -25778,6 +26639,51 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     return `${prefix}-${id}`;
   };
 
+  /**
+   * Frooz Pack on this bill (desktop only): what packing its combos use -- a fixed combo's own, a
+   * customer's-choice combo's as the cashier picked it -- and what this branch is short of. Packing
+   * never stops a bill: a row that cannot be read is left out, a shortage is only a warning.
+   */
+  const packingEnabled = combosEnabled && packing !== null && packing !== undefined;
+  const packingUsage = useMemo(() => {
+    if (!packingEnabled) return { ok: true, usage: [], warnings: [], message: "" };
+    return buildSalePackingUsage({ lines: cart, combos: combos?.combos || [], customPacking });
+  }, [cart, combos, customPacking, packingEnabled]);
+  const packingShort = useMemo(() => (packingEnabled && packing?.status === "ready"
+    ? packingShortages({ usage: packingUsage.usage, catalogue: packing })
+    : []), [packing, packingEnabled, packingUsage]);
+
+  /** A size picked for a customer's-choice combo; picked again, its quantity grows. */
+  const addCustomPacking = (key, row, quantity) => {
+    setCustomPacking((current) => {
+      const rows = Array.isArray(current[key]) ? current[key] : [];
+      const existing = rows.findIndex((entry) => inventoryIdsEqual(entry.packing_size_id, row.packing_size_id));
+      const nextRows = existing >= 0
+        ? rows.map((entry, position) => (position === existing ? { ...entry, quantity: Math.round((entry.quantity + quantity) * 1000) / 1000 } : entry))
+        : [...rows, {
+          packing_size_id: row.packing_size_id,
+          quantity,
+          type_name: row.type_name,
+          design_name: row.design_name,
+          size_name: row.size_name,
+          capacity: row.capacity,
+          unit_cost: row.unit_cost,
+        }];
+      return { ...current, [key]: nextRows };
+    });
+    setPackPickFor(null);
+    // Back to the search box: the next scan or product goes on the bill as before.
+    searchRef.current?.focus();
+  };
+
+  const removeCustomPacking = (key, index) => setCustomPacking((current) => (Array.isArray(current[key])
+    ? { ...current, [key]: current[key].filter((_, position) => position !== index) }
+    : current));
+
+  const customPackingText = (key) => (Array.isArray(customPacking[key]) ? customPacking[key] : [])
+    .map((entry) => `${packingPathLabel(entry)} × ${entry.quantity}`)
+    .join(", ");
+
   const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason, operationId = "", discountApprovalId = "" }) => {
     const invoiceGlobalId = newSyncId("invoice");
     const offlineInvoiceRef = `OFF-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
@@ -25831,6 +26737,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
        */
       other_charges: (totals.chargeLines || []).map((line) => ({ ...line })),
       other_charges_amount: Number(totals.otherChargesAmount || 0),
+      // Frooz Pack: the packing this bill's combos use. Read fresh from the cart; a row that cannot
+      // be read is left out (local/froozPack.js) and never stops the bill.
+      packing_usage: packingEnabled
+        ? buildSalePackingUsage({ lines: cart, combos: combos?.combos || [], customPacking }).usage
+        : [],
       net_total: Number(totals.total || 0),
       status: "COMPLETED",
       sync_status: "pending",
@@ -26155,8 +27066,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           })),
           payments: localSale.payments,
         };
+        // Out of packing is a warning for the bell, raised once the bill is safely saved.
+        if (packingShort.length > 0) onPackingShortages?.(packingShortageNotifications(packingShort));
         setCart([]);
         setCustomBuild(null);
+        setCustomPacking({});
+        setPackPickFor(null);
         setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
         setPaymentMode("CASH");
         setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
@@ -26232,6 +27147,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       pendingCheckoutRef.current = null;
       setCart([]);
       setCustomBuild(null);
+      setCustomPacking({});
+      setPackPickFor(null);
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
       setPaymentMode("CASH");
       setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
@@ -26579,7 +27496,30 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 <strong>Adding to {customBuild.combo.name}</strong>
                 {" "}Tap the products the customer wants, then set each quantity in the cart. The price is worked out for you as one price: {describeCustomPricing({ marginPercent: customBuild.combo.margin_percent, extraCharge: customBuild.combo.extra_charge }, (value) => currency.format(value))}, rounded. Press Done when it is complete.
               </span>
-              <button className="primary-button compact-button" type="button" onClick={finishCustomBuild}>Done</button>
+              <span className="pos-combo-build-actions">
+                {packingEnabled && (
+                  <button className="secondary-button compact-button" type="button" onClick={() => setPackPickFor((current) => (current === customBuild.key ? null : customBuild.key))}>
+                    <Icon name="package" size={14} />Packing
+                  </button>
+                )}
+                <button className="primary-button compact-button" type="button" onClick={finishCustomBuild}>Done</button>
+              </span>
+              {packingEnabled && customPackingText(customBuild.key) && (
+                <small className="pos-combo-packing-note">{`Packing: ${customPackingText(customBuild.key)}`}</small>
+              )}
+            </div>
+          )}
+          {packingEnabled && packPickFor && (
+            // Optional: a customer's-choice combo's packing, picked Type → Design → Size. It changes
+            // nothing on the bill's price (the combo's extra charge already covers it).
+            <div className="pos-packing-pick">
+              <PackingDrillPicker
+                catalogue={packing}
+                quantity
+                title={`Packing for ${cart.find((item) => String(item.combo_line_key || "") === packPickFor)?.combo_name || customBuild?.combo?.name || "this combo"}`}
+                onClose={() => setPackPickFor(null)}
+                onPick={(row, quantity) => addCustomPacking(packPickFor, row, quantity)}
+              />
             </div>
           )}
           {comboNotice && (
@@ -26707,6 +27647,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             </div>
             <span className="cart-count">{totals.itemCount === 1 ? "1 item" : `${totals.itemCount} items`}</span>
           </div>
+          {packingShort.length > 0 && (
+            // Warning only (owner, 22 Oct 2026): the bill still goes through, and the bell is told.
+            <p className="warning-note pos-packing-short" role="status">
+              {`⚠ Packing running short: ${packingShort.map((shortage) => `${shortage.label} (${shortage.needed} needed, ${shortage.onHand} on hand)`).join("; ")}. The bill can still be saved.`}
+            </p>
+          )}
           {cart.length === 0 ? (
             <div className="cart-empty">Search or scan a product to begin billing.</div>
           ) : (
@@ -26727,6 +27673,19 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                                 : `${COMBO_KIND_LABELS[group.comboKind] || "Combo"} · customer's choice: ${describeCustomPricing({ marginPercent: group.lines[0]?.combo_margin_percent, extraCharge: group.lines[0]?.combo_extra_charge }, (value) => currency.format(value))}`}
                               {customBuild?.key === group.key ? " · still adding items" : ""}
                             </small>
+                            {packingEnabled && group.comboType === "CUSTOM" && (
+                              <span className="cart-combo-packing">
+                                {(customPacking[group.key] || []).map((entry, index) => (
+                                  <span className="tag" key={`${group.key}-${entry.packing_size_id}`}>
+                                    {`${packingPathLabel(entry)} × ${entry.quantity}`}
+                                    <button aria-label={`Remove packing ${packingPathLabel(entry)}`} className="cart-combo-packing-remove" type="button" onClick={() => removeCustomPacking(group.key, index)}>×</button>
+                                  </span>
+                                ))}
+                                <button className="secondary-button compact-button" type="button" onClick={() => setPackPickFor((current) => (current === group.key ? null : group.key))}>
+                                  {(customPacking[group.key] || []).length > 0 ? "Change packing" : "Add packing"}
+                                </button>
+                              </span>
+                            )}
                           </td>
                           <td className="primary-cell">{group.comboPrice === null ? MISSING_VALUE : currency.format(comboGroupTotal(group) ?? 0)}</td>
                           <td><button aria-label={`Remove ${group.name}`} className="remove-button" onClick={() => removeCombo(group.key)}><Icon name="trash" size={16} /></button></td>

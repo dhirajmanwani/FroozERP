@@ -534,3 +534,102 @@ test("an empty combo tab names the tabs that do hold combos, or says how a new o
   );
   assert.match(emptyComboTabMessage({ nothingHere: "No gift hampers are set up yet.", elsewhere: [] }), /press Sync now, then open POS again\.$/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Frooz Pack: a combo's packing
+// ---------------------------------------------------------------------------------------------
+
+const packedCombo = () => ({
+  id: "combo-7",
+  name: "Gift Basket",
+  kind: "GIFTING",
+  combo_type: "FIXED",
+  price: "499",
+  extra_charge: 0,
+  margin_percent: 40,
+  items: [{ product_global_id: "product-1", product_id: "1", product_name: "Apple", unit: "kg", quantity: "1" }],
+  packing: [
+    { packing_size_id: "packing-size-9", quantity: "2", sort_order: 1, type_name: "Ribbon", design_name: "Satin", size_name: "petite", capacity: "", unit_cost: "3.50", size_active: true },
+    { size_id: "packing-size-4", quantity: 1, sort_order: 0, type_name: "Gift Box", design_name: "Window Box", size_name: "GRAND", capacity: "1 kg", unit_cost: 45, size_active: false },
+  ],
+});
+
+test("a combo's packing is read in one shape, in its order, from either id field", () => {
+  const combo = normaliseCombo(packedCombo());
+  assert.equal(combo.packing_known, true);
+  assert.deepEqual(combo.packing.map((row) => row.packing_size_id), ["packing-size-4", "packing-size-9"]);
+  assert.equal(combo.packing[0].size_active, false);
+  assert.equal(combo.packing[1].size_name, "PETITE");
+  assert.equal(combo.packing[1].unit_cost, 3.5);
+  assert.equal(combo.packing[1].quantity, 2);
+  // A row from before Frooz Pack: no packing key is "not told", not "none".
+  const { packing: _ignored, ...older } = packedCombo();
+  const plain = normaliseCombo(older);
+  assert.equal(plain.packing_known, false);
+  assert.deepEqual(plain.packing, []);
+});
+
+test("packing round-trips through the form and the payload", () => {
+  const draft = comboDraftFrom(packedCombo());
+  assert.deepEqual(draft.packing.map((row) => [row.packing_size_id, row.quantity, row.type_name]), [
+    ["packing-size-4", "1", "Gift Box"],
+    ["packing-size-9", "2", "Ribbon"],
+  ]);
+  const payload = buildComboPayload(draft);
+  assert.deepEqual(payload.packing, [
+    { packing_size_id: "packing-size-4", quantity: 1, sort_order: 0 },
+    { packing_size_id: "packing-size-9", quantity: 2, sort_order: 1 },
+  ]);
+  // Sale Rate Update's price-only edit keeps the packing it was given.
+  const priceOnly = buildComboPayload({ ...comboDraftFrom(packedCombo()), price: "549" });
+  assert.equal(priceOnly.price, 549);
+  assert.deepEqual(priceOnly.packing, payload.packing);
+});
+
+test("absent packing keeps the stored packing; [] clears it; a customer's-choice combo sends []", () => {
+  const { packing: _ignored, ...older } = packedCombo();
+  const draft = comboDraftFrom(older);
+  assert.equal(Object.hasOwn(draft, "packing"), false, "a row that never said its packing must not clear it");
+  assert.equal(Object.hasOwn(buildComboPayload(draft), "packing"), false);
+  assert.equal(Object.hasOwn(buildComboPayload({ ...draft, packing: null }), "packing"), false, "null is not 'none'");
+  assert.deepEqual(buildComboPayload({ ...draft, packing: [] }).packing, []);
+  assert.deepEqual(buildComboPayload({ ...comboDraftFrom(packedCombo()), combo_type: "CUSTOM" }).packing, []);
+  assert.deepEqual(newComboDraft().packing, []);
+  assert.deepEqual(buildComboPayload(newComboDraft()).packing, []);
+});
+
+test("the form refuses a packing row with no size, no quantity, or a size twice", () => {
+  const base = { ...comboDraftFrom(packedCombo()) };
+  assert.equal(validateComboDraft(base).ok, true);
+  const codes = (packing) => validateComboDraft({ ...base, packing }).errors.map((error) => error.code);
+  assert.deepEqual(codes([{ packing_size_id: "", quantity: "1" }]), ["COMBO_PACKING_INVALID"]);
+  assert.deepEqual(codes([{ packing_size_id: "packing-size-4", quantity: "0" }]), ["COMBO_PACKING_INVALID"]);
+  assert.deepEqual(codes([{ packing_size_id: "packing-size-4", quantity: "1.0001" }]), ["COMBO_PACKING_INVALID"]);
+  assert.deepEqual(codes([{ packing_size_id: "packing-size-4", quantity: "1" }, { packing_size_id: " packing-size-4 ", quantity: "2" }]), ["COMBO_PACKING_INVALID"]);
+  // "004" and "4" are different sizes.
+  assert.deepEqual(codes([{ packing_size_id: "004", quantity: "1" }, { packing_size_id: "4", quantity: "1" }]), []);
+  // Leftover packing rows on a customer's-choice combo are not sent (buildComboPayload sends []).
+  assert.equal(validateComboDraft({ ...base, combo_type: "CUSTOM", price: "", extra_charge: "0", packing: [{ packing_size_id: "", quantity: "" }] }).ok, true);
+});
+
+test("packing cost is part of the suggested price; an unknown packing cost means no suggestion", () => {
+  const items = [{ product_global_id: "product-1", product_id: "1", quantity: 0.5 }];
+  const rates = [{ product_id: 1, latest_effective_cost: "64.00" }];
+  // Fruit 32 + packing 2 × 3.50 + 1 × 45 = 84; × 1.25 = 105.
+  const packing = [
+    { packing_size_id: "packing-size-9", quantity: "2", unit_cost: "3.50" },
+    { packing_size_id: "packing-size-4", quantity: 1, unit_cost: 45 },
+  ];
+  assert.deepEqual(suggestComboPrice({ items, rates, targetMargin: 25, roundingRule: "NEAREST_RUPEE", packing }), { cost: 84, suggested: 105, margin: 25 });
+  // No packing is ₹0 of packing: the fruit-only answer is unchanged.
+  assert.deepEqual(suggestComboPrice({ items, rates, targetMargin: 25, roundingRule: "NEAREST_RUPEE", packing: [] }), { cost: 32, suggested: 40, margin: 25 });
+  // A row with no cost of its own takes the catalogue's.
+  const catalogue = { status: "ready", types: [{ id: "packing-type-1", name: "Gift Box", designs: [{ id: "packing-design-1", name: "Window Box", sizes: [{ id: "packing-size-4", size_name: "GRAND", unit_cost: 45 }] }] }] };
+  assert.equal(suggestComboPrice({ items, rates, targetMargin: 25, packing: [{ packing_size_id: "packing-size-4", quantity: 1 }], catalogue }).cost, 77);
+  // Unknown: no row cost and no catalogue, or a cost of 0 (unset), or a size the catalogue lacks.
+  assert.deepEqual(suggestComboPrice({ items, rates, targetMargin: 25, packing: [{ packing_size_id: "packing-size-4", quantity: 1 }] }), { cost: null, suggested: null, margin: 25 });
+  assert.equal(suggestComboPrice({ items, rates, targetMargin: 25, packing: [{ packing_size_id: "packing-size-4", quantity: 1, unit_cost: 0 }] }).cost, null);
+  assert.equal(suggestComboPrice({ items, rates, targetMargin: 25, packing: [{ packing_size_id: "packing-size-99", quantity: 1 }], catalogue }).cost, null);
+  // Fruit with no cost is still no cost, whatever the packing.
+  assert.equal(suggestComboPrice({ items, rates: [], targetMargin: 25, packing }).cost, null);
+});

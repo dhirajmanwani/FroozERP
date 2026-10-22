@@ -1,6 +1,7 @@
 "use strict";
 
 const { COMBOS_WITH_ITEMS_SQL, unavailableProductsOf } = require("./combos");
+const { PACKING_STOCK_SQL, PACKING_TREE_SQL, buildPackingTree, packingStockPayload, packingTypePayload } = require("./froozPack");
 
 const REFERENCE_BOOTSTRAP_PROTOCOL = "reference-v1";
 /**
@@ -13,9 +14,15 @@ const REFERENCE_BOOTSTRAP_PROTOCOL = "reference-v1";
  *
  * `combo` likewise: a combo's price and items are company-wide master data, and a counter that
  * kept an old combo price would bill a group whose total no longer matches the offer.
+ *
+ * `packing_type` (Frooz Pack: a whole Type > Design > Size tree) is company-wide master data like a
+ * combo. `packing_stock` is one branch's count of one size, and is a company reference type too:
+ * it is logged once, with its branch, and every device of the company pulls it -- the device keeps
+ * every branch's counts and its snapshot shows its own branch's.
  */
 const COMPANY_REFERENCE_ENTITY_TYPES = Object.freeze([
   "product_category", "product", "sale_rate", "supplier", "charge_type", "combo",
+  "packing_type", "packing_stock",
 ]);
 
 const visibleChangePredicate = (offset = 1) => `
@@ -232,6 +239,12 @@ const captureReferenceBootstrap = async (client, context) => {
   // `GET /api/v3/combos` and the `combo` sync change, from the same SQL.
   const combosResult = await client.query(COMBOS_WITH_ITEMS_SQL, [context.companyId, null, null]);
 
+  // Frooz Pack: every packing type of the company as the `packing_type` change carries it (whole
+  // tree, inactive entries included, for the same reason as combos), and every branch's packing
+  // counts as `packing_stock` payloads.
+  const packingTypesResult = await client.query(PACKING_TREE_SQL, [context.companyId, null, null]);
+  const packingStockResult = await client.query(PACKING_STOCK_SQL, [context.companyId]);
+
   const record = (entityType, row) => ({
     change_id: null,
     branch_id: context.branchId,
@@ -258,6 +271,8 @@ const captureReferenceBootstrap = async (client, context) => {
     location_products: locationProductsResult.rows,
     charge_types: chargeTypesResult.rows,
     combos: combosResult.rows.map((row) => ({ ...row, unavailable_products: unavailableProductsOf(row) })),
+    packing_types: buildPackingTree(packingTypesResult.rows).map(packingTypePayload),
+    packing_stock: packingStockResult.rows.map(packingStockPayload),
     records: [
       ...categoriesResult.rows.map((row) => record("product_category", row)),
       ...productsResult.rows.map((row) => record("product", row)),

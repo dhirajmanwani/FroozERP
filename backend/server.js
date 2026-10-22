@@ -81,6 +81,7 @@ const { normaliseLicenceRequest } = require("./activationLicenceRequest");
 const { validateProductPhoto } = require("./productPhoto");
 const { parsePosSection } = require("./productPosSection");
 const comboRules = require("./combos");
+const froozPack = require("./froozPack");
 const { parseBusinessLogo } = require("./businessLogo");
 const saleChangeApproval = require("./saleChangeApproval");
 const {
@@ -2518,6 +2519,139 @@ const initializeDatabase = async () => {
     );
     CREATE INDEX IF NOT EXISTS combo_items_combo_idx
       ON combo_items (combo_id, sort_order);
+
+    -- Frooz Pack (backend/froozPack.js): the packing master Type > Design > Size (company-wide,
+    -- published as packing_type), per-branch packing stock (packing_stock, no >= 0 check: a sale
+    -- never stops for packing), purchases (each writes one 'Packing Material' expense), signed
+    -- movements, a FIXED combo's packing and each bill's packing as billed. No foreign key to sales
+    -- or expenses. Cloud migration 025 carries exactly these statements; keep the two identical.
+    CREATE TABLE IF NOT EXISTS packing_types (
+      id SERIAL PRIMARY KEY,
+      global_id VARCHAR(80) UNIQUE,
+      company_id INTEGER,
+      name VARCHAR(80) NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      created_by INTEGER,
+      updated_by INTEGER,
+      created_at TIMESTAMP DEFAULT now(),
+      updated_at TIMESTAMP DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS packing_types_company_name_key
+      ON packing_types (COALESCE(company_id, 0), LOWER(name))
+      WHERE active;
+    CREATE TABLE IF NOT EXISTS packing_designs (
+      id SERIAL PRIMARY KEY,
+      global_id VARCHAR(80) UNIQUE,
+      type_id INTEGER NOT NULL REFERENCES packing_types(id),
+      name VARCHAR(80) NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_by INTEGER,
+      updated_by INTEGER,
+      created_at TIMESTAMP DEFAULT now(),
+      updated_at TIMESTAMP DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS packing_designs_type_name_key
+      ON packing_designs (type_id, LOWER(name))
+      WHERE active;
+    CREATE TABLE IF NOT EXISTS packing_sizes (
+      id SERIAL PRIMARY KEY,
+      global_id VARCHAR(80) UNIQUE,
+      design_id INTEGER NOT NULL REFERENCES packing_designs(id),
+      size_name VARCHAR(20) NOT NULL,
+      capacity VARCHAR(40),
+      unit_cost NUMERIC(14, 2) NOT NULL DEFAULT 0,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_by INTEGER,
+      updated_by INTEGER,
+      created_at TIMESTAMP DEFAULT now(),
+      updated_at TIMESTAMP DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS packing_sizes_design_size_key
+      ON packing_sizes (design_id, size_name, LOWER(COALESCE(capacity, '')))
+      WHERE active;
+    CREATE TABLE IF NOT EXISTS packing_stock (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER,
+      branch_id INTEGER NOT NULL,
+      size_id INTEGER NOT NULL REFERENCES packing_sizes(id),
+      qty_on_hand NUMERIC(14, 3) NOT NULL DEFAULT 0,
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      updated_at TIMESTAMP DEFAULT now(),
+      UNIQUE (branch_id, size_id)
+    );
+    CREATE TABLE IF NOT EXISTS packing_purchases (
+      id SERIAL PRIMARY KEY,
+      global_id VARCHAR(80) UNIQUE,
+      company_id INTEGER,
+      branch_id INTEGER NOT NULL,
+      supplier_name VARCHAR(160),
+      payment_mode VARCHAR(30),
+      purchase_date DATE,
+      reference_number VARCHAR(80),
+      remarks TEXT,
+      amount NUMERIC(14, 2) NOT NULL DEFAULT 0,
+      expense_id INTEGER,
+      created_by INTEGER,
+      created_at TIMESTAMP DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS packing_purchases_expense_idx
+      ON packing_purchases (expense_id);
+    CREATE TABLE IF NOT EXISTS packing_purchase_lines (
+      id SERIAL PRIMARY KEY,
+      purchase_id INTEGER NOT NULL REFERENCES packing_purchases(id) ON DELETE CASCADE,
+      size_id INTEGER NOT NULL REFERENCES packing_sizes(id),
+      quantity NUMERIC(14, 3) NOT NULL CHECK (quantity > 0),
+      rate NUMERIC(14, 2) NOT NULL CHECK (rate >= 0),
+      amount NUMERIC(14, 2) NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS packing_movements (
+      id BIGSERIAL PRIMARY KEY,
+      company_id INTEGER,
+      branch_id INTEGER NOT NULL,
+      size_id INTEGER NOT NULL,
+      movement_type VARCHAR(20) NOT NULL,
+      quantity NUMERIC(14, 3) NOT NULL,
+      sale_id INTEGER,
+      purchase_id INTEGER,
+      reason TEXT,
+      created_by INTEGER,
+      created_at TIMESTAMP DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_packing_movements_sale
+      ON packing_movements (sale_id, size_id, movement_type)
+      WHERE sale_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS packing_movements_branch_size_idx
+      ON packing_movements (branch_id, size_id, created_at);
+    CREATE TABLE IF NOT EXISTS combo_packing (
+      id SERIAL PRIMARY KEY,
+      combo_id INTEGER NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
+      size_id INTEGER NOT NULL REFERENCES packing_sizes(id),
+      quantity NUMERIC(14, 3) NOT NULL CHECK (quantity > 0),
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS combo_packing_combo_idx
+      ON combo_packing (combo_id, sort_order);
+    CREATE TABLE IF NOT EXISTS sale_packing_usage (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER NOT NULL,
+      combo_line_key VARCHAR(80),
+      combo_id VARCHAR(80),
+      source VARCHAR(10),
+      size_id INTEGER,
+      size_global_id VARCHAR(80),
+      type_name VARCHAR(80),
+      design_name VARCHAR(80),
+      size_name VARCHAR(20),
+      capacity VARCHAR(40),
+      quantity NUMERIC(14, 3) NOT NULL,
+      unit_cost NUMERIC(14, 2)
+    );
+    CREATE INDEX IF NOT EXISTS sale_packing_usage_sale_idx
+      ON sale_packing_usage (sale_id);
 
     CREATE TABLE IF NOT EXISTS rebate_rules (
       id SERIAL PRIMARY KEY,
@@ -10872,6 +11006,28 @@ const listCombosHandler = async (req, res) => {
   }
 };
 
+/**
+ * The branch a company-wide master change is anchored on: a branch of that company (the session's
+ * own when it is one), because `logMasterDataSyncChange` takes the company from the anchor and fans
+ * out to that company's other branches. An anchor in another company (a session with no branch fell
+ * back to branch 1) would publish the change to devices that cannot use it and to none of the ones
+ * that need it. Shared by combos and Frooz Pack's `packing_type`.
+ */
+const companyAnchorBranchId = async (client, companyId, preferredBranchId) => {
+  const company = parsePositiveInteger(companyId);
+  const preferred = parsePositiveInteger(preferredBranchId);
+  const anchor = company
+    ? await client.query(
+      `SELECT id FROM branches
+       WHERE company_id = $1
+       ORDER BY (id = $2) DESC, (active IS DISTINCT FROM FALSE) DESC, id
+       LIMIT 1`,
+      [company, preferred]
+    )
+    : { rows: [] };
+  return parsePositiveInteger(anchor.rows[0]?.id) || preferred || 1;
+};
+
 /** Create (POST, no `:id`) or replace (PUT `:id`, a numeric id or the global id) one combo, items and all. */
 const saveComboHandler = async (req, res) => {
   const updating = req.params.id !== undefined;
@@ -10933,6 +11089,20 @@ const saveComboHandler = async (req, res) => {
       }
     }
 
+    // Frooz Pack: a FIXED combo's packing, each size this company's and switched on. An absent
+    // `packing` key (null here) keeps what is stored; [] clears it. A CUSTOM combo never keeps any.
+    let packingLines = null;
+    if (combo.combo_type === "FIXED" && Array.isArray(combo.packing)) {
+      const resolvedPacking = await froozPack.resolveComboPacking(client, { companyId, packing: combo.packing });
+      if (!resolvedPacking.ok) {
+        await client.query("ROLLBACK");
+        return comboRefusal(res, 400, comboRules.CODES.PACKING_INVALID, resolvedPacking.message);
+      }
+      packingLines = resolvedPacking.lines;
+    } else if (combo.combo_type !== "FIXED" && updating) {
+      packingLines = [];
+    }
+
     if (updating) {
       await client.query(
         `UPDATE combos
@@ -10970,24 +11140,12 @@ const saveComboHandler = async (req, res) => {
         [comboId, productIds[index], item.quantity, item.sort_order]
       );
     }
+    if (packingLines !== null) await froozPack.replaceComboPacking(client, { comboId, lines: packingLines });
 
     const [saved] = await loadCombosWithItems(client, { companyId, comboIds: [comboId] });
     if (!saved) throw new Error("The combo just written could not be read back");
-    // Anchored on a branch of the combo's own company: `logMasterDataSyncChange` takes the company
-    // from the anchor and fans out to that company's other branches, so an anchor in another
-    // company (a session with no branch fell back to branch 1) would publish the combo to devices
-    // that cannot use it and to none of the ones that sell it.
-    const anchor = companyId
-      ? await client.query(
-        `SELECT id FROM branches
-         WHERE company_id = $1
-         ORDER BY (id = $2) DESC, (active IS DISTINCT FROM FALSE) DESC, id
-         LIMIT 1`,
-        [companyId, parsePositiveInteger(req.auth.branchId)]
-      )
-      : { rows: [] };
     await logMasterDataSyncChange(client, {
-      branchId: parsePositiveInteger(anchor.rows[0]?.id) || parsePositiveInteger(req.auth.branchId) || 1,
+      branchId: await companyAnchorBranchId(client, companyId, req.auth.branchId),
       entityType: "combo",
       entityId: saved.global_id,
       operationType: "UPSERT",
@@ -11018,6 +11176,87 @@ const saveComboHandler = async (req, res) => {
 app.get("/api/v3/combos", listCombosHandler);
 app.post("/api/v3/combos", saveComboHandler);
 app.put("/api/v3/combos/:id", saveComboHandler);
+
+// ---------------------------------------------------------------------------------------------
+// Frooz Pack: packing material (backend/froozPack.js holds the rules and the database work).
+//
+// Reading needs only a session: the counter picks packing from the tree, with its own branch's
+// counts. Writing is Owner/Admin through `requireRateManager(req.auth.userId)` -- one call site,
+// in `packingWriteRoute` -- and needs the session's company and branch (stock and the purchase
+// expense are per branch), refused before any write otherwise. No DELETE: `active: false` retires
+// a type, design or size and keeps every bill and purchase that used it readable.
+//
+// The company is always `req.auth.companyId`, the branch `req.auth.branchId`, the actor
+// `req.auth.userId`; nothing here reads an identity from the request body or headers.
+// ---------------------------------------------------------------------------------------------
+
+/** The server's sync loggers, as froozPack.js takes them. A function: they are declared below. */
+const froozPackDeps = () => ({
+  logSyncChange,
+  logMasterDataSyncChange,
+  anchorBranchId: companyAnchorBranchId,
+  today: () => toDateKey(new Date()),
+});
+
+const packingWriteRoute = (work) => async (req, res) => {
+  const client = await pool.connect();
+  let began = false;
+  try {
+    const manager = await requireRateManager(req.auth.userId, client);
+    if (!manager) return res.status(403).json({ code: froozPack.CODES.PERMISSION_REQUIRED, message: froozPack.MESSAGES.PERMISSION_REQUIRED });
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    const branchId = parsePositiveInteger(req.auth.branchId);
+    if (!companyId || !branchId) {
+      return res.status(400).json({ code: froozPack.CODES.COMPANY_REQUIRED, message: froozPack.MESSAGES.COMPANY_REQUIRED });
+    }
+    await client.query("BEGIN");
+    began = true;
+    const outcome = await work(client, {
+      companyId,
+      branchId,
+      actorId: manager.id,
+      id: req.params.id,
+      body: req.body || {},
+    }, froozPackDeps());
+    await client.query(outcome.status >= 400 ? "ROLLBACK" : "COMMIT");
+    began = false;
+    return res.status(outcome.status).json(outcome.body);
+  } catch (error) {
+    if (began) await client.query("ROLLBACK").catch(() => null);
+    console.error("Saving Frooz Pack failed", { code: error?.code, message: error?.message, constraint: error?.constraint });
+    const outcome = froozPack.packingErrorResponse(error);
+    return res.status(outcome.status).json(outcome.body);
+  } finally {
+    client.release();
+  }
+};
+
+const packingReadRoute = (read) => async (req, res) => {
+  try {
+    return res.json(await read(pool, {
+      companyId: parsePositiveInteger(req.auth.companyId),
+      branchId: parsePositiveInteger(req.auth.branchId),
+      query: req.query || {},
+    }));
+  } catch (error) {
+    console.error("Loading Frooz Pack failed", { code: error?.code, message: error?.message });
+    if (error?.code === "42P01") return res.status(500).json({ code: froozPack.CODES.STORAGE_MISSING, message: froozPack.MESSAGES.STORAGE_MISSING });
+    return res.status(500).json({ code: froozPack.CODES.LOAD_FAILED, message: "Frooz Pack could not be loaded." });
+  }
+};
+
+app.get("/api/v3/packing", packingReadRoute((db, scope) => froozPack.listPacking(db, scope)));
+app.get("/api/v3/packing/movements", packingReadRoute((db, scope) => froozPack.listPackingMovements(db, {
+  ...scope, sizeId: scope.query.size_id, limit: scope.query.limit,
+})));
+app.post("/api/v3/packing/types", packingWriteRoute(froozPack.saveType));
+app.put("/api/v3/packing/types/:id", packingWriteRoute(froozPack.saveType));
+app.post("/api/v3/packing/designs", packingWriteRoute(froozPack.saveDesign));
+app.put("/api/v3/packing/designs/:id", packingWriteRoute(froozPack.saveDesign));
+app.post("/api/v3/packing/sizes", packingWriteRoute(froozPack.saveSize));
+app.put("/api/v3/packing/sizes/:id", packingWriteRoute(froozPack.saveSize));
+app.post("/api/v3/packing/purchases", packingWriteRoute(froozPack.recordPackingPurchase));
+app.post("/api/v3/packing/adjustments", packingWriteRoute(froozPack.recordPackingAdjustment));
 
 app.post("/settings/rebate-rules", async (req, res) => {
   try {
@@ -12027,6 +12266,15 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     companyId: context.companyId,
     actorId: context.user.id,
   });
+  // Frooz Pack: the packing this bill used, as billed, out of this branch's counts. Never refuses
+  // the bill (its failures are contained in a savepoint and logged); no query without packing_usage.
+  await froozPack.recordSalePackingUsage(client, {
+    saleId: sale.id,
+    companyId: context.companyId,
+    branchId: context.branchId,
+    actorId: context.user.id,
+    usage: payload.packing_usage,
+  }, froozPackDeps());
 
   for (const item of salePayload.invoiceItems) {
     const invoiceDiscountShare = invoiceDiscountShareOf(salePayload, item);
@@ -12489,6 +12737,8 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
   if (!approval.ok) return rejectOperation(operation, "AUTHORIZATION_ERROR", approval.message);
   const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
   await restoreSaleInventory(client, currentSale.id, canceller.id, "Offline cancellation reversal for invoice", "IN");
+  // Frooz Pack: the bill's packing back into the counts, once. Never refuses the cancel.
+  await froozPack.restoreSalePacking(client, { saleId: currentSale.id, companyId: context.companyId, actorId: canceller.id }, froozPackDeps());
   await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [currentSale.id]);
   await client.query("UPDATE sale_payments SET status = 'REVERSED' WHERE sale_id = $1", [currentSale.id]);
   const updateResult = await client.query(
@@ -21802,7 +22052,8 @@ app.get("/expenses", async (req, res) => {
     const result = await pool.query(
       `
       SELECT e.*, COALESCE(e.paid_to, e.vendor_name) AS paid_to, u.full_name AS created_by_name,
-             eu.full_name AS edited_by_name, cu.full_name AS cancelled_by_name
+             eu.full_name AS edited_by_name, cu.full_name AS cancelled_by_name,
+             EXISTS (SELECT 1 FROM packing_purchases pp WHERE pp.expense_id = e.id) AS packing_purchase
       FROM expenses e
       LEFT JOIN users u ON u.id = e.created_by
       LEFT JOIN users eu ON eu.id = e.edited_by
@@ -21891,6 +22142,11 @@ app.put("/expenses/:id", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled expenses cannot be edited" });
     }
+    // Editing it would let its amount drift from the Frooz Pack purchase it records.
+    if (await froozPack.isPackingPurchaseExpense(client, expenseId)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ code: froozPack.CODES.PURCHASE_EXPENSE, message: froozPack.MESSAGES.PURCHASE_EXPENSE });
+    }
     const editorId = req.auth.userId;
     const reason = cleanText(req.body.reason || req.body.edit_reason || "Expense updated");
     const result = await client.query(
@@ -21957,6 +22213,12 @@ app.post("/expenses/:id/cancel", async (req, res) => {
     if (oldExpense.status === "CANCELLED" || oldExpense.active === false) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Expense is already cancelled" });
+    }
+    // A Frooz Pack purchase's expense goes with the purchase: cancelling it here would leave the
+    // packing counted as bought and paid for nothing. The owner corrects a count with an adjustment.
+    if (await froozPack.isPackingPurchaseExpense(client, expenseId)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ code: froozPack.CODES.PURCHASE_EXPENSE, message: froozPack.MESSAGES.PURCHASE_EXPENSE });
     }
     const result = await client.query(
       `
@@ -26504,6 +26766,12 @@ const cancelSaleHandler = async (req, res) => {
     if (!approval.ok) return rejectSaleChange(client, res, approval);
     const oldSnapshot = await getSaleSnapshot(client, saleId);
     await restoreSaleInventory(client, saleId, canceller.id, "Cancellation reversal for invoice", "IN");
+    // Frooz Pack: the bill's packing back into the counts, once. Never refuses the cancel.
+    await froozPack.restoreSalePacking(client, {
+      saleId,
+      companyId: currentSale.company_id ?? context?.company_id ?? req.auth.companyId,
+      actorId: canceller.id,
+    }, froozPackDeps());
     await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [saleId]);
     await client.query("UPDATE sale_payments SET status = 'REVERSED' WHERE sale_id = $1", [saleId]);
     const updateResult = await client.query(
