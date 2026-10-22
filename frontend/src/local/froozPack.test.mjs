@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   packingEmptyPickerMessage,
+  packingTypesWithoutSize,
   PACKING_LOW_STOCK_AT,
   PACKING_SIZE_LABELS,
   PACKING_SIZE_NAMES,
@@ -664,4 +665,13 @@ test("an empty picker names the packing types that still need a design and a siz
     packingEmptyPickerMessage([{ id: "packing-type-1", name: "Bottle", designs: [] }]),
     "Bottle has no size yet. In Frooz Pack, open it with →, add a Design, then add a Size inside it."
   );
+});
+
+test("types with no usable size are named, so a picker can say why they are missing", () => {
+  assert.deepEqual(packingTypesWithoutSize({ types: [
+    { id: "packing-type-1", name: "Bowl", designs: [{ id: "packing-design-1", name: "Round", sizes: [{ id: "packing-size-1", size_name: "CLASSIC" }] }] },
+    { id: "packing-type-2", name: "Tray", designs: [] },
+    { id: "packing-type-3", name: "Box", designs: [{ id: "packing-design-2", name: "Kraft", active: false, sizes: [{ id: "packing-size-2", size_name: "GRAND" }] }] },
+    { id: "packing-type-4", name: "Off", active: false, designs: [] },
+  ] }), ["Tray", "Box"]);
 });

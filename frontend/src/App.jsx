@@ -176,7 +176,7 @@ import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMast
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
 import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
-import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildSalePackingUsage, createPackingDrill, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
+import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildSalePackingUsage, createPackingDrill, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingTypesWithoutSize, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -15492,7 +15492,10 @@ function PackingDrillPicker({ catalogue, onClose, onPick, quantity = false, titl
         <p className="warning-note" role="status">{catalogue?.message || "The packing list has not reached this computer yet."}</p>
       ) : rows.length === 0 ? (
         <p className="form-note">{packingEmptyPickerMessage(catalogue)}</p>
-      ) : (
+      ) : view.level === "types" && packingTypesWithoutSize(catalogue).length > 0 ? (
+        <p className="form-note">{`Not shown until it has a size: ${packingTypesWithoutSize(catalogue).join(", ")}. Add a Design and a Size in Frooz Pack.`}</p>
+      ) : null}
+      {status === "ready" && rows.length > 0 && (
         <ul
           aria-label={view.title}
           className="packing-rows"

@@ -308,6 +308,12 @@ export const backPackingDrill = (state) => {
  * picked, so a type with no design or no size under it is invisible here. Name those types and
  * say what is missing, so the owner knows where to go instead of re-creating the type.
  */
+/** Active types with no active size under any active design, by name -- invisible to a picker. */
+export const packingTypesWithoutSize = (catalogue) => (Array.isArray(catalogue) ? catalogue : Array.isArray(catalogue?.types) ? catalogue.types : [])
+  .filter((type) => type && type.active !== false)
+  .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
+  .map((type) => text(type.name) || "A packing type");
+
 export const packingEmptyPickerMessage = (catalogue) => {
   const types = (Array.isArray(catalogue) ? catalogue : Array.isArray(catalogue?.types) ? catalogue.types : [])
     .filter((type) => type && type.active !== false);
