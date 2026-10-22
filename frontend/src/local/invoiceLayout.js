@@ -191,6 +191,20 @@ const buildLine = (item, index, { showItemDiscounts }) => {
     discount = { label, amount: discountAmount, amountText, text: `${label} · ${amountText}` };
   }
 
+  const comboKey = text(item.combo_line_key);
+  const combo = comboKey
+    ? {
+      key: comboKey,
+      name: text(item.combo_name),
+      kind: text(item.combo_kind).toUpperCase(),
+      type: text(item.combo_type).toUpperCase(),
+      qty: readAmount(item.combo_qty),
+      price: readAmount(item.combo_price),
+    }
+    : null;
+  // A combo's lines are priced by the combo, not one by one: the paise each line carries as a
+  // discount only make the lines add up to the combo price, so no line prints a discount of its own.
+
   return {
     key: text(item.id) || text(item.sale_item_id) || `${text(item.product_id)}-${text(item.inventory_batch_id)}-${index}`,
     product: text(item.product_name) || EMPTY_LABEL,
@@ -208,8 +222,77 @@ const buildLine = (item, index, { showItemDiscounts }) => {
     gross,
     net,
     discountAmount: hasDiscount ? discountAmount : 0,
-    discount,
+    discount: combo ? null : discount,
+    combo,
   };
+};
+
+// ---------------------------------------------------------------------------------------------
+// Combos: the lines of one combo, printed together
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The bill's lines as printed: a loose line on its own, and the lines of one combo gathered under
+ * it at the place its first line stands (21 Oct 2026).
+ *
+ * Every combo, fixed or the customer's choice, prints ONE price: "Mixed Juice × 2" with the combo's
+ * total, its items beneath by name and quantity, with no fruit prices (the owner: "per combo ya per
+ * gift pricing rahegi"). A combo line missing its name is still grouped by its key and called
+ * "Combo"; nothing is invented.
+ */
+const buildBlocks = (lines, issues) => {
+  const blocks = [];
+  const byKey = new Map();
+  for (const line of lines) {
+    if (!line.combo) {
+      blocks.push({ kind: "line", key: `line-${line.key}`, line });
+      continue;
+    }
+    let block = byKey.get(line.combo.key);
+    if (!block) {
+      block = { kind: "combo", key: `combo-${line.combo.key}`, combo: line.combo, components: [] };
+      byKey.set(line.combo.key, block);
+      blocks.push(block);
+    }
+    block.components.push(line);
+  }
+  return blocks.map((block) => {
+    if (block.kind !== "combo") return block;
+    const { combo, components } = block;
+    const name = combo.name || "Combo";
+    const nets = components.map((line) => line.net);
+    const amount = nets.every((net) => net !== null)
+      ? fromPaise(nets.reduce((sum, net) => sum + toPaise(net), 0))
+      : null;
+    const expected = combo.price !== null && combo.qty !== null ? toPaise(combo.price) * combo.qty : null;
+    if (amount !== null && expected !== null && Math.abs(toPaise(amount) - expected) > 1) {
+      issues.push(`${name} on this bill does not add up to its combo price.`);
+    }
+    return {
+      kind: "combo",
+      key: block.key,
+      comboType: combo.type || "FIXED",
+      name,
+      title: combo.qty !== null ? `${name} × ${formatBillQuantity(combo.qty)}` : name,
+      qty: combo.qty,
+      qtyText: formatBillQuantity(combo.qty),
+      rate: combo.price,
+      rateText: formatBillNumber(combo.price),
+      amount,
+      amountText: formatBillNumber(amount),
+      components,
+    };
+  });
+};
+
+/** What combo lines carry as discount: paise that are part of the combo price. */
+const comboResidual = (lines) => {
+  let paise = 0;
+  for (const line of lines) {
+    if (!line.combo) continue;
+    if (line.discountAmount) paise += toPaise(line.discountAmount);
+  }
+  return paise;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -299,10 +382,15 @@ const buildTotals = (sale, lines, settings) => {
     result.issues.push("The discounts shown on the item lines do not add up to the bill's item discount.");
   }
 
-  const itemsTotal = fromPaise(itemsPaise);
-  const itemDiscountValue = fromPaise(toPaise(itemDiscount));
+  // A combo's lines carry a few paise as discount so they add up to the combo's price. On the bill
+  // that is part of the combo's price, not a saving: it comes off Items total and Total discount
+  // alike, so the printed rows still foot to the grand total exactly.
+  const residual = comboResidual(lines);
+  const comboPaise = residual > 0 && residual <= toPaise(itemDiscount) ? residual : 0;
+  const itemsTotal = fromPaise(itemsPaise - comboPaise);
+  const itemDiscountValue = fromPaise(toPaise(itemDiscount) - comboPaise);
   const billDiscountValue = fromPaise(toPaise(billDiscount));
-  const totalDiscount = fromPaise(discountPaise);
+  const totalDiscount = fromPaise(discountPaise - comboPaise);
   Object.assign(result, {
     reconciled: true,
     itemsTotal,
@@ -315,7 +403,7 @@ const buildTotals = (sale, lines, settings) => {
   });
 
   const rows = [{ key: "items-total", label: "Items total", amount: itemsTotal, amountText: formatBillMoney(itemsTotal), kind: "row" }];
-  if (discountPaise > 0) {
+  if (discountPaise - comboPaise > 0) {
     const both = itemDiscountValue > 0 && billDiscountValue > 0;
     const billLabel = billDiscountLabel(sale);
     rows.push({
@@ -428,6 +516,7 @@ export const buildInvoiceLayout = (sale = {}, settings = {}, options = {}) => {
   const rawItems = Array.isArray(safeSale.items) ? safeSale.items : [];
   const lines = mergeAllocationRows(rawItems).map((item, index) => buildLine(item, index, { showItemDiscounts }));
   const totals = buildTotals(safeSale, lines, safeSettings);
+  const blocks = buildBlocks(lines, totals.issues);
   const payment = buildPayment(safeSale);
 
   const status = text(safeSale.sale_status || safeSale.status).toUpperCase();
@@ -467,6 +556,8 @@ export const buildInvoiceLayout = (sale = {}, settings = {}, options = {}) => {
     },
     columns: INVOICE_COLUMNS,
     lines,
+    // The lines as printed, combos gathered (`lines` stays flat for anything that counts lines).
+    blocks,
     totals,
     payment,
     savings,
@@ -493,6 +584,18 @@ const lineText = (line) => {
   rows.push(`  ${line.qtyText}${unit}${rate}${amount}`);
   if (line.discount) rows.push(`  ${line.discount.label}: ${plainMoney(-line.discount.amount)}`);
   return rows;
+};
+
+const componentText = (line) => {
+  const unit = line.unit === EMPTY_LABEL ? "" : ` ${line.unit}`;
+  return `  · ${line.product} ${line.qtyText}${unit}`;
+};
+
+// One block of the caption. A combo is one block, so trimming never cuts one in half.
+const blockText = (block) => {
+  if (block.kind !== "combo") return lineText(block.line);
+  const amount = block.amount === null ? "" : ` = ₹${block.amountText}`;
+  return [`${block.title}${amount}`, ...block.components.map(componentText)];
 };
 
 /**
@@ -523,7 +626,7 @@ export const buildInvoiceText = (layout, { maxLength = INVOICE_TEXT_MAX_LENGTH }
   if (savings) tail.push("", `*${savings.text.replace(MINUS, "-")}*`);
   tail.push("", footer.message);
 
-  const itemBlocks = lines.map(lineText);
+  const itemBlocks = (Array.isArray(layout.blocks) ? layout.blocks : lines.map((line) => ({ kind: "line", line }))).map(blockText);
   const assemble = (blocks, omitted) => [
     ...head,
     "",

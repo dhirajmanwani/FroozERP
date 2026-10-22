@@ -5,7 +5,7 @@ import test from "node:test";
 const appSource = await readFile(new URL("../App.jsx", import.meta.url), "utf8");
 const navigationViews = [
   "dashboard", "products", "purchase", "pending-bills", "accounts", "returns", "waste",
-  "sales", "discounts", "sale-rates", "expenses", "reports", "settings",
+  "sales", "discounts", "combos", "sale-rates", "expenses", "reports", "settings",
 ];
 
 test("every main navigation module has a render path and refresh path", () => {

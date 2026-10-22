@@ -55,11 +55,12 @@ export const NAVIGATION_LOOKUP = Object.freeze({
  * the start" key and the one most likely to be hit by accident — so it lands on a read-only
  * overview, where a mis-hit costs nothing.
  *
- * There are ten digits and seventeen modules. The seven opened least get a letter instead, named
+ * There are ten digits and eighteen modules. The eight opened least get a letter instead, named
  * after the screen where a letter is free (2 Oct 2026, the owner asked for a key on every screen):
  *
  *   Alt+W  Waste Management       Alt+A  All Shops
  *   Alt+C  Discounts (chhoot)     Alt+B  Branches & Counters
+ *   Alt+O  Combos & Offers
  *   Alt+X  Expenses               Alt+S  Settings
  *   Alt+T  Stock Distribution (transfer)
  *
@@ -141,6 +142,15 @@ const modules = [
     icon: "wallet",
     shortcut: "C",
     keywords: ["offer", "lot discount", "special price", "price off", "concession"],
+    sections: [],
+  },
+  {
+    id: "combos",
+    label: "Combos & Offers",
+    icon: "gift",
+    // O for offers. The owner sets combos up now and then; the counter sells them from POS tabs.
+    shortcut: "O",
+    keywords: ["combo", "offer", "juice", "the cutting", "cut fruit", "gift", "gifting", "basket", "hamper", "frooz bar", "frooz moments"],
     sections: [],
   },
   {

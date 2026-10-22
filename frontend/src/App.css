@@ -8465,19 +8465,26 @@ button.shortcut-sheet-row:focus-visible {
 }
 
 /* POS shelves: Frooz Retail / Frooz Bar / Frooz Moments. */
+/* One row, always: four tabs fit at 1366px, and a narrower window scrolls the strip sideways
+   instead of wrapping a tab onto a second line. */
 .pos-sections {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-top: 13px;
+  padding-bottom: 2px;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .pos-section {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
+  gap: 6px;
+  padding: 7px 10px;
+  white-space: nowrap;
   border: 1px solid var(--line-control);
   border-radius: 999px;
   color: var(--ink-body);
@@ -8506,8 +8513,10 @@ button.shortcut-sheet-row:focus-visible {
 }
 
 .pos-sections-note {
+  flex: 0 0 auto;
   color: var(--ink-muted);
   font-size: 12px;
+  white-space: nowrap;
 }
 
 .product-results .product-result {
@@ -10247,4 +10256,157 @@ button.shortcut-sheet-row:focus-visible {
 /* A logo is often wide; the photo box's `cover` crop would cut it. Show it whole. */
 .brand-identity-editor .product-photo-drop img {
   object-fit: contain;
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Combos & Offers: POS tiles, the customer's-choice build banner, cart groups, the bill block and
+   the management screen.
+   --------------------------------------------------------------------------------------------- */
+
+.product-result-combo {
+  border-style: dashed;
+  border-color: var(--accent-line-strong);
+}
+
+.product-result-unavailable {
+  opacity: 0.6;
+}
+
+/* Why the combo cannot be made: its own line under the title, across the whole tile, wrapping
+   as it needs -- in the corner it squeezed the title and the details into a sliver. */
+.product-results .product-result-unavailable em {
+  grid-column: 1 / -1;
+  white-space: normal;
+  overflow-wrap: break-word;
+  color: var(--danger-ink);
+}
+
+.pos-combo-build {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-line-strong);
+  border-radius: 8px;
+  background: var(--accent-wash);
+}
+
+.pos-combo-ask {
+  width: min(420px, calc(100vw - 32px));
+}
+
+.pos-combo-ask-body {
+  display: grid;
+  gap: 12px;
+}
+
+.cart-table tr.cart-combo-head td {
+  border-top: 2px solid var(--accent-line-strong);
+  background: var(--accent-wash);
+  font-weight: 700;
+}
+
+.cart-table tr.cart-combo-item td {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+.cart-table tr.cart-combo-item td:first-child {
+  padding-left: 22px;
+}
+
+.cart-table tr.cart-combo-item td {
+  background: var(--veil);
+}
+
+.bill-paper .bill-table .bill-combo-item td {
+  padding-top: 1px !important;
+  padding-bottom: 1px !important;
+  color: var(--paper-ink-muted);
+  font-size: 0.85em !important;
+}
+
+.bill-paper .bill-table .bill-combo-item td.bill-product {
+  padding-left: 12px !important;
+}
+
+.combo-items {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+}
+
+.combo-item-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.combo-price-check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.invoice-edit-refusal {
+  max-width: 320px;
+}
+
+@media (max-width: 640px) {
+  .combo-item-row {
+    grid-template-columns: minmax(0, 1fr) 90px auto;
+  }
+}
+
+/* A table box that cannot be typed in looks it: a muted well with a dashed edge, not a white box
+   that only refuses on click (Sale Returns' combo lines, among others). */
+.table-input:disabled {
+  border-style: dashed;
+  color: var(--ink-faint);
+  background: var(--track);
+}
+
+.return-combo-note td {
+  padding-top: 4px;
+  padding-bottom: 10px;
+  white-space: normal;
+}
+
+/* The controls sit right after the item's name, not at the far edge: the cart table is wider than
+   its card at 1366px, and a right-aligned remove button ended up past the visible edge. */
+.cart-combo-item-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px 12px;
+  min-width: 0;
+}
+
+.cart-combo-item-text {
+  min-width: 0;
+  color: var(--ink-body);
+  font-size: 12px;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.cart-combo-item-controls {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cart-combo-item-controls .table-input {
+  width: 90px;
 }

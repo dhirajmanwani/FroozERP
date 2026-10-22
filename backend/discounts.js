@@ -850,11 +850,15 @@ const DISCOUNT_REPORT_SQL = `
     WHERE s.sale_status <> 'CANCELLED' AND s.branch_id = $3
       AND s.sale_date BETWEEN $1 AND $2
   ),
+  -- A combo's lines (FIXED or CUSTOM) are left out of both the subtotal and the rows. Their price is
+  -- the offer, spread over the lines; the paisa of rounding each one carries as discount_amount is
+  -- not a discount, and the bill-total slab does not apply to them (backend/combos.js).
   sale_subtotals AS (
     SELECT si.sale_id,
            SUM(COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0))) AS subtotal
     FROM sale_items si
     JOIN report_sales rs ON rs.id = si.sale_id
+    WHERE COALESCE(si.combo_line_key, si.combo_id, si.combo_type) IS NULL
     GROUP BY si.sale_id
   ),
   report_lines AS (
@@ -895,9 +899,12 @@ const DISCOUNT_REPORT_SQL = `
     LEFT JOIN sale_subtotals st ON st.sale_id = rs.id
     LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
     LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
-    WHERE COALESCE(si.discount_amount, 0) > 0
-      OR si.lot_discount_id IS NOT NULL
-      OR rs.invoice_discount_amount > 0
+    WHERE COALESCE(si.combo_line_key, si.combo_id, si.combo_type) IS NULL
+      AND (
+        COALESCE(si.discount_amount, 0) > 0
+        OR si.lot_discount_id IS NOT NULL
+        OR rs.invoice_discount_amount > 0
+      )
   )
   SELECT
     sale_date,

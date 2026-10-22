@@ -31,6 +31,9 @@ export const checkoutFingerprint = ({ cart = [], customer = {}, payments = [], b
     quantity: String(item?.quantity ?? ""),
     selling_rate: String(item?.selling_rate ?? ""),
     discount_amount: String(item?.discount_amount ?? ""),
+    // The same lines billed as a combo and billed loose are two different bills.
+    combo_line_key: String(item?.combo_line_key ?? ""),
+    combo_id: String(item?.combo_id ?? ""),
   })),
   customer,
   payments,

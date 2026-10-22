@@ -1652,7 +1652,10 @@ test("Discount Report: bill-discount share in its own column and the total; a tw
         id INTEGER PRIMARY KEY, sale_id INTEGER, product_id INTEGER, quantity NUMERIC(14,3),
         selling_rate NUMERIC(14,2), default_selling_rate NUMERIC(14,2), amount NUMERIC(14,2),
         discount_amount NUMERIC(14,2), net_amount NUMERIC(14,2), profit NUMERIC(14,2),
-        lot_discount_id INTEGER, lot_discount_type TEXT, lot_discount_value NUMERIC(14,2)
+        lot_discount_id INTEGER, lot_discount_type TEXT, lot_discount_value NUMERIC(14,2),
+        -- The combo columns (cloud migration 024), appended so the positional inserts below stay valid.
+        combo_line_key VARCHAR(80), combo_id VARCHAR(80), combo_name VARCHAR(120), combo_kind VARCHAR(20),
+        combo_type VARCHAR(10), combo_qty NUMERIC(14,3), combo_price NUMERIC(14,2), line_index INTEGER
       );
       CREATE TABLE sale_batch_allocations (id SERIAL PRIMARY KEY, sale_item_id INTEGER, inventory_batch_id INTEGER, quantity NUMERIC(14,3));
 
@@ -1702,6 +1705,58 @@ test("Discount Report: bill-discount share in its own column and the total; a tw
     assert.equal(total("gross"), 1300, "the two-lot line used to be ₹1,000 on each lot row");
     for (const row of got) assert.equal(Math.round((row.gross - row.discount) * 100) / 100, row.net, "gross - discount = net");
     assert.equal(result.rows[0].bill_discount_rule_name, "Bills ₹1,000 and above");
+  } finally {
+    await db.close();
+  }
+});
+
+test("Discount Report: a combo's lines (FIXED or CUSTOM) are not discounts, and take no bill-discount share", async () => {
+  // A combo's price is spread over its lines as rate + a sub-paisa discount (combos.js,
+  // allocateFixedComboLines). That paisa is rounding, not a discount anyone gave, and the bill-total
+  // slab does not apply to an offer that is already priced -- so the report leaves combo lines out
+  // of both its rows and the subtotal the bill discount is shared over.
+  const { PGlite } = require("@electric-sql/pglite");
+  const db = new PGlite();
+  try {
+    await db.exec(`
+      CREATE TABLE products (id INTEGER PRIMARY KEY, product_name TEXT, unit TEXT);
+      CREATE TABLE inventory_batches (id INTEGER PRIMARY KEY, lot_name TEXT, batch_no TEXT, lot_size NUMERIC);
+      CREATE TABLE sales (
+        id INTEGER PRIMARY KEY, sale_date DATE, invoice_no TEXT, payment_mode TEXT, branch_id INTEGER,
+        sale_status TEXT, invoice_discount_amount NUMERIC(14,2), discount_rule_name TEXT
+      );
+      CREATE TABLE sale_items (
+        id INTEGER PRIMARY KEY, sale_id INTEGER, product_id INTEGER, quantity NUMERIC(14,3),
+        selling_rate NUMERIC(14,2), default_selling_rate NUMERIC(14,2), amount NUMERIC(14,2),
+        discount_amount NUMERIC(14,2), net_amount NUMERIC(14,2), profit NUMERIC(14,2),
+        lot_discount_id INTEGER, lot_discount_type TEXT, lot_discount_value NUMERIC(14,2),
+        combo_line_key VARCHAR(80), combo_id VARCHAR(80), combo_name VARCHAR(120), combo_kind VARCHAR(20),
+        combo_type VARCHAR(10), combo_qty NUMERIC(14,3), combo_price NUMERIC(14,2), line_index INTEGER
+      );
+      CREATE TABLE sale_batch_allocations (id SERIAL PRIMARY KEY, sale_item_id INTEGER, inventory_batch_id INTEGER, quantity NUMERIC(14,3));
+      INSERT INTO products VALUES (1, 'Apple', 'KG'), (2, 'Mango', 'KG'), (3, 'Kiwi', 'PCS');
+      INSERT INTO inventory_batches VALUES (10, 'L1', 'B10', 20), (11, 'L2', 'B11', 20), (12, 'L3', 'B12', 20);
+
+      -- One bill, ₹10 bill discount: a plain Kiwi line (₹100) and a FIXED combo of Apple 0.3 kg +
+      -- Mango 0.7 kg sold at ₹99.99, whose lines carry paisa of rounding as discount_amount, and a
+      -- CUSTOM combo line likewise.
+      INSERT INTO sales VALUES (1, '2026-09-30', 'FZ-1', 'CASH', 2, 'COMPLETED', 10, 'Slab');
+      INSERT INTO sale_items VALUES
+        (101, 1, 3, 1, 100, 100, 100, 0, 100, 20, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0),
+        (102, 1, 1, 0.3, 66.67, 66.67, 20.00, 0.01, 19.99, 5, NULL, NULL, 0,
+          'k1', 'combo-1', 'Fruit Bowl', 'COMBO_OFFER', 'FIXED', 1, 99.99, 1),
+        (103, 1, 2, 0.7, 114.29, 114.29, 80.00, 0, 80.00, 9, NULL, NULL, 0,
+          'k1', 'combo-1', 'Fruit Bowl', 'COMBO_OFFER', 'FIXED', 1, 99.99, 2),
+        (104, 1, 1, 0.5, 60.01, 60.01, 30.01, 0.01, 30.00, 6, NULL, NULL, 0,
+          'k2', 'combo-2', 'Gift Box', 'GIFTING', 'CUSTOM', 1, 30.00, 3);
+      INSERT INTO sale_batch_allocations (sale_item_id, inventory_batch_id, quantity)
+        VALUES (101, 12, 1), (102, 10, 0.3), (103, 11, 0.7), (104, 10, 0.5);
+    `);
+    const result = await db.query(rules.DISCOUNT_REPORT_SQL, ["2026-09-01", "2026-09-30", 2]);
+    assert.equal(result.rows.length, 1, "only the plain line is a discount row");
+    assert.equal(result.rows[0].product_name, "Kiwi");
+    assert.equal(Number(result.rows[0].item_discount_amount), 0, "no combo rounding paisa counted");
+    assert.equal(Number(result.rows[0].bill_discount_share), 10, "the whole bill discount sits on the plain line");
   } finally {
     await db.close();
   }

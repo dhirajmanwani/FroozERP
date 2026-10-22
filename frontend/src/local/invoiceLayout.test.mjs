@@ -523,3 +523,91 @@ test("the invoice modal draws from the model, and so does its WhatsApp caption",
   // The old renderer read line money straight off the sale; nothing in the modal should now.
   assert.doesNotMatch(modal, /item\.net_amount|item\.discount_amount|invoice\.gross_amount/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Combos (21 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+// A desktop bill: one loose Kiwi line, a FIXED "Mixed Juice × 2" at ₹99 each over two lines whose
+// rates carry a paisa of residual, and a CUSTOM basket (₹160 of apple + ₹30 basket = ₹190).
+const comboSale = () => ({
+  id: "invoice-sample-combo",
+  invoice_no: "OFF-SAMPLE-COMBO",
+  sale_status: "COMPLETED",
+  gross_amount: 448.01,
+  item_discount_amount: 0.01,
+  invoice_discount_amount: 0,
+  tax_amount: 0,
+  other_charges_amount: 20,
+  total_amount: 468,
+  items: [
+    { id: "a", product_name: "Kiwi", unit: "PCS", quantity: 2, selling_rate: 30, amount: 60, net_amount: 60, discount_amount: 0 },
+    { id: "b", product_name: "Orange", unit: "KG", quantity: 3, selling_rate: 33.34, amount: 100, net_amount: 100, discount_amount: 0.02,
+      combo_line_key: "K", combo_id: "combo-7", combo_name: "Mixed Juice", combo_kind: "JUICE", combo_type: "FIXED", combo_qty: 2, combo_price: 99 },
+    { id: "c", product_name: "Pomegranate", unit: "KG", quantity: 0.5, selling_rate: 196.01, amount: 98, net_amount: 98, discount_amount: 0,
+      combo_line_key: "K", combo_id: "combo-7", combo_name: "Mixed Juice", combo_kind: "JUICE", combo_type: "FIXED", combo_qty: 2, combo_price: 99 },
+    { id: "d", product_name: "Apple", unit: "KG", quantity: 1, selling_rate: 190, amount: 190, net_amount: 190, discount_amount: 0,
+      combo_line_key: "C", combo_id: "combo-9", combo_name: "Fruit Basket", combo_kind: "GIFTING", combo_type: "CUSTOM", combo_qty: 1, combo_price: 190 },
+  ],
+  payments: [{ mode: "CASH", amount: 468 }],
+});
+
+test("every combo prints as one line with its total, its items beneath without prices", () => {
+  const sale = comboSale();
+  // Make the stored figures the real ones: Orange 3 × 33.34 = 100.02 − 0.02 = 100, Pomegranate 98.
+  sale.gross_amount = 60 + 100.02 + 98.01 + 190;
+  sale.items[2].selling_rate = 196.02;
+  sale.items[2].discount_amount = 0.01;
+  sale.items[2].net_amount = 98;
+  sale.item_discount_amount = 0.03;
+  sale.total_amount = sale.gross_amount - 0.03 + 20;
+  sale.payments[0].amount = sale.total_amount;
+  const layout = buildInvoiceLayout(sale, {}, { billDate: "21 Oct 2026" });
+  assert.equal(layout.lines.length, 4, "lines stay flat");
+  assert.deepEqual(layout.blocks.map((block) => block.kind), ["line", "combo", "combo"]);
+  const juice = layout.blocks[1];
+  assert.equal(juice.comboType, "FIXED");
+  assert.equal(juice.title, "Mixed Juice × 2");
+  assert.equal(juice.amount, 198);
+  assert.equal(juice.amountText, "198.00");
+  assert.deepEqual(juice.components.map((line) => line.product), ["Orange", "Pomegranate"]);
+  assert.ok(juice.components.every((line) => line.discount === null), "no per-line discount inside a fixed combo");
+  const basket = layout.blocks[2];
+  assert.equal(basket.comboType, "CUSTOM");
+  assert.equal(basket.title, "Fruit Basket × 1");
+  assert.equal(basket.amountText, "190.00");
+  // The residual paise are part of the combo price: off Items total and off the discounts alike.
+  assert.equal(layout.totals.reconciled, true, layout.issues.join(" "));
+  assert.equal(layout.totals.itemsTotal, 448);
+  assert.equal(layout.totals.itemDiscount, 0);
+  assert.equal(layout.totals.totalDiscount, 0);
+  assert.ok(!layout.totals.rows.some((row) => row.key === "total-discount"), "no 'discount' row for combo paise");
+  assert.equal(layout.savings, null, "no 'You saved' for paise that are part of a price");
+  assert.deepEqual(layout.issues, []);
+  const printed = 60 + juice.amount + basket.amount;
+  assert.equal(Math.round(printed * 100), Math.round(layout.totals.itemsTotal * 100), "the Amount column foots to Items total");
+});
+
+test("the WhatsApp caption keeps a combo together and lists its items", () => {
+  const sale = comboSale();
+  sale.gross_amount = 60 + 100.02 + 98.01 + 190;
+  sale.items[2].selling_rate = 196.02;
+  sale.items[2].discount_amount = 0.01;
+  sale.item_discount_amount = 0.03;
+  sale.total_amount = sale.gross_amount - 0.03 + 20;
+  const text = buildInvoiceText(buildInvoiceLayout(sale, {}, {}));
+  assert.match(text, /Mixed Juice × 2 = ₹198\.00\n {2}· Orange 3 Kg\n {2}· Pomegranate 0\.5 Kg/);
+  assert.match(text, /Fruit Basket × 1 = ₹190\.00\n {2}· Apple 1 Kg/);
+  assert.doesNotMatch(text, /x ₹(33|196|190)/, "no fruit price for a combo item");
+  assert.doesNotMatch(text, /Discount: -₹0\.0/);
+  // Trimmed by whole blocks: a combo is never cut in half.
+  const short = buildInvoiceText(buildInvoiceLayout(sale, {}, {}), { maxLength: 260 });
+  if (short.includes("Mixed Juice")) assert.match(short, /· Pomegranate/);
+});
+
+test("a FIXED combo that does not add up to its price is said on screen, never re-priced", () => {
+  const sale = comboSale();
+  sale.items[2].net_amount = 90;
+  const layout = buildInvoiceLayout(sale, {}, {});
+  assert.ok(layout.issues.some((issue) => /Mixed Juice on this bill does not add up to its combo price/.test(issue)));
+});

@@ -176,7 +176,10 @@ const SCHEMA = `
   CREATE TABLE sale_items (
     id INTEGER PRIMARY KEY, sale_id INTEGER REFERENCES sales(id), product_id INTEGER, quantity NUMERIC(14,3),
     selling_rate NUMERIC(14,2), amount NUMERIC(14,2), discount_amount NUMERIC(14,2), net_amount NUMERIC(14,2),
-    cost_amount NUMERIC(14,2), profit NUMERIC(14,2)
+    cost_amount NUMERIC(14,2), profit NUMERIC(14,2),
+    -- The combo columns (cloud migration 024), appended so positional inserts stay valid.
+    combo_line_key VARCHAR(80), combo_id VARCHAR(80), combo_name VARCHAR(120), combo_kind VARCHAR(20),
+    combo_type VARCHAR(10), combo_qty NUMERIC(14,3), combo_price NUMERIC(14,2), line_index INTEGER
   );
   CREATE TABLE inventory_batches (
     id INTEGER PRIMARY KEY, remaining_qty NUMERIC(14,3), returned_qty NUMERIC(14,3), batch_status TEXT, lot_name TEXT, lot_size TEXT
@@ -409,6 +412,117 @@ test("a bill with a return cannot be cancelled or edited, online or from a count
     );
     assert.equal((await one(db, "SELECT sale_status FROM sales WHERE id = 100")).sale_status, "COMPLETED");
     assert.equal(qty((await one(db, "SELECT remaining_qty FROM inventory_batches WHERE id = 501")).remaining_qty), 1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Combos & Offers: a combo's line is not returned on its own, and a bill with one is not edited
+// ---------------------------------------------------------------------------------------------
+
+/** Make bill 100's Banana line part of a FIXED combo, as a counter would have billed it. */
+const markComboLine = (db) => db.query(
+  `UPDATE sale_items SET combo_line_key = 'k-1', combo_id = 'combo-3', combo_name = 'Fruit Bowl',
+     combo_kind = 'COMBO_OFFER', combo_type = 'FIXED', combo_qty = 1, combo_price = 400, line_index = 1
+   WHERE id = 1001`
+);
+
+test("combo: the bill discount was earned by the loose lines, so a loose line's refund takes all of it", () => {
+  // A FIXED combo at 500 (two lines) and 1 kg of loose apples at 1000; the 5% slab on 1000+ gave 50,
+  // all of it on the apples. The apples cost the customer 950, so 950 is the refund -- not 966.67.
+  const tag = { combo_line_key: "k1", combo_id: "combo-3", combo_type: "FIXED", combo_qty: 1, combo_price: 500 };
+  const lines = [
+    { id: 1, quantity: "0.500", amount: "300.00", discount_amount: "0.00", net_amount: "300.00", ...tag },
+    { id: 2, quantity: "2.000", amount: "200.00", discount_amount: "0.00", net_amount: "200.00", ...tag },
+    { id: 3, quantity: "1.000", amount: "1000.00", discount_amount: "0.00", net_amount: "1000.00" },
+  ];
+  const sale = { invoice_discount_amount: "50.00", tax_amount: "0.00" };
+  assert.equal(rules.linePaidAmount({ line: lines[2], saleLines: lines, sale }), 950);
+  assert.equal(rules.refundPerUnit({ line: lines[2], saleLines: lines, sale }), 950);
+  assert.equal(rules.linePaidAmount({ line: lines[0], saleLines: lines, sale }), 300, "a combo line paid its own net");
+  // Tax was levied on every line, so it still shares over all of them.
+  const taxed = { ...sale, tax_amount: "15.00" };
+  assert.equal(rules.linePaidAmount({ line: lines[2], saleLines: lines, sale: taxed }), 960);
+  // A bill without a combo is unchanged.
+  const plain = [lines[2], { id: 4, quantity: "1.000", amount: "500.00", discount_amount: "0.00", net_amount: "500.00" }];
+  assert.equal(Math.round(rules.linePaidAmount({ line: plain[0], saleLines: plain, sale }) * 100) / 100, 966.67);
+});
+
+test("combo: on a real bill the preview and the saved return both leave the combo out of the discount share", async () => {
+  await withDatabase(async ({ db }) => {
+    await markComboLine(db);
+    // Bill 100: Apple 600 + the combo's 400, bill discount 100, Mandi Tax 9 on all lines.
+    // Apple paid 600 - 100 + 9 x 0.6 = 505.40, so 168.466667 a kg.
+    const options = await probe(app, "GET", "/sale-returns/options/100", headers);
+    const apple = options.body.items.find((item) => String(item.sale_item_id) === "1000");
+    assert.equal(apple.refund_per_unit, 168.466667);
+    const response = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 3 }] });
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    assert.equal(qty(response.body.total_return_amount), 505.4, "the save agrees with the preview");
+  });
+});
+
+test("combo: a combo's line shows as not returnable and is refused; the bill's other lines still return", async () => {
+  await withDatabase(async ({ db }) => {
+    await markComboLine(db);
+    const options = await probe(app, "GET", "/sale-returns/options/100", headers);
+    assert.equal(options.status, 200, JSON.stringify(options.body));
+    const banana = options.body.items.find((item) => String(item.sale_item_id) === "1001");
+    const apple = options.body.items.find((item) => String(item.sale_item_id) === "1000");
+    assert.equal(banana.returnable_quantity, 0);
+    assert.equal(banana.not_returnable_code, "COMBO_LINE_NOT_RETURNABLE");
+    assert.equal(banana.combo_name, "Fruit Bowl", "the options carry the combo fields for the screen");
+    assert.equal(apple.returnable_quantity, 3);
+    assert.equal(apple.not_returnable_code, null);
+
+    const refused = await postReturn({ items: [{ sale_item_id: 1001, return_quantity: 0.1 }] });
+    assert.equal(refused.status, 409, JSON.stringify(refused.body));
+    assert.equal(refused.body.code, "COMBO_LINE_NOT_RETURNABLE");
+    assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_returns")).n), 0, "nothing written");
+    assert.equal(qty((await one(db, "SELECT remaining_qty FROM inventory_batches WHERE id = 503")).remaining_qty), 0, "no stock back");
+
+    const plain = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 1 }] });
+    assert.equal(plain.status, 201, JSON.stringify(plain.body));
+  });
+});
+
+test("combo: a bill with a combo cannot be edited, online or from a counter's outbox; nothing is touched", async () => {
+  await withDatabase(async ({ db, query, statements }) => {
+    await markComboLine(db);
+    const edit = await probe(app, "PUT", "/api/v3/sales/100", headers, {
+      reason: "Fix rate",
+      other_charges: [],
+      items: [{ product_id: 10, quantity: 1, selling_rate: 200 }],
+      idempotency_key: nextKey(),
+    });
+    assert.equal(edit.status, 409, JSON.stringify(edit.body));
+    assert.equal(edit.body.code, "COMBO_BILL_EDIT_UNSUPPORTED");
+
+    // An edit that itself carries combo fields is refused the same way, before anything is read.
+    const comboEdit = await probe(app, "PUT", "/api/v3/sales/101", headers, {
+      reason: "Add a combo",
+      items: [{ product_id: 10, quantity: 1, selling_rate: 100, combo_line_key: "k", combo_type: "FIXED" }],
+      idempotency_key: nextKey(),
+    });
+    assert.equal(comboEdit.status, 409, JSON.stringify(comboEdit.body));
+    assert.equal(comboEdit.body.code, "COMBO_BILL_EDIT_UNSUPPORTED");
+
+    const context = { companyId: 1, branchId: 1, operationalLocationId: 1, deviceId: "dev-1", assignmentGeneration: 1, user: { id: OWNER_ID } };
+    statements.length = 0;
+    await query("BEGIN");
+    const ack = await processSyncOperation({ query }, {
+      operation_id: "op-combo-edit",
+      entity_type: "pos_sale",
+      entity_id: "sale-g-100",
+      operation_type: "SALE_EDIT",
+      version: 2,
+      payload: { reason: "Counter change", other_charges: [], invoice: { invoice_global_id: "sale-g-100" } },
+    }, context);
+    await query("COMMIT");
+    assert.equal(ack.status, "conflict");
+    assert.equal(ack.error_code, "COMBO_BILL_EDIT_UNSUPPORTED");
+    assert.deepEqual(statements.filter((sql) => /^(UPDATE|DELETE)\b/i.test(sql)), [], "nothing was reversed or deleted");
+    assert.equal((await one(db, "SELECT sale_status FROM sales WHERE id = 100")).sale_status, "COMPLETED");
+    assert.equal(qty((await one(db, "SELECT remaining_qty FROM inventory_batches WHERE id = 503")).remaining_qty), 0);
   });
 });
 

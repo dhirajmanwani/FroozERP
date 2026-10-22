@@ -1,5 +1,7 @@
 "use strict";
 
+const { COMBOS_WITH_ITEMS_SQL, unavailableProductsOf } = require("./combos");
+
 const REFERENCE_BOOTSTRAP_PROTOCOL = "reference-v1";
 /**
  * Entity types every device in the company sees, whatever branch or counter it stands at.
@@ -8,9 +10,12 @@ const REFERENCE_BOOTSTRAP_PROTOCOL = "reference-v1";
  * per-counter thing. Without it a re-priced delivery charge would reach a counter only through a
  * full reference bootstrap, so the counter would keep billing the old rate -- not broken, just
  * confidently wrong, which is worse.
+ *
+ * `combo` likewise: a combo's price and items are company-wide master data, and a counter that
+ * kept an old combo price would bill a group whose total no longer matches the offer.
  */
 const COMPANY_REFERENCE_ENTITY_TYPES = Object.freeze([
-  "product_category", "product", "sale_rate", "supplier", "charge_type",
+  "product_category", "product", "sale_rate", "supplier", "charge_type", "combo",
 ]);
 
 const visibleChangePredicate = (offset = 1) => `
@@ -221,6 +226,12 @@ const captureReferenceBootstrap = async (client, context) => {
     [context.companyId]
   );
 
+  // Combos (Combos & Offers) travel whole -- every combo of the company, inactive ones included,
+  // each with its items -- for the same reason as the charge price list: a device that only heard
+  // about live combos could not tell "switched off" from "never reached me". Same shape as
+  // `GET /api/v3/combos` and the `combo` sync change, from the same SQL.
+  const combosResult = await client.query(COMBOS_WITH_ITEMS_SQL, [context.companyId, null, null]);
+
   const record = (entityType, row) => ({
     change_id: null,
     branch_id: context.branchId,
@@ -246,6 +257,7 @@ const captureReferenceBootstrap = async (client, context) => {
     device_assignment: assignment,
     location_products: locationProductsResult.rows,
     charge_types: chargeTypesResult.rows,
+    combos: combosResult.rows.map((row) => ({ ...row, unavailable_products: unavailableProductsOf(row) })),
     records: [
       ...categoriesResult.rows.map((row) => record("product_category", row)),
       ...productsResult.rows.map((row) => record("product", row)),
