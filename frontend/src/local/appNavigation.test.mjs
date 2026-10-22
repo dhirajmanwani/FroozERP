@@ -63,7 +63,7 @@ test("the registry lists exactly the modules the sidebar lists", () => {
   const block = app.match(/const navigationItems = \[([\s\S]*?)\n\];/);
   assert.ok(block, "navigationItems must still be a literal array in App.jsx");
   const sidebar = [...block[1].matchAll(/\["([^"]+)", "([^"]+)"\]/g)].map(([, id, label]) => ({ id, label }));
-  assert.equal(sidebar.length, 18, "guard against a silently truncated parse");
+  assert.equal(sidebar.length, 19, "guard against a silently truncated parse");
 
   assert.deepEqual(
     navigationRegistry.map((item) => item.id),
@@ -612,4 +612,18 @@ test("a section target that no screen recognises is still cleared", () => {
     app.indexOf("Settings, grouped rather than stacked"),
   );
   assert.match(settingsEffect, /if \(!section\) \{\s*\n\s*onFocusSectionHandled\?\.\(\);/);
+});
+
+test("Frooz Pack sits right after Frooz Menu, on Alt+P, and is found by what packing is called", () => {
+  const ids = navigationRegistry.map((item) => item.id);
+  assert.equal(ids.indexOf("frooz-pack"), ids.indexOf("combos") + 1);
+  const pack = navigationRegistry.find((item) => item.id === "frooz-pack");
+  assert.equal(pack.label, "Frooz Pack");
+  assert.equal(pack.icon, "package");
+  assert.equal(pack.shortcut, "P");
+  for (const word of ["packing", "basket", "gift box", "bottle", "bowl", "packaging"]) {
+    assert.ok(pack.keywords.includes(word), `Frooz Pack must be found by "${word}"`);
+  }
+  assert.equal(resolveShortcutTarget(shortcutEvent("P")).id, "frooz-pack");
+  assert.equal(resolveNavigationTarget("frooz-pack").status, NAVIGATION_LOOKUP.FOUND);
 });

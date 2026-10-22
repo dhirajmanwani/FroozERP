@@ -68,6 +68,7 @@ test("validate: a fixed combo is normalised -- name trimmed, kind and type upper
       { product_ref: "product-41", quantity: 0.5, sort_order: 0 },
       { product_ref: "42", quantity: 2, sort_order: 5 },
     ],
+    packing: null,
   });
 });
 
@@ -109,6 +110,12 @@ test("validate: every refusal has its own code", () => {
     [fixedBody({ margin_percent: -1 }), CODES.MARGIN_INVALID],
     [fixedBody({ margin_percent: 1000.01 }), CODES.MARGIN_INVALID],
     [customBody({ margin_percent: "lots" }), CODES.MARGIN_INVALID],
+    // Frooz Pack (22 Oct 2026): packing belongs to a FIXED combo only.
+    [customBody({ packing: [{ packing_size_id: "packing-size-1", quantity: 1 }] }), CODES.PACKING_FIXED_ONLY],
+    [fixedBody({ packing: "box" }), CODES.PACKING_INVALID],
+    [fixedBody({ packing: [{ quantity: 1 }] }), CODES.PACKING_INVALID],
+    [fixedBody({ packing: [{ packing_size_id: "packing-size-1", quantity: 0 }] }), CODES.PACKING_INVALID],
+    [fixedBody({ packing: [{ packing_size_id: "packing-size-1", quantity: 1 }, { packing_size_id: "packing-size-1", quantity: 2 }] }), CODES.PACKING_INVALID],
   ];
   for (const [body, code, note] of cases) {
     const result = combos.validateComboInput(body);
@@ -358,6 +365,7 @@ test("sale-line fields: read leniently, written in one shape; line_index alone d
 // ---------------------------------------------------------------------------------------------
 
 const MIGRATION = fs.readFileSync(path.join(__dirname, "migrations", "cloud", "024_combos.sql"), "utf8");
+const PACKING_MIGRATION = fs.readFileSync(path.join(__dirname, "migrations", "cloud", "025_frooz_pack.sql"), "utf8");
 const SERVER_SOURCE = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
 
 test("schema: the combo master carries extra_charge and margin_percent, and no charge_type_id", () => {
@@ -372,6 +380,16 @@ test("schema: the combo master carries extra_charge and margin_percent, and no c
     assert.match(SERVER_SOURCE, new RegExp(`ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS ${column} `));
   }
   assert.ok(require("../scripts/run-cloud-migrations").migrationFiles.includes("backend/migrations/cloud/024_combos.sql"));
+});
+
+test("schema: cloud migration 025 (Frooz Pack) is exactly the startup bootstrap's statements, and runs after 024", () => {
+  const statementsOf = (sql) => sql.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").replace(/\s+/g, " ").trim();
+  const migrationBody = statementsOf(PACKING_MIGRATION);
+  assert.ok(migrationBody.startsWith("CREATE TABLE IF NOT EXISTS packing_types ("));
+  assert.ok(statementsOf(SERVER_SOURCE).includes(migrationBody), "server.js initializeDatabase() carries 025 word for word");
+  const files = require("../scripts/run-cloud-migrations").migrationFiles;
+  assert.ok(files.indexOf("backend/migrations/cloud/025_frooz_pack.sql") > files.indexOf("backend/migrations/cloud/024_combos.sql"));
+  assert.doesNotMatch(migrationBody, /REFERENCES (sales|expenses)\b/, "no foreign key to sales or expenses");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -437,6 +455,9 @@ const withMaster = async (run, { role = "Owner" } = {}) => {
   // The migration file itself, twice: the runner replays the whole list every time.
   await db.exec(MIGRATION);
   await db.exec(MIGRATION);
+  // The combo SQL reads each combo's packing (Frooz Pack, migration 025), so the rig holds 025 too.
+  await db.exec(PACKING_MIGRATION);
+  await db.exec(PACKING_MIGRATION);
   const statements = [];
   const state = { role };
   const query = async (text, values) => {
@@ -585,6 +606,74 @@ test("routes: two active combos cannot share a name; a switched-off one frees it
     const first = (await list()).body[0];
     assert.equal((await put(first.global_id, fixedBody({ active: false }))).status, 200);
     assert.equal((await post(fixedBody())).status, 201, "the name is free once the old one is off");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Frooz Pack: a FIXED combo's packing (22 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+const seedPacking = async (db) => {
+  await db.exec(`
+    INSERT INTO packing_types (id, global_id, company_id, name) VALUES (1, 'packing-type-1', 1, 'Gift Box'), (2, 'packing-type-2', 2, 'Their Box');
+    INSERT INTO packing_designs (id, global_id, type_id, name) VALUES (1, 'packing-design-1', 1, 'Window Box'), (2, 'packing-design-2', 2, 'Theirs');
+    INSERT INTO packing_sizes (id, global_id, design_id, size_name, capacity, unit_cost, active) VALUES
+      (1, 'packing-size-1', 1, 'GRAND', '1 kg', 12.50, TRUE),
+      (2, 'packing-size-2', 1, 'PETITE', NULL, 4.00, TRUE),
+      (3, 'packing-size-3', 1, 'ROYAL', NULL, 30.00, FALSE),
+      (4, 'packing-size-4', 2, 'GRAND', NULL, 9.00, TRUE);
+  `);
+};
+
+test("routes: a fixed combo stores its packing, reads it back named and costed, and publishes it", async () => {
+  await withMaster(async ({ db }) => {
+    await seedPacking(db);
+    const created = await post(fixedBody({ packing: [{ packing_size_id: "packing-size-1", quantity: 1 }, { packing_size_id: 2, quantity: "2" }] }));
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.deepEqual(created.body.combo.packing, [
+      { packing_size_id: "packing-size-1", quantity: 1, sort_order: 0, type_name: "Gift Box", design_name: "Window Box", size_name: "GRAND", capacity: "1 kg", unit_cost: 12.5, size_active: true },
+      { packing_size_id: "packing-size-2", quantity: 2, sort_order: 1, type_name: "Gift Box", design_name: "Window Box", size_name: "PETITE", capacity: null, unit_cost: 4, size_active: true },
+    ]);
+    const change = (await db.query("SELECT payload FROM sync_change_log WHERE entity_type = 'combo' AND branch_id = 1")).rows[0];
+    assert.equal(change.payload.packing.length, 2, "the sync change carries the packing");
+
+    // An absent key keeps what is stored.
+    const kept = await put(created.body.combo.global_id, fixedBody({ price: 249 }));
+    assert.equal(kept.status, 200, JSON.stringify(kept.body));
+    assert.equal(kept.body.combo.packing.length, 2);
+    // [] clears it.
+    const cleared = await put(created.body.combo.global_id, fixedBody({ packing: [] }));
+    assert.equal(cleared.status, 200, JSON.stringify(cleared.body));
+    assert.deepEqual(cleared.body.combo.packing, []);
+    assert.equal(Number((await db.query("SELECT COUNT(*) AS n FROM combo_packing")).rows[0].n), 0);
+    // A plain combo with no packing reads back an empty list.
+    assert.deepEqual((await list()).body[0].packing, []);
+  });
+});
+
+test("routes: combo packing refusals -- custom combos, unknown, switched-off and other companies' sizes", async () => {
+  await withMaster(async ({ db, statements }) => {
+    await seedPacking(db);
+    const cases = [
+      [customBody({ packing: [{ packing_size_id: "packing-size-1", quantity: 1 }] }), CODES.PACKING_FIXED_ONLY],
+      [fixedBody({ packing: [{ packing_size_id: "packing-size-99", quantity: 1 }] }), CODES.PACKING_INVALID, "unknown"],
+      [fixedBody({ packing: [{ packing_size_id: "packing-size-3", quantity: 1 }] }), CODES.PACKING_INVALID, "switched off"],
+      [fixedBody({ packing: [{ packing_size_id: "packing-size-4", quantity: 1 }] }), CODES.PACKING_INVALID, "another company's"],
+      [fixedBody({ packing: [{ packing_size_id: 1, quantity: 1 }, { packing_size_id: "packing-size-1", quantity: 1 }] }), CODES.PACKING_INVALID, "one size by two names"],
+    ];
+    for (const [body, code, note] of cases) {
+      statements.length = 0;
+      const response = await post(body);
+      assert.equal(response.status, 400, `${note || code}: ${JSON.stringify(response.body)}`);
+      assert.equal(response.body.code, code, note || code);
+      assert.deepEqual(writes(statements), [], note || code);
+    }
+    // A custom combo may send an empty list, and a FIXED combo turned CUSTOM drops its packing.
+    assert.equal((await post(customBody({ packing: [] }))).status, 201);
+    const fixed = (await post(fixedBody({ name: "Bowl Two", packing: [{ packing_size_id: "packing-size-1", quantity: 1 }] }))).body.combo;
+    const custom = await put(fixed.global_id, customBody({ name: "Bowl Two" }));
+    assert.equal(custom.status, 200, JSON.stringify(custom.body));
+    assert.deepEqual(custom.body.combo.packing, []);
   });
 });
 

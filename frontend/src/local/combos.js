@@ -25,6 +25,7 @@ import { canonicalInventoryId, inventoryIdsEqual } from "./stockInventory.js";
 import { filterLotsForScope } from "./locationScope.js";
 import { lotAvailableQuantity } from "./posInventory.js";
 import { parseTargetMargin, roundSuggestedRate, suggestSaleRate } from "./saleRateUpdate.js";
+import { packingCostOf } from "./froozPack.js";
 
 export const COMBO_KINDS = Object.freeze(["COMBO_OFFER", "THE_CUTTING", "JUICE", "GIFTING"]);
 export const COMBO_TYPES = Object.freeze(["FIXED", "CUSTOM"]);
@@ -149,7 +150,29 @@ const normaliseItem = (item, index) => ({
   sort_order: finiteOrNull(item?.sort_order) ?? index,
 });
 
-/** One combo row as the snapshot or the API sent it, in one shape. */
+/**
+ * One packing row of a combo (Frooz Pack). The API names the size `packing_size_id` (its global
+ * id); the snapshot's `local_combo_packing` row may say `size_id`. Either is read.
+ */
+const normalisePackingRow = (row, index) => ({
+  packing_size_id: text(row?.packing_size_id) || text(row?.size_id) || text(row?.size_global_id),
+  quantity: finiteOrNull(row?.quantity),
+  sort_order: finiteOrNull(row?.sort_order) ?? index,
+  type_name: text(row?.type_name),
+  design_name: text(row?.design_name),
+  size_name: upper(row?.size_name),
+  capacity: text(row?.capacity),
+  unit_cost: finiteOrNull(row?.unit_cost),
+  size_active: row?.size_active !== false && row?.size_active !== 0 && row?.size_active !== "false",
+});
+
+/**
+ * One combo row as the snapshot or the API sent it, in one shape.
+ *
+ * `packing` is always an array; `packing_known` says whether the source actually carried one. A
+ * row from before Frooz Pack has no `packing` key, and "not told" must not become "none": an edit
+ * built from it leaves the stored packing alone (`comboDraftFrom` / `buildComboPayload`).
+ */
 export const normaliseCombo = (row) => {
   const items = (Array.isArray(row?.items) ? row.items : [])
     .map(normaliseItem)
@@ -171,6 +194,11 @@ export const normaliseCombo = (row) => {
     active: row?.active !== false && row?.active !== 0 && row?.active !== "false",
     sort_order: finiteOrNull(row?.sort_order) ?? 0,
     items,
+    packing_known: Array.isArray(row?.packing),
+    packing: (Array.isArray(row?.packing) ? row.packing : [])
+      .filter((entry) => entry && typeof entry === "object")
+      .map(normalisePackingRow)
+      .sort((left, right) => left.sort_order - right.sort_order),
   };
 };
 
@@ -247,6 +275,24 @@ export const validateComboDraft = (draft = {}, { products = null } = {}) => {
       }
       seen.push(key);
     });
+    // Packing (Frooz Pack): optional, but each row must name a size and a quantity, once.
+    const seenSizes = [];
+    (Array.isArray(draft.packing) ? draft.packing : []).forEach((entry, index) => {
+      const row = index + 1;
+      const sizeKey = canonicalInventoryId(entry?.packing_size_id) || canonicalInventoryId(entry?.size_id);
+      if (sizeKey === "") {
+        add("COMBO_PACKING_INVALID", `Packing ${row}: choose a packing size.`);
+        return;
+      }
+      const quantity = finiteOrNull(entry?.quantity);
+      if (quantity === null || quantity <= 0 || !hasAtMostDecimals(entry.quantity, 3)) {
+        add("COMBO_PACKING_INVALID", `Packing ${row}: enter a quantity above 0, with at most 3 decimals.`);
+      }
+      if (seenSizes.some((other) => inventoryIdsEqual(other, sizeKey))) {
+        add("COMBO_PACKING_INVALID", `Packing ${row}: this size is listed twice. Put the whole quantity on one row.`);
+      }
+      seenSizes.push(sizeKey);
+    });
   } else if (type === "CUSTOM") {
     if (finiteOrNull(draft.price) !== null) {
       add("COMBO_PRICE_INVALID", "A customer's-choice combo has no price of its own; items are billed at their rates.");
@@ -277,12 +323,31 @@ export const newComboDraft = ({ kind = "COMBO_OFFER", desiredMargin } = {}) => (
   active: true,
   sort_order: "0",
   items: [{ product_id: "", product_name: "", unit: "", quantity: "" }],
+  packing: [],
 });
 
-/** The form for an existing combo, every number as the text a box shows. `ref` is what PUT takes. */
+/**
+ * The form for an existing combo, every number as the text a box shows. `ref` is what PUT takes.
+ * `packing` is set only when the combo carried one (`packing_known`), so a draft made from a row
+ * that never said what packing it has sends no `packing` key and the server keeps what it stored.
+ */
 export const comboDraftFrom = (combo) => {
   const row = normaliseCombo(combo);
   const box = (value) => (value === null || value === undefined ? "" : String(value));
+  const packing = row.packing_known
+    ? {
+      packing: row.packing.map((entry) => ({
+        packing_size_id: entry.packing_size_id,
+        quantity: box(entry.quantity),
+        type_name: entry.type_name,
+        design_name: entry.design_name,
+        size_name: entry.size_name,
+        capacity: entry.capacity,
+        unit_cost: entry.unit_cost,
+        size_active: entry.size_active,
+      })),
+    }
+    : {};
   return {
     ref: row.global_id || row.id,
     name: row.name,
@@ -300,13 +365,31 @@ export const comboDraftFrom = (combo) => {
       unit: item.unit,
       quantity: box(item.quantity),
     })),
+    ...packing,
   };
 };
 
-/** What POST and PUT /api/v3/combos take. No identity: the server records who from the session. */
+/**
+ * What POST and PUT /api/v3/combos take. No identity: the server records who from the session.
+ *
+ * `packing` follows the server's rule: ABSENT keeps the stored packing, [] clears it. So it is sent
+ * only when the draft has a `packing` array (a `null` or missing one is "not told", never "none"),
+ * and a CUSTOM combo always sends [] (its packing is picked at the counter).
+ */
 export const buildComboPayload = (draft = {}) => {
   const type = upper(draft.combo_type);
   const fixed = type === "FIXED";
+  const packing = Array.isArray(draft.packing)
+    ? {
+      packing: fixed
+        ? draft.packing.map((entry, index) => ({
+          packing_size_id: canonicalInventoryId(entry?.packing_size_id) || canonicalInventoryId(entry?.size_id),
+          quantity: finiteOrNull(entry?.quantity),
+          sort_order: index,
+        }))
+        : [],
+    }
+    : {};
   return {
     name: text(draft.name),
     kind: upper(draft.kind),
@@ -324,6 +407,7 @@ export const buildComboPayload = (draft = {}) => {
         sort_order: index,
       }))
       : [],
+    ...packing,
   };
 };
 
@@ -386,8 +470,11 @@ const costForProduct = (rates, product, item) => {
  * cost × (1 + the combo's own margin %, or the Sale Rate desired margin when it has none), rounded by
  * the shop's rounding rule (`suggestSaleRate`). An item with
  * no known cost means no cost and no suggestion -- a part-sum would suggest a loss.
+ *
+ * Its packing (Frooz Pack) is part of the cost: fruit + Σ packing quantity × unit cost (the row's
+ * own, else `catalogue`'s). A packing row with no known cost is treated like a fruit with none.
  */
-export const suggestComboPrice = ({ items = [], rates = [], products = [], marginPercent = null, targetMargin, roundingRule } = {}) => {
+export const suggestComboPrice = ({ items = [], rates = [], products = [], marginPercent = null, targetMargin, roundingRule, packing = [], catalogue = null } = {}) => {
   const rows = Array.isArray(items) ? items : [];
   const own = text(marginPercent) === "" ? null : finiteOrNull(marginPercent);
   const margin = own !== null && own >= 0 ? own : parseTargetMargin(targetMargin);
@@ -400,7 +487,9 @@ export const suggestComboPrice = ({ items = [], rates = [], products = [], margi
     if (cost === null || quantity === null || quantity <= 0) return { cost: null, suggested: null, margin };
     paise += Math.round((quantity * Math.round(cost * 100 * 100)) / 100000);
   }
-  const cost = fromPaise(paise);
+  const packingCost = packingCostOf(packing, catalogue);
+  if (!packingCost.known) return { cost: null, suggested: null, margin };
+  const cost = fromPaise(paise + toPaise(packingCost.cost));
   return { cost, suggested: suggestSaleRate({ cost, targetMargin: margin, roundingRule }), margin };
 };
 

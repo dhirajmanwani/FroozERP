@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager};
 use crate::entitlement::{self, EntitlementState};
 use crate::machine_identity::{self, AnchorOutcome, AnchorWritePolicy, MachineContext};
 
-const CURRENT_SCHEMA_VERSION: &str = "028_combos";
+const CURRENT_SCHEMA_VERSION: &str = "029_frooz_pack";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -38,6 +38,7 @@ const MIGRATION_025: &str = include_str!("../migrations/sqlite/025_device_machin
 const MIGRATION_026: &str = include_str!("../migrations/sqlite/026_sync_outbox_entity_and_deferred_lots.sql");
 const MIGRATION_027: &str = include_str!("../migrations/sqlite/027_product_pos_section.sql");
 const MIGRATION_028: &str = include_str!("../migrations/sqlite/028_combos.sql");
+const MIGRATION_029: &str = include_str!("../migrations/sqlite/029_frooz_pack.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -143,6 +144,15 @@ pub struct ReferenceBootstrap {
     /// did send — which is exactly what happens today to the bootstrap's top-level `charge_types`.
     #[serde(default)]
     pub combos: Vec<serde_json::Value>,
+    /// Frooz Pack: the company's packing types, each a whole Type -> Design -> Size tree, in the
+    /// same shape as the `packing_type` sync change. `#[serde(default)]` for the same reason as
+    /// `combos`: an older server sends no such key.
+    #[serde(default)]
+    pub packing_types: Vec<serde_json::Value>,
+    /// Frooz Pack: the cloud's packing counts, one row per (branch, size), in the same shape as
+    /// the `packing_stock` sync change.
+    #[serde(default)]
+    pub packing_stock: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -471,6 +481,10 @@ pub fn database_audit(app: &AppHandle) -> Result<serde_json::Value, String> {
         "invoices": count("local_pos_invoices")?,
         "invoice_items": count("local_pos_invoice_items")?,
         "combos": count("local_combos")?,
+        "packing_types": count("local_packing_types")?,
+        "packing_sizes": count("local_packing_sizes")?,
+        "packing_stock_rows": count("local_packing_stock")?,
+        "invoice_packing": count("local_pos_invoice_packing")?,
         "payments": count("local_payment_postings")?,
         "stock_movements": count("local_stock_movements")?,
         "outbox": count("sync_outbox")?,
@@ -938,6 +952,71 @@ fn apply_reference_bootstrap_at(
                 &change,
                 "COMBO_OUTSIDE_COMPANY_SCOPE",
                 Some(format!("combo belongs to company {:?}, this device to {}", payload_company, bootstrap.company_id)),
+            )?;
+            continue;
+        }
+        apply_change_with_tx(&tx, &change)?;
+    }
+
+    // Frooz Pack: the packing catalogue (whole trees) and the cloud's counts, through the same
+    // `packing_type` / `packing_stock` arms the pull feed uses. Like combos, a row of another
+    // company or one that cannot be stored is recorded, never a reason to fail the fill.
+    for packing_type in &bootstrap.packing_types {
+        let type_id = packing_type_identity(packing_type, None)
+            .ok_or_else(|| "Reference bootstrap packing type has no identity".to_string())?;
+        let change = PulledChange {
+            change_id: serde_json::Value::Null,
+            branch_id: Some(bootstrap.branch_id),
+            entity_type: "packing_type".to_string(),
+            entity_id: type_id,
+            operation_type: "UPSERT".to_string(),
+            version: packing_type
+                .get("entity_version")
+                .or_else(|| packing_type.get("version"))
+                .and_then(|value| value.as_i64()),
+            payload: packing_type.clone(),
+            updated_at: optional_text(packing_type, "updated_at"),
+        };
+        let payload_company = packing_type.get("company_id").and_then(json_number).map(|value| value as i64);
+        if payload_company.is_some() && payload_company != Some(bootstrap.company_id) {
+            record_unapplied_change(
+                &tx,
+                &change,
+                "PACKING_OUTSIDE_COMPANY_SCOPE",
+                Some(format!("packing type belongs to company {:?}, this device to {}", payload_company, bootstrap.company_id)),
+            )?;
+            continue;
+        }
+        apply_change_with_tx(&tx, &change)?;
+    }
+    for stock in &bootstrap.packing_stock {
+        let entity_id = optional_text(stock, "global_id").unwrap_or_else(|| {
+            format!(
+                "packing-stock-{}-{}",
+                optional_text(stock, "branch_id").unwrap_or_default(),
+                packing_size_reference(stock).unwrap_or_default()
+            )
+        });
+        let change = PulledChange {
+            change_id: serde_json::Value::Null,
+            branch_id: Some(bootstrap.branch_id),
+            entity_type: "packing_stock".to_string(),
+            entity_id,
+            operation_type: "UPSERT".to_string(),
+            version: stock
+                .get("entity_version")
+                .or_else(|| stock.get("version"))
+                .and_then(|value| value.as_i64()),
+            payload: stock.clone(),
+            updated_at: optional_text(stock, "updated_at"),
+        };
+        let payload_company = stock.get("company_id").and_then(json_number).map(|value| value as i64);
+        if payload_company.is_some() && payload_company != Some(bootstrap.company_id) {
+            record_unapplied_change(
+                &tx,
+                &change,
+                "PACKING_OUTSIDE_COMPANY_SCOPE",
+                Some(format!("packing count belongs to company {:?}, this device to {}", payload_company, bootstrap.company_id)),
             )?;
             continue;
         }
@@ -1655,6 +1734,9 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
         .iter()
         .map(sale_line_combo)
         .collect::<Result<Vec<SaleLineCombo>, String>>()?;
+    // Frooz Pack: checked before the first write as well. A malformed `packing_usage` is our own
+    // POS's bug and refuses the bill; the count itself never does (out of packing is a warning).
+    let packing_usage = parse_sale_packing_usage(&sale)?;
 
     tx.execute(
         "INSERT INTO local_pos_invoices (
@@ -1888,6 +1970,9 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     // have exactly one writer. A tile and a table filled from two different statements are how they
     // start disagreeing.
     write_sale_charges(&tx, &invoice_id, entity_version, &charge_lines, other_charges_amount)?;
+    if let Some(rows) = packing_usage.as_ref() {
+        write_sale_packing(&tx, &invoice_id, rows)?;
+    }
 
     // The outbox payload is the sale as it was stored, not as it arrived: the charges are put back
     // under the canonical keys so the cloud is handed the same shape whichever key the POS used.
@@ -1897,6 +1982,14 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
             "other_charges_amount".to_string(),
             serde_json::json!(other_charges_amount),
         );
+        // Frooz Pack: the packing as stored (canonical size ids, 3dp quantities). Only when the
+        // POS sent the key, so a bill without packing hands the cloud exactly what it always did.
+        if let Some(rows) = packing_usage.as_ref() {
+            object.insert(
+                "packing_usage".to_string(),
+                serde_json::Value::Array(rows.iter().map(SalePackingRow::canonical).collect()),
+            );
+        }
     }
 
     let operation_id = required_text(&sale, "operation_id")?;
@@ -3243,6 +3336,8 @@ fn upsert_combo_with_tx(
         }
         Some(_) => return Err(format!("{name}: items is not a list")),
     };
+    // Frooz Pack: a FIXED combo's packing. Absent key: the stored rows stay; a list replaces them.
+    let packing = parse_combo_packing(&name, payload)?;
     // A CUSTOM combo's own charge (making, basket), per combo. The cloud column is NOT NULL
     // DEFAULT 0, so an absent or null value from an older server is the cloud's own 0; what is
     // refused is a value that is there and is not a usable amount.
@@ -3351,6 +3446,9 @@ fn upsert_combo_with_tx(
             .map_err(to_error)?;
         }
     }
+    if let Some(packing) = packing {
+        replace_combo_packing_with_tx(tx, combo_id, &packing)?;
+    }
     Ok(())
 }
 
@@ -3438,13 +3536,17 @@ fn read_combos(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
             }))
         })
         .map_err(to_error)?;
+    let mut packing_by_combo = read_combo_packing(conn)?;
     let mut combos = Vec::new();
     for row in rows {
         let mut combo = row.map_err(to_error)?;
         let id = optional_text(&combo, "id").unwrap_or_default();
         let items = items_by_combo.remove(&id).unwrap_or_default();
+        // Frooz Pack: always a list, empty when the combo uses no packing.
+        let packing = packing_by_combo.remove(&id).unwrap_or_default();
         if let Some(object) = combo.as_object_mut() {
             object.insert("items".to_string(), serde_json::Value::Array(items));
+            object.insert("packing".to_string(), serde_json::Value::Array(packing));
         }
         combos.push(combo);
     }
@@ -3460,6 +3562,736 @@ fn snapshot_combos(snapshot: &serde_json::Value) -> Option<&Vec<serde_json::Valu
         .get("settings_bundle")
         .and_then(|bundle| bundle.get("combos"))
         .and_then(|value| value.as_array())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Frooz Pack (migration 029): packing catalogue, per-branch counts, combo and bill packing
+// ---------------------------------------------------------------------------------------------
+
+/// A Frooz Pack identity as stored on this device: the cloud's `global_id` spelling.
+///
+/// A bare run of digits is the cloud's numeric id and is spelled the way the cloud mints the
+/// global id (`'<prefix>' || id`), as text — never parsed as a number, so `"004"` stays `"004"`
+/// and never meets `4`. Every table that names a size (stock, combo packing, bill packing) stores
+/// it through this, so a plain text comparison joins them.
+fn packing_identity(raw: Option<String>, prefix: &str) -> Option<String> {
+    let raw = raw?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(format!("{prefix}{raw}"))
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+const PACKING_TYPE_PREFIX: &str = "packing-type-";
+const PACKING_DESIGN_PREFIX: &str = "packing-design-";
+const PACKING_SIZE_PREFIX: &str = "packing-size-";
+
+/// The size a packing row (combo packing, bill packing, stock) points at, under the keys the
+/// contract and the cloud use for it.
+fn packing_size_reference(row: &serde_json::Value) -> Option<String> {
+    packing_identity(
+        optional_text(row, "packing_size_id")
+            .or_else(|| optional_text(row, "size_global_id"))
+            .or_else(|| optional_text(row, "size_id")),
+        PACKING_SIZE_PREFIX,
+    )
+}
+
+/// The identity a packing type is stored under: payload `global_id`, then the change's
+/// `entity_id`, then the payload's `id`.
+fn packing_type_identity(payload: &serde_json::Value, entity_id: Option<&str>) -> Option<String> {
+    packing_identity(
+        optional_text(payload, "global_id")
+            .or_else(|| entity_id.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()))
+            .or_else(|| optional_text(payload, "id")),
+        PACKING_TYPE_PREFIX,
+    )
+}
+
+/// Quantities carry 3 decimals.
+fn round_qty(value: f64) -> f64 {
+    let rounded = (value * 1000.0).round() / 1000.0;
+    if rounded == 0.0 { 0.0 } else { rounded }
+}
+
+fn packing_sort_order(row: &serde_json::Value, fallback: usize) -> i64 {
+    row.get("sort_order")
+        .and_then(json_number)
+        .filter(|value| value.is_finite())
+        .map(|value| value as i64)
+        .unwrap_or(fallback as i64)
+}
+
+/// A money field that may be absent (the cloud's 0) but, when present, must be a usable amount.
+fn packing_money(row: &serde_json::Value, key: &str, label: &str) -> Result<f64, String> {
+    match row.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(0.0),
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => Ok(0.0),
+        Some(value) => {
+            let amount = json_number(value)
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| format!("{label}: {key} is not a number"))?;
+            if amount < 0.0 {
+                return Err(format!("{label}: {key} is negative ({amount})"));
+            }
+            Ok(amount)
+        }
+    }
+}
+
+struct PackingSizeRow {
+    id: String,
+    size_name: String,
+    capacity: Option<String>,
+    unit_cost: f64,
+    active: bool,
+    sort_order: i64,
+}
+
+struct PackingDesignRow {
+    id: String,
+    name: String,
+    active: bool,
+    sort_order: i64,
+    sizes: Vec<PackingSizeRow>,
+}
+
+/// Store one packing type and, when the payload carries `designs`, replace its designs and their
+/// sizes wholesale.
+///
+/// **Every check runs before the first write**, as in `upsert_combo_with_tx`: this runs inside the
+/// pull transaction, and a refusal must leave nothing behind so the caller can record the change
+/// as unapplied while the rest of the page lands. What is not checked is which size names exist —
+/// the cloud route owns that list (see migration 029).
+///
+/// A removal (`deleted`) only switches the type off: the cloud has no DELETE for packing, and a
+/// count or a combo still pointing at its sizes must keep a name to show.
+fn upsert_packing_type_with_tx(
+    tx: &rusqlite::Transaction<'_>,
+    type_id: &str,
+    payload: &serde_json::Value,
+    updated_at: Option<String>,
+    version: i64,
+    deleted: bool,
+) -> Result<(), String> {
+    if deleted {
+        tx.execute(
+            "UPDATE local_packing_types
+             SET active = 0, updated_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             WHERE id = ?1",
+            params![type_id, updated_at],
+        )
+        .map_err(to_error)?;
+        return Ok(());
+    }
+    let name = optional_text(payload, "name").ok_or_else(|| format!("Packing type {type_id} has no name"))?;
+    let designs: Option<Vec<PackingDesignRow>> = match payload.get("designs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(rows)) => {
+            let mut parsed = Vec::with_capacity(rows.len());
+            for (design_index, design) in rows.iter().enumerate() {
+                let design_id = packing_identity(
+                    optional_text(design, "global_id").or_else(|| optional_text(design, "id")),
+                    PACKING_DESIGN_PREFIX,
+                )
+                .ok_or_else(|| format!("{name}: design {} has no identity", design_index + 1))?;
+                let design_name = optional_text(design, "name")
+                    .ok_or_else(|| format!("{name}: design {design_id} has no name"))?;
+                let sizes = match design.get("sizes") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(serde_json::Value::Array(size_rows)) => {
+                        let mut sizes = Vec::with_capacity(size_rows.len());
+                        for (size_index, size) in size_rows.iter().enumerate() {
+                            let size_id = packing_identity(
+                                optional_text(size, "global_id").or_else(|| optional_text(size, "id")),
+                                PACKING_SIZE_PREFIX,
+                            )
+                            .ok_or_else(|| {
+                                format!("{name} › {design_name}: size {} has no identity", size_index + 1)
+                            })?;
+                            let size_name = optional_text(size, "size_name")
+                                .map(|value| value.to_uppercase())
+                                .ok_or_else(|| format!("{name} › {design_name}: size {size_id} has no size name"))?;
+                            let unit_cost = packing_money(size, "unit_cost", &format!("{name} › {design_name} › {size_name}"))?;
+                            sizes.push(PackingSizeRow {
+                                id: size_id,
+                                size_name,
+                                capacity: optional_text(size, "capacity"),
+                                unit_cost,
+                                active: json_flag(size, "active", true),
+                                sort_order: packing_sort_order(size, size_index),
+                            });
+                        }
+                        sizes
+                    }
+                    Some(_) => return Err(format!("{name} › {design_name}: sizes is not a list")),
+                };
+                parsed.push(PackingDesignRow {
+                    id: design_id,
+                    name: design_name,
+                    active: json_flag(design, "active", true),
+                    sort_order: packing_sort_order(design, design_index),
+                    sizes,
+                });
+            }
+            Some(parsed)
+        }
+        Some(_) => return Err(format!("{name}: designs is not a list")),
+    };
+
+    tx.execute(
+        "INSERT INTO local_packing_types (id, company_id, name, active, sort_order, version, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+         ON CONFLICT(id) DO UPDATE SET
+           company_id = COALESCE(excluded.company_id, local_packing_types.company_id),
+           name = excluded.name,
+           active = excluded.active,
+           sort_order = excluded.sort_order,
+           version = excluded.version,
+           updated_at = excluded.updated_at",
+        params![
+            type_id,
+            optional_text(payload, "company_id"),
+            name,
+            if json_flag(payload, "active", true) { 1 } else { 0 },
+            payload.get("sort_order").and_then(json_number).filter(|value| value.is_finite()).map(|value| value as i64).unwrap_or(0),
+            version,
+            updated_at,
+        ],
+    )
+    .map_err(to_error)?;
+
+    if let Some(designs) = designs {
+        // Wholesale: a design or size the cloud no longer lists under this type is gone from it.
+        tx.execute(
+            "DELETE FROM local_packing_sizes
+             WHERE design_id IN (SELECT id FROM local_packing_designs WHERE type_id = ?1)",
+            [type_id],
+        )
+        .map_err(to_error)?;
+        tx.execute("DELETE FROM local_packing_designs WHERE type_id = ?1", [type_id])
+            .map_err(to_error)?;
+        for design in &designs {
+            // ON CONFLICT: a design (or size) moved from another type keeps its one row.
+            tx.execute(
+                "INSERT INTO local_packing_designs (id, type_id, name, active, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                   type_id = excluded.type_id, name = excluded.name,
+                   active = excluded.active, sort_order = excluded.sort_order",
+                params![design.id, type_id, design.name, if design.active { 1 } else { 0 }, design.sort_order],
+            )
+            .map_err(to_error)?;
+            tx.execute("DELETE FROM local_packing_sizes WHERE design_id = ?1", [design.id.as_str()])
+                .map_err(to_error)?;
+            for size in &design.sizes {
+                tx.execute(
+                    "INSERT INTO local_packing_sizes (id, design_id, size_name, capacity, unit_cost, active, sort_order)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(id) DO UPDATE SET
+                       design_id = excluded.design_id, size_name = excluded.size_name,
+                       capacity = excluded.capacity, unit_cost = excluded.unit_cost,
+                       active = excluded.active, sort_order = excluded.sort_order",
+                    params![
+                        size.id,
+                        design.id,
+                        size.size_name,
+                        size.capacity,
+                        size.unit_cost,
+                        if size.active { 1 } else { 0 },
+                        size.sort_order,
+                    ],
+                )
+                .map_err(to_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Store the cloud's count for one (branch, size), exactly as it was published.
+///
+/// The figure is the cloud's own and may be negative (a sale never stops for packing). This
+/// device's undelivered bills are NOT applied to it here: the shown count is derived at read time
+/// (`read_packing`), so the next pull cannot lose a local sale and a delivered one is never
+/// subtracted twice.
+fn upsert_packing_stock_with_tx(
+    tx: &rusqlite::Transaction<'_>,
+    payload: &serde_json::Value,
+    updated_at: Option<String>,
+    version: i64,
+) -> Result<(), String> {
+    let branch_id = optional_text(payload, "branch_id")
+        .ok_or_else(|| "Packing count has no branch".to_string())?;
+    let size_id = packing_identity(
+        optional_text(payload, "size_global_id").or_else(|| optional_text(payload, "size_id")),
+        PACKING_SIZE_PREFIX,
+    )
+    .ok_or_else(|| format!("Packing count for branch {branch_id} does not say which size it is"))?;
+    let qty_on_hand = payload
+        .get("qty_on_hand")
+        .and_then(json_number)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("Packing count for {size_id} at branch {branch_id} is not a number"))?;
+    tx.execute(
+        "INSERT INTO local_packing_stock (branch_id, size_id, qty_on_hand, version, updated_at)
+         VALUES (?1, ?2, ?3, ?4, COALESCE(?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+         ON CONFLICT(branch_id, size_id) DO UPDATE SET
+           qty_on_hand = excluded.qty_on_hand,
+           version = excluded.version,
+           updated_at = excluded.updated_at",
+        params![branch_id, size_id, round_qty(qty_on_hand), version, updated_at],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+/// One packing line of a FIXED combo, validated and ready to store.
+struct ComboPackingRow {
+    size_id: String,
+    quantity: f64,
+    sort_order: i64,
+    type_name: Option<String>,
+    design_name: Option<String>,
+    size_name: Option<String>,
+    capacity: Option<String>,
+    unit_cost: Option<f64>,
+}
+
+/// A combo payload's `packing`: `None` when the key is absent (the stored rows stay), the parsed
+/// rows when it is a list (they replace the stored set; `[]` clears it).
+fn parse_combo_packing(name: &str, payload: &serde_json::Value) -> Result<Option<Vec<ComboPackingRow>>, String> {
+    match payload.get("packing") {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(Some(Vec::new())),
+        Some(serde_json::Value::Array(rows)) => {
+            let mut parsed = Vec::with_capacity(rows.len());
+            for (index, row) in rows.iter().enumerate() {
+                let size_id = packing_size_reference(row)
+                    .ok_or_else(|| format!("{name}: packing {} does not say which size it is", index + 1))?;
+                let quantity = row
+                    .get("quantity")
+                    .and_then(json_number)
+                    .filter(|quantity| quantity.is_finite() && round_qty(*quantity) > 0.0)
+                    .map(round_qty)
+                    .ok_or_else(|| format!("{name}: packing {size_id} has no usable quantity"))?;
+                parsed.push(ComboPackingRow {
+                    size_id,
+                    quantity,
+                    sort_order: packing_sort_order(row, index),
+                    type_name: optional_text(row, "type_name"),
+                    design_name: optional_text(row, "design_name"),
+                    size_name: optional_text(row, "size_name").map(|value| value.to_uppercase()),
+                    capacity: optional_text(row, "capacity"),
+                    unit_cost: row
+                        .get("unit_cost")
+                        .and_then(json_number)
+                        .filter(|value| value.is_finite() && *value >= 0.0),
+                });
+            }
+            Ok(Some(parsed))
+        }
+        Some(_) => Err(format!("{name}: packing is not a list")),
+    }
+}
+
+fn replace_combo_packing_with_tx(
+    tx: &rusqlite::Transaction<'_>,
+    combo_id: &str,
+    rows: &[ComboPackingRow],
+) -> Result<(), String> {
+    tx.execute("DELETE FROM local_combo_packing WHERE combo_id = ?1", [combo_id])
+        .map_err(to_error)?;
+    for row in rows {
+        tx.execute(
+            "INSERT INTO local_combo_packing (
+                combo_id, size_id, quantity, sort_order, type_name, design_name, size_name, capacity, unit_cost
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                combo_id,
+                row.size_id,
+                row.quantity,
+                row.sort_order,
+                row.type_name,
+                row.design_name,
+                row.size_name,
+                row.capacity,
+                row.unit_cost,
+            ],
+        )
+        .map_err(to_error)?;
+    }
+    Ok(())
+}
+
+/// Every combo's packing, by combo id. The names come from the catalogue on this counter when the
+/// size is known here, else from what the cloud sent with the combo; `size_active` is null when
+/// the size is not on this counter at all.
+fn read_combo_packing(conn: &Connection) -> Result<HashMap<String, Vec<serde_json::Value>>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT cp.combo_id, cp.size_id, cp.quantity, cp.sort_order,
+                    COALESCE(t.name, cp.type_name), COALESCE(d.name, cp.design_name),
+                    COALESCE(s.size_name, cp.size_name), COALESCE(s.capacity, cp.capacity),
+                    COALESCE(s.unit_cost, cp.unit_cost), s.active
+             FROM local_combo_packing cp
+             LEFT JOIN local_packing_sizes s ON s.id = cp.size_id
+             LEFT JOIN local_packing_designs d ON d.id = s.design_id
+             LEFT JOIN local_packing_types t ON t.id = d.type_id
+             ORDER BY cp.combo_id, cp.sort_order, cp.rowid",
+        )
+        .map_err(to_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                serde_json::json!({
+                    "packing_size_id": row.get::<_, String>(1)?,
+                    "quantity": row.get::<_, f64>(2)?,
+                    "sort_order": row.get::<_, i64>(3)?,
+                    "type_name": row.get::<_, Option<String>>(4)?,
+                    "design_name": row.get::<_, Option<String>>(5)?,
+                    "size_name": row.get::<_, Option<String>>(6)?,
+                    "capacity": row.get::<_, Option<String>>(7)?,
+                    "unit_cost": row.get::<_, Option<f64>>(8)?,
+                    "size_active": row.get::<_, Option<i64>>(9)?.map(|value| value == 1),
+                }),
+            ))
+        })
+        .map_err(to_error)?;
+    let mut by_combo: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    for row in rows {
+        let (combo_id, packing) = row.map_err(to_error)?;
+        by_combo.entry(combo_id).or_default().push(packing);
+    }
+    Ok(by_combo)
+}
+
+/// SQL: the outbox statuses under which an operation has NOT reached the cloud. Same idea as
+/// `LOT_HOLDS_UNDELIVERED_LOCAL_WORK`, widened to `failed` and `conflict`: here the question is not
+/// "may the cloud's figure overwrite this row" but "has the cloud's figure counted this bill yet",
+/// and a failed or held-back bill has certainly not been counted while its box is already gone.
+const PACKING_UNDELIVERED_STATUSES: &str = "('pending', 'syncing', 'failed', 'conflict')";
+
+/// What this counter's own bills have consumed that the cloud's count does not show yet, per size,
+/// for one branch. Positive means "fewer on the shelf than the cloud says".
+///
+/// * a bill whose create has not reached the cloud and is not cancelled: its usage is taken off;
+/// * a bill cancelled before its create reached the cloud: nothing (the cloud will see both);
+/// * a bill whose create reached the cloud, cancelled here, the cancel not yet delivered: its
+///   usage is given back (the cloud has taken it off and not yet returned it).
+fn pending_packing_usage(conn: &Connection, branch_id: &str) -> Result<HashMap<String, f64>, String> {
+    let create_open = format!(
+        "EXISTS (SELECT 1 FROM sync_outbox o
+                 WHERE o.entity_type = 'pos_sale' AND o.entity_id = i.id
+                   AND UPPER(COALESCE(o.operation_type, 'UPSERT')) NOT IN ('SALE_EDIT', 'SALE_CANCEL')
+                   AND LOWER(COALESCE(o.status, 'pending')) IN {PACKING_UNDELIVERED_STATUSES})"
+    );
+    let cancel_open = format!(
+        "EXISTS (SELECT 1 FROM sync_outbox o
+                 WHERE o.entity_type = 'pos_sale' AND o.entity_id = i.id
+                   AND UPPER(COALESCE(o.operation_type, '')) = 'SALE_CANCEL'
+                   AND LOWER(COALESCE(o.status, 'pending')) IN {PACKING_UNDELIVERED_STATUSES})"
+    );
+    let sql = format!(
+        "SELECT p.size_id,
+                SUM(CASE
+                      WHEN UPPER(COALESCE(i.status, 'COMPLETED')) <> 'CANCELLED' AND {create_open} THEN p.quantity
+                      WHEN UPPER(COALESCE(i.status, 'COMPLETED')) = 'CANCELLED' AND NOT {create_open} AND {cancel_open} THEN -p.quantity
+                      ELSE 0
+                    END)
+         FROM local_pos_invoice_packing p
+         JOIN local_pos_invoices i ON i.id = p.invoice_id
+         WHERE i.branch_id = ?1
+         GROUP BY p.size_id"
+    );
+    let mut statement = conn.prepare(&sql).map_err(to_error)?;
+    let rows = statement
+        .query_map([branch_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?.unwrap_or(0.0))))
+        .map_err(to_error)?;
+    let mut usage = HashMap::new();
+    for row in rows {
+        let (size_id, quantity) = row.map_err(to_error)?;
+        usage.insert(size_id, round_qty(quantity));
+    }
+    Ok(usage)
+}
+
+/// The packing catalogue as this counter's branch sees it, for the reference snapshot.
+///
+/// `status` is `"missing"` until a packing type has ever been stored here — "this device has not
+/// heard about packing" must never read as "the shop has no packing". Inactive entries are emitted
+/// with `active: false`; the POS decides what to show. Per size: `cloud_qty_on_hand` is the cloud's
+/// own count for this branch (0 when the cloud has no row: it has never stocked that size here),
+/// `pending_usage` what this counter's undelivered bills consumed (`pending_packing_usage`), and
+/// `qty_on_hand` the difference. With no branch known the counts are null, never 0.
+fn read_packing(conn: &Connection, branch_id: Option<&str>) -> Result<serde_json::Value, String> {
+    let type_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM local_packing_types", [], |row| row.get(0))
+        .map_err(to_error)?;
+    let cloud_counts: HashMap<String, f64> = match branch_id {
+        Some(branch) => {
+            let mut statement = conn
+                .prepare("SELECT size_id, qty_on_hand FROM local_packing_stock WHERE branch_id = ?1")
+                .map_err(to_error)?;
+            let rows = statement
+                .query_map([branch], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
+                .map_err(to_error)?;
+            rows.collect::<Result<HashMap<_, _>, _>>().map_err(to_error)?
+        }
+        None => HashMap::new(),
+    };
+    let usage = match branch_id {
+        Some(branch) => pending_packing_usage(conn, branch)?,
+        None => HashMap::new(),
+    };
+
+    let mut sizes_by_design: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, design_id, size_name, capacity, unit_cost, active, sort_order
+                 FROM local_packing_sizes ORDER BY design_id, sort_order, size_name, id",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(to_error)?;
+        for row in rows {
+            let (id, design_id, size_name, capacity, unit_cost, active, sort_order) = row.map_err(to_error)?;
+            let (cloud, pending, on_hand) = if branch_id.is_some() {
+                let cloud = cloud_counts.get(&id).copied().unwrap_or(0.0);
+                let pending = usage.get(&id).copied().unwrap_or(0.0);
+                (
+                    serde_json::json!(round_qty(cloud)),
+                    serde_json::json!(pending),
+                    serde_json::json!(round_qty(cloud - pending)),
+                )
+            } else {
+                (serde_json::Value::Null, serde_json::Value::Null, serde_json::Value::Null)
+            };
+            sizes_by_design.entry(design_id).or_default().push(serde_json::json!({
+                "id": id,
+                "size_name": size_name,
+                "capacity": capacity,
+                "unit_cost": unit_cost,
+                "active": active == 1,
+                "sort_order": sort_order,
+                "cloud_qty_on_hand": cloud,
+                "pending_usage": pending,
+                "qty_on_hand": on_hand,
+            }));
+        }
+    }
+
+    let mut designs_by_type: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    {
+        let mut statement = conn
+            .prepare("SELECT id, type_id, name, active, sort_order FROM local_packing_designs ORDER BY type_id, sort_order, name, id")
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(to_error)?;
+        for row in rows {
+            let (id, type_id, name, active, sort_order) = row.map_err(to_error)?;
+            let sizes = sizes_by_design.remove(&id).unwrap_or_default();
+            designs_by_type.entry(type_id).or_default().push(serde_json::json!({
+                "id": id,
+                "name": name,
+                "active": active == 1,
+                "sort_order": sort_order,
+                "sizes": sizes,
+            }));
+        }
+    }
+
+    let mut types = Vec::new();
+    {
+        let mut statement = conn
+            .prepare("SELECT id, name, active, sort_order FROM local_packing_types ORDER BY sort_order, name, id")
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(to_error)?;
+        for row in rows {
+            let (id, name, active, sort_order) = row.map_err(to_error)?;
+            let designs = designs_by_type.remove(&id).unwrap_or_default();
+            types.push(serde_json::json!({
+                "id": id,
+                "name": name,
+                "active": active == 1,
+                "sort_order": sort_order,
+                "designs": designs,
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": if type_count > 0 { "ready" } else { "missing" },
+        "branch_id": branch_id,
+        "types": types,
+    }))
+}
+
+/// One packing row of a local bill, validated and in canonical shape.
+struct SalePackingRow {
+    combo_line_key: Option<String>,
+    combo_id: Option<String>,
+    source: Option<String>,
+    size_id: String,
+    type_name: Option<String>,
+    design_name: Option<String>,
+    size_name: Option<String>,
+    capacity: Option<String>,
+    quantity: f64,
+    unit_cost: Option<f64>,
+}
+
+impl SalePackingRow {
+    fn canonical(&self) -> serde_json::Value {
+        serde_json::json!({
+            "combo_line_key": self.combo_line_key,
+            "combo_id": self.combo_id,
+            "source": self.source,
+            "packing_size_id": self.size_id,
+            "type_name": self.type_name,
+            "design_name": self.design_name,
+            "size_name": self.size_name,
+            "capacity": self.capacity,
+            "quantity": self.quantity,
+            "unit_cost": self.unit_cost,
+        })
+    }
+}
+
+/// A local sale's `packing_usage`. Absent or null: no packing. Anything else that is not a list of
+/// rows each naming a size and a quantity above 0 refuses the sale — this is our own POS's payload,
+/// so a malformed one is a bug to surface, never packing to drop silently.
+fn parse_sale_packing_usage(sale: &serde_json::Value) -> Result<Option<Vec<SalePackingRow>>, String> {
+    let rows = match sale.get("packing_usage") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Array(rows)) => rows,
+        Some(_) => return Err("packing_usage must be a list (PACKING_USAGE_INVALID)".to_string()),
+    };
+    let mut parsed = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        if !row.is_object() {
+            return Err(format!("packing_usage row {} is not an object (PACKING_USAGE_INVALID)", index + 1));
+        }
+        let size_id = packing_size_reference(row).ok_or_else(|| {
+            format!("packing_usage row {} does not say which packing size it is (PACKING_USAGE_INVALID)", index + 1)
+        })?;
+        let quantity = row
+            .get("quantity")
+            .and_then(json_number)
+            .filter(|quantity| quantity.is_finite() && round_qty(*quantity) > 0.0)
+            .map(round_qty)
+            .ok_or_else(|| {
+                format!("packing_usage row {} ({size_id}) has no usable quantity (PACKING_USAGE_INVALID)", index + 1)
+            })?;
+        parsed.push(SalePackingRow {
+            combo_line_key: optional_text(row, "combo_line_key"),
+            combo_id: optional_text(row, "combo_id"),
+            source: optional_text(row, "source").map(|value| value.to_uppercase()),
+            size_id,
+            type_name: optional_text(row, "type_name"),
+            design_name: optional_text(row, "design_name"),
+            size_name: optional_text(row, "size_name").map(|value| value.to_uppercase()),
+            capacity: optional_text(row, "capacity"),
+            quantity,
+            unit_cost: row
+                .get("unit_cost")
+                .and_then(json_number)
+                .filter(|value| value.is_finite() && *value >= 0.0),
+        });
+    }
+    Ok(Some(parsed))
+}
+
+fn write_sale_packing(tx: &rusqlite::Transaction<'_>, invoice_id: &str, rows: &[SalePackingRow]) -> Result<(), String> {
+    for (index, row) in rows.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO local_pos_invoice_packing (
+                id, invoice_id, combo_line_key, combo_id, source, size_id, type_name, design_name,
+                size_name, capacity, quantity, unit_cost
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                // Derived from the bill and the position: a bill's packing has one writer.
+                format!("{invoice_id}::packing::{}", index + 1),
+                invoice_id,
+                row.combo_line_key,
+                row.combo_id,
+                row.source,
+                row.size_id,
+                row.type_name,
+                row.design_name,
+                row.size_name,
+                row.capacity,
+                row.quantity,
+                row.unit_cost,
+            ],
+        )
+        .map_err(to_error)?;
+    }
+    Ok(())
+}
+
+/// A bill's packing as billed, in the canonical `packing_usage` shape.
+fn read_sale_packing(conn: &Connection, invoice_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT combo_line_key, combo_id, source, size_id, type_name, design_name, size_name,
+                    capacity, quantity, unit_cost
+             FROM local_pos_invoice_packing WHERE invoice_id = ?1 ORDER BY rowid",
+        )
+        .map_err(to_error)?;
+    let rows = statement
+        .query_map([invoice_id], |row| {
+            Ok(serde_json::json!({
+                "combo_line_key": row.get::<_, Option<String>>(0)?,
+                "combo_id": row.get::<_, Option<String>>(1)?,
+                "source": row.get::<_, Option<String>>(2)?,
+                "packing_size_id": row.get::<_, String>(3)?,
+                "type_name": row.get::<_, Option<String>>(4)?,
+                "design_name": row.get::<_, Option<String>>(5)?,
+                "size_name": row.get::<_, Option<String>>(6)?,
+                "capacity": row.get::<_, Option<String>>(7)?,
+                "quantity": row.get::<_, f64>(8)?,
+                "unit_cost": row.get::<_, Option<f64>>(9)?,
+            }))
+        })
+        .map_err(to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
 
 /// Shown when a local edit touches a bill with combo lines. A combo's lines carry a price spread
@@ -3694,11 +4526,15 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
     };
 
     let other_charges = read_sale_charges(conn, invoice_id)?;
+    // Frooz Pack: emitted always (empty when none), so the cancel payload built from this snapshot
+    // tells the cloud what packing to give back.
+    let packing_usage = read_sale_packing(conn, invoice_id)?;
 
     Ok(serde_json::json!({
         "invoice": invoice,
         "items": items,
         "payments": payments,
+        "packing_usage": packing_usage,
         // Emitted whether or not there are any, so that a consumer can tell "this bill has no
         // charges" from "this build did not tell me about them" — the edit and cancel paths turn
         // this snapshot straight into the payload the cloud is given.
@@ -4326,6 +5162,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "026_sync_outbox_entity_and_deferred_lots", MIGRATION_026)?;
     apply_migration(&mut conn, "027_product_pos_section", MIGRATION_027)?;
     apply_migration(&mut conn, "028_combos", MIGRATION_028)?;
+    apply_migration(&mut conn, "029_frooz_pack", MIGRATION_029)?;
     if first_open_in_this_process(path) {
         release_interrupted_syncing_at(&conn)?;
     }
@@ -6121,6 +6958,11 @@ fn load_reference_snapshot_at(
     // cached stands exactly as it did before this field existed. `canonical_scope` is a second,
     // independently-computed opinion a caller may prefer once it starts reading it.
     let canonical_scope = canonical_snapshot_scope_at(&conn, requested_device);
+    // Frooz Pack, for this device's own branch: the canonical scope when it resolved one, else the
+    // cached branch context the rest of this snapshot already stands on.
+    let packing_branch = optional_text(&canonical_scope, "branch_id")
+        .or_else(|| optional_text(&branch_context, "branch_id"));
+    let packing = read_packing(&conn, packing_branch.as_deref())?;
 
     Ok(serde_json::json!({
         "reference_ready": reference_ready,
@@ -6139,6 +6981,7 @@ fn load_reference_snapshot_at(
         "customers": customers,
         "charge_types": charge_types,
         "combos": combos,
+        "packing": packing,
         "settings_bundle": settings_bundle,
         "offline_purchases": offline_purchases,
         "sales_history": sales_history,
@@ -8724,6 +9567,43 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 record_unapplied_change(tx, change, "COMBO_NOT_USABLE", Some(detail))?;
             }
         }
+        // Frooz Pack: a packing type travels as its whole Type -> Design -> Size tree, which
+        // replaces the stored designs and sizes of that type.
+        "packing_type" => {
+            match packing_type_identity(&change.payload, Some(change.entity_id.as_str())) {
+                None => record_unapplied_change(
+                    tx,
+                    change,
+                    "PACKING_NOT_USABLE",
+                    Some("packing type has no identity".to_string()),
+                )?,
+                Some(type_id) => {
+                    if let Err(detail) = upsert_packing_type_with_tx(
+                        tx,
+                        &type_id,
+                        &change.payload,
+                        change.updated_at.clone(),
+                        change.version.unwrap_or(1),
+                        operation == "DELETE",
+                    ) {
+                        // Every check runs before the first write, so nothing was stored.
+                        record_unapplied_change(tx, change, "PACKING_NOT_USABLE", Some(detail))?;
+                    }
+                }
+            }
+        }
+        // Frooz Pack: the cloud's count for one (branch, size). Kept for every branch; the
+        // snapshot shows only this device's own.
+        "packing_stock" => {
+            if let Err(detail) = upsert_packing_stock_with_tx(
+                tx,
+                &change.payload,
+                change.updated_at.clone(),
+                change.version.unwrap_or(1),
+            ) {
+                record_unapplied_change(tx, change, "PACKING_STOCK_NOT_USABLE", Some(detail))?;
+            }
+        }
         "sync_test" => {
             tx.execute(
                 "INSERT INTO local_sync_test_entities (id, branch_id, device_id, value, server_version, sync_status, updated_at, deleted_at)
@@ -8868,7 +9748,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 27;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 28;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -9070,6 +9950,8 @@ mod tests {
                 },
             ],
             combos: Vec::new(),
+            packing_types: Vec::new(),
+            packing_stock: Vec::new(),
         }
     }
 
@@ -16692,6 +17574,588 @@ mod tests {
             }),
         )
         .expect("a combo bill can be cancelled");
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Frooz Pack (migration 029)
+    // ---------------------------------------------------------------------------------------------
+
+    fn pulled_packing(entity_type: &str, entity_id: &str, version: i64, payload: serde_json::Value) -> PulledChange {
+        PulledChange {
+            change_id: serde_json::json!(version),
+            branch_id: Some(1),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(version),
+            payload,
+            updated_at: Some("2026-10-22T10:00:00.000Z".to_string()),
+        }
+    }
+
+    /// A Gift Box type the way the cloud publishes it: the whole tree, NUMERIC as text.
+    fn gift_box_tree() -> serde_json::Value {
+        serde_json::json!({
+            "global_id": "packing-type-1",
+            "company_id": 1,
+            "name": "Gift Box",
+            "active": true,
+            "sort_order": 0,
+            "entity_version": 1,
+            "designs": [
+                {
+                    "global_id": "packing-design-1",
+                    "name": "Window Box",
+                    "active": true,
+                    "sort_order": 0,
+                    "sizes": [
+                        { "global_id": "packing-size-1", "size_name": "GRAND", "capacity": "1 kg", "unit_cost": "12.50", "active": true, "sort_order": 1 },
+                        { "global_id": "packing-size-2", "size_name": "petite", "capacity": null, "unit_cost": "4.00", "active": false, "sort_order": 0 }
+                    ]
+                },
+                {
+                    "global_id": "packing-design-2",
+                    "name": "Kraft Box",
+                    "active": true,
+                    "sort_order": 1,
+                    "sizes": [
+                        { "global_id": "packing-size-3", "size_name": "CLASSIC", "capacity": "500 g", "unit_cost": 6, "active": true, "sort_order": 0 }
+                    ]
+                }
+            ]
+        })
+    }
+
+    fn packing_stock_change(branch: i64, size: &str, qty: serde_json::Value, version: i64) -> PulledChange {
+        let id = format!("packing-stock-{branch}-{size}");
+        pulled_packing(
+            "packing_stock",
+            &id,
+            version,
+            serde_json::json!({
+                "global_id": id,
+                "branch_id": branch,
+                "size_global_id": size,
+                "qty_on_hand": qty,
+                "entity_version": version,
+                "updated_at": "2026-10-22T10:00:00.000Z"
+            }),
+        )
+    }
+
+    fn packing_snapshot(path: &Path, device_id: &str) -> serde_json::Value {
+        load_reference_snapshot_at(path, Some("offline-user"), Some(device_id))
+            .expect("load the counter's snapshot")["packing"]
+            .clone()
+    }
+
+    /// Every size in the snapshot's packing tree, by id.
+    fn packing_sizes(packing: &serde_json::Value) -> HashMap<String, serde_json::Value> {
+        let mut sizes = HashMap::new();
+        for packing_type in packing["types"].as_array().expect("types are always a list") {
+            for design in packing_type["designs"].as_array().expect("designs") {
+                for size in design["sizes"].as_array().expect("sizes") {
+                    sizes.insert(size["id"].as_str().unwrap().to_string(), size.clone());
+                }
+            }
+        }
+        sizes
+    }
+
+    fn set_outbox_status(path: &Path, operation_id: &str, status: &str) {
+        let changed = Connection::open(path)
+            .unwrap()
+            .execute("UPDATE sync_outbox SET status = ?2 WHERE operation_id = ?1", params![operation_id, status])
+            .unwrap();
+        assert_eq!(changed, 1, "outbox row {operation_id} exists");
+    }
+
+    /// Migration 029 upgrades a real 028 profile once, a restart changes nothing, and the combos the
+    /// profile already held are untouched (with an empty `packing` list).
+    #[test]
+    fn migration_029_adds_frooz_pack_once_and_keeps_028_combos() {
+        let path = sync_fix_path("migration-029");
+        {
+            let mut conn = Connection::open(&path).expect("open pre-029 database");
+            apply_migrations_through_023(&mut conn);
+            for (version, sql) in [
+                ("024_other_charges", MIGRATION_024),
+                ("025_device_machine_fingerprint", MIGRATION_025),
+                ("026_sync_outbox_entity_and_deferred_lots", MIGRATION_026),
+                ("027_product_pos_section", MIGRATION_027),
+                ("028_combos", MIGRATION_028),
+            ] {
+                apply_migration(&mut conn, version, sql).expect("apply pre-029 migration");
+            }
+            conn.execute(
+                "INSERT INTO local_combos (id, name, kind, combo_type, price) VALUES ('combo-5', 'Mango Shake', 'JUICE', 'FIXED', 60)",
+                [],
+            )
+            .expect("write a pre-029 combo");
+            conn.execute(
+                "INSERT INTO local_combo_items (id, combo_id, product_global_id, quantity) VALUES ('combo-5::item::1', 'combo-5', 'product-276', 0.25)",
+                [],
+            )
+            .expect("write a pre-029 combo component");
+        }
+
+        initialize_at(&path).expect("upgrade to 029");
+        simulate_restart(&path);
+        initialize_at(&path).expect("restart with the upgraded profile");
+        initialize_at(&path).expect("and again");
+
+        let conn = Connection::open(&path).unwrap();
+        let (applied, total): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE version = '029_frooz_pack'),
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((applied, total), (1, EXPECTED_APPLIED_MIGRATIONS));
+        assert_eq!(status_at(&path).expect("status").schema_version, "029_frooz_pack");
+        for table in [
+            "local_packing_types", "local_packing_designs", "local_packing_sizes", "local_packing_stock",
+            "local_combo_packing", "local_pos_invoice_packing",
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{table} must exist after the upgrade");
+        }
+        // The file is safe on its own too: executing it again changes nothing and fails nothing.
+        conn.execute_batch(MIGRATION_029).expect("029 is idempotent on its own");
+        drop(conn);
+
+        let combos = combo_snapshot_by_id(&path, "device-029");
+        assert_eq!(combos.len(), 1);
+        assert_eq!(combos["combo-5"]["name"], "Mango Shake");
+        assert_eq!(combos["combo-5"]["items"].as_array().map(|rows| rows.len()), Some(1));
+        assert_eq!(combos["combo-5"]["packing"], serde_json::json!([]), "a combo with no packing reads an empty list");
+        let packing = packing_snapshot(&path, "device-029");
+        assert_eq!(packing["status"], "missing", "an upgraded profile has never heard about packing");
+        assert_eq!(packing["types"], serde_json::json!([]));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pulled packing type lands as a tree, replays without duplicating, a later change drops the
+    /// designs and sizes it no longer lists, inactive entries are kept, and an unusable change is
+    /// recorded with nothing written.
+    #[test]
+    fn pulled_packing_types_round_trip_through_the_snapshot() {
+        let path = sync_fix_path("packing-pull");
+        initialize_at(&path).expect("initialize");
+        assert_eq!(packing_snapshot(&path, "device-pack")["status"], "missing");
+
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 1, gift_box_tree()));
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 1, gift_box_tree()));
+        let packing = packing_snapshot(&path, "device-pack");
+        assert_eq!(packing["status"], "ready");
+        let types = packing["types"].as_array().unwrap();
+        assert_eq!(types.len(), 1, "replaying a type does not duplicate it");
+        assert_eq!(types[0]["id"], "packing-type-1");
+        assert_eq!(types[0]["name"], "Gift Box");
+        assert_eq!(types[0]["active"], true);
+        let designs = types[0]["designs"].as_array().unwrap();
+        assert_eq!(designs.len(), 2);
+        assert_eq!(designs[0]["name"], "Window Box");
+        let sizes = designs[0]["sizes"].as_array().unwrap();
+        assert_eq!(sizes.len(), 2, "replaying a type does not duplicate a size");
+        // Owner's order: sort_order 0 (the inactive Petite) first.
+        assert_eq!(sizes[0]["id"], "packing-size-2");
+        assert_eq!(sizes[0]["size_name"], "PETITE");
+        assert_eq!(sizes[0]["active"], false, "an inactive size is kept and says so");
+        assert!(sizes[0]["capacity"].is_null());
+        assert_eq!(sizes[1]["size_name"], "GRAND");
+        assert_eq!(sizes[1]["capacity"], "1 kg");
+        assert_eq!(sizes[1]["unit_cost"], 12.5, "NUMERIC text is stored as money");
+        assert_eq!(sizes[1]["cloud_qty_on_hand"], 0.0, "no cloud row: the cloud has never stocked it");
+        assert_eq!(sizes[1]["pending_usage"], 0.0);
+        assert_eq!(sizes[1]["qty_on_hand"], 0.0);
+
+        // The next change drops Kraft Box (and its size) and switches Window Box off.
+        let mut smaller = gift_box_tree();
+        smaller["designs"] = serde_json::json!([smaller["designs"][0].clone()]);
+        smaller["designs"][0]["active"] = serde_json::json!(false);
+        smaller["designs"][0]["sizes"] = serde_json::json!([smaller["designs"][0]["sizes"][0].clone()]);
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 2, smaller));
+        let packing = packing_snapshot(&path, "device-pack");
+        let designs = packing["types"][0]["designs"].as_array().unwrap();
+        assert_eq!(designs.len(), 1, "a design the cloud no longer lists is gone");
+        assert_eq!(designs[0]["active"], false, "an inactive design is kept and says so");
+        assert_eq!(designs[0]["sizes"].as_array().map(|rows| rows.len()), Some(1));
+        let size_rows: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM local_packing_sizes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(size_rows, 1, "the dropped sizes are removed, not orphaned");
+
+        // A change without `designs` says nothing about them, so they stay.
+        let mut renamed = gift_box_tree();
+        renamed.as_object_mut().unwrap().remove("designs");
+        renamed["name"] = serde_json::json!("Gift Boxes");
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 3, renamed));
+        let packing = packing_snapshot(&path, "device-pack");
+        assert_eq!(packing["types"][0]["name"], "Gift Boxes");
+        assert_eq!(packing["types"][0]["designs"].as_array().map(|rows| rows.len()), Some(1));
+
+        // Unusable trees are recorded with a name and change nothing.
+        for (version, bad) in [
+            (4, serde_json::json!({ "global_id": "packing-type-1", "designs": [] })),
+            (5, serde_json::json!({ "global_id": "packing-type-1", "name": "Gift Box", "designs": [{ "global_id": "packing-design-9", "name": "X", "sizes": "lots" }] })),
+            (6, serde_json::json!({ "global_id": "packing-type-1", "name": "Gift Box", "designs": [{ "global_id": "packing-design-9", "name": "X", "sizes": [{ "global_id": "packing-size-9", "size_name": "GRAND", "unit_cost": -1 }] }] })),
+        ] {
+            pull(&path, &pulled_packing("packing_type", "packing-type-1", version, bad));
+            assert_eq!(unapplied_reason_for(&path, "packing-type-1", version).as_deref(), Some("PACKING_NOT_USABLE"));
+        }
+        let packing = packing_snapshot(&path, "device-pack");
+        assert_eq!(packing["types"][0]["name"], "Gift Boxes", "a refused tree writes nothing");
+        assert_eq!(packing["types"][0]["designs"][0]["id"], "packing-design-1");
+        let _ = fs::remove_file(&path);
+    }
+
+    fn unapplied_reason_for(path: &Path, entity_id: &str, version: i64) -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT reason FROM local_unapplied_changes WHERE entity_id = ?1 AND version = ?2",
+                params![entity_id, version],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Counts are kept per branch and the snapshot shows only this device's own; counts that arrive
+    /// before any type still leave the status "missing".
+    #[test]
+    fn pulled_packing_stock_is_per_branch_and_the_snapshot_shows_its_own() {
+        let path = sync_fix_path("packing-stock");
+        initialize_at(&path).expect("initialize");
+        pull(&path, &packing_stock_change(1, "packing-size-1", serde_json::json!("40.000"), 1));
+        pull(&path, &packing_stock_change(2, "packing-size-1", serde_json::json!(7), 1));
+        // The cloud never refuses a sale for packing, so its count can be negative.
+        pull(&path, &packing_stock_change(1, "packing-size-3", serde_json::json!(-2), 1));
+        assert_eq!(
+            packing_snapshot(&path, "device-pack")["status"],
+            "missing",
+            "counts alone are not a catalogue"
+        );
+
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 1, gift_box_tree()));
+        let packing = packing_snapshot(&path, "device-pack");
+        assert_eq!(packing["status"], "ready");
+        assert_eq!(packing["branch_id"], "1");
+        let sizes = packing_sizes(&packing);
+        assert_eq!(sizes["packing-size-1"]["cloud_qty_on_hand"], 40.0, "branch 1's count, not branch 2's 7");
+        assert_eq!(sizes["packing-size-1"]["qty_on_hand"], 40.0);
+        assert_eq!(sizes["packing-size-3"]["qty_on_hand"], -2.0);
+        assert_eq!(sizes["packing-size-2"]["qty_on_hand"], 0.0);
+        let rows: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM local_packing_stock", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 3, "every branch's counts are kept on the device");
+
+        // A later count replaces the earlier one.
+        pull(&path, &packing_stock_change(1, "packing-size-1", serde_json::json!(35), 2));
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 35.0);
+
+        // An unusable count is recorded and stores nothing.
+        let mut bad = packing_stock_change(1, "packing-size-1", serde_json::json!("many"), 3);
+        pull(&path, &bad);
+        assert_eq!(unapplied_reason_for(&path, "packing-stock-1-packing-size-1", 3).as_deref(), Some("PACKING_STOCK_NOT_USABLE"));
+        bad.version = Some(4);
+        bad.payload.as_object_mut().unwrap().remove("branch_id");
+        bad.payload["qty_on_hand"] = serde_json::json!(1);
+        pull(&path, &bad);
+        assert_eq!(unapplied_reason_for(&path, "packing-stock-1-packing-size-1", 4).as_deref(), Some("PACKING_STOCK_NOT_USABLE"));
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 35.0);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A FIXED combo's packing arrives with the combo, is described from the counter's catalogue,
+    /// survives a change without the key, and is cleared by an empty list.
+    #[test]
+    fn pulled_combo_packing_round_trips_through_the_snapshot() {
+        let path = sync_fix_path("combo-packing");
+        initialize_at(&path).expect("initialize");
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 1, gift_box_tree()));
+        let basket = serde_json::json!({
+            "id": 30,
+            "global_id": "combo-30",
+            "company_id": 1,
+            "name": "Mango Box",
+            "kind": "GIFTING",
+            "combo_type": "FIXED",
+            "price": "450.00",
+            "items": [{ "product_global_id": "product-276", "quantity": 3 }],
+            "packing": [
+                { "packing_size_id": "packing-size-1", "quantity": "1.000", "sort_order": 0, "type_name": "Gift Box",
+                  "design_name": "Window Box", "size_name": "GRAND", "capacity": "1 kg", "unit_cost": "12.50", "size_active": true },
+                // The cloud's numeric id is spelled as its global id; a size this counter has not heard of is kept.
+                { "packing_size_id": 77, "quantity": 2, "sort_order": 1, "type_name": "Bag", "design_name": "Jute",
+                  "size_name": "ROYAL", "capacity": null, "unit_cost": 3 }
+            ]
+        });
+        pull(&path, &pulled_combo("combo-30", basket.clone()));
+        pull(&path, &pulled_combo("combo-30", basket.clone()));
+        let combos = combo_snapshot_by_id(&path, "device-pack");
+        let packing = combos["combo-30"]["packing"].as_array().expect("packing list");
+        assert_eq!(packing.len(), 2, "replaying a combo does not duplicate its packing");
+        assert_eq!(packing[0]["packing_size_id"], "packing-size-1");
+        assert_eq!(packing[0]["quantity"], 1.0);
+        assert_eq!(packing[0]["type_name"], "Gift Box");
+        assert_eq!(packing[0]["design_name"], "Window Box");
+        assert_eq!(packing[0]["size_name"], "GRAND");
+        assert_eq!(packing[0]["capacity"], "1 kg");
+        assert_eq!(packing[0]["unit_cost"], 12.5);
+        assert_eq!(packing[0]["size_active"], true);
+        assert_eq!(packing[1]["packing_size_id"], "packing-size-77");
+        assert_eq!(packing[1]["type_name"], "Bag", "the names the cloud sent describe a size this counter lacks");
+        assert!(packing[1]["size_active"].is_null(), "a size not on this counter is neither active nor inactive");
+
+        let mut renamed = basket.clone();
+        renamed.as_object_mut().unwrap().remove("packing");
+        renamed["name"] = serde_json::json!("Mango Crate");
+        pull(&path, &pulled_combo("combo-30", renamed));
+        let combos = combo_snapshot_by_id(&path, "device-pack");
+        assert_eq!(combos["combo-30"]["name"], "Mango Crate");
+        assert_eq!(combos["combo-30"]["packing"].as_array().map(|rows| rows.len()), Some(2), "an absent key keeps the packing");
+
+        let mut cleared = basket.clone();
+        cleared["packing"] = serde_json::json!([]);
+        pull(&path, &pulled_combo("combo-30", cleared));
+        let combos = combo_snapshot_by_id(&path, "device-pack");
+        assert_eq!(combos["combo-30"]["packing"], serde_json::json!([]), "[] clears the packing");
+
+        // Unusable packing refuses the whole combo change and writes nothing.
+        let mut bad = basket.clone();
+        bad["name"] = serde_json::json!("Should not land");
+        bad["packing"] = serde_json::json!([{ "packing_size_id": "packing-size-1", "quantity": 0 }]);
+        pull(&path, &pulled_combo("combo-30", bad));
+        assert_eq!(unapplied_reason(&path, "combo-30").as_deref(), Some("COMBO_NOT_USABLE"));
+        let combos = combo_snapshot_by_id(&path, "device-pack");
+        assert_eq!(combos["combo-30"]["name"], "Mango Box", "the refused change did not rename it");
+        let _ = fs::remove_file(&path);
+    }
+
+    fn combo_sale_with_packing(invoice: &str) -> serde_json::Value {
+        let mut sale = combo_sale_payload(invoice);
+        sale["packing_usage"] = serde_json::json!([
+            {
+                "combo_line_key": "combo-line-1", "combo_id": "combo-12", "source": "fixed",
+                "packing_size_id": "packing-size-1", "type_name": "Gift Box", "design_name": "Window Box",
+                "size_name": "GRAND", "capacity": "1 kg", "quantity": 2, "unit_cost": 12.5
+            },
+            {
+                "combo_line_key": "combo-line-1", "combo_id": "combo-12", "source": "CUSTOM",
+                "packing_size_id": "3", "quantity": "0.5"
+            }
+        ]);
+        sale
+    }
+
+    /// A local sale's packing is stored, rides the outbox, and holds the counter's count down until
+    /// the bill reaches the cloud — after which the cloud's own count is the only figure. A cancel
+    /// gives it back until the cancel is delivered; a malformed `packing_usage` refuses the bill.
+    #[test]
+    fn a_local_sale_with_packing_usage_holds_the_count_until_the_cloud_has_it() {
+        let path = sync_fix_path("packing-sale");
+        initialize_at(&path).expect("initialize");
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 1, gift_box_tree()));
+        pull(&path, &packing_stock_change(1, "packing-size-1", serde_json::json!(40), 1));
+        pull(&path, &packing_stock_change(1, "packing-size-3", serde_json::json!(10), 1));
+        pull(&path, &packing_stock_change(2, "packing-size-1", serde_json::json!(100), 1));
+
+        let result = complete_local_pos_sale_at(&path, combo_sale_with_packing("inv-pack-1")).expect("bill a combo with packing");
+        assert_eq!(result.invoice["packing_usage"][1]["packing_size_id"], "packing-size-3");
+
+        let conn = Connection::open(&path).unwrap();
+        let bill = load_invoice_snapshot(&conn, "inv-pack-1").expect("read the bill");
+        let usage = bill["packing_usage"].as_array().expect("packing_usage");
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0]["packing_size_id"], "packing-size-1");
+        assert_eq!(usage[0]["source"], "FIXED");
+        assert_eq!(usage[0]["quantity"], 2.0);
+        assert_eq!(usage[0]["unit_cost"], 12.5);
+        assert_eq!(usage[1]["packing_size_id"], "packing-size-3", "a bare number is the cloud's id, spelled as its global id");
+        assert_eq!(usage[1]["quantity"], 0.5);
+        let payload: String = conn
+            .query_row("SELECT payload FROM sync_outbox WHERE operation_id = 'op-inv-pack-1'", [], |row| row.get(0))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["packing_usage"], bill["packing_usage"], "the cloud is handed the packing as stored");
+        drop(conn);
+
+        let sizes = packing_sizes(&packing_snapshot(&path, "device-pack"));
+        assert_eq!(sizes["packing-size-1"]["cloud_qty_on_hand"], 40.0);
+        assert_eq!(sizes["packing-size-1"]["pending_usage"], 2.0);
+        assert_eq!(sizes["packing-size-1"]["qty_on_hand"], 38.0);
+        assert_eq!(sizes["packing-size-3"]["qty_on_hand"], 9.5);
+
+        // A failed or held-back bill has still not been counted by the cloud.
+        set_outbox_status(&path, "op-inv-pack-1", "failed");
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 38.0);
+        set_outbox_status(&path, "op-inv-pack-1", "conflict");
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 38.0);
+
+        // Delivered: the cloud's count is the only figure, before and after its decrement arrives.
+        set_outbox_status(&path, "op-inv-pack-1", "synced");
+        let sizes = packing_sizes(&packing_snapshot(&path, "device-pack"));
+        assert_eq!(sizes["packing-size-1"]["pending_usage"], 0.0);
+        assert_eq!(sizes["packing-size-1"]["qty_on_hand"], 40.0);
+        pull(&path, &packing_stock_change(1, "packing-size-1", serde_json::json!(38), 2));
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 38.0);
+
+        // Cancelled after delivery: given back until the cancel reaches the cloud.
+        cancel_local_pos_sale_at(
+            &path,
+            serde_json::json!({ "invoice_global_id": "inv-pack-1", "reason": "returned", "operation_id": "op-cancel-pack-1" }),
+        )
+        .expect("cancel the bill");
+        let cancel_payload: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT payload FROM sync_outbox WHERE operation_id = 'op-cancel-pack-1'", [], |row| row.get(0))
+            .unwrap();
+        let cancel_payload: serde_json::Value = serde_json::from_str(&cancel_payload).unwrap();
+        assert_eq!(
+            cancel_payload["sale"]["packing_usage"].as_array().map(|rows| rows.len()),
+            Some(2),
+            "the cancel tells the cloud what packing to give back"
+        );
+        let sizes = packing_sizes(&packing_snapshot(&path, "device-pack"));
+        assert_eq!(sizes["packing-size-1"]["pending_usage"], -2.0);
+        assert_eq!(sizes["packing-size-1"]["qty_on_hand"], 40.0);
+        set_outbox_status(&path, "op-cancel-pack-1", "synced");
+        pull(&path, &packing_stock_change(1, "packing-size-1", serde_json::json!(40), 3));
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 40.0);
+
+        // Cancelled before it ever reached the cloud: the cloud will see both, so nothing here.
+        let mut second = combo_sale_with_packing("inv-pack-2");
+        for (index, item) in second["items"].as_array_mut().unwrap().iter_mut().enumerate() {
+            item["lot_id"] = serde_json::json!(format!("lot-pack-2-{index}"));
+        }
+        complete_local_pos_sale_at(&path, second).expect("bill a second combo");
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 38.0);
+        cancel_local_pos_sale_at(
+            &path,
+            serde_json::json!({ "invoice_global_id": "inv-pack-2", "reason": "mistake", "operation_id": "op-cancel-pack-2" }),
+        )
+        .expect("cancel it before it syncs");
+        let sizes = packing_sizes(&packing_snapshot(&path, "device-pack"));
+        assert_eq!(sizes["packing-size-1"]["pending_usage"], 0.0);
+        assert_eq!(sizes["packing-size-1"]["qty_on_hand"], 40.0);
+
+        // A pulled cloud bill never touches packing counts.
+        let mut conn = Connection::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        apply_pulled_pos_sale_with_tx(
+            &tx,
+            &PulledChange {
+                change_id: serde_json::json!(1),
+                branch_id: Some(1),
+                entity_type: "pos_sale".to_string(),
+                entity_id: "inv-pack-remote".to_string(),
+                operation_type: "UPSERT".to_string(),
+                version: Some(1),
+                payload: combo_sale_with_packing("inv-pack-remote"),
+                updated_at: Some("2026-10-22T10:00:00.000Z".to_string()),
+            },
+        )
+        .expect("apply a pulled bill");
+        tx.commit().unwrap();
+        let remote_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_pos_invoice_packing WHERE invoice_id = 'inv-pack-remote'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remote_rows, 0);
+        drop(conn);
+        assert_eq!(packing_sizes(&packing_snapshot(&path, "device-pack"))["packing-size-1"]["qty_on_hand"], 40.0);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A malformed `packing_usage` is our own POS's bug: the bill is refused before anything is
+    /// written. A bill without the key is billed exactly as before.
+    #[test]
+    fn a_malformed_packing_usage_refuses_the_sale_and_writes_nothing() {
+        let path = sync_fix_path("packing-bad");
+        initialize_at(&path).expect("initialize");
+        for (label, usage) in [
+            ("not a list", serde_json::json!({ "packing_size_id": "packing-size-1", "quantity": 1 })),
+            ("no size", serde_json::json!([{ "quantity": 1 }])),
+            ("zero", serde_json::json!([{ "packing_size_id": "packing-size-1", "quantity": 0 }])),
+            ("negative", serde_json::json!([{ "packing_size_id": "packing-size-1", "quantity": -1 }])),
+            ("text", serde_json::json!([{ "packing_size_id": "packing-size-1", "quantity": "two" }])),
+            ("not an object", serde_json::json!(["packing-size-1"])),
+        ] {
+            let mut sale = combo_sale_payload("inv-pack-bad");
+            sale["packing_usage"] = usage;
+            let error = complete_local_pos_sale_at(&path, sale).expect_err(label);
+            assert!(error.contains("PACKING_USAGE_INVALID"), "{label}: {error}");
+        }
+        let conn = Connection::open(&path).unwrap();
+        let (invoices, outbox, packing, lots): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM local_pos_invoices), (SELECT COUNT(*) FROM sync_outbox),
+                        (SELECT COUNT(*) FROM local_pos_invoice_packing), (SELECT COUNT(*) FROM local_inventory_lots)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((invoices, outbox, packing, lots), (0, 0, 0, 0), "a refused bill leaves nothing behind");
+        drop(conn);
+
+        complete_local_pos_sale_at(&path, combo_sale_payload("inv-pack-none")).expect("a bill without packing");
+        let conn = Connection::open(&path).unwrap();
+        let payload: String = conn
+            .query_row("SELECT payload FROM sync_outbox WHERE operation_id = 'op-inv-pack-none'", [], |row| row.get(0))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(payload.get("packing_usage").is_none(), "a bill without packing hands the cloud what it always did");
+        let bill = load_invoice_snapshot(&conn, "inv-pack-none").unwrap();
+        assert_eq!(bill["packing_usage"], serde_json::json!([]));
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The reference bootstrap fills the packing catalogue and the counts; another company's type
+    /// is recorded, never stored.
+    #[test]
+    fn reference_bootstrap_fills_packing() {
+        let path = sync_fix_path("packing-bootstrap");
+        initialize_at(&path).expect("initialize");
+        let mut bootstrap = test_reference_bootstrap("device-pack-bootstrap", 1001);
+        let mut foreign = gift_box_tree();
+        foreign["global_id"] = serde_json::json!("packing-type-9");
+        foreign["company_id"] = serde_json::json!(2);
+        foreign["designs"] = serde_json::json!([]);
+        bootstrap.packing_types = vec![gift_box_tree(), foreign];
+        bootstrap.packing_stock = vec![
+            serde_json::json!({ "global_id": "packing-stock-1-packing-size-1", "branch_id": 1, "size_global_id": "packing-size-1", "qty_on_hand": "25.000", "entity_version": 4 }),
+            serde_json::json!({ "global_id": "packing-stock-2-packing-size-1", "branch_id": 2, "size_global_id": "packing-size-1", "qty_on_hand": 3, "entity_version": 1 }),
+        ];
+        apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-pack-bootstrap",
+            Some("2026-10-22T08:00:00.000Z".to_string()),
+        )
+        .expect("bootstrap with packing");
+        let packing = packing_snapshot(&path, "device-pack-bootstrap");
+        assert_eq!(packing["status"], "ready");
+        assert_eq!(packing["types"].as_array().map(|rows| rows.len()), Some(1), "another company's type is never stored");
+        assert_eq!(packing["branch_id"], "1");
+        let sizes = packing_sizes(&packing);
+        assert_eq!(sizes.len(), 3);
+        assert_eq!(sizes["packing-size-1"]["qty_on_hand"], 25.0);
+        assert_eq!(unapplied_reason(&path, "packing-type-9").as_deref(), Some("PACKING_OUTSIDE_COMPANY_SCOPE"));
         let _ = fs::remove_file(&path);
     }
 }

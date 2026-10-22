@@ -99,6 +99,14 @@ const migrationFiles = [
   // refuses to start, and once it did every desktop bill carrying a combo would fail to sync and
   // the reference bootstrap would answer 500 on the missing table.
   "backend/migrations/cloud/024_combos.sql",
+  // 025 (22 Oct 2026) creates the Frooz Pack tables: packing_types, packing_designs,
+  // packing_sizes, packing_stock, packing_purchases, packing_purchase_lines, packing_movements,
+  // combo_packing and sale_packing_usage. All are declared in `initializeDatabase()`, which never
+  // runs on a hosted deployment, so without this file none of them exist there --
+  // `verifyDeclaredSchema` refuses to start, and once it did every combo read (which now carries
+  // the combo's packing) and the reference bootstrap would answer 500 on the missing tables.
+  // Must run after 024: combo_packing references combos.
+  "backend/migrations/cloud/025_frooz_pack.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };
