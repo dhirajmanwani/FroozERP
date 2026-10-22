@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  packingEmptyPickerMessage,
   PACKING_LOW_STOCK_AT,
   PACKING_SIZE_LABELS,
   PACKING_SIZE_NAMES,
@@ -647,4 +648,20 @@ test("the Frooz Pack screen shows everything the picker hides, marked, and falls
   assert.equal(packingManageView(catalogue, { level: "designs", typeId: "packing-type-99" }).level, "types");
   assert.equal(packingManageView(null, createPackingDrill()).rows.length, 0);
   assert.equal(PACKING_MOVEMENT_LABELS.ADJUST, "Count corrected");
+});
+
+test("an empty picker names the packing types that still need a design and a size", () => {
+  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }), "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.");
+  assert.equal(
+    packingEmptyPickerMessage({ status: "ready", types: [
+      { id: "packing-type-1", name: "Bottle", active: true, designs: [] },
+      { id: "packing-type-2", name: "Box", active: true, designs: [{ id: "packing-design-1", name: "Window", active: true, sizes: [] }] },
+      { id: "packing-type-3", name: "Old", active: false, designs: [] },
+    ] }),
+    "Bottle, Box have no size yet. In Frooz Pack, open each one with →, add a Design, then add a Size inside it."
+  );
+  assert.equal(
+    packingEmptyPickerMessage([{ id: "packing-type-1", name: "Bottle", designs: [] }]),
+    "Bottle has no size yet. In Frooz Pack, open it with →, add a Design, then add a Size inside it."
+  );
 });

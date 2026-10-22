@@ -303,6 +303,22 @@ export const backPackingDrill = (state) => {
   return createPackingDrill();
 };
 
+/**
+ * What an empty picker says. "Nothing set up" was wrong once types exist: only a size can be
+ * picked, so a type with no design or no size under it is invisible here. Name those types and
+ * say what is missing, so the owner knows where to go instead of re-creating the type.
+ */
+export const packingEmptyPickerMessage = (catalogue) => {
+  const types = (Array.isArray(catalogue) ? catalogue : Array.isArray(catalogue?.types) ? catalogue.types : [])
+    .filter((type) => type && type.active !== false);
+  if (types.length === 0) return "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.";
+  const unfinished = types
+    .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
+    .map((type) => text(type.name) || "A packing type");
+  if (unfinished.length === 0) return "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.";
+  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. In Frooz Pack, open ${unfinished.length === 1 ? "it" : "each one"} with →, add a Design, then add a Size inside it.`;
+};
+
 const ROOT_CRUMB_LABEL = "Packing";
 
 /**
