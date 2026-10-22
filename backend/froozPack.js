@@ -869,6 +869,206 @@ const saveSize = async (client, { companyId, branchId, actorId, id, body }, deps
   });
 };
 
+// ---------------------------------------------------------------------------------------------
+// New packing in one go: Type (existing or new) > Design (existing or new) > the sizes ticked
+// ---------------------------------------------------------------------------------------------
+
+const SETUP_SIZES_MAX = 40;
+const PACKING_QUICK_START_TYPES = Object.freeze(["Gift Box", "Basket", "Bottle", "Bowl"]);
+
+const sizeWords = (size) => {
+  const label = PACKING_SIZE_LABELS[size.size_name] || size.size_name;
+  return size.capacity ? `${label} · ${size.capacity}` : label;
+};
+const sizeKey = (size) => `${size.size_name}|${String(size.capacity || "").toLowerCase()}`;
+
+/** `{id?}` or `{name?}` of a setup's type or design: {ref} / {name} / null when neither is given. */
+const readSetupNode = (value, what) => {
+  if (value === undefined || value === null) return { ok: true, value: null };
+  if (typeof value !== "object" || Array.isArray(value)) return refuse(CODES.INPUT_INVALID, `The ${what} could not be read.`);
+  const ref = readRef(value.id ?? value.global_id);
+  if (ref) return { ok: true, value: { ref } };
+  if (isBlank(value.name)) return { ok: true, value: null };
+  const name = readName(value.name, what);
+  if (!name.ok) return name;
+  return { ok: true, value: { name: name.value } };
+};
+
+/**
+ * POST /api/v3/packing/setup: {type: {id}|{name}, design?: {id}|{name}, sizes?: [{size_name,
+ * capacity?, unit_cost?}]}. What may be made at once:
+ * - a new type alone (no design, no sizes) -- the owner may name the type first;
+ * - otherwise a design (existing or new) and at least one size under it. A design with no size is
+ *   invisible to every picker, so it is not made empty here.
+ * Sizes are read as POST /sizes reads them; one listed twice is refused before the database is asked.
+ */
+const validateSetupInput = (body = {}) => {
+  const input = body && typeof body === "object" ? body : {};
+  const type = readSetupNode(input.type, "packing type");
+  if (!type.ok) return type;
+  if (!type.value) return refuse(CODES.PARENT_INVALID, "Choose a packing type, or type a name for a new one.");
+  const design = readSetupNode(input.design, "design");
+  if (!design.ok) return design;
+  if (input.sizes !== undefined && input.sizes !== null && !Array.isArray(input.sizes)) {
+    return refuse(CODES.INPUT_INVALID, "The sizes could not be read.");
+  }
+  const rawSizes = Array.isArray(input.sizes) ? input.sizes : [];
+  if (rawSizes.length > SETUP_SIZES_MAX) return refuse(CODES.INPUT_INVALID, `Add at most ${SETUP_SIZES_MAX} sizes at once.`);
+  const sizes = [];
+  const seen = new Set();
+  for (const raw of rawSizes) {
+    const parsed = validateSizeInput(raw && typeof raw === "object" ? { ...raw, design_id: undefined, design_global_id: undefined } : {}, { updating: true });
+    if (!parsed.ok) return parsed;
+    const size = { size_name: parsed.value.size_name, capacity: parsed.value.capacity, unit_cost: parsed.value.unit_cost };
+    if (seen.has(sizeKey(size))) return refuse(CODES.INPUT_INVALID, `${sizeWords(size)} is listed twice. Tick it once.`);
+    seen.add(sizeKey(size));
+    sizes.push(size);
+  }
+  if (!design.value && sizes.length > 0) return refuse(CODES.PARENT_INVALID, "Choose a design for these sizes, or type a name for a new one.");
+  if (design.value && sizes.length === 0) {
+    return refuse(CODES.INPUT_INVALID, "Tick at least one size (Petite, Classic, Grand or Royal). A design with no size cannot be picked anywhere.");
+  }
+  if (!design.value && type.value.ref) return refuse(CODES.INPUT_INVALID, "Nothing new to save: choose or name a design and tick its sizes.");
+  if (design.value?.ref && type.value.name) {
+    return refuse(CODES.PARENT_INVALID, "A design already saved belongs to its own type. Choose that type, or type a new design name.");
+  }
+  return { ok: true, value: { type: type.value, design: design.value, sizes } };
+};
+
+const insertType = async (client, { companyId, actorId, name }) => {
+  const created = await client.query(
+    `INSERT INTO packing_types (company_id, name, active, sort_order, created_by, updated_by)
+     VALUES ($1, $2, TRUE, 0, $3, $3)
+     RETURNING id`,
+    [companyId, name, actorId]
+  );
+  const typeId = created.rows[0].id;
+  await client.query("UPDATE packing_types SET global_id = 'packing-type-' || id::TEXT WHERE id = $1 AND global_id IS NULL", [typeId]);
+  return typeId;
+};
+
+/**
+ * POST /api/v3/packing/setup. Everything is looked up and checked first -- the type and design
+ * belong to the session's company and are switched on, a new name is not an active sibling's
+ * (409 PACKING_NAME_TAKEN), no ticked size already exists switched on under the design (409
+ * PACKING_SIZE_TAKEN, naming it) -- so a refusal writes nothing. Then one type, one design and
+ * the sizes are inserted and the type is published once.
+ */
+const savePackingSetup = async (client, { companyId, branchId, actorId, body }, deps) => {
+  const parsed = validateSetupInput(body);
+  if (!parsed.ok) return refusal(parsed);
+  const { type: typeInput, design: designInput, sizes } = parsed.value;
+
+  let existingType = null;
+  if (typeInput.ref) {
+    existingType = await findType(client, { companyId, ref: typeInput.ref, lock: true });
+    if (!existingType) return answer(400, { code: CODES.PARENT_INVALID, message: "This packing type was not found. Pick it again." });
+    if (existingType.active === false) {
+      return answer(400, { code: CODES.PARENT_INVALID, message: `${existingType.name} is switched off. Switch it on (Edit) before adding to it.` });
+    }
+  } else {
+    const clash = await client.query(
+      "SELECT name FROM packing_types WHERE COALESCE(company_id, 0) = $1 AND LOWER(name) = LOWER($2) AND active",
+      [companyId, typeInput.name]
+    );
+    if (clash.rows.length > 0) {
+      return answer(409, { code: CODES.NAME_TAKEN, message: `A packing type called ${clash.rows[0].name} already exists. Choose it from the list instead.` });
+    }
+  }
+
+  let existingDesign = null;
+  if (designInput?.ref) {
+    existingDesign = await findDesign(client, { companyId, ref: designInput.ref, lock: true });
+    if (!existingDesign || Number(existingDesign.type_id) !== Number(existingType.id)) {
+      return answer(400, { code: CODES.PARENT_INVALID, message: `This design was not found under ${existingType.name}. Pick it again.` });
+    }
+    if (existingDesign.active === false) {
+      return answer(400, { code: CODES.PARENT_INVALID, message: `${existingDesign.name} is switched off. Switch it on (Edit) before adding sizes to it.` });
+    }
+    const taken = await client.query(
+      "SELECT size_name, capacity FROM packing_sizes WHERE design_id = $1 AND active",
+      [existingDesign.id]
+    );
+    const takenKeys = new Set(taken.rows.map((row) => sizeKey({ size_name: row.size_name, capacity: row.capacity })));
+    const already = sizes.find((size) => takenKeys.has(sizeKey(size)));
+    if (already) {
+      return answer(409, { code: CODES.SIZE_TAKEN, message: `${existingDesign.name} already has ${sizeWords(already)}. Untick it, or give it a different capacity.` });
+    }
+  } else if (designInput?.name && existingType) {
+    const clash = await client.query(
+      "SELECT name FROM packing_designs WHERE type_id = $1 AND LOWER(name) = LOWER($2) AND active",
+      [existingType.id, designInput.name]
+    );
+    if (clash.rows.length > 0) {
+      return answer(409, { code: CODES.NAME_TAKEN, message: `${existingType.name} already has a design called ${clash.rows[0].name}. Choose it from the list instead.` });
+    }
+  }
+
+  const typeId = existingType ? existingType.id : await insertType(client, { companyId, actorId, name: typeInput.name });
+  let designId = existingDesign ? existingDesign.id : null;
+  if (!designId && designInput?.name) {
+    const created = await client.query(
+      `INSERT INTO packing_designs (type_id, name, active, sort_order, created_by, updated_by)
+       VALUES ($1, $2, TRUE, 0, $3, $3)
+       RETURNING id`,
+      [typeId, designInput.name, actorId]
+    );
+    designId = created.rows[0].id;
+    await client.query("UPDATE packing_designs SET global_id = 'packing-design-' || id::TEXT WHERE id = $1 AND global_id IS NULL", [designId]);
+  }
+  const sizeIds = [];
+  for (const size of sizes) {
+    const created = await client.query(
+      `INSERT INTO packing_sizes (design_id, size_name, capacity, unit_cost, active, sort_order, created_by, updated_by)
+       VALUES ($1, $2, $3, COALESCE($4, 0), TRUE, 0, $5, $5)
+       RETURNING id`,
+      [designId, size.size_name, size.capacity, size.unit_cost, actorId]
+    );
+    const sizeId = created.rows[0].id;
+    await client.query("UPDATE packing_sizes SET global_id = 'packing-size-' || id::TEXT WHERE id = $1 AND global_id IS NULL", [sizeId]);
+    sizeIds.push(sizeId);
+  }
+
+  // One publish of the whole type. A type made just now starts at version 1, like POST /types.
+  await publishPackingTypes(client, { companyId, typeIds: [typeId], bump: Boolean(existingType), preferredBranchId: branchId }, deps);
+  const type = await typeNode(client, { companyId, branchId, typeId });
+  const design = type && designId ? type.designs.find((entry) => entry.id === designId) || null : null;
+  const madeSizes = design ? sizeIds.map((id) => design.sizes.find((entry) => entry.id === id)).filter(Boolean) : [];
+  return answer(201, { success: true, type, design, sizes: madeSizes });
+};
+
+/**
+ * POST /api/v3/packing/quick-start: the usual four types (Gift Box, Basket, Bottle, Bowl) in one
+ * go. A name the company already has -- switched on or off, any case -- is skipped, so pressing it
+ * twice makes nothing the second time. Each new type is published once.
+ */
+const quickStartPacking = async (client, { companyId, branchId, actorId }, deps) => {
+  const existing = await client.query(
+    "SELECT LOWER(name) AS name FROM packing_types WHERE COALESCE(company_id, 0) = $1 AND LOWER(name) = ANY($2::TEXT[])",
+    [companyId, PACKING_QUICK_START_TYPES.map((name) => name.toLowerCase())]
+  );
+  const have = new Set(existing.rows.map((row) => row.name));
+  const skipped = PACKING_QUICK_START_TYPES.filter((name) => have.has(name.toLowerCase()));
+  const typeIds = [];
+  for (const [index, name] of PACKING_QUICK_START_TYPES.entries()) {
+    if (have.has(name.toLowerCase())) continue;
+    const created = await client.query(
+      `INSERT INTO packing_types (company_id, name, active, sort_order, created_by, updated_by)
+       VALUES ($1, $2, TRUE, $3, $4, $4)
+       RETURNING id`,
+      [companyId, name, index, actorId]
+    );
+    const typeId = created.rows[0].id;
+    await client.query("UPDATE packing_types SET global_id = 'packing-type-' || id::TEXT WHERE id = $1 AND global_id IS NULL", [typeId]);
+    typeIds.push(typeId);
+  }
+  if (typeIds.length > 0) {
+    await publishPackingTypes(client, { companyId, typeIds, bump: false, preferredBranchId: branchId }, deps);
+  }
+  const created = typeIds.length > 0 ? await loadPackingTree(client, { companyId, branchId, typeIds }) : [];
+  return answer(typeIds.length > 0 ? 201 : 200, { success: true, created, skipped });
+};
+
 /**
  * POST /api/v3/packing/purchases. One transaction: the purchase and its lines, each size's count up
  * at the session's branch with a PURCHASE movement, each size's unit cost set to the line's rate,
@@ -1198,6 +1398,7 @@ module.exports = {
   MOVEMENT_TYPES,
   PACKING_EXPENSE_CATEGORY,
   PACKING_PAYMENT_MODES,
+  PACKING_QUICK_START_TYPES,
   PACKING_SIZE_LABELS,
   PACKING_SIZE_NAMES,
   PACKING_STOCK_SQL,
@@ -1214,6 +1415,7 @@ module.exports = {
   packingTypePayload,
   publishPackingStock,
   publishPackingTypes,
+  quickStartPacking,
   readRef,
   readSalePackingUsage,
   recordPackingAdjustment,
@@ -1224,11 +1426,13 @@ module.exports = {
   resolveSizes,
   restoreSalePacking,
   saveDesign,
+  savePackingSetup,
   saveSize,
   saveType,
   validateAdjustmentInput,
   validateDesignInput,
   validatePurchaseInput,
+  validateSetupInput,
   validateSizeInput,
   validateTypeInput,
 };

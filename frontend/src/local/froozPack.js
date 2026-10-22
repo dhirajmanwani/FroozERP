@@ -322,10 +322,22 @@ export const packingEmptyPickerMessage = (catalogue) => {
     .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
     .map((type) => text(type.name) || "A packing type");
   if (unfinished.length === 0) return "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.";
-  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. In Frooz Pack, open ${unfinished.length === 1 ? "it" : "each one"} with →, add a Design, then add a Size inside it.`;
+  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. In Frooz Pack, press New packing, choose ${unfinished.length === 1 ? "it" : "each one"}, name a design and tick its sizes.`;
 };
 
 const ROOT_CRUMB_LABEL = "Packing";
+
+/**
+ * What a size row says under its name wherever packing is picked: "On hand 12 · last ₹4.50".
+ * A count that has not reached this computer says "Count not known", and a size never bought
+ * (cost unset, stored as 0) says "no rate yet" -- an unknown is never shown as 0.
+ */
+export const packingLeafSublabel = (size) => {
+  const qty = finiteOrNull(size?.qty_on_hand);
+  const cost = knownUnitCost(size?.unit_cost);
+  const count = qty === null ? "Count not known" : `On hand ${formatCount(qty)}`;
+  return `${count} · ${cost === null ? "no rate yet" : `last ₹${cost.toFixed(2)}`}`;
+};
 
 /**
  * What the picker shows for `state`. Only active entries, and a type or design with no active
@@ -352,7 +364,7 @@ export const packingDrillView = (catalogue, state) => {
       rows: activeSizes(design).map((size) => ({
         id: size.id,
         label: packingSizeLabel(size),
-        sublabel: Number.isFinite(size.unit_cost) && size.unit_cost > 0 ? `₹${size.unit_cost.toFixed(2)} each` : "Cost not set",
+        sublabel: packingLeafSublabel(size),
         qty_on_hand: Number.isFinite(size.qty_on_hand) ? size.qty_on_hand : null,
         stockState: packingStockState(size.qty_on_hand),
         leaf: true,
@@ -794,6 +806,211 @@ export const validatePackingNode = (kind, draft = {}) => {
     payload.unit_cost = unitCost;
   }
   return { ok: true, payload, message: "" };
+};
+
+// ---------------------------------------------------------------------------------------------
+// New packing in one go: Type → Design → the sizes ticked (POST /api/v3/packing/setup)
+// ---------------------------------------------------------------------------------------------
+
+/** What Quick start makes when the shop has no packing types at all. */
+export const PACKING_QUICK_START_TYPES = Object.freeze(["Gift Box", "Basket", "Bottle", "Bowl"]);
+
+/** Quick start is offered only on a list that loaded and has no type at all (on or off). */
+export const packingQuickStartOffered = (catalogue) => (
+  !Array.isArray(catalogue) && text(catalogue?.status) === "ready" && catalogueTypes(catalogue).length === 0
+);
+
+const collapse = (value) => text(value).replace(/\s+/g, " ");
+const sameName = (left, right) => collapse(left).toLowerCase() === collapse(right).toLowerCase();
+const activeTypes = (catalogue) => catalogueTypes(catalogue).filter((type) => type && type.active !== false);
+const activeDesigns = (type) => (Array.isArray(type?.designs) ? type.designs : []).filter((design) => design && design.active !== false);
+
+/**
+ * A blank New-packing form. `typeId` / `designId` start it where the owner already is (the
+ * module's drill-down), so "New packing" inside Gift Box › Window Box only asks for sizes. An
+ * empty id means "a new one", named in `type_name` / `design_name`.
+ */
+export const createPackingSetupDraft = ({ typeId = "", designId = "" } = {}) => ({
+  type_id: canonicalInventoryId(typeId),
+  type_name: "",
+  design_id: canonicalInventoryId(typeId) ? canonicalInventoryId(designId) : "",
+  design_name: "",
+  sizes: PACKING_SIZE_NAMES.map((size_name) => ({ size_name, checked: false, capacity: "", unit_cost: "" })),
+});
+
+/**
+ * What the New-packing form offers for `draft`: the switched-on types, the switched-on designs of
+ * the chosen type, and the sizes the chosen design already has (so the owner sees them before
+ * ticking a duplicate). A type or design with no size yet is offered: this is where it gets one.
+ */
+export const packingSetupChoices = (catalogue, draft = {}) => {
+  const types = activeTypes(catalogue);
+  const type = text(draft?.type_id) ? types.find((entry) => nodeMatches(entry, draft.type_id)) || null : null;
+  const designs = type ? activeDesigns(type) : [];
+  const design = type && text(draft?.design_id) ? designs.find((entry) => nodeMatches(entry, draft.design_id)) || null : null;
+  return {
+    types: types.map((entry) => ({ id: entry.id, label: entry.name })),
+    designs: designs.map((entry) => ({ id: entry.id, label: entry.name })),
+    existingSizes: design ? activeSizes(design).map((size) => packingSizeLabel(size)) : [],
+    type,
+    design,
+  };
+};
+
+/**
+ * The body `POST /api/v3/packing/setup` takes, checked as the server checks it, or the first
+ * problem in words. A typed name that is already a switched-on type (or design of the chosen
+ * type), in any case, is taken as that one rather than refused as a duplicate. A size the design
+ * already has, switched on, is refused here naming it. `summary` is what was made, for the notice.
+ */
+export const buildPackingSetupPayload = (draft = {}, catalogue = null) => {
+  const types = activeTypes(catalogue);
+  let type;
+  let typeName = "";
+  if (text(draft?.type_id)) {
+    type = types.find((entry) => nodeMatches(entry, draft.type_id)) || null;
+    if (!type) return refuse("That packing type is no longer in the list. Choose it again.");
+  } else {
+    typeName = collapse(draft?.type_name);
+    if (typeName === "") return refuse("Choose a packing type, or type a name for a new one.");
+    if (typeName.length > 80) return refuse("Keep the packing type name to 80 letters or fewer.");
+    type = types.find((entry) => sameName(entry.name, typeName)) || null;
+  }
+
+  let design;
+  let designName = "";
+  if (type && text(draft?.design_id)) {
+    design = activeDesigns(type).find((entry) => nodeMatches(entry, draft.design_id)) || null;
+    if (!design) return refuse(`That design is no longer under ${type.name}. Choose it again.`);
+  } else {
+    designName = collapse(draft?.design_name);
+    if (designName.length > 80) return refuse("Keep the design name to 80 letters or fewer.");
+    design = designName !== "" && type ? activeDesigns(type).find((entry) => sameName(entry.name, designName)) || null : null;
+  }
+
+  const sizes = [];
+  for (const row of Array.isArray(draft?.sizes) ? draft.sizes : []) {
+    if (!row?.checked) continue;
+    const sizeName = upper(row.size_name);
+    const label = PACKING_SIZE_LABELS[sizeName];
+    if (!label) return refuse("Choose a size: Petite, Classic, Grand or Royal.");
+    const capacity = collapse(row.capacity);
+    if (capacity.length > 40) return refuse(`${label}: keep the capacity to 40 letters or fewer (for example 1 kg or 300 ml).`);
+    const size = { size_name: sizeName, capacity };
+    if (text(row.unit_cost) !== "") {
+      const unitCost = finiteOrNull(row.unit_cost);
+      if (unitCost === null || unitCost < 0 || !hasAtMostDecimals(row.unit_cost, 2)) {
+        return refuse(`${label}: the unit cost must be ₹0 or more, with at most 2 decimals.`);
+      }
+      size.unit_cost = unitCost;
+    }
+    if (sizes.some((other) => other.size_name === size.size_name && sameName(other.capacity, size.capacity))) {
+      return refuse(`${packingSizeLabel(size)} is ticked twice.`);
+    }
+    sizes.push(size);
+  }
+
+  const hasDesign = Boolean(design) || designName !== "";
+  if (!hasDesign && sizes.length > 0) return refuse("Choose the design these sizes belong to, or type a name for a new one.");
+  if (hasDesign && sizes.length === 0) return refuse("Tick at least one size: Petite, Classic, Grand or Royal. A design with no size cannot be picked anywhere.");
+  if (!hasDesign && type) return refuse(`${type.name} is already there. Choose or name a design and tick its sizes.`);
+
+  if (design) {
+    const already = sizes.find((size) => activeSizes(design).some((existing) => upper(existing.size_name) === size.size_name && sameName(existing.capacity, size.capacity)));
+    if (already) return refuse(`${design.name} already has ${packingSizeLabel(already)}. Untick it, or give it a different capacity.`);
+  }
+
+  const payload = {
+    type: type ? { id: type.id } : { name: typeName },
+    sizes,
+  };
+  if (design) payload.design = { id: design.id };
+  else if (designName !== "") payload.design = { name: designName };
+  const where = [type ? type.name : typeName, design ? design.name : designName].filter(Boolean).join(" › ");
+  const summary = sizes.length > 0 ? `${where}: ${sizes.map(packingSizeLabel).join(", ")}` : where;
+  return { ok: true, payload, message: "", summary };
+};
+
+/**
+ * The size a purchase line takes after "+ New packing" made it: the first size the server sent
+ * back, as a picker row (`packing_size_id` is its global id). Null when no size was made.
+ */
+export const packingSetupPickRow = (body) => {
+  const size = Array.isArray(body?.sizes) ? body.sizes.find((entry) => entry && typeof entry === "object") : null;
+  if (!size) return null;
+  const sizeId = text(size.global_id) || text(size.id);
+  if (sizeId === "") return null;
+  const cost = knownUnitCost(size.unit_cost);
+  return {
+    packing_size_id: sizeId,
+    type_name: text(body?.type?.name),
+    design_name: text(body?.design?.name),
+    size_name: upper(size.size_name),
+    capacity: text(size.capacity),
+    unit_cost: cost,
+    qty_on_hand: finiteOrNull(size.qty_on_hand),
+  };
+};
+
+// ---------------------------------------------------------------------------------------------
+// The purchase table: Packing → Qty → Rate → Amount, one row per line
+// ---------------------------------------------------------------------------------------------
+
+export const createPackingPurchaseLine = (key) => ({ key: text(key), size_id: "", label: "", quantity: "", rate: "" });
+
+/** A line's amount (quantity × rate, half-up to the paisa, as the server works it) or null while unreadable. */
+export const packingPurchaseLineAmount = (line) => {
+  const quantity = finiteOrNull(line?.quantity);
+  const rate = finiteOrNull(line?.rate);
+  if (quantity === null || rate === null || quantity <= 0 || rate < 0) return null;
+  const thousandths = toThousandths(quantity);
+  const paise = toPaise(rate);
+  return Math.floor((thousandths * paise * 2 + 1000) / 2000) / 100;
+};
+
+/** The running total of the lines whose amount can be worked out. */
+export const packingPurchaseDraftTotal = (lines) => {
+  let paise = 0;
+  for (const line of Array.isArray(lines) ? lines : []) {
+    const amount = packingPurchaseLineAmount(line);
+    if (amount !== null) paise += Math.round(amount * 100);
+  }
+  return paise / 100;
+};
+
+/**
+ * Put a picked size on line `key`. The rate starts at the size's last unit cost when it is known
+ * and the line has no rate yet; a rate already typed is the bill's own and stays.
+ */
+export const applyPackingToPurchaseLine = (lines, key, row) => (Array.isArray(lines) ? lines : []).map((line) => {
+  if (line?.key !== key || !row) return line;
+  const cost = knownUnitCost(row.unit_cost);
+  return {
+    ...line,
+    size_id: text(row.packing_size_id),
+    label: packingPathLabel(row),
+    rate: text(line.rate) !== "" ? line.rate : (cost === null ? "" : String(cost)),
+  };
+});
+
+/**
+ * Where Enter goes from `field` of line `key`: Qty → the same line's Rate; Rate → the next line's
+ * Packing button, adding a fresh line (`makeLine()`) when this is the last. A blank trailing line
+ * is dropped at save (`buildPackingPurchasePayload`), so it is never in the way.
+ *
+ * @returns {{lines: object[], focus: {key: string, field: "pick"|"quantity"|"rate"} | null}}
+ */
+export const advancePackingPurchaseLine = (lines, key, field, makeLine) => {
+  const list = Array.isArray(lines) ? lines : [];
+  const index = list.findIndex((line) => line?.key === key);
+  if (index === -1) return { lines: list, focus: null };
+  if (field === "pick") return { lines: list, focus: { key, field: "quantity" } };
+  if (field === "quantity") return { lines: list, focus: { key, field: "rate" } };
+  if (field !== "rate") return { lines: list, focus: null };
+  if (index < list.length - 1) return { lines: list, focus: { key: list[index + 1].key, field: "pick" } };
+  const fresh = typeof makeLine === "function" ? makeLine() : null;
+  if (!fresh) return { lines: list, focus: null };
+  return { lines: [...list, fresh], focus: { key: fresh.key, field: "pick" } };
 };
 
 // ---------------------------------------------------------------------------------------------

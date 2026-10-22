@@ -11255,6 +11255,9 @@ app.post("/api/v3/packing/designs", packingWriteRoute(froozPack.saveDesign));
 app.put("/api/v3/packing/designs/:id", packingWriteRoute(froozPack.saveDesign));
 app.post("/api/v3/packing/sizes", packingWriteRoute(froozPack.saveSize));
 app.put("/api/v3/packing/sizes/:id", packingWriteRoute(froozPack.saveSize));
+// New packing in one go (Type > Design > the sizes ticked), and the four usual types in one press.
+app.post("/api/v3/packing/setup", packingWriteRoute(froozPack.savePackingSetup));
+app.post("/api/v3/packing/quick-start", packingWriteRoute(froozPack.quickStartPacking));
 app.post("/api/v3/packing/purchases", packingWriteRoute(froozPack.recordPackingPurchase));
 app.post("/api/v3/packing/adjustments", packingWriteRoute(froozPack.recordPackingAdjustment));
 

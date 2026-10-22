@@ -10549,22 +10549,54 @@ button.shortcut-sheet-row:focus-visible {
   padding-right: 8px;
 }
 
-.packing-purchase-line {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 90px 100px auto;
-  gap: 8px;
-  align-items: center;
+.packing-picker-tools {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* The purchase as a table: Packing → Qty → Rate → Amount, the picker opening on a row below. */
+.packing-purchase-table table {
+  width: 100%;
+  table-layout: fixed;
+}
+
+.packing-purchase-table th:nth-child(1) { width: auto; }
+.packing-purchase-table th:nth-child(2) { width: 100px; }
+.packing-purchase-table th:nth-child(3) { width: 110px; }
+.packing-purchase-table th:nth-child(4) { width: 110px; }
+.packing-purchase-table th:nth-child(5) { width: 52px; }
+
+.packing-purchase-table .table-input {
+  width: 100%;
 }
 
 .packing-line-pick {
+  display: block;
+  width: 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: left;
 }
 
-.packing-line-picker {
-  grid-column: 1 / -1;
+.packing-line-amount {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.packing-line-picker-row > td {
+  padding-top: 0;
+}
+
+/* New packing: one row per size -- tick, actual size, cost. */
+.packing-setup-size {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr) 140px;
+  gap: 8px;
+  align-items: center;
 }
 
 .packing-path {
@@ -10618,8 +10650,16 @@ button.shortcut-sheet-row:focus-visible {
 }
 
 @media (max-width: 640px) {
-  .packing-purchase-line {
-    grid-template-columns: minmax(0, 1fr) 80px 90px auto;
+  .packing-purchase-table th:nth-child(2),
+  .packing-purchase-table th:nth-child(3),
+  .packing-purchase-table th:nth-child(4) { width: 80px; }
+
+  .packing-setup-size {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .packing-setup-size .check-field {
+    grid-column: 1 / -1;
   }
 
   .packing-row {
