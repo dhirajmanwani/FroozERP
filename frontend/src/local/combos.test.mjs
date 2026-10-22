@@ -33,6 +33,12 @@ import {
   suggestComboPrice,
   validateComboCart,
   validateComboDraft,
+  comboItemProductNote,
+  comboPickableProducts,
+  comboStockNotifications,
+  comboStockProblems,
+  describeComboStockProblem,
+  emptyComboTabMessage,
 } from "./combos.js";
 
 const paise = (value) => Math.round(value * 100);
@@ -459,4 +465,72 @@ test("the cart badge counts each combo once and each loose line once", () => {
   ];
   assert.equal(cartItemCount(cart), 4);
   assert.equal(cartItemCount([]), 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Combos whose fruit is missing (owner, 22 Oct 2026)
+// ---------------------------------------------------------------------------------------------
+
+test("the combo form offers only fruit that is on sale and in stock", () => {
+  const catalogue = [
+    { id: "p-3", product_name: "Mango", current_stock: "12.500" },
+    { id: "p-1", product_name: "Alphonso Mango", current_stock: 0 },
+    { id: "p-2", product_name: "apple", current_stock: 4 },
+    { id: "p-4", product_name: "Kiwi", current_stock: 9, active: false },
+    { id: "p-5", product_name: "Guava" },
+  ];
+  // An unreadable stock figure is not zero: Guava stays, so a missing column cannot empty the list.
+  assert.deepEqual(comboPickableProducts(catalogue).map((product) => product.id), ["p-2", "p-5", "p-3"]);
+  assert.equal(comboItemProductNote(catalogue, { product_id: "p-1" }), "no stock");
+  assert.equal(comboItemProductNote(catalogue, { product_id: "p-4" }), "not on sale");
+  assert.equal(comboItemProductNote(catalogue, { product_id: "p-9" }), "not on sale");
+  assert.equal(comboItemProductNote(catalogue, { product_id: "p-2" }), "");
+  assert.deepEqual(comboPickableProducts(null), []);
+});
+
+test("a fixed combo the shelf cannot make one of is reported with every item that stops it", () => {
+  assert.deepEqual(comboStockProblems({ combos: [juice], products, lots }), [], "enough of both");
+  const dry = lots.filter((lot) => lot.product_id !== "product-1");
+  const thin = lots.map((lot) => (lot.product_id === "product-2" ? { ...lot, remaining_qty: 0.1 } : lot));
+  assert.deepEqual(comboStockProblems({ combos: [juice], products, lots: dry }), [
+    { key: "combo-stock:combo-7", comboName: "Mixed Juice", kind: "JUICE", missing: [{ productName: "Orange", reason: "OUT_OF_STOCK" }] },
+  ]);
+  const both = comboStockProblems({ combos: [juice], products, lots: thin.filter((lot) => lot.product_id !== "product-1") });
+  assert.deepEqual(both[0].missing, [
+    { productName: "Orange", reason: "OUT_OF_STOCK" },
+    // The BOX lot of Pomegranate does not count towards a quantity in KG.
+    { productName: "Pomegranate", reason: "NOT_ENOUGH" },
+  ]);
+  assert.equal(describeComboStockProblem(both[0]), "Orange is out of stock, Pomegranate is too low for one");
+  const kiwi = normaliseCombo({ global_id: "combo-8", name: "Kiwi cup", kind: "THE_CUTTING", combo_type: "FIXED", price: 40, items: [{ product_global_id: "product-3", quantity: 2 }] });
+  assert.deepEqual(comboStockProblems({ combos: [kiwi], products, lots })[0].missing, [{ productName: "Kiwi", reason: "NOT_ON_SALE" }]);
+});
+
+test("switched-off and customer's-choice combos are never reported; another shop's lots do not count", () => {
+  const off = normaliseCombo({ global_id: "combo-9", name: "Old Juice", kind: "JUICE", combo_type: "FIXED", price: 50, active: false, items: [{ product_global_id: "product-1", quantity: 9 }] });
+  const custom = normaliseCombo({ global_id: "combo-10", name: "Gift Basket", kind: "GIFTING", combo_type: "CUSTOM", items: [] });
+  assert.deepEqual(comboStockProblems({ combos: [off, custom], products, lots: [] }), []);
+  const scope = { known: true, companyId: "", branchId: "2", operationalLocationId: "" };
+  const foreign = lots.map((lot) => ({ ...lot, branch_id: "1" }));
+  assert.equal(comboStockProblems({ combos: [juice], products, lots: foreign, scope }).length, 1);
+});
+
+test("the bell row names the combo and says what to do", () => {
+  const [row] = comboStockNotifications([{ key: "combo-stock:combo-7", comboName: "Mango Juice", missing: [{ productName: "Alphonso Mango", reason: "OUT_OF_STOCK" }] }]);
+  assert.deepEqual(row, {
+    severity: "warning",
+    title: "Edit combo: Mango Juice",
+    message: "Alphonso Mango is out of stock. Edit Mango Juice in Frooz Menu, or add stock, before selling it.",
+    source: "Frooz Menu",
+    dedupeKey: "combo-stock:combo-7",
+  });
+  assert.deepEqual(comboStockNotifications(null), []);
+});
+
+test("an empty combo tab names the tabs that do hold combos, or says how a new one arrives", () => {
+  assert.equal(
+    emptyComboTabMessage({ nothingHere: "No combo offers are set up yet.", elsewhere: [{ label: "Frooz Bar", count: 1, names: ["Mango Juice"] }, { label: "Frooz Moments", count: 0, names: [] }] }),
+    "No combo offers are set up yet. Combos on this computer are on other tabs: Frooz Bar (Mango Juice).",
+  );
+  assert.match(emptyComboTabMessage({ nothingHere: "No gift hampers are set up yet.", elsewhere: [] }), /press Sync now, then open POS again\.$/);
 });

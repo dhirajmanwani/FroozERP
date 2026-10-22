@@ -66,10 +66,10 @@ test("Product Master no longer offers a POS section, and a save no longer sends 
   assert.match(source, /Every product is sold on the Frooz Retail tab\./);
 });
 
-test("an empty combo tab points at Combos & Offers, never at a product setting", () => {
+test("an empty combo tab points at Frooz Menu, never at a product setting", () => {
   const source = app();
   assert.doesNotMatch(source, /its POS section is/);
-  assert.match(source, /are set up yet\. The Owner or an Admin adds them in Combos & Offers\./);
+  assert.match(source, /emptyComboTabMessage\(\{/);
 });
 
 test("a stored shelf that is not Retail is just a remembered value; normalising never invents one", () => {

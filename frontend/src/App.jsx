@@ -175,7 +175,7 @@ import { findDuplicateProductName, isSameProduct, isServerProductId, productGlob
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
-import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
+import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -1210,7 +1210,7 @@ const navigationItems = [
   ["waste", "Waste Management"],
   ["sales", "POS Billing"],
   ["discounts", "Discounts"],
-  ["combos", "Combos & Offers"],
+  ["combos", "Frooz Menu"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["orders", "Orders"],
@@ -5234,6 +5234,39 @@ function App() {
       }
     }
   }, [frostBell, frostBellAllowed, notify, clearNotice]);
+
+  /**
+   * Combos this counter cannot make because a fruit in them is out of stock or off sale (owner,
+   * 22 Oct 2026): a warning in the bell per combo, saying to edit it or add stock, and the same list
+   * on the POS screen. Worked out from this computer's own shelf (`posShelf`, filled when POS opens
+   * and after every sync), so it is null -- nothing raised, nothing retracted -- until that shelf and
+   * the combos have been read and the counter knows its shop. Unknown is not "all fine".
+   */
+  const comboProblems = useMemo(() => {
+    if (!isTauriRuntime() || posCombos.status !== "ready" || !posShelf.loaded) return null;
+    const shelfState = resolveSellableProducts({ products: posShelf.products, inventoryLots: posShelf.inventoryLots, scope: counterScope });
+    if (!shelfState.usable) return null;
+    return comboStockProblems({ combos: posCombos.combos, products: posShelf.products, lots: posShelf.inventoryLots, scope: counterScope });
+  }, [counterScope, posCombos, posShelf]);
+  const raisedComboRows = useRef(new Map());
+
+  useEffect(() => {
+    if (comboProblems === null) return;
+    const rows = comboStockNotifications(comboProblems);
+    const raised = raisedComboRows.current;
+    for (const row of rows) {
+      // Raised once per wording, like the FROST rows above: a re-check is not a new problem.
+      if (raised.get(row.dedupeKey) === row.message) continue;
+      notify(row);
+      raised.set(row.dedupeKey, row.message);
+    }
+    const live = new Set(rows.map((row) => row.dedupeKey));
+    for (const key of [...raised.keys()]) {
+      if (live.has(key)) continue;
+      clearNotice(key);
+      raised.delete(key);
+    }
+  }, [comboProblems, notify, clearNotice]);
 
   /**
    * Read today's payments: who to collect from and who to pay (`GET /api/ai/payments-due`).
@@ -10424,7 +10457,7 @@ function App() {
                           </select>
                         </Field>
                       </div>
-                      <p className="pm-hint">Every product is sold on the Frooz Retail tab. Juices, The Cutting, gift hampers and offers are made from products in Combos &amp; Offers.</p>
+                      <p className="pm-hint">Every product is sold on the Frooz Retail tab. Juices, The Cutting, gift hampers and offers are made from products in Frooz Menu.</p>
                       <div className="product-photo-field">
                         <span className="product-photo-label">Photo</span>
                         <div className="product-photo-row">
@@ -10967,6 +11000,7 @@ function App() {
               chargeTypes={chargeTypes}
               // Combos are sold from the counter app only (v1); the browser POS shows no combo tabs.
               combos={isTauriRuntime() ? posCombos : null}
+              comboProblems={comboProblems}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
               seedCart={posSeedCart}
@@ -15270,7 +15304,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
  * comes from local/discounts.js, which POS and the server share.
  */
 /**
- * Combos & Offers: the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
+ * Frooz Menu (the Combos & Offers module): the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
  * either a fixed set of items at one price or the customer's choice priced from the items' rates.
  * Kept on the server (`/api/v3/combos`); a desktop's POS gets them through its SQLite snapshot.
  */
@@ -15321,9 +15355,9 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
   const firstLoad = (load.status === "idle" || load.status === "loading") && combos.length === 0;
   const disabled = !canManage || Boolean(unavailableReason) || failed;
   const sorted = sortCombos(combos);
-  const productChoices = products
-    .filter((product) => product && product.active !== false && !product.deleted_at)
-    .sort((left, right) => String(left.product_name || "").localeCompare(String(right.product_name || ""), "en-IN", { sensitivity: "base" }));
+  // Only fruit that is on sale and in stock is offered (local/combos.js); an item already chosen
+  // keeps its line, marked, so editing a combo never silently drops one.
+  const productChoices = comboPickableProducts(products);
   const fixed = draft?.combo_type === "FIXED";
   const check = draft ? validateComboDraft(draft, { products }) : { ok: true, errors: [] };
   const itemsValue = draft && fixed ? comboItemsValue(draft.items, products) : null;
@@ -15429,8 +15463,8 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     <section className="settings-layout">
       <ModuleCard
         eyebrow="Pricing"
-        title="Combos & Offers"
-        subtitle="Juices, The Cutting, gift baskets and combo offers, sold at one price in the desktop POS."
+        title="Frooz Menu"
+        subtitle="Juices, The Cutting, gift hampers and combo offers, made from your fruits and sold at one price. Each shows on its own POS tab: Frooz Bar, Frooz Moments or Combos & Offers."
         actions={canManage && !unavailableReason && !failed && !draft
           ? <button className="primary-button" disabled={firstLoad} type="button" onClick={startNew}><Icon name="add" size={16} />Add combo</button>
           : null}
@@ -15479,7 +15513,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                             <select aria-label={`Item ${index + 1} product`} value={String(item.product_id || "")} onChange={(event) => updateItem(index, "product_id", event.target.value)}>
                               <option value="">Choose a product</option>
                               {item.product_id && !productChoices.some((choice) => inventoryIdsEqual(choice.id, item.product_id)) && (
-                                <option value={String(item.product_id)}>{`${item.product_name || "A product"} (not on sale)`}</option>
+                                <option value={String(item.product_id)}>{`${item.product_name || "A product"} (${comboItemProductNote(products, item) || "not offered"})`}</option>
                               )}
                               {productChoices.map((product) => (
                                 <option key={String(product.id)} value={String(product.id)}>{product.product_name}{product.unit ? ` (${product.unit})` : ""}</option>
@@ -15490,6 +15524,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                           </div>
                         ))}
                         <button className="secondary-button compact-button" type="button" onClick={addItemRow}><Icon name="add" size={14} />Add item</button>
+                        <p className="form-note">Only fruits with stock are listed. A fruit with no stock appears here again once it arrives.</p>
                       </fieldset>
                       <Field label="Combo price (₹)">
                         <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.price} onChange={(event) => updateDraft("price", event.target.value)} />
@@ -15678,7 +15713,7 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
       {load.status !== "failed" && (
         <DataTable className="pm-table combo-table" headers={["Combo", "Margin", "Cost today", "Suggested", "Current price", "New price"]}>
           {load.status !== "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>Loading combos…</td></tr>}
-          {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in Combos & Offers.</td></tr>}
+          {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in Frooz Menu.</td></tr>}
           {rows.map((row) => (
             <tr key={row.key}>
               <td className="primary-cell">{row.combo.name}<small className="cell-note">{COMBO_KIND_LABELS[row.combo.kind] || row.combo.kind}</small></td>
@@ -24959,7 +24994,7 @@ const newCartLineId = () => {
   return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
-function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, comboProblems = null, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -26553,6 +26588,16 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <button className="secondary-button compact-button" type="button" onClick={() => setComboNotice("")}>OK</button>
             </div>
           )}
+          {combosEnabled && comboProblems?.length > 0 && !customBuild && (
+            // The same list the bell carries (owner, 22 Oct 2026): a combo whose fruit is gone is
+            // named here with what stops it, rather than only greyed out on its tab.
+            <p className="warning-note pos-combo-problems" role="status">
+              <Icon name="alert" size={14} />
+              {` ${comboProblems.length === 1 ? "1 combo cannot" : `${comboProblems.length} combos cannot`} be sold right now: `}
+              {comboProblems.map((problem) => `${problem.comboName} (${describeComboStockProblem(problem)})`).join("; ")}
+              . Edit {comboProblems.length === 1 ? "it" : "them"} in Frooz Menu, or add stock.
+            </p>
+          )}
           {combosEnabled && combos?.status !== "ready" && (
             <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Frooz Bar, Frooz Moments and Combos &amp; Offers tabs are empty. Press Sync now, then open POS again.</p>
           )}
@@ -26632,7 +26677,15 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <div className="cart-empty">
                 {posSection === "retail"
                   ? (posEmptyReason || "Nothing in Frooz Retail has stock right now.")
-                  : `No ${posSection === "bar" ? "juices or The Cutting" : posSection === "moments" ? "gift hampers" : "combo offers"} are set up yet. The Owner or an Admin adds them in Combos & Offers.`}
+                  : emptyComboTabMessage({
+                    nothingHere: `No ${posSection === "bar" ? "juices or The Cutting" : posSection === "moments" ? "gift hampers" : "combo offers"} are set up yet.`,
+                    elsewhere: posTabs
+                      .filter((tab) => tab.key !== posSection)
+                      .map((tab) => {
+                        const names = comboOptions.filter((option) => option.tab === tab.key).map((option) => option.combo.name);
+                        return { label: tab.label, count: names.length, names };
+                      }),
+                  })}
               </div>
             )}
             {searchResults.length === 0 && (posSearching || !shelf.usable) && (
