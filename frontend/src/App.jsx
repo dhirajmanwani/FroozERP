@@ -15588,7 +15588,9 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const failed = load.status === "failed";
   const firstLoad = (load.status === "idle" || load.status === "loading") && catalogue.status !== "ready";
   const disabled = !canManage || Boolean(unavailableReason) || failed;
-  const busy = Boolean(nodeForm || purchase || adjust);
+  // An open purchase does not block building the list: a size can be added mid-purchase and is
+  // pickable as soon as the list reloads. Only one type/design/size or count form at a time.
+  const busy = Boolean(nodeForm || adjust);
   const view = packingManageView(catalogue, drill);
   const rows = view.rows;
   const active = Math.min(highlight, Math.max(rows.length - 1, 0));
@@ -15765,13 +15767,13 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
         eyebrow="Stock"
         title="Frooz Pack"
         subtitle="The baskets, gift boxes, bottles and bowls combos go out in. Each size is counted here; buying it books the expense under Packing Material, and selling a combo takes it off. Running out is only a warning: bills always go through."
-        actions={canManage && !unavailableReason && !failed && !busy
+        actions={canManage && !unavailableReason && !failed
           ? (
             <>
-              <button className="secondary-button" disabled={firstLoad || (levelKind !== "type" && !(levelKind === "design" ? view.type : view.design))} type="button" onClick={() => startNode(levelKind)}>
+              <button className="secondary-button" disabled={busy || firstLoad || (levelKind !== "type" && !(levelKind === "design" ? view.type : view.design))} type="button" onClick={() => startNode(levelKind)}>
                 <Icon name="add" size={16} />{`Add ${PACK_NODE_WORDS[levelKind]}`}
               </button>
-              <button className="primary-button" disabled={firstLoad} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
+              <button className="primary-button" disabled={busy || firstLoad || Boolean(purchase)} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
             </>
           )
           : null}
