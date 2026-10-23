@@ -92,8 +92,9 @@ const INDIRECT_ACTORS = [
  * `PUT /api/v3/combos/:id`, one shared handler) checks `requireRateManager(req.auth.userId, client)`.
  * A combo's price is a price, so the same Owner/Admin check as products and charge types.
  *
- * 58 -> 59 on 22 Oct 2026: Frooz Pack. All ten packing write routes (types, designs, sizes,
- * purchases, adjustments) go through one wrapper, `packingWriteRoute`, which checks
+ * 58 -> 59 on 22 Oct 2026: Frooz Pack. Every packing write route (types, designs and sizes made,
+ * edited and deleted, setup, quick start, purchases, adjustments) goes through one wrapper,
+ * `packingWriteRoute`, which checks
  * `requireRateManager(req.auth.userId, client)` once for all of them.
  */
 const SESSION_DERIVED_RATE_MANAGER_CALLS = 59;

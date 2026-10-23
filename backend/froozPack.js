@@ -56,6 +56,7 @@ const CODES = Object.freeze({
   SIZE_TAKEN: "PACKING_SIZE_TAKEN",
   PARENT_INVALID: "PACKING_PARENT_INVALID",
   NOT_FOUND: "PACKING_NOT_FOUND",
+  IN_USE: "PACKING_IN_USE",
   INPUT_INVALID: "PACKING_INPUT_INVALID",
   PURCHASE_INVALID: "PACKING_PURCHASE_INVALID",
   ADJUSTMENT_INVALID: "PACKING_ADJUSTMENT_INVALID",
@@ -635,7 +636,8 @@ const notFound = (what) => answer(404, { code: CODES.NOT_FOUND, message: `This $
 /** GET /api/v3/packing: the company's tree with the session branch's counts. */
 const listPacking = async (client, { companyId, branchId }) => {
   if (!companyId) return { types: [] };
-  return { types: await loadPackingTree(client, { companyId, branchId }) };
+  const types = await loadPackingTree(client, { companyId, branchId });
+  return { types: markPackingInUse(types, await usedPackingSizeIds(client, companyId)) };
 };
 
 /** GET /api/v3/packing/movements?size_id=&limit= : the session branch's recent movements. */
@@ -867,6 +869,165 @@ const saveSize = async (client, { companyId, branchId, actorId, id, body }, deps
     size: design ? design.sizes.find((entry) => entry.id === sizeId) || null : null,
     type,
   });
+};
+
+// ---------------------------------------------------------------------------------------------
+// Delete: only packing nothing has ever touched. Anything bought, counted, billed or put in a
+// combo stays (its expense and bills name it); the owner unticks "In use" to hide it instead.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why these sizes cannot be deleted, as words the owner can read, or null when nothing has ever
+ * touched them. A stock row at 0 with no movement is not use: the purchase and adjustment paths
+ * always write a movement, so a bare row is only ever an empty one.
+ */
+const packingUseOf = async (client, sizeIds) => {
+  const ids = [...new Set((sizeIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (ids.length === 0) return null;
+  const result = await client.query(
+    `SELECT
+       EXISTS (SELECT 1 FROM packing_purchase_lines WHERE size_id = ANY($1::INTEGER[])) AS bought,
+       EXISTS (SELECT 1 FROM sale_packing_usage u
+               JOIN packing_sizes s ON s.id = ANY($1::INTEGER[])
+               WHERE u.size_id = s.id OR u.size_global_id = COALESCE(s.global_id, 'packing-size-' || s.id::TEXT)) AS billed,
+       EXISTS (SELECT 1 FROM combo_packing WHERE size_id = ANY($1::INTEGER[])) AS in_combo,
+       EXISTS (SELECT 1 FROM packing_movements WHERE size_id = ANY($1::INTEGER[])) AS moved,
+       EXISTS (SELECT 1 FROM packing_stock WHERE size_id = ANY($1::INTEGER[]) AND qty_on_hand <> 0) AS counted`,
+    [ids]
+  );
+  const use = result.rows[0] || {};
+  if (use.bought) return "it has been bought";
+  if (use.billed) return "it is on a bill";
+  if (use.in_combo) return "a combo uses it";
+  if (use.moved || use.counted) return "its count has been changed";
+  return null;
+};
+
+/** Size ids used by anything, of this company: the Set `listPacking` marks `in_use` from. */
+const usedPackingSizeIds = async (client, companyId) => {
+  const result = await client.query(
+    `SELECT s.id
+     FROM packing_sizes s
+     JOIN packing_designs d ON d.id = s.design_id
+     JOIN packing_types t ON t.id = d.type_id
+     WHERE t.company_id = $1
+       AND (EXISTS (SELECT 1 FROM packing_purchase_lines l WHERE l.size_id = s.id)
+         OR EXISTS (SELECT 1 FROM sale_packing_usage u
+                    WHERE u.size_id = s.id OR u.size_global_id = COALESCE(s.global_id, 'packing-size-' || s.id::TEXT))
+         OR EXISTS (SELECT 1 FROM combo_packing cp WHERE cp.size_id = s.id)
+         OR EXISTS (SELECT 1 FROM packing_movements m WHERE m.size_id = s.id)
+         OR EXISTS (SELECT 1 FROM packing_stock st WHERE st.size_id = s.id AND st.qty_on_hand <> 0))`,
+    [companyId]
+  );
+  return new Set(result.rows.map((row) => Number(row.id)));
+};
+
+/** The tree with `in_use` on every size, design and type: true when it, or anything under it, is used. */
+const markPackingInUse = (types, usedSizeIds) => {
+  for (const type of types) {
+    let typeUsed = false;
+    for (const design of type.designs) {
+      let designUsed = false;
+      for (const size of design.sizes) {
+        size.in_use = usedSizeIds.has(Number(size.id));
+        designUsed = designUsed || size.in_use;
+      }
+      design.in_use = designUsed;
+      typeUsed = typeUsed || designUsed;
+    }
+    type.in_use = typeUsed;
+  }
+  return types;
+};
+
+const inUseRefusal = (what, reason) => answer(409, {
+  code: CODES.IN_USE,
+  message: `This ${what} cannot be deleted: ${reason}. Untick "In use" to hide it instead.`,
+});
+
+/** Lock the sizes about to go, so a purchase or combo cannot start using one before the delete. */
+const lockSizesOf = async (client, { designIds = [], sizeIds = [] }) => {
+  const result = await client.query(
+    `SELECT id FROM packing_sizes
+     WHERE design_id = ANY($1::INTEGER[]) OR id = ANY($2::INTEGER[])
+     ORDER BY id
+     FOR UPDATE`,
+    [designIds, sizeIds]
+  );
+  return result.rows.map((row) => Number(row.id));
+};
+
+const deleteSizeRows = async (client, sizeIds) => {
+  if (sizeIds.length === 0) return;
+  // Only empty rows can be left (packingUseOf refused anything counted).
+  await client.query("DELETE FROM packing_stock WHERE size_id = ANY($1::INTEGER[])", [sizeIds]);
+  await client.query("DELETE FROM packing_sizes WHERE id = ANY($1::INTEGER[])", [sizeIds]);
+};
+
+/** DELETE /api/v3/packing/sizes/:id. The type is republished without it. */
+const deleteSize = async (client, { companyId, branchId, id }, deps) => {
+  const ref = readRef(id);
+  const size = ref ? await findSize(client, { companyId, ref, lock: true }) : null;
+  if (!size) return notFound("packing size");
+  const reason = await packingUseOf(client, [size.id]);
+  if (reason) return inUseRefusal("size", reason);
+  await deleteSizeRows(client, [Number(size.id)]);
+  await publishPackingTypes(client, { companyId, typeIds: [size.type_id], preferredBranchId: branchId }, deps);
+  return answer(200, { success: true, deleted: { kind: "size", id: Number(size.id) }, type: await typeNode(client, { companyId, branchId, typeId: size.type_id }) });
+};
+
+/** DELETE /api/v3/packing/designs/:id, with its sizes. The type is republished without it. */
+const deleteDesign = async (client, { companyId, branchId, id }, deps) => {
+  const ref = readRef(id);
+  const design = ref ? await findDesign(client, { companyId, ref, lock: true }) : null;
+  if (!design) return notFound("packing design");
+  const sizeIds = await lockSizesOf(client, { designIds: [design.id] });
+  const reason = await packingUseOf(client, sizeIds);
+  if (reason) return inUseRefusal("design", reason);
+  await deleteSizeRows(client, sizeIds);
+  await client.query("DELETE FROM packing_designs WHERE id = $1", [design.id]);
+  await publishPackingTypes(client, { companyId, typeIds: [design.type_id], preferredBranchId: branchId }, deps);
+  return answer(200, { success: true, deleted: { kind: "design", id: Number(design.id) }, type: await typeNode(client, { companyId, branchId, typeId: design.type_id }) });
+};
+
+/**
+ * DELETE /api/v3/packing/types/:id, with its designs and sizes. Devices hear it as a `packing_type`
+ * DELETE change and drop the whole tree.
+ */
+const deleteType = async (client, { companyId, branchId, id }, deps) => {
+  const ref = readRef(id);
+  const type = ref ? await findType(client, { companyId, ref, lock: true }) : null;
+  if (!type) return notFound("packing type");
+  const designs = await client.query("SELECT id FROM packing_designs WHERE type_id = $1 ORDER BY id FOR UPDATE", [type.id]);
+  const designIds = designs.rows.map((row) => Number(row.id));
+  const sizeIds = await lockSizesOf(client, { designIds });
+  const reason = await packingUseOf(client, sizeIds);
+  if (reason) return inUseRefusal("type", reason);
+  const gone = await client.query(
+    `SELECT COALESCE(global_id, 'packing-type-' || id::TEXT) AS global_id, company_id, name,
+            COALESCE(entity_version, 1) + 1 AS entity_version
+     FROM packing_types WHERE id = $1`,
+    [type.id]
+  );
+  await deleteSizeRows(client, sizeIds);
+  await client.query("DELETE FROM packing_designs WHERE type_id = $1", [type.id]);
+  await client.query("DELETE FROM packing_types WHERE id = $1", [type.id]);
+  const payload = {
+    global_id: gone.rows[0].global_id,
+    company_id: gone.rows[0].company_id ?? null,
+    name: gone.rows[0].name,
+    entity_version: Number(gone.rows[0].entity_version),
+    deleted: true,
+  };
+  await deps.logMasterDataSyncChange(client, {
+    branchId: await deps.anchorBranchId(client, companyId, branchId),
+    entityType: "packing_type",
+    entityId: payload.global_id,
+    operationType: "DELETE",
+    version: payload.entity_version,
+    payload,
+  });
+  return answer(200, { success: true, deleted: { kind: "type", id: Number(type.id), global_id: payload.global_id } });
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1405,10 +1566,15 @@ module.exports = {
   PACKING_TREE_SQL,
   applyStockDelta,
   buildPackingTree,
+  deleteDesign,
+  deleteSize,
+  deleteType,
   isPackingPurchaseExpense,
   listPacking,
   listPackingMovements,
   loadPackingTree,
+  markPackingInUse,
+  packingUseOf,
   packingErrorResponse,
   packingStockEntityId,
   packingStockPayload,
