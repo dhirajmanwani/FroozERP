@@ -49,7 +49,8 @@ const loader = () => {
 };
 
 test("the bell is fed by the tested module, not by a second copy of the judgement", () => {
-  assert.match(appJsx, /import \{\s*FROST_BELL_STATUS,\s*buildFrostBellNotifications,\s*\} from "\.\/local\/frostBellNotifications"/);
+  // The dismissed-stock-reminder helpers ride the same import (23 Oct 2026).
+  assert.match(appJsx, /import \{\s*FROST_BELL_STATUS,\s*buildFrostBellNotifications,[^}]*\} from "\.\/local\/frostBellNotifications"/);
   assert.match(publishEffect(), /buildFrostBellNotifications\(\{/);
 });
 
