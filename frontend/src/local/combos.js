@@ -199,8 +199,19 @@ export const normaliseCombo = (row) => {
       .filter((entry) => entry && typeof entry === "object")
       .map(normalisePackingRow)
       .sort((left, right) => left.sort_order - right.sort_order),
+    // Whether a bill names it (server list only). Unknown stays null, never false: Delete is
+    // offered only on a plain `false`, so a list that did not say cannot offer a refused delete.
+    in_use: row?.in_use === true ? true : (row?.in_use === false ? false : null),
   };
 };
+
+/**
+ * Delete is for a combo nothing was billed with (owner, 23 Oct 2026; the same rule as Frooz Pack).
+ * One on a bill is switched off instead, so old bills and reports can still name it.
+ */
+export const comboDeletable = (combo) => combo?.in_use === false;
+
+export const COMBO_IN_USE_NOTE = "This combo is on a bill, so it cannot be deleted. Untick \"On sale in POS\" to hide it from the counter.";
 
 /**
  * The combo list from a snapshot or an API reply, as a named state.
@@ -366,6 +377,8 @@ export const comboDraftFrom = (combo) => {
       quantity: box(item.quantity),
     })),
     ...packing,
+    // Shown, never sent: a combo on a bill tells the owner why it has no Delete.
+    inUse: row.in_use === true,
   };
 };
 

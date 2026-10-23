@@ -3263,8 +3263,8 @@ fn upsert_combo_with_tx(
     product_ids: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     if deleted {
-        // A removal needs no name, price or items: it only hides the combo. The cloud has no
-        // DELETE for combos (active=false hides one), so this is for a server that grows one.
+        // A removal needs no name, price or items: it only hides the combo. The cloud deletes only
+        // a combo no bill names (23 Oct 2026); bills keep their own copy of its name and price.
         tx.execute(
             "UPDATE local_combos
              SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -17833,6 +17833,46 @@ mod tests {
         assert_eq!(packing["types"][0]["name"], "Gift Boxes", "a refused tree writes nothing");
         assert_eq!(packing["types"][0]["designs"][0]["id"], "packing-design-1");
         let _ = fs::remove_file(&path);
+    }
+
+    /// A combo the cloud deleted (only one no bill names) leaves POS; other combos stay.
+    #[test]
+    fn pulled_combo_delete_takes_it_off_the_counter() {
+        let path = sync_fix_path("combo-delete");
+        initialize_at(&path).expect("initialize");
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO local_products (id, product_name, unit, sale_rate) VALUES ('product-276', 'Langda', 'KG', 120)",
+                [],
+            )
+            .unwrap();
+        let combo = |id: &str, name: &str| {
+            serde_json::json!({
+                "global_id": id,
+                "name": name,
+                "kind": "COMBO_OFFER",
+                "combo_type": "FIXED",
+                "price": "60.00",
+                "items": [{ "product_global_id": "product-276", "quantity": "0.250" }]
+            })
+        };
+        pull(&path, &pulled_combo("combo-21", combo("combo-21", "The Solo Guy")));
+        pull(&path, &pulled_combo("combo-22", combo("combo-22", "Fruit Bowl")));
+        assert_eq!(combo_snapshot_by_id(&path, "device-combo").len(), 2);
+
+        let mut gone = pulled_combo(
+            "combo-21",
+            serde_json::json!({ "global_id": "combo-21", "name": "The Solo Guy", "entity_version": 2, "deleted": true }),
+        );
+        gone.operation_type = "DELETE".to_string();
+        gone.version = Some(2);
+        pull(&path, &gone);
+
+        let combos = combo_snapshot_by_id(&path, "device-combo");
+        assert!(!combos.contains_key("combo-21"), "the deleted combo is off the counter");
+        assert!(combos.contains_key("combo-22"), "the other combo stays");
+        assert_eq!(unapplied_reason(&path, "combo-21"), None, "the delete applied");
     }
 
     /// A deleted packing type (the cloud deletes only unused packing) leaves no type, design, size

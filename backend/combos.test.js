@@ -609,6 +609,67 @@ test("routes: two active combos cannot share a name; a switched-off one frees it
   });
 });
 
+const remove = (id) => probe(app, "DELETE", `/api/v3/combos/${id}`, headers);
+
+test("routes: a combo nothing was billed with can be deleted; the list marks which are on a bill; devices hear it", async () => {
+  await withMaster(async ({ db }) => {
+    const sold = (await post(fixedBody())).body.combo;
+    const unsold = (await post(fixedBody({ name: "The Solo Guy" }))).body.combo;
+    const packed = (await post(fixedBody({ name: "Packed Only" }))).body.combo;
+    await db.query("INSERT INTO sale_items (sale_id, combo_id) VALUES (1, $1)", [sold.global_id]);
+    await db.query("INSERT INTO sale_packing_usage (sale_id, combo_id, quantity) VALUES (2, $1, 1)", [packed.global_id]);
+
+    const listed = await list();
+    assert.equal(listed.status, 200, JSON.stringify(listed.body));
+    assert.deepEqual(
+      Object.fromEntries(listed.body.map((row) => [row.name, row.in_use])),
+      { "Fruit Bowl": true, "The Solo Guy": false, "Packed Only": true },
+    );
+
+    await db.query("DELETE FROM sync_change_log");
+    const gone = await remove(unsold.global_id);
+    assert.equal(gone.status, 200, JSON.stringify(gone.body));
+    assert.deepEqual(gone.body.deleted, { id: unsold.id, global_id: unsold.global_id });
+    assert.equal((await db.query("SELECT COUNT(*)::INT AS n FROM combos WHERE id = $1", [unsold.id])).rows[0].n, 0);
+    assert.equal((await db.query("SELECT COUNT(*)::INT AS n FROM combo_items WHERE combo_id = $1", [unsold.id])).rows[0].n, 0, "its items go with it");
+    const changes = (await db.query("SELECT branch_id, entity_type, entity_id, operation_type, payload FROM sync_change_log ORDER BY change_id")).rows;
+    assert.deepEqual(changes.map((row) => [row.branch_id, row.entity_type, row.entity_id, row.operation_type]), [
+      [1, "combo", unsold.global_id, "DELETE"],
+      [2, "combo", unsold.global_id, "DELETE"],
+    ]);
+    assert.equal(changes[0].payload.deleted, true);
+    assert.equal((await remove(unsold.global_id)).status, 404, "a second delete finds nothing");
+    assert.deepEqual((await list()).body.map((row) => row.name).sort(), ["Fruit Bowl", "Packed Only"]);
+
+    // By numeric id too, and the name is free again afterwards.
+    const again = (await post(fixedBody({ name: "The Solo Guy" }))).body.combo;
+    assert.equal((await remove(again.id)).status, 200);
+  });
+});
+
+test("routes: a combo on a bill cannot be deleted, says to switch it off, and nothing is written", async () => {
+  await withMaster(async ({ db, statements }) => {
+    const sold = (await post(fixedBody())).body.combo;
+    await db.query("INSERT INTO sale_items (sale_id, combo_id) VALUES (1, $1)", [sold.global_id]);
+    const before = statements.length;
+    const refused = await remove(sold.global_id);
+    assert.equal(refused.status, 409, JSON.stringify(refused.body));
+    assert.equal(refused.body.code, CODES.IN_USE);
+    assert.match(refused.body.message || refused.body.error || "", /On sale in POS/);
+    assert.deepEqual(writes(statements.slice(before)), [], "a refused delete writes nothing");
+    assert.equal((await db.query("SELECT COUNT(*)::INT AS n FROM combos")).rows[0].n, 1);
+  });
+});
+
+test("routes: a Cashier cannot delete a combo", async () => {
+  await withMaster(async ({ statements }) => {
+    const response = await remove("combo-1");
+    assert.equal(response.status, 403);
+    assert.equal(response.body.code, CODES.PERMISSION_REQUIRED);
+    assert.deepEqual(writes(statements), []);
+  }, { role: "Cashier" });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Frooz Pack: a FIXED combo's packing (22 Oct 2026)
 // ---------------------------------------------------------------------------------------------

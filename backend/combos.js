@@ -71,6 +71,7 @@ const CODES = Object.freeze({
   ALLOCATION_INVALID: "COMBO_ALLOCATION_INVALID",
   PACKING_FIXED_ONLY: "COMBO_PACKING_FIXED_ONLY",
   PACKING_INVALID: "COMBO_PACKING_INVALID",
+  IN_USE: "COMBO_IN_USE",
 });
 
 const MESSAGES = Object.freeze({
@@ -297,6 +298,17 @@ const unavailableProductsOf = (combo) =>
   (Array.isArray(combo?.items) ? combo.items : [])
     .filter((item) => item && item.product_active === false)
     .map((item) => item.product_name || idKey(item.product_global_id || item.product_id));
+
+/**
+ * Which of the given combo global ids are on a bill: a sale line or a sale's packing names it.
+ * Such a combo cannot be deleted (owner, 23 Oct 2026, the same rule as Frooz Pack: "delete tab kaam
+ * nhi kre jab vo use hui ho"); it can be switched off instead. $1 TEXT[] of global ids.
+ */
+const COMBO_USE_SQL = `
+  SELECT combo_id FROM sale_items WHERE combo_id = ANY($1::TEXT[])
+  UNION
+  SELECT combo_id FROM sale_packing_usage WHERE combo_id = ANY($1::TEXT[])
+`;
 
 /**
  * A combo with its items, one row per combo, in the shape every device receives -- from
@@ -638,6 +650,7 @@ module.exports = {
   COMBO_LINE_FIELDS,
   COMBO_TYPES,
   COMBOS_WITH_ITEMS_SQL,
+  COMBO_USE_SQL,
   MESSAGES,
   SALE_ITEM_COMBO_COLUMNS,
   allocateFixedComboLines,
