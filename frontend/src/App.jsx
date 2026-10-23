@@ -176,7 +176,7 @@ import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMast
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
 import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
-import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildSalePackingUsage, createPackingDrill, enterPackingDrill, packingCostOf, packingDrillView, packingManageView, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
+import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingTypesWithoutSize, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -15367,6 +15367,8 @@ const formatPackCount = (value) => (Number.isFinite(value)
 const PACK_STOCK_TONE = Object.freeze({ ok: "stock-ok", low: "origin-rate", out: "stock-low", unknown: "tag" });
 const packCountText = (row) => (Number.isFinite(row?.qty_on_hand) ? `${formatPackCount(row.qty_on_hand)} on hand` : "Count not known");
 const packGroupText = (state) => (state === "out" ? "All out" : state === "low" ? "Running low" : "");
+// A picker's size row already says its count and last rate underneath; the tag only flags trouble.
+const packLeafTag = (state) => (state === "out" ? "Out" : state === "low" ? "Running low" : "");
 const PACK_PAYMENT_LABELS = Object.freeze({ CASH: "Cash", UPI: "UPI", BANK_TRANSFER: "Bank transfer", CHEQUE: "Cheque" });
 const PACK_NODE_WORDS = Object.freeze({ type: "packing type", design: "design", size: "size" });
 const PACK_LEVEL_KIND = Object.freeze({ types: "type", designs: "design", sizes: "size" });
@@ -15426,10 +15428,12 @@ function PackDrillHeader({ crumbs = [], level, onBack, onCrumb, title }) {
 /**
  * Frooz Pack's picker: Type → Design → Size, one level at a time, the way the owner thinks of it
  * ("Gift Box › Window Box › Grand · 1 kg"). Only what is switched on and has a size is shown.
- * `onPick(sizeRow, quantity)`; with `quantity`, a "How many" box rides along. Used by the Frooz
- * Pack purchase form, the combo form in Frooz Menu and POS.
+ * `onPick(sizeRow, quantity)`; with `quantity`, a "How many" box rides along. With `onCreate`, a
+ * "+ New packing" button opens the New-packing form (the purchase table uses it). Used by the Frooz
+ * Pack purchase form, the combo form in Frooz Menu and POS. Each size row says its count and last
+ * rate (local/froozPack.js `packingLeafSublabel`).
  */
-function PackingDrillPicker({ catalogue, onClose, onPick, quantity = false, title = "" }) {
+function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = false, title = "" }) {
   const [drill, setDrill] = useState(() => createPackingDrill());
   const [highlight, setHighlight] = useState(0);
   const [qty, setQty] = useState("1");
@@ -15477,7 +15481,10 @@ function PackingDrillPicker({ catalogue, onClose, onPick, quantity = false, titl
           onBack={goBack}
           onCrumb={(crumb) => { setDrill(packCrumbState(crumb)); setHighlight(0); }}
         />
-        {onClose && <button className="secondary-button compact-button" type="button" onClick={onClose}>Close</button>}
+        <span className="packing-picker-tools">
+          {onCreate && <button className="secondary-button compact-button" type="button" onClick={onCreate}><Icon name="add" size={14} />New packing</button>}
+          {onClose && <button className="secondary-button compact-button" type="button" onClick={onClose}>Close</button>}
+        </span>
       </div>
       {quantity && status === "ready" && (
         <label className="packing-picker-qty">
@@ -15491,8 +15498,11 @@ function PackingDrillPicker({ catalogue, onClose, onPick, quantity = false, titl
       ) : status !== "ready" ? (
         <p className="warning-note" role="status">{catalogue?.message || "The packing list has not reached this computer yet."}</p>
       ) : rows.length === 0 ? (
-        <p className="form-note">No packing set up yet. The Owner or an Admin adds it in Frooz Pack.</p>
-      ) : (
+        <p className="form-note">{packingEmptyPickerMessage(catalogue)}</p>
+      ) : view.level === "types" && packingTypesWithoutSize(catalogue).length > 0 ? (
+        <p className="form-note">{`Not shown until it has a size: ${packingTypesWithoutSize(catalogue).join(", ")}. Give it a design and sizes with New packing in Frooz Pack.`}</p>
+      ) : null}
+      {status === "ready" && rows.length > 0 && (
         <ul
           aria-label={view.title}
           className="packing-rows"
@@ -15509,7 +15519,7 @@ function PackingDrillPicker({ catalogue, onClose, onPick, quantity = false, titl
                   <small>{row.sublabel}</small>
                 </span>
                 {row.leaf
-                  ? <span className={PACK_STOCK_TONE[row.stockState] || "tag"}>{packCountText(row)}</span>
+                  ? (packLeafTag(row.stockState) && <span className={PACK_STOCK_TONE[row.stockState] || "tag"}>{packLeafTag(row.stockState)}</span>)
                   : (
                     <span className="packing-row-go">
                       {packGroupText(row.stockState) && <span className={PACK_STOCK_TONE[row.stockState]}>{packGroupText(row.stockState)}</span>}
@@ -15522,6 +15532,72 @@ function PackingDrillPicker({ catalogue, onClose, onPick, quantity = false, titl
         </ul>
       )}
       <small className="form-note">→ opens, ← goes back, ↑ ↓ move, Enter picks a size.</small>
+    </div>
+  );
+}
+
+/**
+ * New packing in one go: a type (pick or name a new one) → a design under it (pick or name) → the
+ * sizes ticked, each with its own capacity and optional unit cost. One Save makes all of it
+ * (`POST /api/v3/packing/setup`). Every check is local/froozPack.js `buildPackingSetupPayload`.
+ */
+function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChange, onSave, title = "New packing" }) {
+  const { draft } = setup;
+  const choices = packingSetupChoices(catalogue, draft);
+  const newType = draft.type_id === "";
+  const newDesign = draft.design_id === "";
+  const setSize = (sizeName, patch) => onChange({
+    sizes: draft.sizes.map((row) => (row.size_name === sizeName ? { ...row, ...patch } : row)),
+  });
+  // Typing a capacity or a cost for a size means that size is wanted.
+  const typeSize = (sizeName, field, value) => setSize(sizeName, { [field]: value, ...(String(value).trim() !== "" ? { checked: true } : {}) });
+  return (
+    <div className="discount-block combo-form packing-setup">
+      <h3>{title}</h3>
+      <div className="discount-form">
+        <Field label="Type">
+          <select disabled={disabled} value={draft.type_id} onChange={(event) => onChange({ type_id: event.target.value, design_id: "", design_name: "" })}>
+            <option value="">+ New type…</option>
+            {choices.types.map((type) => <option key={type.id} value={type.id}>{type.label}</option>)}
+          </select>
+        </Field>
+        {newType && (
+          <Field label="New type name">
+            <input autoFocus disabled={disabled} maxLength={80} placeholder="Gift Box, Basket, Bottle" value={draft.type_name} onChange={(event) => onChange({ type_name: event.target.value })} />
+          </Field>
+        )}
+        <Field label="Design">
+          <select disabled={disabled || newType} value={draft.design_id} onChange={(event) => onChange({ design_id: event.target.value, design_name: "" })}>
+            <option value="">+ New design…</option>
+            {choices.designs.map((design) => <option key={design.id} value={design.id}>{design.label}</option>)}
+          </select>
+        </Field>
+        {newDesign && (
+          <Field label={newType ? "New design name (leave blank to make only the type)" : "New design name"}>
+            <input disabled={disabled} maxLength={80} placeholder="Window Box, Round, Kraft" value={draft.design_name} onChange={(event) => onChange({ design_name: event.target.value })} />
+          </Field>
+        )}
+        <fieldset className="combo-items packing-setup-sizes" disabled={disabled}>
+          <legend>Sizes to make</legend>
+          {choices.existingSizes.length > 0 && <p className="form-note">{`Already here: ${choices.existingSizes.join(", ")}.`}</p>}
+          {draft.sizes.map((row) => (
+            <div className="packing-setup-size" key={row.size_name}>
+              <label className="check-field">
+                <input checked={row.checked} type="checkbox" onChange={(event) => setSize(row.size_name, { checked: event.target.checked })} />
+                <span>{PACKING_SIZE_LABELS[row.size_name] || row.size_name}</span>
+              </label>
+              <input aria-label={`${PACKING_SIZE_LABELS[row.size_name]} actual size`} maxLength={40} placeholder="1 kg, 300 ml (optional)" value={row.capacity} onChange={(event) => typeSize(row.size_name, "capacity", event.target.value)} />
+              <input aria-label={`${PACKING_SIZE_LABELS[row.size_name]} unit cost`} inputMode="decimal" min="0" placeholder="Cost ₹ (optional)" step="0.01" type="number" value={row.unit_cost} onChange={(event) => typeSize(row.size_name, "unit_cost", event.target.value)} />
+            </div>
+          ))}
+          <p className="form-note">Each purchase sets a size's cost to the rate paid, so the cost can be left blank now.</p>
+        </fieldset>
+        {setup.error && <div className="inline-error" role="alert">{setup.error}</div>}
+        <div className="button-row">
+          <button className="primary-button" disabled={disabled || setup.saving} type="button" onClick={onSave}>{setup.saving ? "Saving…" : "Save"}</button>
+          <button className="secondary-button" disabled={setup.saving} type="button" onClick={onCancel}>Cancel</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -15544,9 +15620,27 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const [purchase, setPurchase] = useState(null);
   // { row, draft: { quantity, reason }, error, saving }
   const [adjust, setAdjust] = useState(null);
+  // New packing in one go: { draft, error, saving, forLine }. `forLine` is the purchase line that
+  // asked for it ("+ New packing" in its picker); the size made goes onto that line.
+  const [setup, setSetup] = useState(null);
+  const [quickStart, setQuickStart] = useState({ skipped: false, saving: false, error: "" });
   const [notice, setNotice] = useState(null);
   const lineSeq = useRef(0);
   const listRef = useRef(null);
+  // The purchase table's inputs by "<line key>:<pick|quantity|rate>", and where Enter sends focus
+  // next (applied after the render that shows it, so a line just added is there to focus).
+  const purchaseFields = useRef(new Map());
+  const pendingFocus = useRef(null);
+
+  useEffect(() => {
+    const target = pendingFocus.current;
+    if (!target) return;
+    const element = purchaseFields.current.get(`${target.key}:${target.field}`);
+    if (!element) return;
+    pendingFocus.current = null;
+    element.focus();
+    if (target.field !== "pick") element.select?.();
+  });
 
   const loadPacking = async () => {
     setLoad((current) => ({ ...current, status: "loading", message: "" }));
@@ -15588,7 +15682,9 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const failed = load.status === "failed";
   const firstLoad = (load.status === "idle" || load.status === "loading") && catalogue.status !== "ready";
   const disabled = !canManage || Boolean(unavailableReason) || failed;
-  const busy = Boolean(nodeForm || purchase || adjust);
+  // An open purchase does not block building the list: a size can be added mid-purchase and is
+  // pickable as soon as the list reloads. Only one edit, New-packing or count form at a time.
+  const busy = Boolean(nodeForm || adjust || setup);
   const view = packingManageView(catalogue, drill);
   const rows = view.rows;
   const active = Math.min(highlight, Math.max(rows.length - 1, 0));
@@ -15658,11 +15754,116 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     await afterWrite(`${wasNew ? "Added" : "Saved"} ${label}. Counters get it at their next sync.`);
   };
 
+  // --- New packing in one go, and Quick start -----------------------------------------------
+
+  /** From the module, start where the owner is (inside a type or design); from a purchase line, blank. */
+  const startSetup = (forLine = null) => {
+    setNotice(null);
+    const draft = forLine
+      ? createPackingSetupDraft()
+      : createPackingSetupDraft({ typeId: view.type?.id || "", designId: view.design?.id || "" });
+    setSetup({ draft, error: "", saving: false, forLine });
+  };
+
+  const updateSetup = (patch) => setSetup((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, ...patch } }
+    : current));
+
+  const saveSetup = async () => {
+    if (!setup || setup.saving || disabled) return;
+    const check = buildPackingSetupPayload(setup.draft, catalogue);
+    if (!check.ok) {
+      setSetup((current) => (current ? { ...current, error: check.message } : current));
+      return;
+    }
+    setSetup((current) => (current ? { ...current, saving: true, error: "" } : current));
+    let response;
+    try {
+      response = await axios.post(`${API_URL}/api/v3/packing/setup`, check.payload);
+    } catch (error) {
+      setSetup((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "It could not be saved. Nothing was changed.") } : current));
+      return;
+    }
+    const forLine = setup.forLine;
+    const row = forLine ? packingSetupPickRow(response?.data) : null;
+    setSetup(null);
+    if (forLine) {
+      setPurchase((current) => (current
+        ? {
+          ...current,
+          pickingLine: null,
+          error: "",
+          draft: { ...current.draft, lines: row ? applyPackingToPurchaseLine(current.draft.lines, forLine, row) : current.draft.lines },
+        }
+        : current));
+      pendingFocus.current = { key: forLine, field: row ? "quantity" : "pick" };
+    }
+    await afterWrite(`Added ${check.summary}.${forLine && row ? ` ${packingPathLabel(row)} is on the purchase line.` : ""} Counters get it at their next sync.`);
+  };
+
+  // From a purchase line, Cancel goes back to that line's picker (still open under it).
+  const cancelSetup = () => setSetup(null);
+
+  const runQuickStart = async () => {
+    if (quickStart.saving || disabled) return;
+    setNotice(null);
+    setQuickStart((current) => ({ ...current, saving: true, error: "" }));
+    let response;
+    try {
+      response = await axios.post(`${API_URL}/api/v3/packing/quick-start`, {});
+    } catch (error) {
+      setQuickStart((current) => ({ ...current, saving: false, error: getErrorMessage(error, "Quick start could not be saved. Nothing was changed.") }));
+      return;
+    }
+    setQuickStart((current) => ({ ...current, saving: false }));
+    const made = (Array.isArray(response?.data?.created) ? response.data.created : []).map((type) => type?.name).filter(Boolean);
+    await afterWrite(made.length > 0
+      ? `Added ${made.join(", ")}. Now press New packing to give each one a design and its sizes.`
+      : "These packing types are already here. Press New packing to give each one a design and its sizes.");
+  };
+
   // --- Packing purchase ----------------------------------------------------------------------
 
   const newPurchaseLine = () => {
     lineSeq.current += 1;
-    return { key: `pack-line-${lineSeq.current}`, size_id: "", label: "", quantity: "", rate: "" };
+    return createPackingPurchaseLine(`pack-line-${lineSeq.current}`);
+  };
+
+  /** A purchase-table field's ref: kept in `purchaseFields` so Enter can move focus to it. */
+  const purchaseFieldRef = (key, field) => (element) => {
+    const id = `${key}:${field}`;
+    if (element) purchaseFields.current.set(id, element);
+    else purchaseFields.current.delete(id);
+  };
+
+  /** Enter in Qty → Rate; Enter in Rate → the next line's Packing, adding a line at the end. */
+  const purchaseEnter = (event, key, field) => {
+    if (event.key !== "Enter" || !purchase) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const next = advancePackingPurchaseLine(purchase.draft.lines, key, field, newPurchaseLine);
+    if (next.lines !== purchase.draft.lines) {
+      // A line was added: focus it after the render that shows it.
+      setPurchase((current) => (current ? { ...current, draft: { ...current.draft, lines: next.lines } } : current));
+      pendingFocus.current = next.focus;
+      return;
+    }
+    // Nothing changes, so no render follows: move focus now.
+    const element = next.focus ? purchaseFields.current.get(`${next.focus.key}:${next.focus.field}`) : null;
+    if (element) {
+      element.focus();
+      if (next.focus.field !== "pick") element.select?.();
+    }
+  };
+
+  const togglePurchasePicker = (key) => {
+    if (setup?.forLine) return;
+    setPurchase((current) => (current ? { ...current, pickingLine: current.pickingLine === key ? null : key } : current));
+  };
+
+  const closePurchasePicker = (key) => {
+    setPurchase((current) => (current ? { ...current, pickingLine: null } : current));
+    pendingFocus.current = { key, field: "pick" };
   };
 
   const startPurchase = () => {
@@ -15683,28 +15884,15 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     ? { ...current, error: "", draft: { ...current.draft, lines: current.draft.lines.map((line) => (line.key === key ? { ...line, [field]: value } : line)) } }
     : current));
 
-  const pickPurchaseLine = (row) => setPurchase((current) => {
-    if (!current) return current;
-    const lines = current.draft.lines.map((line) => (line.key !== current.pickingLine ? line : {
-      ...line,
-      size_id: row.packing_size_id,
-      label: packingPathLabel(row),
-      // The last rate paid, as a starting point; the bill's own rate replaces it.
-      rate: String(line.rate).trim() !== "" ? line.rate : (Number.isFinite(row.unit_cost) && row.unit_cost > 0 ? String(row.unit_cost) : ""),
-    }));
-    return { ...current, pickingLine: null, error: "", draft: { ...current.draft, lines } };
-  });
+  // The last rate paid starts the line's rate (a rate already typed stays); then on to Qty.
+  const pickPurchaseLine = (key, row) => {
+    setPurchase((current) => (current
+      ? { ...current, pickingLine: null, error: "", draft: { ...current.draft, lines: applyPackingToPurchaseLine(current.draft.lines, key, row) } }
+      : current));
+    pendingFocus.current = { key, field: "quantity" };
+  };
 
-  const purchaseCheck = purchase ? buildPackingPurchasePayload(purchase.draft) : null;
-  const purchaseTotal = purchase
-    ? (purchaseCheck?.ok
-      ? purchaseCheck.total
-      : roundUi(purchase.draft.lines.reduce((sum, line) => {
-        const quantity = String(line.quantity).trim() === "" ? Number.NaN : Number(line.quantity);
-        const rate = String(line.rate).trim() === "" ? Number.NaN : Number(line.rate);
-        return Number.isFinite(quantity) && Number.isFinite(rate) ? sum + quantity * rate : sum;
-      }, 0)))
-    : 0;
+  const purchaseTotal = purchase ? packingPurchaseDraftTotal(purchase.draft.lines) : 0;
 
   const savePurchase = async () => {
     if (!purchase || purchase.saving || disabled) return;
@@ -15754,10 +15942,12 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   };
 
   const emptyText = view.level === "types"
-    ? "No packing set up yet. Add a packing type (for example Gift Box, Basket, Bottle or Bowl) to start."
+    ? "No packing set up yet. Press New packing to make a type, its design and sizes in one go."
     : view.level === "designs"
-      ? `No designs under ${view.type?.name || "this type"} yet. Add one.`
-      : `No sizes under ${view.design?.name || "this design"} yet. Add Petite, Classic, Grand or Royal.`;
+      ? `No designs under ${view.type?.name || "this type"} yet. Press "New packing" below to name one and tick its sizes.`
+      : `No sizes under ${view.design?.name || "this design"} yet. Press "New packing" below and tick Petite, Classic, Grand or Royal.`;
+  const showQuickStart = canManage && !failed && load.status === "ready" && !quickStart.skipped && packingQuickStartOffered(catalogue);
+  const hereLabel = view.level !== "types" && view.crumbs.length > 1 ? view.crumbs[view.crumbs.length - 1].label : "";
 
   return (
     <section className="settings-layout">
@@ -15765,13 +15955,13 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
         eyebrow="Stock"
         title="Frooz Pack"
         subtitle="The baskets, gift boxes, bottles and bowls combos go out in. Each size is counted here; buying it books the expense under Packing Material, and selling a combo takes it off. Running out is only a warning: bills always go through."
-        actions={canManage && !unavailableReason && !failed && !busy
+        actions={canManage && !unavailableReason && !failed
           ? (
             <>
-              <button className="secondary-button" disabled={firstLoad || (levelKind !== "type" && !(levelKind === "design" ? view.type : view.design))} type="button" onClick={() => startNode(levelKind)}>
-                <Icon name="add" size={16} />{`Add ${PACK_NODE_WORDS[levelKind]}`}
+              <button className="secondary-button" disabled={busy || firstLoad} type="button" onClick={() => startSetup(null)}>
+                <Icon name="add" size={16} />New packing
               </button>
-              <button className="primary-button" disabled={firstLoad} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
+              <button className="primary-button" disabled={busy || firstLoad || Boolean(purchase)} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
             </>
           )
           : null}
@@ -15788,6 +15978,29 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
             )}
             {!canManage && !failed && <p className="form-note">Only the Owner or an Admin can change packing.</p>}
             {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+
+            {showQuickStart && (
+              <div className="discount-block packing-quick-start">
+                <h3>Quick start</h3>
+                <p className="form-note">{`Make the usual packing types in one press: ${PACKING_QUICK_START_TYPES.join(", ")}. You give each a design and sizes after. Or skip this and make your own with New packing.`}</p>
+                {quickStart.error && <div className="inline-error" role="alert">{quickStart.error}</div>}
+                <div className="button-row">
+                  <button className="primary-button" disabled={disabled || busy || quickStart.saving} type="button" onClick={runQuickStart}>{quickStart.saving ? "Saving…" : "Quick start"}</button>
+                  <button className="secondary-button" disabled={quickStart.saving} type="button" onClick={() => setQuickStart((current) => ({ ...current, skipped: true }))}>Skip</button>
+                </div>
+              </div>
+            )}
+
+            {setup && !setup.forLine && !failed && (
+              <PackingSetupForm
+                catalogue={catalogue}
+                disabled={disabled}
+                setup={setup}
+                onCancel={cancelSetup}
+                onChange={updateSetup}
+                onSave={saveSetup}
+              />
+            )}
 
             {nodeForm && !failed && (
               <div className="discount-block combo-form">
@@ -15847,24 +16060,68 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                   <Field label="Bill / reference number (optional)">
                     <input disabled={disabled} maxLength={80} value={purchase.draft.reference_number} onChange={(event) => updatePurchase("reference_number", event.target.value)} />
                   </Field>
-                  <fieldset className="combo-items" disabled={disabled || purchase.saving}>
+                  <fieldset className="combo-items packing-purchase-items" disabled={disabled || purchase.saving}>
                     <legend>What was bought</legend>
-                    {purchase.draft.lines.map((line, index) => (
-                      <div className="packing-purchase-line" key={line.key}>
-                        <button className="secondary-button compact-button packing-line-pick" type="button" onClick={() => setPurchase((current) => (current ? { ...current, pickingLine: current.pickingLine === line.key ? null : line.key } : current))}>
-                          {line.label || "Choose packing"}
-                        </button>
-                        <input aria-label={`Line ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={line.quantity} onChange={(event) => updatePurchaseLine(line.key, "quantity", event.target.value)} />
-                        <input aria-label={`Line ${index + 1} rate`} inputMode="decimal" min="0" placeholder="Rate ₹" step="0.01" type="number" value={line.rate} onChange={(event) => updatePurchaseLine(line.key, "rate", event.target.value)} />
-                        <button aria-label={`Remove line ${index + 1}`} className="remove-button" disabled={purchase.draft.lines.length <= 1} type="button" onClick={() => setPurchase((current) => (current ? { ...current, error: "", draft: { ...current.draft, lines: current.draft.lines.filter((other) => other.key !== line.key) } } : current))}><Icon name="trash" size={16} /></button>
-                        {purchase.pickingLine === line.key && (
-                          <div className="packing-line-picker">
-                            <PackingDrillPicker catalogue={catalogue} title={`Line ${index + 1}`} onClose={() => setPurchase((current) => (current ? { ...current, pickingLine: null } : current))} onPick={(row) => pickPurchaseLine(row)} />
-                          </div>
-                        )}
-                      </div>
-                    ))}
+                    <div className="table-wrap packing-purchase-table">
+                      <table>
+                        <thead>
+                          <tr><th>Packing</th><th>Qty</th><th>Rate ₹</th><th>Amount</th><th><span className="pm-sr-only">Remove</span></th></tr>
+                        </thead>
+                        <tbody>
+                          {purchase.draft.lines.map((line, index) => {
+                            const amount = packingPurchaseLineAmount(line);
+                            return (
+                              <React.Fragment key={line.key}>
+                                <tr>
+                                  <td data-label="Packing">
+                                    <button className="secondary-button compact-button packing-line-pick" ref={purchaseFieldRef(line.key, "pick")} title={line.label || ""} type="button" onClick={() => togglePurchasePicker(line.key)}>
+                                      {line.label || "Choose packing"}
+                                    </button>
+                                  </td>
+                                  <td data-label="Qty">
+                                    <input aria-label={`Line ${index + 1} quantity`} className="table-input" inputMode="decimal" min="0" placeholder="Qty" ref={purchaseFieldRef(line.key, "quantity")} step="0.001" type="number" value={line.quantity} onChange={(event) => updatePurchaseLine(line.key, "quantity", event.target.value)} onKeyDown={(event) => purchaseEnter(event, line.key, "quantity")} />
+                                  </td>
+                                  <td data-label="Rate ₹">
+                                    <input aria-label={`Line ${index + 1} rate`} className="table-input" inputMode="decimal" min="0" placeholder="Rate" ref={purchaseFieldRef(line.key, "rate")} step="0.01" type="number" value={line.rate} onChange={(event) => updatePurchaseLine(line.key, "rate", event.target.value)} onKeyDown={(event) => purchaseEnter(event, line.key, "rate")} />
+                                  </td>
+                                  <td className="packing-line-amount" data-label="Amount">{amount === null ? MISSING_VALUE : currency.format(amount)}</td>
+                                  <td>
+                                    <button aria-label={`Remove line ${index + 1}`} className="remove-button" disabled={purchase.draft.lines.length <= 1 || setup?.forLine === line.key} type="button" onClick={() => setPurchase((current) => (current ? { ...current, error: "", pickingLine: current.pickingLine === line.key ? null : current.pickingLine, draft: { ...current.draft, lines: current.draft.lines.filter((other) => other.key !== line.key) } } : current))}><Icon name="trash" size={16} /></button>
+                                  </td>
+                                </tr>
+                                {purchase.pickingLine === line.key && (
+                                  <tr className="packing-line-picker-row">
+                                    <td colSpan={5}>
+                                      {setup?.forLine === line.key ? (
+                                        <PackingSetupForm
+                                          catalogue={catalogue}
+                                          disabled={disabled}
+                                          setup={setup}
+                                          title={`New packing for line ${index + 1}`}
+                                          onCancel={cancelSetup}
+                                          onChange={updateSetup}
+                                          onSave={saveSetup}
+                                        />
+                                      ) : (
+                                        <PackingDrillPicker
+                                          catalogue={catalogue}
+                                          title={`Line ${index + 1}`}
+                                          onClose={() => closePurchasePicker(line.key)}
+                                          onCreate={busy ? undefined : () => startSetup(line.key)}
+                                          onPick={(row) => pickPurchaseLine(line.key, row)}
+                                        />
+                                      )}
+                                    </td>
+                                  </tr>
+                                )}
+                              </React.Fragment>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
                     <button className="secondary-button compact-button" type="button" onClick={() => setPurchase((current) => (current ? { ...current, draft: { ...current.draft, lines: [...current.draft.lines, newPurchaseLine()] } } : current))}><Icon name="add" size={14} />Add line</button>
+                    <small className="form-note">Enter in Qty goes to Rate; Enter in Rate goes to the next line (a new one is added at the end). A blank last line is left out.</small>
                   </fieldset>
                   <p className="form-note combo-price-check"><strong>{`Total ${currency.format(purchaseTotal)}`}</strong> · booked as one expense under Packing Material.</p>
                   <Field label="Remarks (optional)">
@@ -15872,8 +16129,8 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                   </Field>
                   {purchase.error && <div className="inline-error" role="alert">{purchase.error}</div>}
                   <div className="button-row">
-                    <button className="primary-button" disabled={disabled || purchase.saving} type="button" onClick={savePurchase}>{purchase.saving ? "Saving…" : "Save purchase"}</button>
-                    <button className="secondary-button" disabled={purchase.saving} type="button" onClick={() => setPurchase(null)}>Cancel</button>
+                    <button className="primary-button" disabled={disabled || purchase.saving || Boolean(setup?.forLine)} type="button" onClick={savePurchase}>{purchase.saving ? "Saving…" : "Save purchase"}</button>
+                    <button className="secondary-button" disabled={purchase.saving || Boolean(setup?.forLine)} type="button" onClick={() => setPurchase(null)}>Cancel</button>
                   </div>
                 </div>
               </div>
@@ -15945,6 +16202,13 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                       </li>
                     ))}
                   </ul>
+                )}
+                {canManage && !firstLoad && (
+                  // The header button is easy to miss, and an empty level is exactly when it is needed.
+                  // Inside a type or design the New-packing form starts there.
+                  <button className="secondary-button compact-button packing-add-here" disabled={busy || disabled} type="button" onClick={() => startSetup(null)}>
+                    <Icon name="add" size={14} />{hereLabel ? `New packing in ${hereLabel}` : "New packing"}
+                  </button>
                 )}
                 <small className="form-note">→ opens, ← goes back, ↑ ↓ move. Counts are this branch's.</small>
               </div>

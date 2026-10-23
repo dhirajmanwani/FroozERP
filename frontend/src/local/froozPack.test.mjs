@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  packingEmptyPickerMessage,
+  packingTypesWithoutSize,
   PACKING_LOW_STOCK_AT,
   PACKING_SIZE_LABELS,
   PACKING_SIZE_NAMES,
@@ -23,6 +25,18 @@ import {
   readPackingCatalogue,
   resolvePackAvailability,
   validatePackingNode,
+  PACKING_QUICK_START_TYPES,
+  advancePackingPurchaseLine,
+  applyPackingToPurchaseLine,
+  buildPackingSetupPayload,
+  createPackingPurchaseLine,
+  createPackingSetupDraft,
+  packingLeafSublabel,
+  packingPurchaseDraftTotal,
+  packingPurchaseLineAmount,
+  packingQuickStartOffered,
+  packingSetupChoices,
+  packingSetupPickRow,
 } from "./froozPack.js";
 
 // The snapshot's shape: `id` is already the global id.
@@ -278,8 +292,10 @@ test("the designs level and the sizes level", () => {
     ["Royal · 2 kg", null, "unknown", true],
   ]);
   const grand = sizes.rows[1];
-  assert.equal(grand.sublabel, "₹45.00 each");
-  assert.equal(sizes.rows[2].sublabel, "Cost not set");
+  // Count and last rate on every leaf; an unknown count or an unset (₹0) cost is said, never 0.
+  assert.equal(grand.sublabel, "On hand 3 · last ₹45.00");
+  assert.equal(sizes.rows[0].sublabel, "On hand 0 · last ₹20.00");
+  assert.equal(sizes.rows[2].sublabel, "Count not known · no rate yet");
   assert.deepEqual(
     [grand.packing_size_id, grand.type_name, grand.design_name, grand.size_name, grand.capacity, grand.unit_cost],
     ["packing-size-4", "Gift Box", "Window Box", "GRAND", "1 kg", 45],
@@ -647,4 +663,188 @@ test("the Frooz Pack screen shows everything the picker hides, marked, and falls
   assert.equal(packingManageView(catalogue, { level: "designs", typeId: "packing-type-99" }).level, "types");
   assert.equal(packingManageView(null, createPackingDrill()).rows.length, 0);
   assert.equal(PACKING_MOVEMENT_LABELS.ADJUST, "Count corrected");
+});
+
+test("an empty picker names the packing types that still need a design and a size", () => {
+  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }), "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.");
+  assert.equal(
+    packingEmptyPickerMessage({ status: "ready", types: [
+      { id: "packing-type-1", name: "Bottle", active: true, designs: [] },
+      { id: "packing-type-2", name: "Box", active: true, designs: [{ id: "packing-design-1", name: "Window", active: true, sizes: [] }] },
+      { id: "packing-type-3", name: "Old", active: false, designs: [] },
+    ] }),
+    "Bottle, Box have no size yet. In Frooz Pack, press New packing, choose each one, name a design and tick its sizes."
+  );
+  assert.equal(
+    packingEmptyPickerMessage([{ id: "packing-type-1", name: "Bottle", designs: [] }]),
+    "Bottle has no size yet. In Frooz Pack, press New packing, choose it, name a design and tick its sizes."
+  );
+});
+
+test("types with no usable size are named, so a picker can say why they are missing", () => {
+  assert.deepEqual(packingTypesWithoutSize({ types: [
+    { id: "packing-type-1", name: "Bowl", designs: [{ id: "packing-design-1", name: "Round", sizes: [{ id: "packing-size-1", size_name: "CLASSIC" }] }] },
+    { id: "packing-type-2", name: "Tray", designs: [] },
+    { id: "packing-type-3", name: "Box", designs: [{ id: "packing-design-2", name: "Kraft", active: false, sizes: [{ id: "packing-size-2", size_name: "GRAND" }] }] },
+    { id: "packing-type-4", name: "Off", active: false, designs: [] },
+  ] }), ["Tray", "Box"]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// New packing in one go, Quick start, the purchase table and the picker's count and rate
+// ---------------------------------------------------------------------------------------------
+
+const tick = (draft, ticks) => ({
+  ...draft,
+  sizes: draft.sizes.map((row) => (ticks[row.size_name] ? { ...row, checked: true, ...ticks[row.size_name] } : row)),
+});
+
+test("New packing: the form starts where the owner is, and offers only switched-on types and designs", () => {
+  const catalogue = ready();
+  const blank = createPackingSetupDraft();
+  assert.deepEqual([blank.type_id, blank.design_id, blank.sizes.map((row) => row.size_name)], ["", "", ["PETITE", "CLASSIC", "GRAND", "ROYAL"]]);
+  assert.ok(blank.sizes.every((row) => row.checked === false));
+  assert.equal(createPackingSetupDraft({ designId: "packing-design-2" }).design_id, "", "a design means nothing without its type");
+  const here = createPackingSetupDraft({ typeId: "packing-type-1", designId: "packing-design-2" });
+  const choices = packingSetupChoices(catalogue, here);
+  // Bowl has no design yet but is offered: this is where it gets one. Retired is switched off.
+  assert.deepEqual(choices.types.map((row) => row.label), ["Gift Box", "Bottle", "Bowl"]);
+  assert.deepEqual(choices.designs.map((row) => row.label), ["Window Box", "Old Box"]);
+  assert.deepEqual(choices.existingSizes, ["Petite", "Grand · 1 kg", "Royal · 2 kg"], "switched-off sizes are free to make again");
+  assert.deepEqual(packingSetupChoices(catalogue, createPackingSetupDraft()).designs, []);
+});
+
+test("New packing: one payload for a new type, design and sizes; typed names that exist are taken as those", () => {
+  const catalogue = ready();
+  const fresh = buildPackingSetupPayload(tick({ ...createPackingSetupDraft(), type_name: "  Tray ", design_name: "Kraft  Round" }, {
+    GRAND: { capacity: " 1  kg ", unit_cost: "12.50" }, PETITE: {},
+  }), catalogue);
+  assert.equal(fresh.ok, true, fresh.message);
+  assert.deepEqual(fresh.payload, {
+    type: { name: "Tray" },
+    design: { name: "Kraft Round" },
+    sizes: [{ size_name: "PETITE", capacity: "" }, { size_name: "GRAND", capacity: "1 kg", unit_cost: 12.5 }],
+  });
+  assert.equal(fresh.summary, "Tray › Kraft Round: Petite, Grand · 1 kg");
+
+  // "gift box" typed as new is the Gift Box already there; "window box" likewise its design.
+  const typed = buildPackingSetupPayload(tick({ ...createPackingSetupDraft(), type_name: "gift box", design_name: "WINDOW BOX" }, { CLASSIC: {} }), catalogue);
+  assert.equal(typed.ok, true, typed.message);
+  assert.deepEqual(typed.payload, { type: { id: "packing-type-1" }, design: { id: "packing-design-2" }, sizes: [{ size_name: "CLASSIC", capacity: "" }] });
+
+  // A type alone.
+  assert.deepEqual(buildPackingSetupPayload({ ...createPackingSetupDraft(), type_name: "Tray" }, catalogue).payload, { type: { name: "Tray" }, sizes: [] });
+});
+
+test("New packing: each confusion is refused in words before anything is sent", () => {
+  const catalogue = ready();
+  const at = createPackingSetupDraft({ typeId: "packing-type-1", designId: "packing-design-2" });
+  const cases = [
+    [createPackingSetupDraft(), /Choose a packing type/],
+    [{ ...createPackingSetupDraft(), type_name: "x".repeat(81) }, /80 letters/],
+    [{ ...createPackingSetupDraft({ typeId: "packing-type-99" }) }, /no longer in the list/],
+    [{ ...createPackingSetupDraft({ typeId: "packing-type-4" }) }, /no longer in the list/],
+    [createPackingSetupDraft({ typeId: "packing-type-1", designId: "packing-design-4" }), /no longer under Gift Box/],
+    [tick({ ...createPackingSetupDraft(), type_name: "Tray" }, { GRAND: {} }), /Choose the design these sizes belong to/],
+    [{ ...createPackingSetupDraft(), type_name: "Tray", design_name: "Kraft" }, /Tick at least one size/],
+    [createPackingSetupDraft({ typeId: "packing-type-1" }), /Gift Box is already there/],
+    [tick(at, { GRAND: { capacity: "1 KG" } }), /Window Box already has Grand · 1 KG/],
+    [tick(at, { ROYAL: { unit_cost: "-1" } }), /Royal: the unit cost/],
+    [tick(at, { ROYAL: { unit_cost: "1.234" } }), /at most 2 decimals/],
+    [tick(at, { ROYAL: { capacity: "x".repeat(41) } }), /Royal: keep the capacity/],
+  ];
+  for (const [draft, message] of cases) {
+    const result = buildPackingSetupPayload(draft, catalogue);
+    assert.equal(result.ok, false, JSON.stringify(draft));
+    assert.match(result.message, message);
+  }
+  // Grand with another capacity, or a size that is switched off, is new.
+  assert.equal(buildPackingSetupPayload(tick(at, { GRAND: { capacity: "2 kg" }, CLASSIC: {} }), catalogue).ok, true);
+});
+
+test("New packing from a purchase line: the first size made is what the line takes", () => {
+  const body = {
+    success: true,
+    type: { id: 1, global_id: "packing-type-1", name: "Gift Box" },
+    design: { id: 2, global_id: "packing-design-2", name: "Window Box" },
+    sizes: [
+      { id: 7, global_id: "packing-size-7", size_name: "GRAND", capacity: "1 kg", unit_cost: 12, qty_on_hand: 0 },
+      { id: 8, global_id: "packing-size-8", size_name: "PETITE", capacity: null, unit_cost: 0, qty_on_hand: 0 },
+    ],
+  };
+  const row = packingSetupPickRow(body);
+  assert.deepEqual(row, {
+    packing_size_id: "packing-size-7", type_name: "Gift Box", design_name: "Window Box", size_name: "GRAND", capacity: "1 kg", unit_cost: 12, qty_on_hand: 0,
+  });
+  assert.equal(packingSetupPickRow({ ...body, sizes: [body.sizes[1]] }).unit_cost, null, "an unset cost is unknown, not ₹0");
+  assert.equal(packingSetupPickRow({ ...body, sizes: [] }), null, "a type alone gives the line nothing");
+  assert.equal(packingSetupPickRow(null), null);
+  const lines = applyPackingToPurchaseLine([createPackingPurchaseLine("a"), createPackingPurchaseLine("b")], "b", row);
+  assert.deepEqual(lines[1], { key: "b", size_id: "packing-size-7", label: "Gift Box › Window Box › Grand · 1 kg", quantity: "", rate: "12" });
+  assert.deepEqual(lines[0], createPackingPurchaseLine("a"));
+});
+
+test("Quick start: offered only when the list loaded with no type at all", () => {
+  assert.deepEqual(PACKING_QUICK_START_TYPES, ["Gift Box", "Basket", "Bottle", "Bowl"]);
+  assert.equal(packingQuickStartOffered(readPackingCatalogue({ types: [] })), true);
+  assert.equal(packingQuickStartOffered(ready()), false);
+  assert.equal(packingQuickStartOffered(readPackingCatalogue({ types: [{ id: "t", name: "Old", active: false, designs: [] }] })), false, "a switched-off type is still a type");
+  assert.equal(packingQuickStartOffered(readPackingCatalogue(null)), false, "not loaded is not empty");
+  assert.equal(packingQuickStartOffered(readPackingCatalogue({ status: "weird" })), false);
+});
+
+test("purchase table: rate starts at the last cost, amounts and the total are worked as the server does", () => {
+  const picked = applyPackingToPurchaseLine([{ ...createPackingPurchaseLine("a"), rate: "9" }], "a", { packing_size_id: "packing-size-4", type_name: "Gift Box", design_name: "Window Box", size_name: "GRAND", capacity: "1 kg", unit_cost: 45 });
+  assert.equal(picked[0].rate, "9", "a rate already typed is the bill's own");
+  const unset = applyPackingToPurchaseLine([createPackingPurchaseLine("a")], "a", { packing_size_id: "s", size_name: "GRAND", unit_cost: 0 });
+  assert.equal(unset[0].rate, "", "no last cost: left blank, never 0");
+  assert.equal(packingPurchaseLineAmount({ quantity: "20", rate: "3.255" }), 65.2, "the rate is a paisa amount first, as the server rounds it");
+  assert.equal(packingPurchaseLineAmount({ quantity: "0.5", rate: "0.05" }), 0.03, "half-up to the paisa");
+  assert.equal(packingPurchaseLineAmount({ quantity: "", rate: "3" }), null);
+  assert.equal(packingPurchaseLineAmount({ quantity: "2", rate: "" }), null);
+  assert.equal(packingPurchaseLineAmount({ quantity: "-1", rate: "3" }), null);
+  assert.equal(packingPurchaseDraftTotal([{ quantity: "50", rate: "12.5" }, { quantity: "20", rate: "3.25" }, { quantity: "", rate: "" }]), 690);
+  // The table's total and the payload's total agree.
+  const draft = { payment_mode: "CASH", lines: [
+    { key: "a", size_id: "packing-size-4", quantity: "3.333", rate: "1.15" },
+    { key: "b", size_id: "packing-size-3", quantity: "0.333", rate: "7.77" },
+  ] };
+  assert.equal(packingPurchaseDraftTotal(draft.lines), 6.42, "3.83 + 2.59");
+  assert.equal(packingPurchaseDraftTotal(draft.lines), buildPackingPurchasePayload(draft).total);
+});
+
+test("purchase table: Enter walks Packing → Qty → Rate → next line, adding one at the end, and a blank last line is not sent", () => {
+  let seq = 0;
+  const makeLine = () => createPackingPurchaseLine(`n${(seq += 1)}`);
+  const lines = [createPackingPurchaseLine("a"), createPackingPurchaseLine("b")];
+  assert.deepEqual(advancePackingPurchaseLine(lines, "a", "pick", makeLine).focus, { key: "a", field: "quantity" });
+  assert.deepEqual(advancePackingPurchaseLine(lines, "a", "quantity", makeLine).focus, { key: "a", field: "rate" });
+  const next = advancePackingPurchaseLine(lines, "a", "rate", makeLine);
+  assert.deepEqual(next.focus, { key: "b", field: "pick" });
+  assert.equal(next.lines, lines, "no line added in the middle");
+  const added = advancePackingPurchaseLine(lines, "b", "rate", makeLine);
+  assert.deepEqual(added.lines.map((line) => line.key), ["a", "b", "n1"]);
+  assert.deepEqual(added.focus, { key: "n1", field: "pick" });
+  assert.deepEqual(advancePackingPurchaseLine(lines, "zz", "rate", makeLine), { lines, focus: null });
+
+  const filled = [
+    { ...createPackingPurchaseLine("a"), size_id: "packing-size-4", quantity: "10", rate: "45" },
+    createPackingPurchaseLine("n1"),
+  ];
+  const built = buildPackingPurchasePayload({ payment_mode: "CASH", lines: filled });
+  assert.equal(built.ok, true, built.message);
+  assert.deepEqual(built.payload.lines, [{ size_id: "packing-size-4", quantity: 10, rate: 45 }], "the spare blank line is dropped");
+  // Only a wholly blank line is spare: a line with just a rate is still a line to finish.
+  assert.match(buildPackingPurchasePayload({ payment_mode: "CASH", lines: [filled[0], { ...createPackingPurchaseLine("x"), rate: "5" }] }).message, /Line 2: choose a packing size/);
+});
+
+test("every picker's size row says the count and the last rate, and says when either is not known", () => {
+  assert.equal(packingLeafSublabel({ qty_on_hand: 12, unit_cost: 4.5 }), "On hand 12 · last ₹4.50");
+  assert.equal(packingLeafSublabel({ qty_on_hand: -2, unit_cost: 0 }), "On hand -2 · no rate yet");
+  assert.equal(packingLeafSublabel({ qty_on_hand: null, unit_cost: null }), "Count not known · no rate yet");
+  assert.equal(packingLeafSublabel({ qty_on_hand: 1234.5, unit_cost: 10 }), "On hand 1,234.5 · last ₹10.00");
+  // The API's NUMERIC strings read as numbers.
+  const api = readPackingCatalogue(apiPacking());
+  const view = packingDrillView(api, { level: "sizes", typeId: "packing-type-1", designId: "packing-design-2" });
+  assert.equal(view.rows[0].sublabel, "On hand 0 · last ₹45.00");
 });

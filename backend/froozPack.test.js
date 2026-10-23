@@ -502,6 +502,162 @@ test("routes: a Cashier reads the tree but writes nothing; no session reads noth
 });
 
 // ---------------------------------------------------------------------------------------------
+// New packing in one go (POST /api/v3/packing/setup) and Quick start (POST /api/v3/packing/quick-start)
+// ---------------------------------------------------------------------------------------------
+
+test("validate setup: a type alone, or a design with at least one size; sizes read as POST /sizes reads them", () => {
+  const full = pack.validateSetupInput({
+    type: { name: " Gift  Box " },
+    design: { name: "Window Box" },
+    sizes: [{ size_name: "grand", capacity: " 1  kg ", unit_cost: "12.505" }, { size_name: "PETITE" }],
+  });
+  assert.equal(full.ok, true, JSON.stringify(full));
+  assert.deepEqual(full.value.type, { name: "Gift Box" });
+  assert.deepEqual(full.value.sizes, [
+    { size_name: "GRAND", capacity: "1 kg", unit_cost: 12.51 },
+    { size_name: "PETITE", capacity: null, unit_cost: null },
+  ]);
+  assert.equal(pack.validateSetupInput({ type: { name: "Basket" } }).ok, true, "a new type alone is fine");
+  assert.deepEqual(pack.validateSetupInput({ type: { id: "packing-type-3", name: "ignored" }, design: { id: 4 }, sizes: [{ size_name: "ROYAL" }] }).value.design, { ref: { ref: "4", intId: 4 } });
+  const refusals = [
+    [{}, CODES.PARENT_INVALID],
+    [{ type: { name: "  " } }, CODES.PARENT_INVALID],
+    [{ type: "Gift Box" }, CODES.INPUT_INVALID],
+    [{ type: { id: 3 } }, CODES.INPUT_INVALID],
+    [{ type: { name: "Box" }, design: { name: "Window" } }, CODES.INPUT_INVALID],
+    [{ type: { name: "Box" }, design: { name: "Window" }, sizes: [] }, CODES.INPUT_INVALID],
+    [{ type: { name: "Box" }, sizes: [{ size_name: "GRAND" }] }, CODES.PARENT_INVALID],
+    [{ type: { name: "Box" }, design: { id: 4 }, sizes: [{ size_name: "GRAND" }] }, CODES.PARENT_INVALID],
+    [{ type: { name: "Box" }, design: { name: "W" }, sizes: [{ size_name: "JUMBO" }] }, CODES.SIZE_NAME_INVALID],
+    [{ type: { name: "Box" }, design: { name: "W" }, sizes: [{ size_name: "GRAND", unit_cost: -1 }] }, CODES.INPUT_INVALID],
+    [{ type: { name: "Box" }, design: { name: "W" }, sizes: [{ size_name: "GRAND", capacity: "1 kg" }, { size_name: "grand", capacity: "1 KG" }] }, CODES.INPUT_INVALID],
+    [{ type: { name: "Box" }, design: { name: "W" }, sizes: "GRAND" }, CODES.INPUT_INVALID],
+    [{ type: { name: "x".repeat(81) } }, CODES.NAME_REQUIRED],
+  ];
+  for (const [body, code] of refusals) {
+    const result = pack.validateSetupInput(body);
+    assert.equal(result.ok, false, JSON.stringify(body));
+    assert.equal(result.code, code, JSON.stringify(body));
+  }
+  // The same size name with another capacity is another size.
+  assert.equal(pack.validateSetupInput({ type: { name: "Box" }, design: { name: "W" }, sizes: [{ size_name: "GRAND", capacity: "1 kg" }, { size_name: "GRAND", capacity: "2 kg" }] }).ok, true);
+});
+
+test("routes: setup makes a new type, design and sizes in one transaction and publishes the type once", async () => {
+  await withPack(async ({ db }) => {
+    const made = await call("POST", "/api/v3/packing/setup", {
+      type: { name: "Gift Box" },
+      design: { name: "Window Box" },
+      sizes: [{ size_name: "GRAND", capacity: "1 kg", unit_cost: 12 }, { size_name: "PETITE" }],
+    });
+    assert.equal(made.status, 201, JSON.stringify(made.body));
+    const { type, design, sizes } = made.body;
+    assert.equal(made.body.success, true);
+    assert.equal(type.global_id, `packing-type-${type.id}`);
+    assert.equal(type.name, "Gift Box");
+    assert.equal(design.global_id, `packing-design-${design.id}`);
+    assert.deepEqual(type.designs.map((entry) => entry.id), [design.id], "the type comes back in the GET tree shape");
+    assert.deepEqual(sizes.map((size) => [size.global_id, size.size_name, size.capacity, size.unit_cost, size.qty_on_hand, size.active]), [
+      [`packing-size-${sizes[0].id}`, "GRAND", "1 kg", 12, 0, true],
+      [`packing-size-${sizes[1].id}`, "PETITE", null, 0, 0, true],
+    ], "in the order they were sent");
+    const changes = (await db.query("SELECT branch_id, entity_id, entity_version, payload FROM sync_change_log WHERE entity_type = 'packing_type' ORDER BY change_id")).rows;
+    assert.deepEqual(changes.map((row) => [row.branch_id, row.entity_id, row.entity_version]), [[1, type.global_id, 1], [2, type.global_id, 1]], "one publish, heard by both branches");
+    assert.equal(changes[0].payload.designs[0].sizes.length, 2);
+    const listed = (await call("GET", "/api/v3/packing")).body.types;
+    assert.deepEqual(listed[0].designs[0].sizes.map((size) => size.size_name), ["PETITE", "GRAND"]);
+
+    // Under the existing type: a new design. Under the existing design: one more size.
+    const second = await call("POST", "/api/v3/packing/setup", { type: { id: type.global_id }, design: { name: "Kraft" }, sizes: [{ size_name: "ROYAL", capacity: "2 kg" }] });
+    assert.equal(second.status, 201, JSON.stringify(second.body));
+    assert.equal(second.body.type.id, type.id);
+    assert.equal(second.body.design.name, "Kraft");
+    const third = await call("POST", "/api/v3/packing/setup", { type: { id: type.id }, design: { id: design.global_id }, sizes: [{ size_name: "GRAND", capacity: "2 kg" }] });
+    assert.equal(third.status, 201, JSON.stringify(third.body));
+    assert.equal(third.body.design.id, design.id);
+    assert.deepEqual(third.body.sizes.map((size) => [size.size_name, size.capacity]), [["GRAND", "2 kg"]]);
+    const versions = (await db.query("SELECT entity_version FROM sync_change_log WHERE entity_type = 'packing_type' AND branch_id = 1 ORDER BY change_id")).rows;
+    assert.deepEqual(versions.map((row) => row.entity_version), [1, 2, 3], "a write under an existing type raises its version");
+
+    // A type alone.
+    const alone = await call("POST", "/api/v3/packing/setup", { type: { name: "Basket" } });
+    assert.equal(alone.status, 201, JSON.stringify(alone.body));
+    assert.deepEqual([alone.body.type.name, alone.body.design, alone.body.sizes], ["Basket", null, []]);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_sizes"), 4);
+  });
+});
+
+test("routes: setup refuses taken names, a size already there, other companies' and switched-off parents -- and writes nothing", async () => {
+  await withPack(async ({ db, statements }) => {
+    const { type, design } = await buildTree();
+    await db.exec(`
+      INSERT INTO packing_types (id, global_id, company_id, name) VALUES (90, 'packing-type-90', 2, 'Theirs');
+      INSERT INTO packing_designs (id, global_id, type_id, name) VALUES (90, 'packing-design-90', 90, 'Theirs');
+      INSERT INTO packing_types (id, global_id, company_id, name, active) VALUES (91, 'packing-type-91', 1, 'Old Basket', FALSE);
+      INSERT INTO packing_types (id, global_id, company_id, name) VALUES (92, 'packing-type-92', 1, 'Bottle');
+      INSERT INTO packing_designs (id, global_id, type_id, name) VALUES (92, 'packing-design-92', 92, 'Round');
+    `);
+    const grand = [{ size_name: "GRAND", capacity: "1 KG" }];
+    const cases = [
+      [{ type: { name: "gift box" }, design: { name: "X" }, sizes: [{ size_name: "PETITE" }] }, 409, CODES.NAME_TAKEN, /Gift Box/],
+      [{ type: { id: type.id }, design: { name: "window box" }, sizes: [{ size_name: "ROYAL" }] }, 409, CODES.NAME_TAKEN, /Window Box/],
+      [{ type: { id: type.id }, design: { id: design.id }, sizes: [{ size_name: "ROYAL" }, ...grand] }, 409, CODES.SIZE_TAKEN, /Window Box already has Grand · 1 KG/],
+      [{ type: { id: "packing-type-90" }, design: { name: "Mine" }, sizes: [{ size_name: "ROYAL" }] }, 400, CODES.PARENT_INVALID, /not found/],
+      [{ type: { id: type.id }, design: { id: "packing-design-90" }, sizes: [{ size_name: "ROYAL" }] }, 400, CODES.PARENT_INVALID, /not found under Gift Box/],
+      [{ type: { id: type.id }, design: { id: "packing-design-92" }, sizes: [{ size_name: "ROYAL" }] }, 400, CODES.PARENT_INVALID, /not found under Gift Box/],
+      [{ type: { id: 91 }, design: { name: "New" }, sizes: [{ size_name: "ROYAL" }] }, 400, CODES.PARENT_INVALID, /switched off/],
+      [{ type: { id: type.id }, design: { name: "New" }, sizes: [{ size_name: "ROYAL" }, { size_name: "MEDIUM" }] }, 400, CODES.SIZE_NAME_INVALID, /Petite/],
+    ];
+    for (const [body, status, code, message] of cases) {
+      statements.length = 0;
+      const response = await call("POST", "/api/v3/packing/setup", body);
+      assert.equal(response.status, status, `${JSON.stringify(body)}: ${JSON.stringify(response.body)}`);
+      assert.equal(response.body.code, code, JSON.stringify(body));
+      assert.match(response.body.message, message);
+      assert.deepEqual(writes(statements), [], `${JSON.stringify(body)} wrote nothing`);
+    }
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_types WHERE company_id = 1"), 3);
+    // A switched-off size frees its name and capacity, as with POST /sizes.
+    await call("PUT", `/api/v3/packing/sizes/packing-size-${(await db.query("SELECT id FROM packing_sizes WHERE size_name = 'GRAND'")).rows[0].id}`, { size_name: "GRAND", capacity: "1 kg", active: false });
+    assert.equal((await call("POST", "/api/v3/packing/setup", { type: { id: type.id }, design: { id: design.id }, sizes: grand })).status, 201);
+  });
+});
+
+test("routes: quick start makes Gift Box, Basket, Bottle and Bowl once, skipping names the shop already has", async () => {
+  await withPack(async ({ db }) => {
+    await db.exec("INSERT INTO packing_types (id, global_id, company_id, name, active) VALUES (91, 'packing-type-91', 1, 'basket', FALSE)");
+    await db.exec("INSERT INTO packing_types (id, global_id, company_id, name) VALUES (90, 'packing-type-90', 2, 'Bowl')");
+    const first = await call("POST", "/api/v3/packing/quick-start", {});
+    assert.equal(first.status, 201, JSON.stringify(first.body));
+    assert.deepEqual(first.body.created.map((type) => type.name), ["Gift Box", "Bottle", "Bowl"], "another company's Bowl is not ours");
+    assert.deepEqual(first.body.skipped, ["Basket"], "a switched-off Basket is the owner's choice, kept");
+    assert.ok(first.body.created.every((type) => type.global_id === `packing-type-${type.id}` && type.designs.length === 0));
+    const published = (await db.query("SELECT entity_id, entity_version FROM sync_change_log WHERE entity_type = 'packing_type' AND branch_id = 1 ORDER BY change_id")).rows;
+    assert.deepEqual(published.map((row) => row.entity_id), first.body.created.map((type) => type.global_id));
+    assert.ok(published.every((row) => row.entity_version === 1));
+
+    const again = await call("POST", "/api/v3/packing/quick-start", {});
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    assert.deepEqual(again.body.created, []);
+    assert.deepEqual(again.body.skipped, ["Gift Box", "Basket", "Bottle", "Bowl"]);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_types WHERE company_id = 1"), 4);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM sync_change_log WHERE entity_type = 'packing_type' AND branch_id = 1"), 3, "a second press publishes nothing");
+  });
+});
+
+test("routes: a Cashier cannot run setup or quick start", async () => {
+  await withPack(async ({ statements }) => {
+    for (const url of ["/api/v3/packing/setup", "/api/v3/packing/quick-start"]) {
+      const response = await call("POST", url, { type: { name: "X" } }, headersFor({ role: "Cashier" }));
+      assert.equal(response.status, 403, url);
+      assert.equal(response.body.code, CODES.PERMISSION_REQUIRED);
+    }
+    assert.deepEqual(writes(statements), []);
+  }, { role: "Cashier" });
+  assert.equal((await probe(app, "POST", "/api/v3/packing/setup", { "content-type": "application/json" }, {})).status, 401);
+});
+
+// ---------------------------------------------------------------------------------------------
 // Bills: recordSalePackingUsage and restoreSalePacking, called as the sale paths call them
 // ---------------------------------------------------------------------------------------------
 
