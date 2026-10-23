@@ -11,6 +11,11 @@
 //! in `frontend/src/local/weighingScale.js`, where it is testable. Nothing here is ever a weight:
 //! a port that sends nothing, sends rubbish or drops out is a status with a message, never 0.
 //!
+//! The reader keeps going by itself (24 Oct 2026, "taaki future me kabhi dikkat nhi aaye"): a port
+//! that cannot be opened (scale off, out of range, held by the phone's iScale app) or a link that
+//! drops mid-day is tried again every `RETRY_DELAY` until it answers or someone disconnects. What
+//! happened is written to the app log, so a counter's scale trouble can be read afterwards.
+//!
 //! Local only. A serial port is not the network, so LOCAL_ONLY is untouched.
 
 use serde::Serialize;
@@ -26,6 +31,10 @@ const BAUD_RATE: u32 = 9600;
 const READ_TIMEOUT: Duration = Duration::from_millis(400);
 /// The characters kept: several whole readings, so the newest complete one is always in there.
 const TEXT_TAIL: usize = 160;
+/// How long to wait before trying a port that failed again.
+const RETRY_DELAY: Duration = Duration::from_secs(3);
+/// After this many failures in a row, only every tenth one is logged.
+const LOG_EVERY_FAILURE_UNTIL: u32 = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct ScalePort {
@@ -47,12 +56,46 @@ pub struct ScaleStatus {
     pub last_data_at_ms: Option<u64>,
     pub now_ms: u64,
     pub error: Option<String>,
+    /// Opening attempts since the last time the scale answered; 0 while it is answering.
+    pub attempts: u32,
+    /// True while a failed port is waiting to be tried again by itself.
+    pub retrying: bool,
     /// Raised by every connect and disconnect; a reader thread stops once it is out of date.
     pub generation: u64,
 }
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static STATUS: OnceLock<Mutex<ScaleStatus>> = OnceLock::new();
+static LOGGER: OnceLock<fn(&str, &str)> = OnceLock::new();
+
+/// The app log writer (lib.rs `write_app_log`), set once at startup. Without one, nothing is logged.
+pub fn set_logger(logger: fn(&str, &str)) {
+    let _ = LOGGER.set(logger);
+}
+
+fn log(level: &str, message: &str) {
+    if let Some(logger) = LOGGER.get() {
+        logger(level, &format!("[weighing scale] {message}"));
+    }
+}
+
+fn is_current(generation: u64) -> bool {
+    GENERATION.load(Ordering::SeqCst) == generation
+}
+
+/// Sleep for `total` in short steps; false as soon as this reader has been replaced.
+fn wait_while_current(generation: u64, total: Duration) -> bool {
+    let step = Duration::from_millis(100);
+    let mut waited = Duration::ZERO;
+    while waited < total {
+        if !is_current(generation) {
+            return false;
+        }
+        thread::sleep(step);
+        waited += step;
+    }
+    is_current(generation)
+}
 
 fn status_cell() -> &'static Mutex<ScaleStatus> {
     STATUS.get_or_init(|| {
@@ -143,6 +186,7 @@ pub fn status() -> ScaleStatus {
 /// Stop reading. Safe to call when nothing is connected.
 pub fn disconnect() -> ScaleStatus {
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    log("INFO", "disconnected");
     if let Ok(mut status) = status_cell().lock() {
         *status = ScaleStatus {
             status: "idle".to_string(),
@@ -166,10 +210,12 @@ pub fn connect(port_name: String) -> Result<ScaleStatus, String> {
         *status = ScaleStatus {
             status: "connecting".to_string(),
             port_name: Some(port_name.clone()),
+            attempts: 1,
             generation,
             ..ScaleStatus::default()
         };
     }
+    log("INFO", &format!("connecting to {port_name}"));
     thread::Builder::new()
         .name("froozerp-weighing-scale".to_string())
         .spawn(move || read_port(port_name, generation))
@@ -177,53 +223,106 @@ pub fn connect(port_name: String) -> Result<ScaleStatus, String> {
     Ok(status())
 }
 
+/// One reader: open the port, read until told to stop, and when opening fails or the link drops,
+/// wait `retry_delay` and open it again. Only `disconnect` or a newer `connect` ends it.
 fn read_port(port_name: String, generation: u64) {
-    let opened = serialport::new(port_name.as_str(), BAUD_RATE)
-        .data_bits(serialport::DataBits::Eight)
-        .parity(serialport::Parity::None)
-        .stop_bits(serialport::StopBits::One)
-        .flow_control(serialport::FlowControl::None)
-        .timeout(READ_TIMEOUT)
-        .open();
-    let mut port = match opened {
-        Ok(port) => port,
-        Err(error) => {
-            update_if_current(generation, |status| {
-                status.status = "failed".to_string();
-                status.error = Some(format!("{port_name} could not be opened: {error}"));
-            });
-            return;
-        }
-    };
-    if !update_if_current(generation, |status| status.status = "reading".to_string()) {
-        return;
-    }
-    let mut buffer = [0u8; 256];
+    read_port_with(port_name, generation, RETRY_DELAY)
+}
+
+fn read_port_with(port_name: String, generation: u64, retry_delay: Duration) {
+    let mut failures: u32 = 0;
     loop {
-        if GENERATION.load(Ordering::SeqCst) != generation {
+        if !is_current(generation) {
             return;
         }
-        match port.read(&mut buffer) {
-            Ok(0) => {}
-            Ok(read) => {
-                let at = now_ms();
+        let opened = serialport::new(port_name.as_str(), BAUD_RATE)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(READ_TIMEOUT)
+            .open();
+        let mut port = match opened {
+            Ok(port) => port,
+            Err(error) => {
+                failures += 1;
+                let message = format!("{port_name} could not be opened: {error}");
+                if failures <= LOG_EVERY_FAILURE_UNTIL || failures % 10 == 0 {
+                    log("WARN", &format!("{message} (attempt {failures})"));
+                }
                 let current = update_if_current(generation, |status| {
-                    append_tail(&mut status.text, &buffer[..read], TEXT_TAIL);
-                    status.bytes_read += read as u64;
-                    status.last_data_at_ms = Some(at);
+                    status.status = "failed".to_string();
+                    status.error = Some(message);
+                    status.attempts = failures;
+                    status.retrying = true;
                 });
-                if !current {
+                if !current || !wait_while_current(generation, retry_delay) {
                     return;
                 }
+                if !update_if_current(generation, |status| {
+                    status.status = "connecting".to_string();
+                    status.attempts = failures + 1;
+                }) {
+                    return;
+                }
+                continue;
             }
-            Err(error) if error.kind() == ErrorKind::TimedOut || error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => {
-                update_if_current(generation, |status| {
-                    status.status = "failed".to_string();
-                    status.error = Some(format!("The scale on {port_name} stopped: {error}"));
-                });
+        };
+        if failures > 0 {
+            log("INFO", &format!("{port_name} opened after {failures} failed attempt(s)"));
+        } else {
+            log("INFO", &format!("{port_name} opened"));
+        }
+        // A new link starts with nothing heard: a weight from before the drop is not this one.
+        if !update_if_current(generation, |status| {
+            status.status = "reading".to_string();
+            status.text.clear();
+            status.last_data_at_ms = None;
+            status.error = None;
+            status.attempts = 0;
+            status.retrying = false;
+        }) {
+            return;
+        }
+        let mut buffer = [0u8; 256];
+        let dropped = loop {
+            if !is_current(generation) {
                 return;
             }
+            match port.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => {
+                    let at = now_ms();
+                    let current = update_if_current(generation, |status| {
+                        append_tail(&mut status.text, &buffer[..read], TEXT_TAIL);
+                        status.bytes_read += read as u64;
+                        status.last_data_at_ms = Some(at);
+                    });
+                    if !current {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::TimedOut || error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => break format!("The link to the scale on {port_name} dropped: {error}"),
+            }
+        };
+        drop(port);
+        log("WARN", &dropped);
+        failures = 1;
+        let current = update_if_current(generation, |status| {
+            status.status = "failed".to_string();
+            status.error = Some(dropped);
+            status.attempts = 1;
+            status.retrying = true;
+        });
+        if !current || !wait_while_current(generation, retry_delay) {
+            return;
+        }
+        if !update_if_current(generation, |status| {
+            status.status = "connecting".to_string();
+            status.attempts = 2;
+        }) {
+            return;
         }
     }
 }
@@ -255,23 +354,35 @@ mod tests {
     }
 
     #[test]
-    fn a_port_that_cannot_open_fails_with_its_name_and_a_disconnect_goes_idle() {
+    fn a_port_that_cannot_open_is_tried_again_by_itself_until_disconnected() {
+        // One test owns the shared reader state, so the cases run in order here.
         let started = connect("COM-FROOZERP-DOES-NOT-EXIST".to_string()).expect("the reader starts");
         assert_eq!(started.status, "connecting");
+        assert_eq!(started.attempts, 1);
+        // The thread connect() started uses the real delay; replace it with a quick one to watch retries.
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut status) = status_cell().lock() {
+            status.generation = generation;
+        }
+        let quick = thread::spawn(move || read_port_with("COM-FROOZERP-DOES-NOT-EXIST".to_string(), generation, Duration::from_millis(150)));
         let mut seen = status();
-        for _ in 0..50 {
-            if seen.status != "connecting" {
+        for _ in 0..100 {
+            if seen.attempts >= 3 {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
             seen = status();
         }
-        assert_eq!(seen.status, "failed");
+        assert!(seen.attempts >= 3, "it kept trying: {seen:?}");
+        assert!(seen.retrying);
         assert!(seen.error.as_deref().unwrap_or("").contains("COM-FROOZERP-DOES-NOT-EXIST"));
-        assert_eq!(seen.text, "", "a failed port reports no reading at all");
+        assert_eq!(seen.text, "", "a port that never opened reports no reading at all");
         let idle = disconnect();
         assert_eq!(idle.status, "idle");
-        assert!(idle.generation > started.generation);
+        assert!(!idle.retrying);
+        quick.join().expect("the reader stops once disconnected");
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(status().status, "idle", "nothing writes after a disconnect");
         assert!(connect("   ".to_string()).is_err(), "no port, no reader");
     }
 }
