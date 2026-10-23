@@ -57,6 +57,9 @@ tauri = { version = "2", features = [] }
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+# The counter's weighing scale (src/weighing_scale.rs): a Bluetooth SPP scale is a virtual COM
+# port on Windows. No default features, so no libudev on Linux, which ships nothing.
+serialport = { version = "4", default-features = false }
 
 # The phone's ANDROID_ID (src/machine_identity.rs), read through JNI from the activity tao already
 # registered. Both versions are the ones Tauri itself links on Android, so nothing new is pulled in.

@@ -318,6 +318,7 @@ import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure,
 import { UPI_BANK_PAYMENT_MODES, dayBookVoucherLabel, paymentReportTotals, saleGrossAmount, salesHistoryMoneyTotals } from "./local/salesReportTotals";
 import { checkoutFingerprint, resolveCheckoutRef } from "./local/checkoutRetry";
 import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
+import { SCALE_STATES, createSteadiness, describeScale, findScalePort, formatKg, isWeighedUnit, nextSteadiness, readSavedScalePort, saveScalePort, scaleQuantityFor } from "./local/weighingScale";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 // The phone app is a Tauri runtime too, so `isDesktopShell()` is true there as well. What differs on
@@ -22649,6 +22650,201 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
   );
 }
 
+// --- The counter's weighing scale (local/weighingScale.js, src-tauri/src/weighing_scale.rs) -----
+
+const scaleStorage = () => {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+};
+
+/** A Tauri command's refusal is a plain string; anything else is said as best it can be. */
+const scaleErrorText = (error, fallback) => (typeof error === "string" && error.trim() ? error : error?.message || fallback);
+
+const sameScaleView = (left, right) => left.state === right.state
+  && left.kg === right.kg
+  && left.steady === right.steady
+  && left.readingId === right.readingId
+  && left.message === right.message;
+
+/**
+ * Polls the desktop scale reader while `active` and folds each poll into a steady or settling
+ * weight. With `autoConnect`, a computer whose scale port was saved connects to it once when
+ * nothing is connected yet. Re-renders only when what it says changes.
+ */
+function useWeighingScale(active, { autoConnect = true } = {}) {
+  const desktop = isDesktopShell();
+  const [view, setView] = useState(() => describeScale(desktop ? { status: "idle" } : null));
+  const steadyRef = useRef(createSteadiness());
+  const triedConnect = useRef(false);
+
+  useEffect(() => {
+    if (!active || !desktop) return undefined;
+    let stopped = false;
+    let timer = null;
+    const poll = async () => {
+      let status;
+      try {
+        status = await invokeTauriCommand("scale_status");
+      } catch (error) {
+        status = { status: "failed", error: scaleErrorText(error, "the scale reader did not answer") };
+      }
+      if (stopped) return;
+      if (autoConnect && !triedConnect.current && status?.status === "idle") {
+        triedConnect.current = true;
+        const port = readSavedScalePort(scaleStorage());
+        if (port) {
+          try {
+            status = await invokeTauriCommand("scale_connect", { portName: port });
+          } catch (error) {
+            status = { status: "failed", port_name: port, error: scaleErrorText(error, `${port} could not be opened`) };
+          }
+          if (stopped) return;
+        }
+      }
+      steadyRef.current = nextSteadiness(steadyRef.current, status);
+      const next = describeScale(status, steadyRef.current);
+      setView((current) => (sameScaleView(current, next) ? current : next));
+      timer = setTimeout(poll, 250);
+    };
+    poll();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [active, autoConnect, desktop]);
+
+  return view;
+}
+
+const SCALE_VIEW_TONE = {
+  [SCALE_STATES.LIVE]: "stock-ok",
+  [SCALE_STATES.CONNECTING]: "stock-low",
+  [SCALE_STATES.WAITING]: "stock-low",
+  [SCALE_STATES.OFF]: "stock-low",
+};
+
+/** This computer's scale: which port it is on, found or picked, and what it reads right now. */
+function ScaleConnectionPanel() {
+  const desktop = isDesktopShell();
+  const view = useWeighingScale(desktop, { autoConnect: false });
+  const [ports, setPorts] = useState({ status: "idle", rows: [], message: "" });
+  const [port, setPort] = useState(() => readSavedScalePort(scaleStorage()));
+  const [work, setWork] = useState({ busy: false, message: "", tone: "" });
+
+  const loadPorts = async () => {
+    setPorts((current) => ({ ...current, status: "loading", message: "" }));
+    try {
+      const rows = await invokeTauriCommand("scale_list_ports");
+      setPorts({ status: "ready", rows: Array.isArray(rows) ? rows : [], message: Array.isArray(rows) ? "" : "The port list could not be read." });
+      return Array.isArray(rows) ? rows : [];
+    } catch (error) {
+      setPorts({ status: "failed", rows: [], message: `The computer's ports could not be listed: ${scaleErrorText(error, "no answer")}` });
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    if (desktop) loadPorts();
+  }, [desktop]);
+
+  const remember = (name) => {
+    setPort(name);
+    if (!saveScalePort(scaleStorage(), name)) {
+      setWork({ busy: false, tone: "warning", message: `Connected to ${name}, but this computer could not remember it. Pick it again after a restart.` });
+      return false;
+    }
+    return true;
+  };
+
+  const connect = async () => {
+    if (!port) {
+      setWork({ busy: false, tone: "error", message: "Choose the scale's port first, or press Find scale." });
+      return;
+    }
+    setWork({ busy: true, tone: "", message: "" });
+    try {
+      await invokeTauriCommand("scale_connect", { portName: port });
+      if (remember(port)) setWork({ busy: false, tone: "success", message: `Connecting to ${port}. The live weight shows above once the scale answers.` });
+    } catch (error) {
+      setWork({ busy: false, tone: "error", message: scaleErrorText(error, `${port} could not be opened.`) });
+    }
+  };
+
+  const disconnect = async () => {
+    setWork({ busy: true, tone: "", message: "" });
+    try {
+      await invokeTauriCommand("scale_disconnect");
+      saveScalePort(scaleStorage(), "");
+      setPort("");
+      setWork({ busy: false, tone: "success", message: "Scale disconnected. POS falls back to typed quantities." });
+    } catch (error) {
+      setWork({ busy: false, tone: "error", message: scaleErrorText(error, "The scale could not be disconnected.") });
+    }
+  };
+
+  const find = async () => {
+    setWork({ busy: true, tone: "", message: "Looking for the scale…" });
+    const rows = await loadPorts();
+    if (rows === null) {
+      setWork({ busy: false, tone: "error", message: "The computer's ports could not be listed, so the scale could not be looked for." });
+      return;
+    }
+    const found = await findScalePort({
+      ports: rows,
+      connect: (name) => invokeTauriCommand("scale_connect", { portName: name }),
+      readStatus: () => invokeTauriCommand("scale_status"),
+      disconnect: () => invokeTauriCommand("scale_disconnect"),
+      wait: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+      onTry: (name) => setWork({ busy: true, tone: "", message: `Trying ${name}…` }),
+    });
+    if (found.port) {
+      if (remember(found.port)) setWork({ busy: false, tone: "success", message: `Scale found on ${found.port}. This computer will connect to it by itself from now on.` });
+    } else {
+      setWork({ busy: false, tone: "error", message: found.message });
+    }
+  };
+
+  if (!desktop) {
+    return <p className="form-note">The scale connects to the FroozERP desktop app on the counter's computer. It cannot be connected from a browser.</p>;
+  }
+
+  return (
+    <div className="discount-block">
+      <h3>This computer's scale</h3>
+      <p className={`scale-live ${SCALE_VIEW_TONE[view.state] || "inline-error"}`} role="status">{view.message}</p>
+      <div className="form-grid supplier-form-grid">
+        <Field label="Scale port">
+          <select disabled={work.busy || ports.status === "loading"} value={port} onChange={(event) => setPort(event.target.value)}>
+            <option value="">{ports.status === "loading" ? "Reading ports…" : "Choose a port"}</option>
+            {port && !ports.rows.some((row) => row.port_name === port) && <option value={port}>{port} (not found now)</option>}
+            {ports.rows.map((row) => (
+              <option key={row.port_name} value={row.port_name}>
+                {row.port_name}{row.kind === "bluetooth" ? " · Bluetooth" : row.kind === "usb" ? ` · USB${row.description ? ` (${row.description})` : ""}` : ""}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      {ports.status === "ready" && ports.rows.length === 0 && <p className="form-note">No ports on this computer yet. Pair the scale first (below).</p>}
+      {ports.message && <div className="inline-error" role="alert">{ports.message}</div>}
+      <div className="button-row">
+        <button className="primary-button" disabled={work.busy} type="button" onClick={find}>{work.busy ? "Working…" : "Find scale"}</button>
+        <button className="secondary-button" disabled={work.busy || !port} type="button" onClick={connect}>Connect</button>
+        <button className="secondary-button" disabled={work.busy} type="button" onClick={disconnect}>Disconnect</button>
+        <button className="secondary-button" disabled={work.busy || ports.status === "loading"} type="button" onClick={loadPorts}>Refresh ports</button>
+      </div>
+      {work.message && <p className={work.tone === "error" ? "inline-error" : work.tone === "warning" ? "stock-low" : "form-note"} role={work.tone === "error" ? "alert" : "status"}>{work.message}</p>}
+      <p className="form-note">
+        First time: switch the scale ON, then on this computer open Windows Settings, Bluetooth &amp; devices, Add device, Bluetooth, pick iScale-BT and enter PIN 0111.
+        Then press Find scale. Windows makes two ports for one Bluetooth scale and only one of them talks; Find scale tries each.
+      </p>
+    </div>
+  );
+}
+
 function PosSettingsSection({ canManage, onReload, posSettings, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(posSettings, defaultPosSettings);
   const save = async () => {
@@ -22661,23 +22857,13 @@ function PosSettingsSection({ canManage, onReload, posSettings, user }) {
     }
   };
   return (
-    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="Connect a scale by USB, serial or Bluetooth. Weights can always be typed in by hand.">
+    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="A scale on the counter puts the weight straight into the bill. Weights can always be typed in by hand.">
       <div className="form-grid supplier-form-grid">
-        <label className="check-field"><input checked={draft.enable_weighing_scale === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_weighing_scale", event.target.checked)} /><span>Enable weighing scale mode</span></label>
-        <Field label="Connection Type">
-          <select disabled={!canManage} value={draft.scale_connection_type || "MANUAL_FALLBACK"} onChange={(event) => updateDraft("scale_connection_type", event.target.value)}>
-            <option value="USB">USB</option>
-            <option value="SERIAL">Serial</option>
-            <option value="BLUETOOTH">Bluetooth</option>
-            <option value="MANUAL_FALLBACK">Manual Fallback</option>
-          </select>
-        </Field>
-        <Field label="COM Port"><input disabled={!canManage} placeholder="Example: COM3" value={draft.scale_com_port || ""} onChange={(event) => updateDraft("scale_com_port", event.target.value)} /></Field>
-        <Field label="Baud Rate"><input disabled={!canManage} min="1" type="number" value={draft.scale_baud_rate || 9600} onChange={(event) => updateDraft("scale_baud_rate", event.target.value)} /></Field>
-        <label className="check-field"><input checked={draft.scale_auto_read === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("scale_auto_read", event.target.checked)} /><span>Auto-read weight when hardware support is available</span></label>
+        <label className="check-field"><input checked={draft.enable_weighing_scale === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_weighing_scale", event.target.checked)} /><span>Use the weighing scale in POS (all counters)</span></label>
       </div>
-      <p className="form-note">Browser-based hardware reading is prepared but not enabled until a supported local bridge or Web Serial workflow is connected. Manual quantity entry remains available.</p>
+      <p className="form-note">In POS, put the fruit on the scale and add the item: its steady weight becomes the quantity (kg items only). F6 reads the weight again into the item being edited.</p>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save POS Settings</button>
+      <ScaleConnectionPanel />
     </ModuleCard>
   );
 }
@@ -26290,6 +26476,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   }, [seedCart]);
 
   const effectiveQuantityMode = posSettings.enable_weighing_scale ? quantityMode : "MANUAL";
+  // The scale's live weight while in scale mode, and the steady weight last put on an item: adding
+  // the next item does not take that same weight again (local/weighingScale.js).
+  const scale = useWeighingScale(effectiveQuantityMode === "SCALE");
+  const [takenScaleReading, setTakenScaleReading] = useState(null);
   const lotSelectionMode = String(saleRateSettings.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase();
   const rawLotBalance = (lot) => Number(lot?.remaining_qty ?? lot?.balance_qty ?? 0);
   const lotBalance = (lot) => lotAvailableQuantity(lot);
@@ -26676,6 +26866,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return;
     }
     const availableStock = lotBalance(lot);
+    // In scale mode a kg item takes the scale's steady weight, once; otherwise one unit as before.
+    const saleUnit = lot.unit || product.unit;
+    const weighed = effectiveQuantityMode === "SCALE" ? scaleQuantityFor(saleUnit, scale, takenScaleReading) : null;
+    const addQuantity = weighed ?? 1;
     // Stock promised to orders is not the counter's to sell. Checked at product level and before
     // the per-lot arithmetic below, which is left exactly as it was — it handles money, and this
     // is not the change to disturb it with.
@@ -26686,7 +26880,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // remainder unsellable: with 0.4 kg free the first add was refused, and there was then no line
       // to type 0.4 into. Produce is sold by weight, so the operator sets the quantity next anyway,
       // and the quantity handler re-checks with the real number.
-      requested: getCartQuantityForProduct(product.id),
+      requested: getCartQuantityForProduct(product.id) + (weighed ?? 0),
       unit: lot.unit || product.unit || "",
     });
     if (counterStock.status !== COUNTER_STOCK.FREE) {
@@ -26703,8 +26897,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const comboKey = comboTag?.combo_line_key || "";
     const cartIdentity = `${buildCartIdentity({ product, lot, unit: lot.unit || product.unit, sellingRate: discounted.sellingRate })}${comboKey ? `|combo:${comboKey}` : ""}`;
     const currentItem = cart.find((item) => item.cart_identity === cartIdentity && String(item.combo_line_key || "") === comboKey);
-    const nextQuantity = Number(currentItem?.quantity || 0) + 1;
-    const nextLotQuantity = getCartQuantityForLot(lot.id) + 1;
+    // Quantities carry 3 decimals; a weight added to a line must not leave 1.8900000000000001.
+    const nextQuantity = Math.round((Number(currentItem?.quantity || 0) + addQuantity) * 1000) / 1000;
+    const nextLotQuantity = getCartQuantityForLot(lot.id) + addQuantity;
     if (availableStock < nextLotQuantity) {
       const moreAvailable = Math.max(availableStock - getCartQuantityForLot(lot.id), 0);
       alert(`Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${lotStableName(lot) || lot.id}.`);
@@ -26729,7 +26924,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         available_qty: availableStock,
         default_selling_rate: defaultRate,
         selling_rate: nextDiscounted.sellingRate,
-        quantity: 1,
+        quantity: nextQuantity,
         discount_amount: nextDiscounted.discountAmount,
         lot_discount_id: lotDiscount?.id || null,
         lot_discount_type: lotDiscount?.discount_type || null,
@@ -26738,6 +26933,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         ...(comboTag || {}),
       }]
     ));
+    if (weighed !== null) {
+      setTakenScaleReading(scale.readingId);
+      setScaleMessage(`${product.product_name}: ${formatKg(weighed)} from the scale.`);
+    } else if (effectiveQuantityMode === "SCALE" && isWeighedUnit(saleUnit)) {
+      setScaleMessage(`${product.product_name}: no steady weight on the scale, so the quantity is 1. Press F6 once the weight holds, or type it.`);
+    }
     setSearch("");
     setHighlightedIndex(0);
     closeLotSelector();
@@ -26909,14 +27110,34 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     setBarcode("");
   };
 
+  // F6 / Read Weight: the scale's steady weight into the item whose quantity is being edited, or
+  // else the last kg item. It reads whatever is steady now, even a weight already used.
   const readScaleWeight = () => {
-    setScaleMessage("Scale not connected - enter quantity manually.");
-    const lastItem = cart.at(-1);
-    if (lastItem) {
-      const input = quantityRefs.current[lastItem.line_id];
+    const focusedLineId = Object.keys(quantityRefs.current).find((lineId) => quantityRefs.current[lineId] && quantityRefs.current[lineId] === document.activeElement);
+    const target = cart.find((item) => item.line_id === focusedLineId) || [...cart].reverse().find((item) => isWeighedUnit(item.unit));
+    if (!target) {
+      setScaleMessage(scale.state === SCALE_STATES.LIVE ? `${scale.message}. Add a kg item to put it on.` : scale.message);
+      return;
+    }
+    const input = quantityRefs.current[target.line_id];
+    const kg = scaleQuantityFor(target.unit, scale);
+    if (kg === null) {
+      setScaleMessage(!isWeighedUnit(target.unit)
+        ? `${target.product_name} is not sold by the kg, so it takes no weight. Type its quantity.`
+        : scale.state !== SCALE_STATES.LIVE
+          ? scale.message
+          : !(scale.kg > 0)
+            ? "Nothing on the scale."
+            : "The weight is still settling. Press F6 again when it holds.");
       input?.focus();
       input?.select();
+      return;
     }
+    updateCartItem(target.line_id, "quantity", kg);
+    setTakenScaleReading(scale.readingId);
+    setScaleMessage(`${target.product_name}: ${formatKg(kg)} from the scale.`);
+    input?.focus();
+    input?.select();
   };
 
   const selectCustomer = (customerId) => {
@@ -27631,6 +27852,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       event.preventDefault();
       checkout(true);
     }
+    if (event.key === "F6" && effectiveQuantityMode === "SCALE") {
+      event.preventDefault();
+      readScaleWeight();
+    }
   };
 
   const printLastInvoice = () => {
@@ -27740,7 +27965,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <h2>Add items</h2>
               <p>Search for a product or scan its barcode.</p>
             </div>
-            <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout</span>
+            <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout{effectiveQuantityMode === "SCALE" ? " - F6 Weight" : ""}</span>
           </div>
           <div className="pos-mode-panel">
             <Field label="Quantity Mode">
@@ -27749,10 +27974,15 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 <option disabled={!posSettings.enable_weighing_scale} value="SCALE">Weighing Scale Mode</option>
               </select>
             </Field>
-            <button className="secondary-button" disabled={effectiveQuantityMode !== "SCALE"} onClick={readScaleWeight}>Read Weight</button>
-            <span className={effectiveQuantityMode === "SCALE" ? "stock-low" : "stock-ok"}>
-              {effectiveQuantityMode === "SCALE" ? (scaleMessage || "Scale mode ready - manual fallback active") : "Manual quantity entry"}
-            </span>
+            <button className="secondary-button" disabled={effectiveQuantityMode !== "SCALE"} onClick={readScaleWeight}>Read Weight (F6)</button>
+            {effectiveQuantityMode === "SCALE" ? (
+              <span className="scale-readout">
+                <span className={SCALE_VIEW_TONE[scale.state] || "inline-error"} role="status">{scale.message}</span>
+                {scaleMessage && <small className="cell-note">{scaleMessage}</small>}
+              </span>
+            ) : (
+              <span className="stock-ok">Manual quantity entry</span>
+            )}
           </div>
           <div className="pos-inputs">
             <label className="icon-input">
