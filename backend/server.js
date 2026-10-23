@@ -11255,6 +11255,10 @@ app.post("/api/v3/packing/designs", packingWriteRoute(froozPack.saveDesign));
 app.put("/api/v3/packing/designs/:id", packingWriteRoute(froozPack.saveDesign));
 app.post("/api/v3/packing/sizes", packingWriteRoute(froozPack.saveSize));
 app.put("/api/v3/packing/sizes/:id", packingWriteRoute(froozPack.saveSize));
+// Delete only what nothing has used; anything bought, billed, counted or in a combo is refused (409).
+app.delete("/api/v3/packing/types/:id", packingWriteRoute(froozPack.deleteType));
+app.delete("/api/v3/packing/designs/:id", packingWriteRoute(froozPack.deleteDesign));
+app.delete("/api/v3/packing/sizes/:id", packingWriteRoute(froozPack.deleteSize));
 // New packing in one go (Type > Design > the sizes ticked), and the four usual types in one press.
 app.post("/api/v3/packing/setup", packingWriteRoute(froozPack.savePackingSetup));
 app.post("/api/v3/packing/quick-start", packingWriteRoute(froozPack.quickStartPacking));

@@ -176,7 +176,7 @@ import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMast
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
 import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
-import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingTypesWithoutSize, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
+import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingTypesWithoutSize, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -15620,6 +15620,8 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const [purchase, setPurchase] = useState(null);
   // { row, draft: { quantity, reason }, error, saving }
   const [adjust, setAdjust] = useState(null);
+  // Delete, asked once before it happens: { kind, ref, label, error, saving }
+  const [removal, setRemoval] = useState(null);
   // New packing in one go: { draft, error, saving, forLine }. `forLine` is the purchase line that
   // asked for it ("+ New packing" in its picker); the size made goes onto that line.
   const [setup, setSetup] = useState(null);
@@ -15684,7 +15686,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const disabled = !canManage || Boolean(unavailableReason) || failed;
   // An open purchase does not block building the list: a size can be added mid-purchase and is
   // pickable as soon as the list reloads. Only one edit, New-packing or count form at a time.
-  const busy = Boolean(nodeForm || adjust || setup);
+  const busy = Boolean(nodeForm || adjust || setup || removal);
   const view = packingManageView(catalogue, drill);
   const rows = view.rows;
   const active = Math.min(highlight, Math.max(rows.length - 1, 0));
@@ -15721,7 +15723,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
         unit_cost: node && Number.isFinite(node.unit_cost) && node.unit_cost > 0 ? String(node.unit_cost) : "",
       }
       : { ...common, name: node?.name || "" };
-    setNodeForm({ kind, ref: node ? packNodeRef(node) : "", draft, error: "", saving: false });
+    setNodeForm({ kind, ref: node ? packNodeRef(node) : "", draft, inUse: node?.in_use === true, error: "", saving: false });
   };
 
   const updateNode = (field, value) => setNodeForm((current) => (current
@@ -15752,6 +15754,27 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     const wasNew = !nodeForm.ref;
     setNodeForm(null);
     await afterWrite(`${wasNew ? "Added" : "Saved"} ${label}. Counters get it at their next sync.`);
+  };
+
+  // --- Delete: only what nothing has used; the server checks again --------------------------
+
+  const startRemoval = (kind, node, label) => {
+    setNotice(null);
+    setRemoval({ kind, ref: packNodeRef(node), label, error: "", saving: false });
+  };
+
+  const confirmRemoval = async () => {
+    if (!removal || removal.saving || disabled) return;
+    setRemoval((current) => (current ? { ...current, saving: true, error: "" } : current));
+    try {
+      await axios.delete(`${API_URL}/api/v3/packing/${removal.kind}s/${encodeURIComponent(removal.ref)}`);
+    } catch (error) {
+      setRemoval((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "It could not be deleted. Nothing was changed.") } : current));
+      return;
+    }
+    const { label } = removal;
+    setRemoval(null);
+    await afterWrite(`Deleted ${label}. Counters drop it at their next sync.`);
   };
 
   // --- New packing in one go, and Quick start -----------------------------------------------
@@ -16033,11 +16056,28 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                     <input checked={nodeForm.draft.active !== false} disabled={disabled} type="checkbox" onChange={(event) => updateNode("active", event.target.checked)} />
                     <span>In use (offered when picking packing)</span>
                   </label>
+                  {nodeForm.inUse && <p className="form-note">{PACKING_IN_USE_NOTE}</p>}
                   {nodeForm.error && <div className="inline-error" role="alert">{nodeForm.error}</div>}
                   <div className="button-row">
                     <button className="primary-button" disabled={disabled || nodeForm.saving} type="button" onClick={saveNode}>{nodeForm.saving ? "Saving…" : "Save"}</button>
                     <button className="secondary-button" disabled={nodeForm.saving} type="button" onClick={() => setNodeForm(null)}>Cancel</button>
                   </div>
+                </div>
+              </div>
+            )}
+
+            {removal && !failed && (
+              <div className="discount-block combo-form" role="alertdialog" aria-label={`Delete ${removal.label}`}>
+                <h3>Delete {removal.label}?</h3>
+                <p className="form-note">
+                  {removal.kind === "size"
+                    ? "Nothing has used it yet, so nothing else changes."
+                    : "Everything under it goes too. Nothing has used any of it yet, so nothing else changes."}
+                </p>
+                {removal.error && <div className="inline-error" role="alert">{removal.error}</div>}
+                <div className="button-row">
+                  <button className="danger-text-button" disabled={disabled || removal.saving} type="button" onClick={confirmRemoval}>{removal.saving ? "Deleting…" : "Delete"}</button>
+                  <button className="secondary-button" disabled={removal.saving} type="button" onClick={() => setRemoval(null)}>Cancel</button>
                 </div>
               </div>
             )}
@@ -16197,6 +16237,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                           <span className="packing-row-actions">
                             <button className="secondary-button compact-button" disabled={busy || disabled} type="button" onClick={() => startNode(levelKind, row.node)}>Edit</button>
                             {row.leaf && <button className="secondary-button compact-button" disabled={busy || disabled} type="button" onClick={() => startAdjust(row)}>Correct count</button>}
+                            {packingDeletable(row.node) && <button className="danger-text-button compact-button" disabled={busy || disabled} type="button" onClick={() => startRemoval(levelKind, row.node, row.label)}>Delete</button>}
                           </span>
                         )}
                       </li>

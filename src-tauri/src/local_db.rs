@@ -3680,13 +3680,27 @@ fn upsert_packing_type_with_tx(
     deleted: bool,
 ) -> Result<(), String> {
     if deleted {
+        // The cloud deletes only packing nothing ever used (bought, billed, counted or in a combo),
+        // so the whole tree goes. A bill or combo row that names a size keeps its own copy of the
+        // names; none of them has a key to these tables.
         tx.execute(
-            "UPDATE local_packing_types
-             SET active = 0, updated_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             WHERE id = ?1",
-            params![type_id, updated_at],
+            "DELETE FROM local_packing_stock
+             WHERE size_id IN (SELECT s.id FROM local_packing_sizes s
+                               JOIN local_packing_designs d ON d.id = s.design_id
+                               WHERE d.type_id = ?1)",
+            [type_id],
         )
         .map_err(to_error)?;
+        tx.execute(
+            "DELETE FROM local_packing_sizes
+             WHERE design_id IN (SELECT id FROM local_packing_designs WHERE type_id = ?1)",
+            [type_id],
+        )
+        .map_err(to_error)?;
+        tx.execute("DELETE FROM local_packing_designs WHERE type_id = ?1", [type_id])
+            .map_err(to_error)?;
+        tx.execute("DELETE FROM local_packing_types WHERE id = ?1", [type_id])
+            .map_err(to_error)?;
         return Ok(());
     }
     let name = optional_text(payload, "name").ok_or_else(|| format!("Packing type {type_id} has no name"))?;
@@ -17818,6 +17832,41 @@ mod tests {
         let packing = packing_snapshot(&path, "device-pack");
         assert_eq!(packing["types"][0]["name"], "Gift Boxes", "a refused tree writes nothing");
         assert_eq!(packing["types"][0]["designs"][0]["id"], "packing-design-1");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A deleted packing type (the cloud deletes only unused packing) leaves no type, design, size
+    /// or count behind, and other types stay.
+    #[test]
+    fn pulled_packing_type_delete_removes_the_whole_tree() {
+        let path = sync_fix_path("packing-delete");
+        initialize_at(&path).expect("initialize");
+        pull(&path, &pulled_packing("packing_type", "packing-type-1", 1, gift_box_tree()));
+        let mut bottle = gift_box_tree();
+        bottle["global_id"] = serde_json::json!("packing-type-7");
+        bottle["name"] = serde_json::json!("Bottle");
+        bottle["designs"] = serde_json::json!([]);
+        pull(&path, &pulled_packing("packing_type", "packing-type-7", 1, bottle));
+        pull(&path, &packing_stock_change(1, "packing-size-1", serde_json::json!("0.000"), 1));
+
+        let mut gone = pulled_packing(
+            "packing_type",
+            "packing-type-1",
+            2,
+            serde_json::json!({ "global_id": "packing-type-1", "name": "Gift Box", "deleted": true }),
+        );
+        gone.operation_type = "DELETE".to_string();
+        pull(&path, &gone);
+
+        let packing = packing_snapshot(&path, "device-pack");
+        let names: Vec<_> = packing["types"].as_array().unwrap().iter().map(|row| row["name"].clone()).collect();
+        assert_eq!(names, vec![serde_json::json!("Bottle")], "only the deleted type is gone");
+        let conn = Connection::open(&path).unwrap();
+        for table in ["local_packing_designs", "local_packing_sizes", "local_packing_stock"] {
+            let rows: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap();
+            assert_eq!(rows, 0, "{table} keeps nothing of the deleted type");
+        }
+        drop(conn);
         let _ = fs::remove_file(&path);
     }
 

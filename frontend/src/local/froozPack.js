@@ -114,6 +114,10 @@ const nestedList = (value, problems, what) => {
   return value.filter((row) => row && typeof row === "object");
 };
 
+// Only the owner's list (GET /api/v3/packing) says whether something has been used; the counter's
+// snapshot does not. Unknown stays null, and null is never "unused".
+const readInUse = (value) => (value === true ? true : value === false ? false : null);
+
 const normaliseSize = (row, index) => ({
   id: nodeId(row),
   global_id: text(row?.global_id) || nodeId(row),
@@ -127,6 +131,7 @@ const normaliseSize = (row, index) => ({
   qty_on_hand: finiteOrNull(row?.qty_on_hand),
   cloud_qty_on_hand: finiteOrNull(row?.cloud_qty_on_hand),
   pending_usage: finiteOrNull(row?.pending_usage),
+  in_use: readInUse(row?.in_use),
 });
 
 const normaliseDesign = (row, index, problems) => ({
@@ -136,6 +141,7 @@ const normaliseDesign = (row, index, problems) => ({
   name: text(row?.name),
   active: isActive(row?.active),
   sort_order: finiteOrNull(row?.sort_order) ?? index,
+  in_use: readInUse(row?.in_use),
   sizes: nestedList(row?.sizes, problems, `sizes of design "${text(row?.name) || nodeId(row)}"`)
     .map(normaliseSize)
     .sort(bySizeOrder),
@@ -148,10 +154,19 @@ const normaliseType = (row, index, problems) => ({
   name: text(row?.name),
   active: isActive(row?.active),
   sort_order: finiteOrNull(row?.sort_order) ?? index,
+  in_use: readInUse(row?.in_use),
   designs: nestedList(row?.designs, problems, `designs of type "${text(row?.name) || nodeId(row)}"`)
     .map((design, designIndex) => normaliseDesign(design, designIndex, problems))
     .sort(byOrder),
 });
+
+/**
+ * Whether the owner may delete this type, design or size: only when the server said nothing has
+ * used it (bought, billed, counted or put in a combo). The server checks again and refuses (409).
+ */
+export const packingDeletable = (node) => node?.in_use === false;
+
+export const PACKING_IN_USE_NOTE = 'Already used (bought, billed, counted or in a combo), so it cannot be deleted. Untick "In use" to hide it from billing and combos; its old bills and expenses stay as they are.';
 
 export const PACKING_MISSING_MESSAGE = "The packing list has not reached this computer yet. It arrives with the next sync once the Owner or an Admin sets packing up in Frooz Pack.";
 

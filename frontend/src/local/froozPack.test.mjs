@@ -37,6 +37,7 @@ import {
   packingQuickStartOffered,
   packingSetupChoices,
   packingSetupPickRow,
+  packingDeletable,
 } from "./froozPack.js";
 
 // The snapshot's shape: `id` is already the global id.
@@ -847,4 +848,26 @@ test("every picker's size row says the count and the last rate, and says when ei
   const api = readPackingCatalogue(apiPacking());
   const view = packingDrillView(api, { level: "sizes", typeId: "packing-type-1", designId: "packing-design-2" });
   assert.equal(view.rows[0].sublabel, "On hand 0 · last ₹45.00");
+});
+
+test("delete: only what the owner's list says is unused; unknown (the counter's snapshot) is never unused", () => {
+  const read = readPackingCatalogue({
+    types: [
+      { id: 1, global_id: "packing-type-1", name: "Bottle", in_use: false, designs: [
+        { id: 2, global_id: "packing-design-2", name: "Round", in_use: false, sizes: [{ id: 3, global_id: "packing-size-3", size_name: "GRAND", in_use: false }] },
+      ] },
+      { id: 4, global_id: "packing-type-4", name: "Gift Box", in_use: true, designs: [
+        { id: 5, global_id: "packing-design-5", name: "Window", in_use: true, sizes: [{ id: 6, global_id: "packing-size-6", size_name: "ROYAL", in_use: true }] },
+      ] },
+    ],
+  });
+  assert.equal(read.status, "ready");
+  const [bottle, giftBox] = [read.types.find((type) => type.name === "Bottle"), read.types.find((type) => type.name === "Gift Box")];
+  assert.deepEqual([packingDeletable(bottle), packingDeletable(bottle.designs[0]), packingDeletable(bottle.designs[0].sizes[0])], [true, true, true]);
+  assert.deepEqual([packingDeletable(giftBox), packingDeletable(giftBox.designs[0]), packingDeletable(giftBox.designs[0].sizes[0])], [false, false, false]);
+
+  const snapshot = readPackingCatalogue({ status: "ready", types: [{ id: "packing-type-1", name: "Bottle", designs: [] }] });
+  assert.equal(snapshot.types[0].in_use, null);
+  assert.equal(packingDeletable(snapshot.types[0]), false, "no answer about use is not 'unused'");
+  for (const odd of [undefined, null, {}, { in_use: "false" }, { in_use: 0 }]) assert.equal(packingDeletable(odd), false);
 });

@@ -486,6 +486,7 @@ test("routes: a Cashier reads the tree but writes nothing; no session reads noth
       ["POST", "/api/v3/packing/types"], ["PUT", "/api/v3/packing/types/1"], ["POST", "/api/v3/packing/designs"],
       ["PUT", "/api/v3/packing/designs/1"], ["POST", "/api/v3/packing/sizes"], ["PUT", "/api/v3/packing/sizes/1"],
       ["POST", "/api/v3/packing/purchases"], ["POST", "/api/v3/packing/adjustments"],
+      ["DELETE", "/api/v3/packing/types/1"], ["DELETE", "/api/v3/packing/designs/1"], ["DELETE", "/api/v3/packing/sizes/1"],
     ]) {
       const response = await call(method, url, { name: "X" }, headersFor({ role: "Cashier" }));
       assert.equal(response.status, 403, `${method} ${url}`);
@@ -499,6 +500,87 @@ test("routes: a Cashier reads the tree but writes nothing; no session reads noth
   const anonymous = { "content-type": "application/json" };
   assert.equal((await probe(app, "GET", "/api/v3/packing", anonymous)).status, 401);
   assert.equal((await probe(app, "POST", "/api/v3/packing/purchases", anonymous, {})).status, 401);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Delete: only packing nothing has touched
+// ---------------------------------------------------------------------------------------------
+
+test("routes: unused packing can be deleted; the tree marks what is in use; devices hear it", async () => {
+  await withPack(async ({ db }) => {
+    const { type, design, grand, petite } = await buildTree();
+    const fresh = (await call("GET", "/api/v3/packing")).body.types[0];
+    assert.deepEqual([fresh.in_use, fresh.designs[0].in_use, fresh.designs[0].sizes.map((size) => size.in_use)], [false, false, [false, false]]);
+    // The sync payload never carries in_use: it is the owner's screen's, not the counter's.
+    const lastPayload = (await db.query("SELECT payload FROM sync_change_log WHERE entity_type = 'packing_type' ORDER BY change_id DESC LIMIT 1")).rows[0].payload;
+    assert.equal("in_use" in lastPayload, false);
+
+    // A size: gone, and the type republished without it to both branches.
+    await db.query("DELETE FROM sync_change_log");
+    const goneSize = await call("DELETE", `/api/v3/packing/sizes/${petite.global_id}`);
+    assert.equal(goneSize.status, 200, JSON.stringify(goneSize.body));
+    assert.deepEqual(goneSize.body.type.designs[0].sizes.map((size) => size.id), [grand.id]);
+    assert.equal(await count(db, `SELECT COUNT(*) AS n FROM packing_sizes WHERE id = ${petite.id}`), 0);
+    const republished = (await db.query("SELECT branch_id, operation_type, payload FROM sync_change_log WHERE entity_type = 'packing_type' ORDER BY change_id")).rows;
+    assert.deepEqual(republished.map((row) => [row.branch_id, row.operation_type]), [[1, "UPSERT"], [2, "UPSERT"]]);
+    assert.deepEqual(republished[0].payload.designs[0].sizes.map((size) => size.global_id), [grand.global_id]);
+
+    // A whole type: its design and sizes go with it; devices get one DELETE change per branch.
+    await db.query("DELETE FROM sync_change_log");
+    const goneType = await call("DELETE", `/api/v3/packing/types/${type.id}`);
+    assert.equal(goneType.status, 200, JSON.stringify(goneType.body));
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_types"), 0);
+    assert.equal(await count(db, `SELECT COUNT(*) AS n FROM packing_designs WHERE id = ${design.id}`), 0);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_sizes"), 0);
+    const deletes = (await db.query("SELECT branch_id, entity_type, entity_id, operation_type, payload FROM sync_change_log ORDER BY change_id")).rows;
+    assert.deepEqual(deletes.map((row) => [row.branch_id, row.entity_type, row.entity_id, row.operation_type]), [
+      [1, "packing_type", type.global_id, "DELETE"],
+      [2, "packing_type", type.global_id, "DELETE"],
+    ]);
+    assert.equal(deletes[0].payload.deleted, true);
+    assert.equal((await call("DELETE", `/api/v3/packing/types/${type.id}`)).status, 404, "a second delete finds nothing");
+  });
+});
+
+test("routes: packing that was bought, counted or put in a combo cannot be deleted, and nothing is written", async () => {
+  await withPack(async ({ db, statements }) => {
+    const { type, design, grand, petite } = await buildTree();
+    const bought = await call("POST", "/api/v3/packing/purchases", {
+      payment_mode: "CASH", purchase_date: "2026-10-20", lines: [{ size_id: grand.id, quantity: 5, rate: 10 }],
+    });
+    assert.equal(bought.status, 201, JSON.stringify(bought.body));
+    const counted = await call("POST", "/api/v3/packing/adjustments", { size_id: petite.id, quantity: 2, reason: "Found in store" });
+    assert.equal(counted.status, 201, JSON.stringify(counted.body));
+
+    const tree = (await call("GET", "/api/v3/packing")).body.types[0];
+    assert.deepEqual([tree.in_use, tree.designs[0].in_use, tree.designs[0].sizes.map((size) => size.in_use)], [true, true, [true, true]]);
+
+    const before = statements.length;
+    const refusals = [
+      [`/api/v3/packing/sizes/${grand.global_id}`, "it has been bought"],
+      [`/api/v3/packing/sizes/${petite.id}`, "its count has been changed"],
+      [`/api/v3/packing/designs/${design.global_id}`, "it has been bought"],
+      [`/api/v3/packing/types/${type.global_id}`, "it has been bought"],
+    ];
+    for (const [url, reason] of refusals) {
+      const response = await call("DELETE", url);
+      assert.equal(response.status, 409, `${url} ${JSON.stringify(response.body)}`);
+      assert.equal(response.body.code, CODES.IN_USE);
+      assert.match(response.body.message, new RegExp(reason));
+      assert.match(response.body.message, /Untick "In use"/);
+    }
+    assert.deepEqual(writes(statements.slice(before)), [], "a refused delete writes nothing");
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_sizes"), 2);
+
+    // A size only a combo names is in use too.
+    const lone = await call("POST", "/api/v3/packing/sizes", { design_id: design.id, size_name: "ROYAL" });
+    assert.equal(lone.status, 201, JSON.stringify(lone.body));
+    const combo = (await db.query("INSERT INTO combos (company_id, name, kind, combo_type, price) VALUES (1, 'Gift Hamper', 'GIFTING', 'FIXED', 500) RETURNING id")).rows[0];
+    await db.query("INSERT INTO combo_packing (combo_id, size_id, quantity) VALUES ($1, $2, 1)", [combo.id, lone.body.size.id]);
+    const inCombo = await call("DELETE", `/api/v3/packing/sizes/${lone.body.size.id}`);
+    assert.equal(inCombo.status, 409);
+    assert.match(inCombo.body.message, /a combo uses it/);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
