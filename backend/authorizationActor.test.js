@@ -96,8 +96,10 @@ const INDIRECT_ACTORS = [
  * edited and deleted, setup, quick start, purchases, adjustments) goes through one wrapper,
  * `packingWriteRoute`, which checks
  * `requireRateManager(req.auth.userId, client)` once for all of them.
+ *
+ * 59 -> 60 on 23 Oct 2026: deleting a combo nothing was billed with (`DELETE /api/v3/combos/:id`).
  */
-const SESSION_DERIVED_RATE_MANAGER_CALLS = 59;
+const SESSION_DERIVED_RATE_MANAGER_CALLS = 60;
 
 /** Every `requireRateManager(` occurrence in the file, session-derived or listed above. */
 const TOTAL_RATE_MANAGER_CALLS = SESSION_DERIVED_RATE_MANAGER_CALLS + INDIRECT_ACTORS.length;

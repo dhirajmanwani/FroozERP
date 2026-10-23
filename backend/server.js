@@ -10994,9 +10994,27 @@ const loadCombosWithItems = async (client, { companyId, comboIds = null }) => {
   return result.rows.map(presentCombo);
 };
 
+/**
+ * `in_use` on each combo: true when a bill names it, so Frooz Menu offers Delete only for the rest.
+ * When the check itself fails the flag is left off (unknown), which hides Delete rather than offering
+ * one the server would refuse; the list is still served.
+ */
+const markCombosInUse = async (client, combos) => {
+  if (combos.length === 0) return combos;
+  try {
+    const used = await client.query(comboRules.COMBO_USE_SQL, [combos.map((combo) => String(combo.global_id))]);
+    const usedIds = new Set(used.rows.map((row) => String(row.combo_id)));
+    return combos.map((combo) => ({ ...combo, in_use: usedIds.has(String(combo.global_id)) }));
+  } catch (error) {
+    console.error("Checking which combos are on a bill failed", { code: error?.code, message: error?.message });
+    return combos;
+  }
+};
+
 const listCombosHandler = async (req, res) => {
   try {
-    return res.json(await loadCombosWithItems(pool, { companyId: parsePositiveInteger(req.auth.companyId) }));
+    const combos = await loadCombosWithItems(pool, { companyId: parsePositiveInteger(req.auth.companyId) });
+    return res.json(await markCombosInUse(pool, combos));
   } catch (error) {
     console.error("Loading combos failed", { code: error?.code, message: error?.message });
     if (error?.code === "42P01") {
@@ -11173,9 +11191,81 @@ const saveComboHandler = async (req, res) => {
   }
 };
 
+/**
+ * Delete a combo nothing was ever billed with (`:id` is the numeric id or the global id). One on a
+ * bill is refused with COMBO_IN_USE and can be switched off instead, so old bills and reports keep
+ * a combo they can name. Devices hear a `combo` DELETE and drop it from POS.
+ */
+const deleteComboHandler = async (req, res) => {
+  const client = await pool.connect();
+  let began = false;
+  try {
+    const manager = await requireRateManager(req.auth.userId, client);
+    if (!manager) return comboRefusal(res, 403, comboRules.CODES.PERMISSION_REQUIRED, "Only the Owner or an Admin can manage combos and offers.");
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    const rawComboRef = cleanText(String(req.params.id || ""));
+    if (!rawComboRef) return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
+
+    await client.query("BEGIN");
+    began = true;
+    const existing = await client.query(
+      `SELECT id, COALESCE(global_id, 'combo-' || id::TEXT) AS global_id, company_id, name,
+              COALESCE(entity_version, 1) + 1 AS entity_version
+       FROM combos
+       WHERE (($1::INTEGER IS NOT NULL AND id = $1) OR global_id = $2)
+         AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
+       FOR UPDATE`,
+      [/^\d+$/.test(rawComboRef) ? parsePositiveInteger(rawComboRef) : null, rawComboRef, companyId]
+    );
+    const combo = existing.rows[0];
+    if (!combo) {
+      await client.query("ROLLBACK");
+      began = false;
+      return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
+    }
+    const used = await client.query(comboRules.COMBO_USE_SQL, [[String(combo.global_id)]]);
+    if (used.rows.length > 0) {
+      await client.query("ROLLBACK");
+      began = false;
+      return comboRefusal(res, 409, comboRules.CODES.IN_USE, `${combo.name} is on a bill, so it cannot be deleted. Untick "On sale in POS" to hide it instead.`);
+    }
+    await client.query("DELETE FROM combo_packing WHERE combo_id = $1", [combo.id]);
+    await client.query("DELETE FROM combo_items WHERE combo_id = $1", [combo.id]);
+    await client.query("DELETE FROM combos WHERE id = $1", [combo.id]);
+    const payload = {
+      global_id: combo.global_id,
+      company_id: combo.company_id ?? null,
+      name: combo.name,
+      entity_version: Number(combo.entity_version),
+      deleted: true,
+    };
+    await logMasterDataSyncChange(client, {
+      branchId: await companyAnchorBranchId(client, companyId, req.auth.branchId),
+      entityType: "combo",
+      entityId: payload.global_id,
+      operationType: "DELETE",
+      version: payload.entity_version,
+      payload,
+    });
+    await client.query("COMMIT");
+    began = false;
+    return res.json({ success: true, deleted: { id: Number(combo.id), global_id: payload.global_id } });
+  } catch (error) {
+    if (began) await client.query("ROLLBACK").catch(() => null);
+    console.error("Deleting a combo failed", { code: error?.code, message: error?.message });
+    if (error?.code === "42P01") {
+      return comboRefusal(res, 500, "COMBO_STORAGE_MISSING", "Combos are not set up on this server yet. Ask the administrator to update the database.");
+    }
+    return comboRefusal(res, 500, "COMBO_DELETE_FAILED", "The combo could not be deleted. Nothing was changed.");
+  } finally {
+    client.release();
+  }
+};
+
 app.get("/api/v3/combos", listCombosHandler);
 app.post("/api/v3/combos", saveComboHandler);
 app.put("/api/v3/combos/:id", saveComboHandler);
+app.delete("/api/v3/combos/:id", deleteComboHandler);
 
 // ---------------------------------------------------------------------------------------------
 // Frooz Pack: packing material (backend/froozPack.js holds the rules and the database work).

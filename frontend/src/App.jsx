@@ -175,7 +175,7 @@ import { findDuplicateProductName, isSameProduct, isServerProductId, productGlob
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
-import { COMBO_EDIT_REFUSAL, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
+import { COMBO_EDIT_REFUSAL, COMBO_IN_USE_NOTE, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboDeletable, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
 import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingTypesWithoutSize, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -16404,6 +16404,8 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [notice, setNotice] = useState(null);
+  // The combo being deleted: { ref, name, saving, error }. Offered only for one no bill names.
+  const [removal, setRemoval] = useState(null);
   const roundingRule = saleRateSettings?.rounding_rule || "NEAREST_RUPEE";
   const targetMargin = parseTargetMargin(desiredMargin, saleRateSettings?.desired_margin_percent);
 
@@ -16591,6 +16593,30 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
       : { tone: "warning", text: `${said} The list could not be refreshed, so it may not show it yet.` });
   };
 
+  const startRemoval = (combo) => {
+    setNotice(null);
+    setRemoval({ ref: combo.global_id || combo.id, name: combo.name || "this combo", saving: false, error: "" });
+  };
+
+  const confirmRemoval = async () => {
+    if (!removal || removal.saving || disabled) return;
+    setRemoval((current) => (current ? { ...current, saving: true, error: "" } : current));
+    try {
+      await axios.delete(`${API_URL}/api/v3/combos/${encodeURIComponent(String(removal.ref))}`);
+    } catch (error) {
+      setRemoval((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "It could not be deleted. Nothing was changed.") } : current));
+      return;
+    }
+    const { name } = removal;
+    setRemoval(null);
+    const reloaded = await loadCombos();
+    onSaved?.();
+    const said = `Deleted ${name}. Counters drop it at their next sync.`;
+    setNotice(reloaded
+      ? { tone: "success", text: said }
+      : { tone: "warning", text: `${said} The list could not be refreshed, so it may still show it.` });
+  };
+
   const pricingText = (combo) => (combo.combo_type === "FIXED"
     ? (combo.price === null ? MISSING_VALUE : currency.format(combo.price))
     : `${describeCustomPricing({ marginPercent: combo.margin_percent, extraCharge: combo.extra_charge }, (value) => currency.format(value))}, rounded`);
@@ -16605,7 +16631,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
         eyebrow="Pricing"
         title="Frooz Menu"
         subtitle="Juices, The Cutting, gift hampers and combo offers, made from your fruits and sold at one price. Each shows on its own POS tab: Frooz Bar, Frooz Moments or Combos & Offers."
-        actions={canManage && !unavailableReason && !failed && !draft
+        actions={canManage && !unavailableReason && !failed && !draft && !removal
           ? <button className="primary-button" disabled={firstLoad} type="button" onClick={startNew}><Icon name="add" size={16} />Add combo</button>
           : null}
       >
@@ -16623,6 +16649,17 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
               <p className="form-note">Only the Owner or an Admin can add or change combos. You can see what is set up.</p>
             )}
             {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+            {removal && !failed && (
+              <div className="discount-block combo-form" role="alertdialog" aria-label={`Delete ${removal.name}`}>
+                <h3>Delete {removal.name}?</h3>
+                <p className="form-note">It has never been on a bill, so nothing else changes. Counters drop it at their next sync.</p>
+                {removal.error && <div className="inline-error" role="alert">{removal.error}</div>}
+                <div className="button-row">
+                  <button className="danger-text-button" disabled={disabled || removal.saving} type="button" onClick={confirmRemoval}>{removal.saving ? "Deleting…" : "Delete"}</button>
+                  <button className="secondary-button" disabled={removal.saving} type="button" onClick={() => setRemoval(null)}>Cancel</button>
+                </div>
+              </div>
+            )}
             {draft && !failed && (
               <div className="discount-block combo-form">
                 <h3>{draft.ref ? `Edit ${draft.name || "combo"}` : "New combo"}</h3>
@@ -16748,6 +16785,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                     <input checked={draft.active !== false} disabled={disabled} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} />
                     <span>On sale in POS</span>
                   </label>
+                  {draft.inUse && <p className="form-note">{COMBO_IN_USE_NOTE}</p>}
                   {attempted && !check.ok && (
                     <div className="inline-error" role="alert">
                       {check.errors.map((error) => <div key={`${error.code}-${error.message}`}>{error.message}</div>)}
@@ -16792,7 +16830,10 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                           <td data-label="Status">{combo.active ? "On sale" : "Switched off"}</td>
                           <td className="discount-actions-cell">
                             {canManage && (
-                              <button className="secondary-button compact-button" disabled={Boolean(draft) || disabled} type="button" onClick={() => startEdit(combo)}>Edit</button>
+                              <button className="secondary-button compact-button" disabled={Boolean(draft) || Boolean(removal) || disabled} type="button" onClick={() => startEdit(combo)}>Edit</button>
+                            )}
+                            {canManage && comboDeletable(combo) && (
+                              <button className="danger-text-button compact-button" disabled={Boolean(draft) || Boolean(removal) || disabled} type="button" onClick={() => startRemoval(combo)}>Delete</button>
                             )}
                           </td>
                         </tr>

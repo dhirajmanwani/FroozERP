@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  COMBO_IN_USE_NOTE,
+  comboDeletable,
   COMBO_EDIT_REFUSAL,
   COMBO_TAB_FOR_KIND,
   allocateComboPrice,
@@ -632,4 +634,24 @@ test("packing cost is part of the suggested price; an unknown packing cost means
   assert.equal(suggestComboPrice({ items, rates, targetMargin: 25, packing: [{ packing_size_id: "packing-size-99", quantity: 1 }], catalogue }).cost, null);
   // Fruit with no cost is still no cost, whatever the packing.
   assert.equal(suggestComboPrice({ items, rates: [], targetMargin: 25, packing }).cost, null);
+});
+
+test("Delete is offered only for a combo the server says no bill names; unknown is not deletable", () => {
+  const listed = readCombos([
+    { id: 1, global_id: "combo-1", name: "The Solo Guy", in_use: false },
+    { id: 2, global_id: "combo-2", name: "Fruit Bowl", in_use: true },
+    { id: 3, global_id: "combo-3", name: "From a snapshot" },
+    { id: 4, global_id: "combo-4", name: "Odd", in_use: "false" },
+  ]).combos;
+  assert.deepEqual(listed.map((combo) => combo.in_use), [false, true, null, null]);
+  assert.deepEqual(listed.map(comboDeletable), [true, false, false, false]);
+  assert.equal(comboDeletable(null), false);
+
+  // The edit form says why there is no Delete, and the flag never reaches the server.
+  const draft = comboDraftFrom(listed[1]);
+  assert.equal(draft.inUse, true);
+  assert.equal(comboDraftFrom(listed[0]).inUse, false);
+  assert.equal("inUse" in buildComboPayload(draft), false);
+  assert.equal("in_use" in buildComboPayload(draft), false);
+  assert.match(COMBO_IN_USE_NOTE, /On sale in POS/);
 });
