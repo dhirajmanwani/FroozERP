@@ -11,6 +11,8 @@ pub mod activation;
 mod local_db;
 mod machine_identity;
 mod mobile_gateway;
+#[cfg(desktop)]
+mod weighing_scale;
 
 use local_db::{
     LocalDbStatus, LocalPosSaleResult, LocalPurchaseIntentResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation,
@@ -1965,6 +1967,51 @@ fn unique_preview_pdf_path(preview_dir: &Path, file_name: &str) -> PathBuf {
     preview_dir.join(format!("{}-{}.pdf", stem, timestamp_ms()))
 }
 
+// The counter's weighing scale (src/weighing_scale.rs). Desktop only: the phone has no COM ports.
+#[cfg(desktop)]
+type ScalePorts = Vec<weighing_scale::ScalePort>;
+#[cfg(mobile)]
+type ScalePorts = Vec<serde_json::Value>;
+#[cfg(desktop)]
+type ScaleState = weighing_scale::ScaleStatus;
+#[cfg(mobile)]
+type ScaleState = serde_json::Value;
+
+#[tauri::command]
+fn scale_list_ports() -> Result<ScalePorts, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("The weighing scale");
+    #[cfg(desktop)]
+    return weighing_scale::list_ports();
+}
+
+#[tauri::command]
+fn scale_connect(port_name: String) -> Result<ScaleState, String> {
+    #[cfg(mobile)]
+    {
+        let _ = port_name;
+        return not_in_phone_app("The weighing scale");
+    }
+    #[cfg(desktop)]
+    return weighing_scale::connect(port_name);
+}
+
+#[tauri::command]
+fn scale_disconnect() -> Result<ScaleState, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("The weighing scale");
+    #[cfg(desktop)]
+    return Ok(weighing_scale::disconnect());
+}
+
+#[tauri::command]
+fn scale_status() -> Result<ScaleState, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("The weighing scale");
+    #[cfg(desktop)]
+    return Ok(weighing_scale::status());
+}
+
 #[tauri::command]
 fn open_pdf_in_system_viewer(file_name: String, bytes: Vec<u8>) -> Result<String, String> {
     #[cfg(mobile)]
@@ -3289,7 +3336,11 @@ pub fn run() {
             purchase_list_local,
             runtime_profile,
             mobile_gateway_request,
-            mobile_gateway_cloud_decision
+            mobile_gateway_cloud_decision,
+            scale_list_ports,
+            scale_connect,
+            scale_disconnect,
+            scale_status
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
