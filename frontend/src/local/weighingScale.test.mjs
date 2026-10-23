@@ -11,6 +11,7 @@ import {
   nextSteadiness,
   orderPortsForSearch,
   parseScaleText,
+  plainScaleError,
   readSavedScalePort,
   saveScalePort,
   scaleQuantityFor,
@@ -61,7 +62,7 @@ test("describe: every way the scale can fail is words, never a weight of zero", 
     assert.equal(view.kg, null, `${state} carries no weight`);
     assert.ok(view.message.length > 10, `${state} says why`);
   }
-  assert.match(describeScale({ status: "failed", error: "COM5 could not be opened: Access is denied." }).message, /Access is denied/);
+  assert.match(describeScale({ status: "failed", port_name: "COM5", error: "COM5 could not be opened: Access is denied." }).message, /COM5 is being used by another program/);
 });
 
 test("steadiness: the same reading for long enough is steady, a swinging one never is", () => {
@@ -141,4 +142,24 @@ test("saved port: per computer, and a storage that throws is not a crash", () =>
   const broken = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); } };
   assert.equal(readSavedScalePort(broken), "");
   assert.equal(saveScalePort(broken, "COM5"), false);
+});
+
+test("errors: Windows' words become what to do, and a reader that is retrying says so", () => {
+  assert.match(plainScaleError("COM12 could not be opened: The semaphore timeout period has expired.", "COM12"), /did not answer on COM12.*phone's iScale app/);
+  assert.match(plainScaleError("COM12 could not be opened: Access is denied.", "COM12"), /being used by another program/);
+  assert.match(plainScaleError("COM9 could not be opened: The system cannot find the file specified.", "COM9"), /not on this computer any more.*PIN 0111/);
+  assert.match(plainScaleError("The link to the scale on COM12 dropped: broken pipe", "COM12"), /dropped.*ON and in range/);
+  assert.equal(plainScaleError("something new", "COM3"), "The scale on COM3 is not working: something new");
+  assert.equal(plainScaleError(null, "COM3"), "The scale on COM3 is not working.");
+
+  const retrying = describeScale({ status: "failed", retrying: true, attempts: 4, port_name: "COM12", error: "COM12 could not be opened: The semaphore timeout period has expired." });
+  assert.equal(retrying.state, SCALE_STATES.RETRYING);
+  assert.equal(retrying.kg, null);
+  assert.match(retrying.message, /did not answer on COM12.*Trying again by itself/);
+  const again = describeScale({ status: "connecting", attempts: 5, port_name: "COM12", error: "COM12 could not be opened: The semaphore timeout period has expired." });
+  assert.equal(again.state, SCALE_STATES.RETRYING, "between tries it still says why");
+  assert.equal(describeScale({ status: "connecting", attempts: 1, port_name: "COM12" }).state, SCALE_STATES.CONNECTING);
+  const stopped = describeScale({ status: "failed", retrying: false, port_name: "COM12", error: "COM12 could not be opened: Access is denied." });
+  assert.equal(stopped.state, SCALE_STATES.FAILED);
+  assert.match(stopped.message, /Then press Connect or Find scale/);
 });

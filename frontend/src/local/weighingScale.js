@@ -39,6 +39,7 @@ export const SCALE_STATES = Object.freeze({
   WAITING: "waiting",
   SILENT: "silent",
   FAILED: "failed",
+  RETRYING: "retrying",
   UNREADABLE: "unreadable",
   NEGATIVE: "negative",
   LIVE: "live",
@@ -88,6 +89,28 @@ export const parseScaleText = (text) => {
   return { status: "none" };
 };
 
+/**
+ * What a port error means at the counter, in words the cashier can act on. Windows' own text
+ * ("The semaphore timeout period has expired") stays in the app log, where the reader writes it.
+ */
+export const plainScaleError = (error, port = "the scale's port") => {
+  const raw = typeof error === "string" ? error.trim() : "";
+  const text = raw.toLowerCase();
+  if (/semaphore timeout|os error 121|timed out/.test(text)) {
+    return `The scale did not answer on ${port}. It may be OFF, too far away, or connected to the phone's iScale app (close that app or turn the phone's Bluetooth off).`;
+  }
+  if (/access is denied|os error 5\b|permission denied|busy/.test(text)) {
+    return `${port} is being used by another program (perhaps the iScale app on this computer). Close it and the scale connects by itself.`;
+  }
+  if (/cannot find the file|os error 2\b|no such file|not found|element not found|os error 1168/.test(text)) {
+    return `${port} is not on this computer any more. Pair the scale again in Windows Bluetooth settings (PIN 0111), then press Find scale.`;
+  }
+  if (/dropped/.test(text)) {
+    return `The link to the scale on ${port} dropped. Check it is ON and in range.`;
+  }
+  return raw ? `The scale on ${port} is not working: ${raw}` : `The scale on ${port} is not working.`;
+};
+
 const finite = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
 
 export const formatKg = (kg) => `${Number(kg).toLocaleString("en-IN", { minimumFractionDigits: 3, maximumFractionDigits: 3 })} kg`;
@@ -106,14 +129,21 @@ export const describeScale = (status, steady = null) => {
     case "idle":
       return { state: SCALE_STATES.OFF, kg: null, steady: false, readingId: null, message: "Scale not connected. Connect it in Settings > Weighing Scale." };
     case "connecting":
+      // A retry keeps the last reason, so the counter sees why it is still not connected.
+      if (status.error && Number(status.attempts) > 1) {
+        return { state: SCALE_STATES.RETRYING, kg: null, steady: false, readingId: null, message: `${plainScaleError(status.error, port)} Trying again…` };
+      }
       return { state: SCALE_STATES.CONNECTING, kg: null, steady: false, readingId: null, message: `Connecting to the scale on ${port}…` };
     case "failed":
+      if (status.retrying === true) {
+        return { state: SCALE_STATES.RETRYING, kg: null, steady: false, readingId: null, message: `${plainScaleError(status.error, port)} Trying again by itself every few seconds.` };
+      }
       return {
         state: SCALE_STATES.FAILED,
         kg: null,
         steady: false,
         readingId: null,
-        message: `Scale not working: ${status.error || `${port} stopped`}. Check the scale is ON and paired, then connect again.`,
+        message: `${plainScaleError(status.error, port)} Then press Connect or Find scale.`,
       };
     case "reading":
       break;
@@ -221,6 +251,7 @@ export const findScalePort = async ({ ports, connect, readStatus, disconnect, wa
       } catch {
         break;
       }
+      // A port that failed is retried by the reader forever; for the search it is a miss.
       if (status?.status === "failed") break;
       const reading = status?.status === "reading" ? parseScaleText(status.text) : { status: "none" };
       if (reading.status === "weight") return { port: port.port_name, tried };

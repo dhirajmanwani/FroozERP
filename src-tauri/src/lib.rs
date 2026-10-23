@@ -3186,6 +3186,9 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build());
+    // The scale reader writes what happened to it into the same app log as everything else.
+    #[cfg(desktop)]
+    weighing_scale::set_logger(write_app_log);
     let result = builder
         .setup(|app| {
             remember_resolved_app_data_dir(app.handle());
