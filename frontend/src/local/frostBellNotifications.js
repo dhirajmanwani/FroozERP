@@ -63,8 +63,19 @@ export const FROST_BELL_SOURCE = "FROST";
 export const FROST_BELL_KIND = Object.freeze({
   ALERT: "ALERT",
   REMINDER: "REMINDER",
+  STOCK_REMINDER: "STOCK_REMINDER",
   FROST_UNREADABLE: "FROST_UNREADABLE",
 });
+
+/**
+ * A fruit at zero stock is a reminder, not an error (owner, 23 Oct 2026: "that should be more of a
+ * reminder, qki season k khtm hone k baad kuch kuch fruits nhi aane wale he"). When a season ends
+ * the fruit stops coming and its stock sits at zero for months; a red, clear-proof Error for that
+ * says something is broken when nothing is. So `ZERO_STOCK` alerts ring as an Info row tagged
+ * "Reminder" that can be dismissed. Low stock (some left, under the minimum) is unchanged.
+ */
+export const FROST_STOCK_REMINDER_LABEL = "Reminder";
+export const FROST_STOCK_REMINDER_MESSAGE = "If it is still in season, order more. If its season is over, you can dismiss this.";
 
 /**
  * Whether the two lists were read at all.
@@ -152,6 +163,7 @@ const KIND_ORDER = Object.freeze({
   [FROST_BELL_KIND.FROST_UNREADABLE]: 0,
   [FROST_BELL_KIND.ALERT]: 1,
   [FROST_BELL_KIND.REMINDER]: 2,
+  [FROST_BELL_KIND.STOCK_REMINDER]: 3,
 });
 
 const SEVERITY_ORDER = Object.freeze({
@@ -296,7 +308,7 @@ const isPutAway = (row, nowMs) => {
 
 const severityFor = (value) => FROST_SEVERITY_TO_NOTIFICATION[upper(value)] || UNKNOWN_FROST_SEVERITY;
 
-const buildItem = ({ kind, identity, severity, title, message, timing = "", at, sticky, overdueMs, rowId }) => {
+const buildItem = ({ kind, identity, severity, title, message, timing = "", at, sticky, overdueMs, rowId, label = "" }) => {
   const key = frostBellKey(kind, identity.scope, identity.value);
   return {
     id: key,
@@ -307,6 +319,8 @@ const buildItem = ({ kind, identity, severity, title, message, timing = "", at, 
     source: FROST_BELL_SOURCE,
     at,
     sticky,
+    // The bell's tag in place of the severity word ("Reminder" rather than "Info"); empty for most.
+    label,
     // Carried for the screen and used as sort keys. `createNotification` reads only the fields
     // above and ignores these, so an item can be handed to it unchanged.
     kind,
@@ -327,11 +341,47 @@ const buildItem = ({ kind, identity, severity, title, message, timing = "", at, 
  * unread badge — at which point the badge means nothing and the overdue customer underneath it goes
  * unread too. They remain in the panel's Alerts list, which is where browsing belongs.
  */
+/** The product an alert's `facts` names. `pg` sends jsonb as an object; a cache may hold it as text. */
+const factsProductName = (row) => {
+  let facts = row?.facts;
+  if (typeof facts === "string") {
+    try {
+      facts = JSON.parse(facts);
+    } catch {
+      return "";
+    }
+  }
+  return facts && typeof facts === "object" ? firstText(facts.product_name, facts.productName) : "";
+};
+
+/**
+ * A `ZERO_STOCK` alert as a reminder (see {@link FROST_STOCK_REMINDER_LABEL}). Its own kind, so its
+ * key differs from the Error row an older build raised for the same alert: that row is retracted as
+ * no longer live instead of being merged into this one, which `addNotification` would keep at Error
+ * because severity never downgrades.
+ */
+const stockReminderItem = (row, identity, at) => {
+  const name = factsProductName(row);
+  return buildItem({
+    kind: FROST_BELL_KIND.STOCK_REMINDER,
+    identity,
+    severity: NOTIFICATION_SEVERITY.INFO,
+    title: name ? `${name} is out of stock` : (firstText(row.title, row.message) || "A fruit is out of stock"),
+    message: FROST_STOCK_REMINDER_MESSAGE,
+    at,
+    sticky: false,
+    overdueMs: 0,
+    rowId: row.id,
+    label: FROST_STOCK_REMINDER_LABEL,
+  });
+};
+
 const alertItem = (row, nowMs, at) => {
   if (!row || typeof row !== "object") return null;
   if (isPutAway(row, nowMs)) return null;
   const identity = rowIdentity(row);
   if (!identity) return null;
+  if (upper(row.alert_type ?? row.alertType) === "ZERO_STOCK") return stockReminderItem(row, identity, at);
   const severity = severityFor(row.severity);
   if (severity === NOTIFICATION_SEVERITY.INFO) return null;
 
@@ -518,4 +568,56 @@ export const buildFrostBellNotifications = ({ alerts, reminders, nowMs, failure 
   } catch {
     return unreadable("FROST alerts and reminders could not be read, so the bell is not watching them. Reopen FROST, and restart the app if it stays empty.", new Date(0).toISOString());
   }
+};
+
+/**
+ * Stock reminders the owner dismissed on this computer, remembered across restarts.
+ *
+ * The bell list itself is not kept between launches, so without this a fruit whose season is over
+ * would come back as a fresh unread reminder every morning for months. A dismissal lasts until the
+ * reminder stops being live (stock came back, or FROST resolved it); if the fruit runs out again
+ * later, it rings again. Only stock reminders are remembered: an overdue customer must not be
+ * silenced for good by one click.
+ */
+export const DISMISSED_STOCK_REMINDERS_KEY = "froozerp.frostBell.dismissedStockReminders";
+
+const STOCK_REMINDER_KEY_PREFIX = `frost:${FROST_BELL_KIND.STOCK_REMINDER.toLowerCase()}:`;
+
+export const isStockReminderKey = (key) => typeof key === "string" && key.startsWith(STOCK_REMINDER_KEY_PREFIX);
+
+/** The remembered keys. A storage that is missing, throws or holds rubbish reads as none. */
+export const readDismissedStockReminders = (storage) => {
+  try {
+    const parsed = JSON.parse(storage?.getItem(DISMISSED_STOCK_REMINDERS_KEY) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter(isStockReminderKey) : []);
+  } catch {
+    return new Set();
+  }
+};
+
+/** Saves the set; `false` when storage refused (the dismissal then lasts until the app closes). */
+export const writeDismissedStockReminders = (storage, keys) => {
+  try {
+    const list = [...(keys || [])].filter(isStockReminderKey);
+    if (list.length === 0) storage.removeItem(DISMISSED_STOCK_REMINDERS_KEY);
+    else storage.setItem(DISMISSED_STOCK_REMINDERS_KEY, JSON.stringify(list));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** The set after `entries` were dismissed or cleared from the bell. */
+export const withDismissedStockReminders = (dismissed, entries) => {
+  const next = new Set(dismissed || []);
+  for (const entry of entries || []) {
+    if (isStockReminderKey(entry?.dedupeKey)) next.add(entry.dedupeKey);
+  }
+  return next;
+};
+
+/** Forget dismissals whose reminder is no longer live, so the next run-out rings again. */
+export const pruneDismissedStockReminders = (dismissed, liveKeys) => {
+  const live = new Set(liveKeys || []);
+  return new Set([...(dismissed || [])].filter((key) => live.has(key)));
 };

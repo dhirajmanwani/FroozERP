@@ -70,6 +70,7 @@ export const createNotification = ({
   dedupeKey,
   at,
   sticky = false,
+  label = "",
 } = {}) => {
   const resolvedSeverity = isSeverity(severity) ? severity : NOTIFICATION_SEVERITY.INFO;
   const resolvedTitle = text(title);
@@ -93,6 +94,8 @@ export const createNotification = ({
     // Sticky notifications survive "clear all" — reserved for conditions that are still true, so
     // clearing the list cannot hide a problem that has not gone away.
     sticky: Boolean(sticky),
+    // Shown in the tag instead of the severity word when set, e.g. "Reminder" on an Info row.
+    label: text(label),
   };
 };
 
@@ -137,6 +140,7 @@ export const addNotification = (list, notification) => {
     count: existing.count + 1,
     read: false,
     sticky: existing.sticky || Boolean(notification.sticky),
+    label: text(notification.label) || existing.label || "",
   };
   return [merged, ...entries.filter((entry) => entry.dedupeKey !== notification.dedupeKey)];
 };

@@ -16,8 +16,15 @@ import {
   FROST_BELL_KIND,
   FROST_BELL_SOURCE,
   FROST_BELL_STATUS,
+  FROST_STOCK_REMINDER_LABEL,
   FROST_UNREADABLE_KEY,
+  DISMISSED_STOCK_REMINDERS_KEY,
   buildFrostBellNotifications,
+  isStockReminderKey,
+  pruneDismissedStockReminders,
+  readDismissedStockReminders,
+  withDismissedStockReminders,
+  writeDismissedStockReminders,
 } from "./frostBellNotifications.js";
 import { NOTIFICATION_SEVERITY, addNotification, createNotification } from "./notificationCenter.js";
 
@@ -383,4 +390,82 @@ test("the keys are exactly what the caller must retract when a row stops being r
   const collected = build({ alerts: [], reminders: [reminder()] });
   assert.ok(!collected.keys.includes(result.items.find((item) => item.kind === FROST_BELL_KIND.ALERT).dedupeKey),
     "an alert FROST no longer returns must fall out of the keys so it can be retracted");
+});
+
+const zeroStock = (overrides = {}) => alert({
+  id: 77,
+  dedup_key: "low-stock:1:9",
+  alert_type: "ZERO_STOCK",
+  severity: "CRITICAL",
+  source_module: "Inventory Lots",
+  linked_entity_type: "product",
+  linked_entity_id: "9",
+  title: "Alphonso Mango stock needs attention",
+  message: "Alphonso Mango has 0 KG available against minimum 0.",
+  facts: { id: 9, product_name: "Alphonso Mango", available_stock: 0, minimum_stock: 0 },
+  ...overrides,
+});
+
+test("a fruit at zero stock is a dismissible reminder, not an error (season over is normal)", () => {
+  const result = build({ alerts: [zeroStock()] });
+  assert.equal(result.items.length, 1);
+  const [item] = result.items;
+  assert.equal(item.kind, FROST_BELL_KIND.STOCK_REMINDER);
+  assert.equal(item.severity, NOTIFICATION_SEVERITY.INFO, "never red, whatever severity the server sent");
+  assert.equal(item.label, FROST_STOCK_REMINDER_LABEL);
+  assert.equal(item.sticky, false, "can be dismissed and cleared");
+  assert.equal(item.title, "Alphonso Mango is out of stock");
+  assert.match(item.message, /season/);
+
+  // The bell row carries the tag, and keeps it when a repeat collapses into it.
+  const entry = createNotification(item);
+  assert.equal(entry.label, "Reminder");
+  assert.equal(entry.severity, NOTIFICATION_SEVERITY.INFO);
+  assert.equal(addNotification([entry], createNotification(item))[0].label, "Reminder");
+  assert.equal(createNotification({ title: "Plain" }).label, "", "other rows keep the severity word");
+
+  // jsonb as text, or no facts at all, still gives a readable title.
+  assert.equal(build({ alerts: [zeroStock({ facts: JSON.stringify({ product_name: "Kiwi" }) })] }).items[0].title, "Kiwi is out of stock");
+  assert.equal(build({ alerts: [zeroStock({ facts: "{not json" })] }).items[0].title, "Alphonso Mango stock needs attention");
+
+  // Low stock (some left, under the minimum) is unchanged: still an alert at its own severity.
+  const low = build({ alerts: [zeroStock({ alert_type: "LOW_STOCK", severity: "HIGH" })] }).items[0];
+  assert.equal(low.kind, FROST_BELL_KIND.ALERT);
+  assert.equal(low.severity, NOTIFICATION_SEVERITY.ERROR);
+  assert.notEqual(low.dedupeKey, item.dedupeKey, "the old Error row is retracted rather than merged (severity never downgrades)");
+
+  // An overdue customer still outranks it.
+  assert.deepEqual(kinds(build({ alerts: [zeroStock(), alert({ severity: "ATTENTION" })] })), [FROST_BELL_KIND.ALERT, FROST_BELL_KIND.STOCK_REMINDER]);
+});
+
+test("a dismissed stock reminder stays away after a restart, until the fruit comes back and runs out again", () => {
+  const store = new Map();
+  const storage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem: (key) => store.delete(key) };
+  const item = build({ alerts: [zeroStock()] }).items[0];
+  const customer = build({ alerts: [alert()] }).items[0];
+  assert.equal(isStockReminderKey(item.dedupeKey), true);
+  assert.equal(isStockReminderKey(customer.dedupeKey), false);
+
+  // Dismissing a customer row is not remembered; dismissing the reminder is.
+  const dismissed = withDismissedStockReminders(readDismissedStockReminders(storage), [item, customer]);
+  assert.deepEqual([...dismissed], [item.dedupeKey]);
+  assert.equal(writeDismissedStockReminders(storage, dismissed), true);
+  assert.deepEqual([...readDismissedStockReminders(storage)], [item.dedupeKey], "read back after a restart");
+
+  // Still out of stock: kept. Stock came back (no longer live): forgotten, so the next run-out rings.
+  assert.equal(pruneDismissedStockReminders(dismissed, [item.dedupeKey, customer.dedupeKey]).size, 1);
+  const pruned = pruneDismissedStockReminders(dismissed, [customer.dedupeKey]);
+  assert.equal(pruned.size, 0);
+  writeDismissedStockReminders(storage, pruned);
+  assert.equal(store.has(DISMISSED_STOCK_REMINDERS_KEY), false);
+
+  // Broken or hostile storage is never a crash.
+  store.set(DISMISSED_STOCK_REMINDERS_KEY, "{not json");
+  assert.equal(readDismissedStockReminders(storage).size, 0);
+  store.set(DISMISSED_STOCK_REMINDERS_KEY, JSON.stringify(["frost:alert:dedup:customer-overdue:1:7", item.dedupeKey]));
+  assert.deepEqual([...readDismissedStockReminders(storage)], [item.dedupeKey], "only stock reminders can be silenced");
+  const broken = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); }, removeItem: () => { throw new Error("blocked"); } };
+  assert.equal(readDismissedStockReminders(broken).size, 0);
+  assert.equal(writeDismissedStockReminders(broken, dismissed), false);
+  assert.equal(readDismissedStockReminders(null).size, 0);
 });

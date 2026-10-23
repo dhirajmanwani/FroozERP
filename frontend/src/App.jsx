@@ -213,6 +213,10 @@ import {
 import {
   FROST_BELL_STATUS,
   buildFrostBellNotifications,
+  pruneDismissedStockReminders,
+  readDismissedStockReminders,
+  withDismissedStockReminders,
+  writeDismissedStockReminders,
 } from "./local/frostBellNotifications";
 import {
   DUE_OUTREACH_ACTION,
@@ -5213,6 +5217,19 @@ function App() {
    * warnings because a request timed out -- an error rendering as an empty bell.
    */
   const raisedFrostBellRows = useRef(new Map());
+  // Stock reminders dismissed on this computer (see `readDismissedStockReminders`); read once.
+  const dismissedStockReminders = useRef(null);
+  const stockRemindersDismissed = useCallback(() => {
+    if (dismissedStockReminders.current === null) dismissedStockReminders.current = readDismissedStockReminders(deviceStorage());
+    return dismissedStockReminders.current;
+  }, []);
+  const rememberDismissed = useCallback((entries) => {
+    const before = stockRemindersDismissed();
+    const next = withDismissedStockReminders(before, entries);
+    if (next.size === before.size) return;
+    dismissedStockReminders.current = next;
+    writeDismissedStockReminders(deviceStorage(), next);
+  }, [stockRemindersDismissed]);
 
   useEffect(() => {
     if (!frostBellAllowed) {
@@ -5230,7 +5247,9 @@ function App() {
       failure: frostBell.error,
     });
     const raised = raisedFrostBellRows.current;
+    const dismissed = stockRemindersDismissed();
     for (const item of bell.items) {
+      if (dismissed.has(item.dedupeKey)) continue;
       if (raised.get(item.dedupeKey) === item.message) continue;
       notify(item);
       raised.set(item.dedupeKey, item.message);
@@ -5242,8 +5261,13 @@ function App() {
         clearNotice(key);
         raised.delete(key);
       }
+      const kept = pruneDismissedStockReminders(dismissed, bell.keys);
+      if (kept.size !== dismissed.size) {
+        dismissedStockReminders.current = kept;
+        writeDismissedStockReminders(deviceStorage(), kept);
+      }
     }
-  }, [frostBell, frostBellAllowed, notify, clearNotice]);
+  }, [frostBell, frostBellAllowed, notify, clearNotice, stockRemindersDismissed]);
 
   /**
    * Combos this counter cannot make because a fruit in them is out of stock or off sale (owner,
@@ -10081,8 +10105,14 @@ function App() {
                   <NotificationPanel
                     notifications={notifications}
                     onClose={() => setNotificationsOpen(false)}
-                    onDismiss={(id) => setNotifications((current) => dismissNotification(current, id))}
-                    onClearAll={() => setNotifications((current) => clearNotifications(current))}
+                    onDismiss={(id) => {
+                      rememberDismissed(notifications.filter((entry) => entry.id === id));
+                      setNotifications((current) => dismissNotification(current, id));
+                    }}
+                    onClearAll={() => {
+                      rememberDismissed(notifications.filter((entry) => !entry.sticky));
+                      setNotifications((current) => clearNotifications(current));
+                    }}
                     onMarkAllRead={() => setNotifications((current) => markAllRead(current))}
                   />
                 )}
@@ -13954,7 +13984,7 @@ function NotificationPanel({ notifications, onClose, onDismiss, onClearAll, onMa
             >
               <div className="notification-item-head">
                 <span className={`notification-tag severity-${entry.severity}`}>
-                  {severityLabel[entry.severity] || "Info"}
+                  {entry.label || severityLabel[entry.severity] || "Info"}
                 </span>
                 <strong>{entry.title}</strong>
                 {entry.count > 1 && (
