@@ -30,6 +30,7 @@ const {
   processSyncOperation,
   resolveServerEntityId,
   ensureProductEntrySchemaOnce,
+  salesListWindow,
 } = require("./server");
 
 const SOURCE = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
@@ -232,6 +233,60 @@ test("allowZeroRate covers only a line that carried an explicit 0; a missing, nu
     assert.equal(result.error, undefined, JSON.stringify(result.error));
     assert.equal(result.invoiceItems[0].sellingRate, 0, `${JSON.stringify(zero)} is an explicit 0`);
   }
+});
+
+/**
+ * A bill already handed over is not refused because its product or customer was switched off
+ * afterwards (BE-1). The product and customer reads run against a real Postgres, so the predicate
+ * is judged the way the database would judge it, not by its text.
+ */
+const inactiveMasterClient = async () => {
+  const { PGlite } = require("@electric-sql/pglite");
+  const db = new PGlite();
+  await db.exec(`
+    CREATE TABLE products (id INTEGER PRIMARY KEY, product_name TEXT, selling_rate NUMERIC, unit TEXT, active BOOLEAN, deleted_at TIMESTAMP);
+    CREATE TABLE customers (id INTEGER PRIMARY KEY, customer_name TEXT, active BOOLEAN);
+    INSERT INTO products VALUES (11, 'Mango', 100, 'KG', FALSE, CURRENT_TIMESTAMP);
+    INSERT INTO customers VALUES (5, 'Ravi', FALSE), (6, 'Sita', TRUE);
+  `);
+  const fallback = rateClient();
+  return {
+    db,
+    query: async (text, values) => {
+      const sql = normalise(text);
+      if (/FROM products WHERE id = ANY/.test(sql) || /FROM customers WHERE id = \$1/.test(sql)) return db.query(sql, values);
+      return fallback.query(text, values);
+    },
+  };
+};
+
+test("a desktop bill naming a product and a customer switched off since is recorded, the checkout stays strict", async () => {
+  const client = await inactiveMasterClient();
+  try {
+    const bill = (options) => buildSalePayload(client, {
+      items: [paidLine], branchId: 1, createdBy: 7, customer: { account_id: 5 }, invoiceDiscount: 0,
+      payments: [{ mode: "CASH", amount: 100 }], allowRateOverride: true, invoiceDiscountMode: "AS_BILLED",
+      billDate: "2026-10-01", companyId: 1, ...options,
+    });
+    const strict = await bill({});
+    assert.equal(strict.error?.status, 400, "the checkout still refuses a switched-off customer");
+    const strictProduct = await bill({ customer: { account_id: 6 } });
+    assert.equal(strictProduct.error?.status, 404, "and a switched-off product");
+    const recorded = await bill({ allowInactiveProducts: true });
+    assert.equal(recorded.error, undefined, JSON.stringify(recorded.error));
+    assert.equal(recorded.customerName, "Ravi");
+    assert.equal(recorded.invoiceItems[0].productId, 11);
+    assert.equal(recorded.totalAmount, 100);
+  } finally {
+    await client.db.close();
+  }
+});
+
+test("only the sync path records a switched-off product, and a missing one is held as a conflict, not rejected", () => {
+  assert.equal(SOURCE.split("allowInactiveProducts: true").length - 1, 1, "exactly one caller opts in");
+  const body = bodyOf("const processPosSaleFoundationOperation");
+  assert.match(body, /allowInactiveProducts: true/);
+  assert.match(body, /salePayload\.error\.status === 409 \|\| salePayload\.error\.status === 404\) \{\s*return conflict\(/);
 });
 
 test("a blank rate is not a rate: the default applies, as before", async () => {
@@ -505,4 +560,61 @@ test("no dashboard path turns a failed figure back into 0", () => {
   assert.match(bodyOf("const buildDashboardInsights"), /Supplier outstanding could not be loaded\./);
   assert.match(SOURCE, /customer_receivables: metrics\.customerOutstanding === null \? null :/);
   assert.match(SOURCE, /supplier_payables: metrics\.supplierOutstanding === null \? null :/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// GET /sales: an optional window by date, and the ids a counter files a cached bill under
+// ---------------------------------------------------------------------------------------------
+
+test("GET /sales window: days counts back from the India day, date_from wins, nothing means everything", () => {
+  assert.deepEqual(salesListWindow({}, "2026-10-24"), { dateFrom: null });
+  assert.deepEqual(salesListWindow({ days: "" }, "2026-10-24"), { dateFrom: null });
+  assert.deepEqual(salesListWindow({ days: "30" }, "2026-10-24"), { dateFrom: "2026-09-25" }, "today and the 29 days before it");
+  assert.deepEqual(salesListWindow({ days: "1" }, "2026-03-01"), { dateFrom: "2026-03-01" });
+  assert.deepEqual(salesListWindow({ days: "30", date_from: "2026-01-01" }, "2026-10-24"), { dateFrom: "2026-01-01" });
+  for (const bad of [{ days: "0" }, { days: "-3" }, { days: "3.5" }, { days: "abc" }, { days: "3651" }, { date_from: "24/10/2026" }, { date_from: "2026-13-45" }]) {
+    assert.ok(salesListWindow(bad, "2026-10-24").error, JSON.stringify(bad));
+  }
+});
+
+test("GET /sales with no window runs the same unbounded read; with one it filters by sale date; a bad one reads nothing", async () => {
+  const listRead = ({ sql }) => /FROM sales s LEFT JOIN customers c/.test(sql);
+  const plain = await call("GET", "/sales");
+  assert.equal(plain.response.status, 200, JSON.stringify(plain.response.body));
+  const [unbounded] = plain.statements.filter(listRead);
+  assert.deepEqual(unbounded.values, [3]);
+  assert.doesNotMatch(unbounded.sql, /sale_date >=/);
+  assert.match(unbounded.sql, /s\.global_id, s\.offline_invoice_ref,/, "a counter files a cached bill under its own id");
+
+  const windowed = await call("GET", "/sales?date_from=2026-09-25");
+  assert.equal(windowed.response.status, 200);
+  const [bounded] = windowed.statements.filter(listRead);
+  assert.deepEqual(bounded.values, [3, "2026-09-25"]);
+  assert.match(bounded.sql, /WHERE s\.branch_id = \$1 AND s\.sale_date >= \$2::DATE GROUP BY/);
+
+  const bad = await call("GET", "/sales?days=lots");
+  assert.equal(bad.response.status, 400);
+  assert.equal(bad.response.body.code, "SALES_WINDOW_INVALID");
+  assert.equal(bad.statements.filter(listRead).length, 0);
+});
+
+test("a resend answered from the processed store carries the first answer's bill id and invoice number", async () => {
+  // DT-5: the stored ack came back without `result_payload`, and the counter overwrote the bill's
+  // cloud invoice number with nothing.
+  const client = {
+    query: async (text) => {
+      if (/FROM sync_processed_operations WHERE operation_id = \$1/.test(normalise(text))) {
+        return rows([{
+          operation_id: "op-resend", result_status: "accepted", processed_at: "2026-10-24T05:00:00.000Z",
+          result_payload: { status: "accepted", server_entity_version: 1, result_payload: { sale_id: 9, invoice_no: "INV-9", offline_invoice_ref: "OFF-1" } },
+        }]);
+      }
+      throw new Error(`unexpected query: ${normalise(text)}`);
+    },
+  };
+  const ack = await processSyncOperation(client, {
+    operation_id: "op-resend", entity_type: "pos_sale", entity_id: "invoice-1", operation_type: "UPSERT", payload: {},
+  }, { companyId: 1, branchId: 1, operationalLocationId: null, deviceId: "dev-1", assignmentGeneration: null, user: { id: 7 } });
+  assert.equal(ack.status, "accepted");
+  assert.deepEqual(ack.result_payload, { sale_id: 9, invoice_no: "INV-9", offline_invoice_ref: "OFF-1" });
 });

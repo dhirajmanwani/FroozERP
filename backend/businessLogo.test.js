@@ -35,6 +35,12 @@ test("no logo is absent, null or blank", () => {
   }
 });
 
+test("a save that does not send the logo keeps the stored one; null or blank sent on purpose clears it", () => {
+  assert.deepEqual(parseBusinessLogo(undefined, PNG), { ok: true, value: PNG });
+  assert.deepEqual(parseBusinessLogo(null, PNG), { ok: true, value: null });
+  assert.deepEqual(parseBusinessLogo("", PNG), { ok: true, value: null });
+});
+
 test("an uploaded picture is kept as sent", () => {
   assert.deepEqual(parseBusinessLogo(PNG), { ok: true, value: PNG });
 });

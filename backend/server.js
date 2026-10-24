@@ -4178,6 +4178,51 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS credit_status VARCHAR(30) DEFAULT 'PAID';
     UPDATE sale_items SET default_selling_rate = selling_rate WHERE default_selling_rate IS NULL;
 
+    -- Frooz Pack purchase idempotency key, the combo/packing TIMESTAMPTZ conversion and the
+    -- "in use" indexes. Cloud migration 026 carries exactly these statements; keep the two
+    -- identical. Here, after sale_items has its combo columns and 025's tables exist.
+    ALTER TABLE packing_purchases ADD COLUMN IF NOT EXISTS client_ref VARCHAR(80);
+    CREATE UNIQUE INDEX IF NOT EXISTS packing_purchases_client_ref_key
+      ON packing_purchases (company_id, client_ref)
+      WHERE client_ref IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS sale_items_combo_id_idx
+      ON sale_items (combo_id)
+      WHERE combo_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS sale_packing_usage_size_idx
+      ON sale_packing_usage (size_id);
+    CREATE INDEX IF NOT EXISTS sale_packing_usage_size_global_idx
+      ON sale_packing_usage (size_global_id);
+    CREATE INDEX IF NOT EXISTS sale_packing_usage_combo_idx
+      ON sale_packing_usage (combo_id)
+      WHERE combo_id IS NOT NULL;
+    DO $$
+    DECLARE
+      target RECORD;
+    BEGIN
+      FOR target IN
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND data_type = 'timestamp without time zone'
+          AND (table_name, column_name) IN (
+            ('combos', 'created_at'), ('combos', 'updated_at'),
+            ('packing_types', 'created_at'), ('packing_types', 'updated_at'),
+            ('packing_designs', 'created_at'), ('packing_designs', 'updated_at'),
+            ('packing_sizes', 'created_at'), ('packing_sizes', 'updated_at'),
+            ('packing_stock', 'updated_at'),
+            ('packing_purchases', 'created_at'),
+            ('packing_movements', 'created_at')
+          )
+      LOOP
+        EXECUTE format(
+          'ALTER TABLE %I ALTER COLUMN %I TYPE TIMESTAMPTZ USING %I AT TIME ZONE ''UTC''',
+          target.table_name,
+          target.column_name,
+          target.column_name
+        );
+      END LOOP;
+    END $$;
+
     CREATE TABLE IF NOT EXISTS pos_rate_override_audit (
       id SERIAL PRIMARY KEY,
       sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
@@ -6571,20 +6616,27 @@ const recordComboFindings = async (client, { saleId, invoiceItems, companyId, ac
  * A line's share of the bill discount, for its stored profit. Unchanged for a bill without a
  * combo. With one, the offer's lines take none of it -- the bill-total slab does not apply to a
  * combo that is already priced -- and the rest share it on their net, as before.
+ *
+ * A bill with no loose line to carry it (only combos, and a manual bill discount) shares it over
+ * every line, the pre-combo rule. It used to share it over nothing: `sales.profit` was net of the
+ * discount and the lines' profit was not, so product-wise profit overstated the bill's.
+ * `recalculateSalesForBatch` and `saleReturns.linePaidAmount` follow the same rule.
  */
 const invoiceDiscountShareOf = (salePayload, item) => {
   const invoiceItems = salePayload.invoiceItems || [];
-  if (!invoiceItems.some((entry) => comboRules.isComboPricedLine(entry))) {
+  const shareOverEveryLine = () => {
     const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
     return subtotalAfterItemDiscounts === 0
       ? 0
       : roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / subtotalAfterItemDiscounts));
-  }
-  if (comboRules.isComboPricedLine(item)) return 0;
+  };
+  if (!invoiceItems.some((entry) => comboRules.isComboPricedLine(entry))) return shareOverEveryLine();
   const base = roundCurrency(invoiceItems
     .filter((entry) => !comboRules.isComboPricedLine(entry))
     .reduce((sum, entry) => sum + Number(entry.netAmount || 0), 0));
-  return base > 0 ? roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / base)) : 0;
+  if (base <= 0) return shareOverEveryLine();
+  if (comboRules.isComboPricedLine(item)) return 0;
+  return roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / base));
 };
 
 /** The refusal for an edit of a bill that has combo lines: cancel and re-bill instead. */
@@ -7151,6 +7203,12 @@ const buildSalePayload = async (
     // (a desktop bill already handed over; an Owner/Admin edit), or the edited line was already 0.
     // It used to be parsed as "no rate" and silently re-priced at the default rate.
     allowZeroRate = false,
+    // A desktop bill already handed to the customer (the sync path only) names products and a
+    // customer that were live when it was billed. Switching either off afterwards -- the season's
+    // last mango, a closed credit account -- used to reject the bill for good ("One or more products
+    // could not be found"), so the cloud's sales and cash never held it. The browser checkout
+    // stays strict.
+    allowInactiveProducts = false,
   }
 ) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
@@ -7191,7 +7249,10 @@ const buildSalePayload = async (
 
   let customerAccount;
   if (selectedCustomerId) {
-    const customerResult = await client.query("SELECT * FROM customers WHERE id = $1 AND active = TRUE FOR SHARE", [selectedCustomerId]);
+    const customerResult = await client.query(
+      "SELECT * FROM customers WHERE id = $1 AND (active = TRUE OR $2::BOOLEAN) FOR SHARE",
+      [selectedCustomerId, allowInactiveProducts]
+    );
     if (customerResult.rows.length === 0) {
       return { error: { status: 400, message: "Selected customer account is not active" } };
     }
@@ -7207,8 +7268,8 @@ const buildSalePayload = async (
 
   const productIds = [...new Set(parsedItems.map((item) => item.productId))];
   const productResult = await client.query(
-    "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND active = TRUE ORDER BY id FOR SHARE",
-    [productIds]
+    "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND (active = TRUE OR $2::BOOLEAN) ORDER BY id FOR SHARE",
+    [productIds, allowInactiveProducts]
   );
   if (productResult.rows.length !== productIds.length) {
     return { error: { status: 404, message: "One or more products could not be found" } };
@@ -10973,8 +11034,9 @@ app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res)
 // Combos & Offers: the master (backend/combos.js holds the rules).
 //
 // Reading needs only a session: the counter sells from it. Writing is Owner/Admin through
-// `requireRateManager`, like charge types and products -- a combo's price is a price. There is no
-// DELETE: `active: false` takes a combo off the POS and keeps every bill that sold it readable.
+// `requireRateManager`, like charge types and products -- a combo's price is a price. DELETE removes
+// only a combo no bill names (409 COMBO_IN_USE otherwise); `active: false` takes one off the POS and
+// keeps every bill that sold it readable.
 //
 // Every create and update republishes the whole combo, items nested, with
 // `logMasterDataSyncChange` (one change row per branch, so every branch's counters hear it) as
@@ -10985,6 +11047,13 @@ app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res)
 // ---------------------------------------------------------------------------------------------
 
 const comboRefusal = (res, status, code, message) => res.status(status).json({ code, message });
+
+/**
+ * A session with no company is refused, as Frooz Pack refuses it. The queries read a NULL company
+ * as "any company", so such a session listed, edited and deleted every company's combos and made
+ * new ones every company saw. Every session issued today carries a company; this is the backstop.
+ */
+const COMBO_COMPANY_REQUIRED_MESSAGE = "This session has no shop to keep combos for. Sign in at a counter of the shop.";
 
 /** A combo row as the API, the sync change and the bootstrap hand it out. */
 const presentCombo = (row) => ({ ...row, unavailable_products: comboRules.unavailableProductsOf(row) });
@@ -11013,7 +11082,9 @@ const markCombosInUse = async (client, combos) => {
 
 const listCombosHandler = async (req, res) => {
   try {
-    const combos = await loadCombosWithItems(pool, { companyId: parsePositiveInteger(req.auth.companyId) });
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return comboRefusal(res, 400, comboRules.CODES.COMPANY_REQUIRED, COMBO_COMPANY_REQUIRED_MESSAGE);
+    const combos = await loadCombosWithItems(pool, { companyId });
     return res.json(await markCombosInUse(pool, combos));
   } catch (error) {
     console.error("Loading combos failed", { code: error?.code, message: error?.message });
@@ -11058,6 +11129,7 @@ const saveComboHandler = async (req, res) => {
     if (!parsed.ok) return comboRefusal(res, 400, parsed.code, parsed.message);
     const combo = parsed.value;
     const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return comboRefusal(res, 400, comboRules.CODES.COMPANY_REQUIRED, COMBO_COMPANY_REQUIRED_MESSAGE);
     const rawComboRef = updating ? cleanText(String(req.params.id || "")) : "";
     if (updating && !rawComboRef) return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
 
@@ -11203,6 +11275,7 @@ const deleteComboHandler = async (req, res) => {
     const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return comboRefusal(res, 403, comboRules.CODES.PERMISSION_REQUIRED, "Only the Owner or an Admin can manage combos and offers.");
     const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return comboRefusal(res, 400, comboRules.CODES.COMPANY_REQUIRED, COMBO_COMPANY_REQUIRED_MESSAGE);
     const rawComboRef = cleanText(String(req.params.id || ""));
     if (!rawComboRef) return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
 
@@ -11273,8 +11346,9 @@ app.delete("/api/v3/combos/:id", deleteComboHandler);
 // Reading needs only a session: the counter picks packing from the tree, with its own branch's
 // counts. Writing is Owner/Admin through `requireRateManager(req.auth.userId)` -- one call site,
 // in `packingWriteRoute` -- and needs the session's company and branch (stock and the purchase
-// expense are per branch), refused before any write otherwise. No DELETE: `active: false` retires
-// a type, design or size and keeps every bill and purchase that used it readable.
+// expense are per branch), refused before any write otherwise. DELETE removes only packing nothing
+// has used (409 PACKING_IN_USE otherwise); `active: false` retires a type, design or size and keeps
+// every bill and purchase that used it readable.
 //
 // The company is always `req.auth.companyId`, the branch `req.auth.branchId`, the actor
 // `req.auth.userId`; nothing here reads an identity from the request body or headers.
@@ -11285,7 +11359,9 @@ const froozPackDeps = () => ({
   logSyncChange,
   logMasterDataSyncChange,
   anchorBranchId: companyAnchorBranchId,
-  today: () => toDateKey(new Date()),
+  // The shop's day, not the server's: the process runs in UTC, so before 05:30 IST `toDateKey`
+  // named yesterday and an early-morning purchase was booked to the day before.
+  today: () => saleReturnRules.indiaBusinessDateKey(),
 });
 
 const packingWriteRoute = (work) => async (req, res) => {
@@ -11769,6 +11845,9 @@ const processedAckFromRow = (row) => ({
   server_updated_at: row.result_payload?.server_updated_at || row.processed_at,
   error_code: row.result_payload?.error_code || null,
   message: row.result_payload?.message || "Already processed",
+  // The first answer's own result (a bill's server id and invoice number), so a resend answered
+  // from here does not leave the counter without them. Absent when the first answer had none.
+  ...(row.result_payload?.result_payload ? { result_payload: row.result_payload.result_payload } : {}),
 });
 
 /** A new desktop bill (not an edit or a cancel): the only stored conflict that is judged again. */
@@ -12229,9 +12308,13 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     // already been given to the customer. A hand-entered amount that reaches here was authorised on
     // the device that wrote it; refusing it now would strand the invoice in the sync queue forever.
     allowManualChargeAmount: true,
+    // Switched off since it was billed is not a reason to refuse it: see buildSalePayload.
+    allowInactiveProducts: true,
   });
   if (salePayload.error) {
-    if (salePayload.error.status === 409) {
+    // 404: a product the bill names is not on the server at all. Held as a conflict, judged again
+    // on the next push, rather than rejected and stored as processed for good.
+    if (salePayload.error.status === 409 || salePayload.error.status === 404) {
       return conflict(salePayload.error.message || "POS sale conflict; invoice retained locally for review", salePayload.error);
     }
     return rejectOperation(operation, "VALIDATION_ERROR", salePayload.error.message || "POS sale validation failed");
@@ -22193,15 +22276,18 @@ app.post("/expenses", async (req, res) => {
         expense_date, category, amount, payment_mode, reference_number,
         vendor_name, paid_to, remarks, branch_id, created_by, active, status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ACTIVE')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, 'ACTIVE')
       RETURNING *
       `,
+      // Always active: a client `active: false` used to store a row that said ACTIVE, was paid, and
+      // was left out of every report (they all filter `active IS DISTINCT FROM FALSE`), with no way
+      // to edit it back. Cancelling, with a reason, is the only way an expense stops counting.
       [
         req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
         nullableText(req.body.reference_number), nullableText(req.body.vendor_name || req.body.paid_to),
         nullableText(req.body.paid_to || req.body.vendor_name),
         nullableText(req.body.remarks), req.auth.branchId,
-        req.auth.userId, req.body.active !== false,
+        req.auth.userId,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -23094,11 +23180,13 @@ const recalculateSalesForBatch = async (client, batchId) => {
       -- The bill discount is shared over the loose lines only, as the bill booked it
       -- (invoiceDiscountShareOf): a combo's lines are already priced and take none of it. A bill
       -- with no combo is unchanged. Summed with CASE rather than filtered, so a combo-only bill
-      -- still has its row here and its lines' cost and profit are still updated.
+      -- still has its row here and its lines' cost and profit are still updated. A bill with no
+      -- loose net to carry the discount shares it over every line (all_subtotal), as the bill did.
       sale_subtotal AS (
         SELECT sale_id,
                SUM(CASE WHEN COALESCE(combo_line_key, combo_id, combo_type) IS NULL
-                        THEN COALESCE(net_amount, amount) ELSE 0 END) AS subtotal
+                        THEN COALESCE(net_amount, amount) ELSE 0 END) AS subtotal,
+               SUM(COALESCE(net_amount, amount)) AS all_subtotal
         FROM sale_items
         WHERE sale_id = $1
         GROUP BY sale_id
@@ -23112,6 +23200,8 @@ const recalculateSalesForBatch = async (client, batchId) => {
           - CASE
               WHEN sale_subtotal.subtotal > 0 AND COALESCE(si.combo_line_key, si.combo_id, si.combo_type) IS NULL
               THEN COALESCE(s.invoice_discount_amount, 0) * (COALESCE(si.net_amount, si.amount) / sale_subtotal.subtotal)
+              WHEN COALESCE(sale_subtotal.subtotal, 0) <= 0 AND sale_subtotal.all_subtotal > 0
+              THEN COALESCE(s.invoice_discount_amount, 0) * (COALESCE(si.net_amount, si.amount) / sale_subtotal.all_subtotal)
               ELSE 0
             END
           - item_costs.cost_amount
@@ -25525,11 +25615,49 @@ const createSaleHandler = async (req, res) => {
 app.post("/sales", createSaleHandler);
 app.post("/api/v3/sales", rateLimitSyncRequest, v3WriteAdapter(createSaleHandler));
 
+/**
+ * The optional window of `GET /sales`, from its query string.
+ *
+ * - `days=N` (whole number, 1..3650): bills dated within the last N India business days, today
+ *   included -- `days=30` is today and the 29 days before it. The Sale Returns screen sends this.
+ * - `date_from=YYYY-MM-DD`: bills dated on or after that day. Wins over `days` when both are sent.
+ *
+ * Neither: `{ dateFrom: null }`, and the route answers exactly as it always has, every bill of the
+ * branch. Anything else is `{ error }`, answered 400, never read as "no window".
+ */
+const salesListWindow = (query = {}, today = saleReturnRules.indiaBusinessDateKey()) => {
+  const rawFrom = query.date_from;
+  const rawDays = query.days;
+  if (rawFrom !== undefined && rawFrom !== "") {
+    if (!isDateInput(rawFrom) || Number.isNaN(Date.parse(`${rawFrom}T00:00:00Z`))) {
+      return { error: "date_from must be a date written YYYY-MM-DD." };
+    }
+    return { dateFrom: String(rawFrom) };
+  }
+  if (rawDays !== undefined && rawDays !== "") {
+    const days = /^\d+$/.test(String(rawDays)) ? Number(rawDays) : NaN;
+    if (!Number.isInteger(days) || days < 1 || days > 3650) return { error: "days must be a whole number from 1 to 3650." };
+    const from = new Date(`${today}T00:00:00Z`);
+    from.setUTCDate(from.getUTCDate() - (days - 1));
+    return { dateFrom: from.toISOString().slice(0, 10) };
+  }
+  return { dateFrom: null };
+};
+
+// Optional window: `?days=N` or `?date_from=YYYY-MM-DD` (see `salesListWindow`). Without either it
+// lists every bill of the branch, as it always has; callers that only need recent bills should send
+// one, since the list is joined line by line and grows with every bill.
 app.get("/sales", async (req, res) => {
   try {
+    const window = salesListWindow(req.query || {});
+    if (window.error) return res.status(400).json({ code: "SALES_WINDOW_INVALID", message: window.error });
+    const values = [req.auth.branchId];
+    if (window.dateFrom) values.push(window.dateFrom);
     const result = await pool.query(`
       SELECT
         s.id,
+        s.global_id,
+        s.offline_invoice_ref,
         s.invoice_no,
         s.sale_date,
         s.created_at,
@@ -25575,9 +25703,10 @@ app.get("/sales", async (req, res) => {
       LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
       LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
       WHERE s.branch_id = $1
+        ${window.dateFrom ? "AND s.sale_date >= $2::DATE" : ""}
       GROUP BY s.id, c.customer_name
       ORDER BY s.created_at DESC, s.id DESC
-    `, [req.auth.branchId]);
+    `, values);
 
     return res.json(result.rows);
   } catch (error) {
@@ -26014,12 +26143,12 @@ const createSaleReturnHandler = async (req, res) => {
     const createdBy = req.auth.userId;
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     if (!saleId || !REFUND_TYPES.has(refundType) || !returnReason || items.length === 0) {
-      return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
+      return res.status(400).json({ code: "SALE_RETURN_INVALID_REQUEST", message: "Select invoice, products, refund type and return reason" });
     }
     // One line per sale line. A repeated sale_item_id would be checked against the returnable
     // quantity and mapped to batches as if the other line did not exist.
     if (saleReturnRules.findDuplicateSaleItemId(items)) {
-      return res.status(400).json({ message: "Each product can appear only once in a return. Combine the quantities into one line." });
+      return res.status(400).json({ code: "SALE_RETURN_DUPLICATE_LINE", message: "Each product can appear only once in a return. Combine the quantities into one line." });
     }
     // `billing`, not `invoice_cancellation`, and the choice is deliberate. A return refunds money and
     // is a partial void of a sale, so the stricter key is arguable — but returns are counter work a
@@ -26092,7 +26221,7 @@ const createSaleReturnHandler = async (req, res) => {
     });
     if (returnDate.error) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: returnDate.error });
+      return res.status(400).json({ code: "SALE_RETURN_DATE_INVALID", message: returnDate.error });
     }
     // Every line of the bill, for its share of the bill discount and Mandi Tax.
     const saleLinesResult = await client.query(
@@ -26103,7 +26232,9 @@ const createSaleReturnHandler = async (req, res) => {
       [saleId]
     );
     const saleLines = saleLinesResult.rows;
-    const returnNo = `RET-${Date.now()}`;
+    // A random suffix: two returns in the same millisecond (two counters, or a double press that
+    // passes the line locks on different lines) collided on the UNIQUE return_no and answered 500.
+    const returnNo = `RET-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
     const returnResult = await client.query(
       `
       INSERT INTO sale_returns (
@@ -26132,7 +26263,7 @@ const createSaleReturnHandler = async (req, res) => {
       const requestedQuantity = saleReturnRules.normalizeReturnQuantity(requested.return_quantity);
       if (!saleItemId || !requestedQuantity) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: "Enter valid return quantities" });
+        return res.status(400).json({ code: "SALE_RETURN_QUANTITY_INVALID", message: "Enter valid return quantities" });
       }
       const returnQuantity = requestedQuantity.quantity;
       // Lock the line first, then read what earlier returns took from it: a concurrent return of
@@ -26167,12 +26298,12 @@ const createSaleReturnHandler = async (req, res) => {
         : 0;
       if (!saleItem || requestedQuantity.thousandths > returnable) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: `${saleItem?.product_name || "Item"} return quantity exceeds returnable quantity` });
+        return res.status(400).json({ code: "SALE_RETURN_QUANTITY_EXCEEDS", message: `${saleItem?.product_name || "Item"} return quantity exceeds returnable quantity` });
       }
       const perUnit = saleReturnRules.refundPerUnit({ line: saleItem, saleLines, sale });
       if (perUnit === null) {
         await client.query("ROLLBACK");
-        return res.status(409).json({ message: `${saleItem.product_name || "Item"} has no sold quantity to price the return against` });
+        return res.status(409).json({ code: "SALE_RETURN_UNPRICEABLE", message: `${saleItem.product_name || "Item"} has no sold quantity to price the return against` });
       }
       const returnAmount = saleReturnRules.refundAmountFor(perUnit, returnQuantity);
       const allocations = await client.query(
@@ -26192,7 +26323,7 @@ const createSaleReturnHandler = async (req, res) => {
       });
       if (restoration.unmappedThousandths > 0) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: "Unable to map return quantity to original inventory batch" });
+        return res.status(400).json({ code: "SALE_RETURN_UNMAPPED_BATCH", message: "Unable to map return quantity to original inventory batch" });
       }
       for (const line of restoration.lines) {
         await client.query(
@@ -26268,7 +26399,7 @@ const createSaleReturnHandler = async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
-    return res.status(500).json({ message: "Error Saving Sale Return" });
+    return res.status(500).json({ code: "SALE_RETURN_SAVE_FAILED", message: "Error Saving Sale Return" });
   } finally {
     client.release();
   }
@@ -27532,4 +27663,8 @@ module.exports = {
   // that an absent or malformed fingerprint never erases a stored one.
   readDevicePayload,
   upsertDeviceRequest,
+  // Exported so `salesSyncIntegrity.test.js` can pin the optional `GET /sales` window by date.
+  salesListWindow,
+  // Exported so `combos.test.js` can check that a line's discount share adds up to the bill's.
+  invoiceDiscountShareOf,
 };

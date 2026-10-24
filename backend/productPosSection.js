@@ -16,6 +16,12 @@
  * ## What a refusal looks like
  *
  * `{ ok: false, code: "POS_SECTION_INVALID", message }`, the message written for the shop owner.
+ *
+ * ## Vestigial since 22 Oct 2026
+ *
+ * The POS no longer reads the stored value: by the owner's decision every product sits on the Frooz
+ * Retail shelf, and Bar / Moments / Combos list combos only (`frontend/src/local/posSections.js`).
+ * The column and this rule stay so saved values and older counters keep working; do not drop it.
  */
 
 const POS_SECTIONS = Object.freeze(["retail", "bar", "moments"]);

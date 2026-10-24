@@ -79,6 +79,8 @@ const CAPACITY_MAX = 40;
 const SUPPLIER_MAX = 160;
 const REFERENCE_MAX = 80;
 const REMARKS_MAX = 1000;
+const CLIENT_REF_MAX = 80;
+const CLIENT_REF_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const MONEY_MAX = 10_000_000;
 const QUANTITY_MAX = 1_000_000_000;
 const LINES_MAX = 200;
@@ -210,10 +212,14 @@ const isCalendarDate = (value) => {
 };
 
 /**
- * POST /api/v3/packing/purchases: {supplier_name?, purchase_date (YYYY-MM-DD, default `today`),
- * payment_mode (CASH|UPI|BANK_TRANSFER|CHEQUE), reference_number?, remarks?, lines:[{size_id,
- * quantity > 0, rate >= 0}]}. Each line's amount is round2(quantity x rate); the purchase's amount
- * is their sum, and must be above zero because it becomes an expense.
+ * POST /api/v3/packing/purchases: {supplier_name?, purchase_date (YYYY-MM-DD, default `today`, never
+ * after `today`), payment_mode (CASH|UPI|BANK_TRANSFER|CHEQUE), reference_number?, remarks?,
+ * client_ref?, lines:[{size_id, quantity > 0, rate >= 0}]}. Each line's amount is
+ * round2(quantity x rate); the purchase's amount is their sum, and must be above zero because it
+ * becomes an expense. `today` is the India business day (the server runs in UTC).
+ *
+ * `client_ref` (optional, up to 80 of A-Z a-z 0-9 . _ : -) is the form's idempotency key: the
+ * client makes one per purchase form and sends it again on a retry. See `recordPackingPurchase`.
  */
 const validatePurchaseInput = (body = {}, { today } = {}) => {
   const input = body && typeof body === "object" ? body : {};
@@ -221,6 +227,14 @@ const validatePurchaseInput = (body = {}, { today } = {}) => {
   if (supplierName.length > SUPPLIER_MAX) return refuse(CODES.PURCHASE_INVALID, `Keep the supplier name to ${SUPPLIER_MAX} letters or fewer.`);
   const purchaseDate = isBlank(input.purchase_date) ? text(today) : text(input.purchase_date);
   if (!isCalendarDate(purchaseDate)) return refuse(CODES.PURCHASE_INVALID, "Enter the purchase date as YYYY-MM-DD.");
+  // Dates are YYYY-MM-DD, so string order is date order.
+  if (isCalendarDate(text(today)) && purchaseDate > text(today)) {
+    return refuse(CODES.PURCHASE_INVALID, "The purchase date cannot be in the future.");
+  }
+  const clientRef = text(input.client_ref);
+  if (clientRef && (clientRef.length > CLIENT_REF_MAX || !CLIENT_REF_PATTERN.test(clientRef))) {
+    return refuse(CODES.PURCHASE_INVALID, "This purchase form sent a reference the server cannot read. Reopen the form and save again.");
+  }
   const paymentMode = text(input.payment_mode).toUpperCase();
   if (!PACKING_PAYMENT_MODES.includes(paymentMode)) {
     return refuse(CODES.PURCHASE_INVALID, "Choose how the purchase was paid: Cash, UPI, Bank transfer or Cheque.");
@@ -258,6 +272,7 @@ const validatePurchaseInput = (body = {}, { today } = {}) => {
       payment_mode: paymentMode,
       reference_number: referenceNumber || null,
       remarks: remarks || null,
+      client_ref: clientRef || null,
       lines,
       amount,
     },
@@ -646,13 +661,15 @@ const listPackingMovements = async (client, { companyId, branchId, sizeId, limit
   const sizeRef = readRef(sizeId);
   const parsedLimit = positiveInt(limit);
   const result = await client.query(
-    `SELECT m.id, m.movement_type, m.quantity, m.sale_id, m.purchase_id, m.reason, m.created_by, m.created_at,
+    `SELECT m.id, m.movement_type, m.quantity, m.sale_id, bill.invoice_no, m.purchase_id, m.reason, m.created_by, m.created_at,
             s.id AS size_id, COALESCE(s.global_id, 'packing-size-' || s.id::TEXT) AS size_global_id,
             s.size_name, s.capacity, d.name AS design_name, t.name AS type_name
      FROM packing_movements m
      JOIN packing_sizes s ON s.id = m.size_id
      JOIN packing_designs d ON d.id = s.design_id
      JOIN packing_types t ON t.id = d.type_id
+     -- The bill's invoice number, so the history names a bill the way every other screen does.
+     LEFT JOIN sales bill ON bill.id = m.sale_id AND bill.branch_id = m.branch_id
      WHERE m.branch_id = $1
        AND t.company_id = $2
        AND (m.company_id IS NULL OR m.company_id = $2)
@@ -1231,15 +1248,76 @@ const quickStartPacking = async (client, { companyId, branchId, actorId }, deps)
 };
 
 /**
+ * A purchase already stored, in the shape `recordPackingPurchase` answers with, or null. Read for
+ * a replayed `client_ref`, so the retry gets the first save's answer rather than a second save.
+ */
+const storedPurchaseAnswer = async (client, { companyId, clientRef }) => {
+  const found = await client.query(
+    `SELECT id, COALESCE(global_id, 'packing-purchase-' || id::TEXT) AS global_id, branch_id, supplier_name, payment_mode,
+            TO_CHAR(purchase_date, 'YYYY-MM-DD') AS purchase_date, reference_number, remarks, amount, expense_id
+     FROM packing_purchases
+     WHERE company_id = $1 AND client_ref = $2`,
+    [companyId, clientRef]
+  );
+  const row = found.rows[0];
+  if (!row) return null;
+  const lines = await client.query(
+    `SELECT COALESCE(s.global_id, 'packing-size-' || s.id::TEXT) AS size_id, t.name AS type_name, d.name AS design_name,
+            s.size_name, s.capacity, l.quantity, l.rate, l.amount
+     FROM packing_purchase_lines l
+     JOIN packing_sizes s ON s.id = l.size_id
+     JOIN packing_designs d ON d.id = s.design_id
+     JOIN packing_types t ON t.id = d.type_id
+     WHERE l.purchase_id = $1
+     ORDER BY l.id`,
+    [row.id]
+  );
+  const expenseId = row.expense_id === null ? null : Number(row.expense_id);
+  return answer(200, {
+    success: true,
+    replayed: true,
+    purchase: {
+      id: Number(row.id),
+      global_id: row.global_id,
+      branch_id: Number(row.branch_id),
+      supplier_name: row.supplier_name,
+      payment_mode: row.payment_mode,
+      purchase_date: row.purchase_date,
+      reference_number: row.reference_number,
+      remarks: row.remarks,
+      amount: roundMoney(row.amount),
+      expense_id: expenseId,
+      lines: lines.rows.map((line) => ({
+        size_id: line.size_id, type_name: line.type_name, design_name: line.design_name, size_name: line.size_name,
+        capacity: line.capacity ?? null, quantity: Number(line.quantity), rate: roundMoney(line.rate), amount: roundMoney(line.amount),
+      })),
+    },
+    expense_id: expenseId,
+  });
+};
+
+/**
  * POST /api/v3/packing/purchases. One transaction: the purchase and its lines, each size's count up
  * at the session's branch with a PURCHASE movement, each size's unit cost set to the line's rate,
  * one 'Packing Material' expense for the total (its id stored on the purchase), then the counts
  * and the affected types published.
+ *
+ * Idempotent on `client_ref`: a save whose answer was lost (a timeout after COMMIT) used to be
+ * saved again on retry -- a second purchase, a second expense and the count raised twice. Now a
+ * repeat of a stored `client_ref` answers 200 with the first purchase (`replayed: true`) and writes
+ * nothing. A transaction-scoped advisory lock serialises two copies arriving at once, so the second
+ * waits and then finds the first; the unique index (026) is the backstop. Without a `client_ref`
+ * the behaviour is what it always was.
  */
 const recordPackingPurchase = async (client, { companyId, branchId, actorId, body }, deps) => {
   const parsed = validatePurchaseInput(body, { today: deps.today() });
   if (!parsed.ok) return refusal(parsed);
   const purchase = parsed.value;
+  if (purchase.client_ref) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`packing-purchase:${companyId}:${purchase.client_ref}`]);
+    const replay = await storedPurchaseAnswer(client, { companyId, clientRef: purchase.client_ref });
+    if (replay) return replay;
+  }
   const sizes = await resolveSizes(client, { companyId, refs: purchase.lines.map((line) => line.size_ref) });
   for (const line of purchase.lines) {
     const size = sizes.get(line.size_ref.ref);
@@ -1255,12 +1333,12 @@ const recordPackingPurchase = async (client, { companyId, branchId, actorId, bod
 
   const created = await client.query(
     `INSERT INTO packing_purchases (
-       company_id, branch_id, supplier_name, payment_mode, purchase_date, reference_number, remarks, amount, created_by
+       company_id, branch_id, supplier_name, payment_mode, purchase_date, reference_number, remarks, amount, created_by, client_ref
      )
-     VALUES ($1, $2, $3, $4, $5::DATE, $6, $7, $8, $9)
+     VALUES ($1, $2, $3, $4, $5::DATE, $6, $7, $8, $9, $10)
      RETURNING id`,
     [companyId, branchId, purchase.supplier_name, purchase.payment_mode, purchase.purchase_date,
-      purchase.reference_number, purchase.remarks, purchase.amount, actorId]
+      purchase.reference_number, purchase.remarks, purchase.amount, actorId, purchase.client_ref]
   );
   const purchaseId = created.rows[0].id;
   await client.query("UPDATE packing_purchases SET global_id = 'packing-purchase-' || id::TEXT WHERE id = $1 AND global_id IS NULL", [purchaseId]);
@@ -1543,6 +1621,10 @@ const isPackingPurchaseExpense = async (client, expenseId) => {
 /** A database error from a Frooz Pack write, as a response. */
 const packingErrorResponse = (error) => {
   if (error?.code === "23505") {
+    if (/packing_purchases_client_ref/.test(String(error.constraint || ""))) {
+      // Only reachable if the advisory lock was bypassed; the purchase is already saved once.
+      return answer(409, { code: CODES.PURCHASE_INVALID, message: "This purchase was already saved. Check Expenses and the packing counts before saving it again." });
+    }
     if (/packing_sizes/.test(String(error.constraint || ""))) {
       return answer(409, { code: CODES.SIZE_TAKEN, message: "This design already has an active size with this name and capacity." });
     }

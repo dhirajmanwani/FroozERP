@@ -133,6 +133,15 @@ test("validate: a bill's packing usage is read leniently -- bad rows are set asi
 const COMBO_MIGRATION = fs.readFileSync(path.join(__dirname, "migrations", "cloud", "024_combos.sql"), "utf8");
 const MIGRATION = fs.readFileSync(path.join(__dirname, "migrations", "cloud", "025_frooz_pack.sql"), "utf8");
 const SERVER_SOURCE = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+const CLIENT_REF_MIGRATION = fs.readFileSync(path.join(__dirname, "migrations", "cloud", "026_packing_purchase_client_ref.sql"), "utf8");
+
+test("schema: 026 is registered after 025 and is in the bootstrap word for word", () => {
+  const files = require("../scripts/run-cloud-migrations").migrationFiles;
+  assert.ok(files.indexOf("backend/migrations/cloud/026_packing_purchase_client_ref.sql") > files.indexOf("backend/migrations/cloud/025_frooz_pack.sql"));
+  const statementsOf = (sql) => sql.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").replace(/\s+/g, " ").trim();
+  assert.ok(statementsOf(SERVER_SOURCE).includes(statementsOf(CLIENT_REF_MIGRATION)), "initializeDatabase() carries 026 word for word");
+  assert.doesNotMatch(statementsOf(CLIENT_REF_MIGRATION), /\b(INSERT|DELETE|UPDATE)\s+(INTO\s+)?[a-z_]+\s/i, "026 changes no rows");
+});
 
 test("schema: 025 is registered after 024, identical to the bootstrap, and has no foreign key to sales or expenses", () => {
   const files = require("../scripts/run-cloud-migrations").migrationFiles;
@@ -181,6 +190,7 @@ const SCHEMA = `
     deleted_at TIMESTAMP, company_id INTEGER
   );
   CREATE TABLE sale_items (id SERIAL PRIMARY KEY, sale_id INTEGER);
+  CREATE TABLE sales (id INTEGER PRIMARY KEY, branch_id INTEGER, invoice_no TEXT);
   CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, active BOOLEAN DEFAULT TRUE);
   CREATE TABLE sync_change_log (
     change_id BIGSERIAL PRIMARY KEY, company_id INTEGER, branch_id INTEGER, operational_location_id INTEGER,
@@ -224,8 +234,10 @@ const openDatabase = async () => {
   await db.exec(SCHEMA);
   await db.exec(COMBO_MIGRATION);
   await db.exec(MIGRATION);
+  await db.exec(CLIENT_REF_MIGRATION);
   await db.exec(COMBO_MIGRATION);
   await db.exec(MIGRATION);
+  await db.exec(CLIENT_REF_MIGRATION);
   return db;
 };
 
@@ -907,4 +919,108 @@ test("server: the sale and cancel paths call the packing hooks where the contrac
   const restoreInventory = SERVER_SOURCE.indexOf("const restoreSaleInventory = async");
   const body = SERVER_SOURCE.slice(restoreInventory, SERVER_SOURCE.indexOf("\n};\n", restoreInventory));
   assert.doesNotMatch(body, /froozPack/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// A purchase is saved once per client_ref (026), and dated by the shop's day (BE-4, BE-8)
+// ---------------------------------------------------------------------------------------------
+
+test("schema: 026 adds client_ref with its partial unique index and makes the timestamps TIMESTAMPTZ", async () => {
+  const db = await openDatabase();
+  try {
+    const columns = (await db.query(
+      `SELECT table_name, column_name, data_type FROM information_schema.columns
+       WHERE (table_name IN ('combos', 'packing_types', 'packing_designs', 'packing_sizes', 'packing_stock', 'packing_purchases', 'packing_movements')
+              AND column_name IN ('created_at', 'updated_at'))
+          OR (table_name = 'packing_purchases' AND column_name = 'client_ref')
+       ORDER BY table_name, column_name`
+    )).rows;
+    assert.equal(columns.length, 12);
+    for (const column of columns) {
+      const expected = column.column_name === "client_ref" ? "character varying" : "timestamp with time zone";
+      assert.equal(column.data_type, expected, `${column.table_name}.${column.column_name}`);
+    }
+    const indexes = (await db.query("SELECT indexname FROM pg_indexes WHERE indexname = ANY($1::TEXT[]) ORDER BY indexname", [[
+      "packing_purchases_client_ref_key", "sale_items_combo_id_idx", "sale_packing_usage_combo_idx",
+      "sale_packing_usage_size_global_idx", "sale_packing_usage_size_idx",
+    ]])).rows.map((row) => row.indexname);
+    assert.equal(indexes.length, 5, JSON.stringify(indexes));
+  } finally {
+    await db.close();
+  }
+});
+
+test("routes: a purchase retried with the same client_ref is answered with the first, never saved twice", async () => {
+  await withPack(async ({ db }) => {
+    const { grand } = await buildTree();
+    const body = {
+      supplier_name: "Box Co", payment_mode: "CASH", purchase_date: "2026-10-20", client_ref: "pack-form-3f2a9c",
+      lines: [{ size_id: grand.global_id, quantity: 10, rate: 12 }],
+    };
+    const first = await call("POST", "/api/v3/packing/purchases", body);
+    assert.equal(first.status, 201, JSON.stringify(first.body));
+    const again = await call("POST", "/api/v3/packing/purchases", body);
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    assert.equal(again.body.replayed, true);
+    assert.equal(again.body.purchase.global_id, first.body.purchase.global_id);
+    assert.equal(again.body.expense_id, first.body.expense_id);
+    assert.deepEqual(again.body.purchase.lines, first.body.purchase.lines);
+    assert.equal(again.body.purchase.amount, first.body.purchase.amount);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_purchases"), 1);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM expenses"), 1, "one expense");
+    assert.equal(Number((await db.query("SELECT qty_on_hand FROM packing_stock")).rows[0].qty_on_hand), 10, "the count raised once");
+
+    // A different form is a different purchase, and no client_ref behaves as it always did.
+    assert.equal((await call("POST", "/api/v3/packing/purchases", { ...body, client_ref: "pack-form-other" })).status, 201);
+    const { client_ref: _dropped, ...withoutRef } = body;
+    assert.equal((await call("POST", "/api/v3/packing/purchases", withoutRef)).status, 201);
+    assert.equal((await call("POST", "/api/v3/packing/purchases", withoutRef)).status, 201);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_purchases"), 4);
+
+    // An unreadable ref is refused before anything is written.
+    const bad = await call("POST", "/api/v3/packing/purchases", { ...body, client_ref: "has spaces; and quotes'" });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.code, CODES.PURCHASE_INVALID);
+  });
+});
+
+test("validate: a purchase date after today is refused, today and earlier are kept", () => {
+  const base = { payment_mode: "CASH", lines: [{ size_id: 1, quantity: 1, rate: 5 }] };
+  const future = pack.validatePurchaseInput({ ...base, purchase_date: "2026-10-23" }, { today: "2026-10-22" });
+  assert.equal(future.code, CODES.PURCHASE_INVALID);
+  assert.match(future.message, /cannot be in the future/);
+  assert.equal(pack.validatePurchaseInput({ ...base, purchase_date: "2026-10-22" }, { today: "2026-10-22" }).ok, true);
+  assert.equal(pack.validatePurchaseInput({ ...base, purchase_date: "2025-01-01" }, { today: "2026-10-22" }).ok, true);
+});
+
+test("routes: a purchase saved at 05:00 IST with no date is booked to that India day, not the UTC one", async (t) => {
+  // 23:30 UTC on the 24th is 05:00 IST on the 25th: mandi buying hours.
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-24T23:30:00Z") });
+  await withPack(async ({ db }) => {
+    const { grand } = await buildTree();
+    const saved = await call("POST", "/api/v3/packing/purchases", { payment_mode: "CASH", lines: [{ size_id: grand.id, quantity: 1, rate: 5 }] });
+    assert.equal(saved.status, 201, JSON.stringify(saved.body));
+    assert.equal(saved.body.purchase.purchase_date, "2026-10-25");
+    assert.equal((await db.query("SELECT TO_CHAR(expense_date, 'YYYY-MM-DD') AS day FROM expenses")).rows[0].day, "2026-10-25");
+    const future = await call("POST", "/api/v3/packing/purchases", { payment_mode: "CASH", purchase_date: "2026-10-26", lines: [{ size_id: grand.id, quantity: 1, rate: 5 }] });
+    assert.equal(future.status, 400);
+    assert.equal(future.body.code, CODES.PURCHASE_INVALID);
+  });
+});
+
+test("routes: a bill's packing movement names the bill by its invoice number", async () => {
+  // "Bill 4512" (or a desktop bill's uuid) where every other screen says the invoice number (BO-18).
+  await withPack(async ({ db }) => {
+    const { grand } = await buildTree();
+    await db.exec(`
+      INSERT INTO sales VALUES (4512, 1, 'INV-77'), (4513, 2, 'INV-OTHER-BRANCH');
+      INSERT INTO packing_movements (company_id, branch_id, size_id, movement_type, quantity, sale_id)
+        VALUES (1, 1, ${grand.id}, 'SALE', -1, 4512), (1, 1, ${grand.id}, 'SALE', -1, 4513);
+    `);
+    const history = await call("GET", "/api/v3/packing/movements");
+    assert.equal(history.status, 200, JSON.stringify(history.body));
+    const bySale = Object.fromEntries(history.body.movements.map((row) => [row.sale_id, row.invoice_no]));
+    assert.equal(bySale[4512], "INV-77");
+    assert.equal(bySale[4513], null, "a bill of another branch is not looked up across branches");
+  });
 });

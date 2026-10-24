@@ -131,6 +131,12 @@ const captureReferenceBootstrap = async (client, context) => {
     `,
     [context.companyId]
   );
+  // Live products, and any switched-off one a lot sent below still points at. Switching a product
+  // off sets `deleted_at` even while lots of it remain, and a lot whose product is missing from
+  // this list cannot be stored on the device (its product_id is a foreign key there): the whole fill
+  // rolled back and a rebuilt counter stayed empty, retrying every cycle. The product travels as it
+  // is, `active: false` and all, so the counter keeps it off sale. The EXISTS is the lots query's
+  // own predicate.
   const productsResult = await client.query(
     `
     SELECT COALESCE(p.global_id, 'product-' || p.id::TEXT) AS entity_id,
@@ -142,10 +148,22 @@ const captureReferenceBootstrap = async (client, context) => {
            COALESCE(p.selling_rate_updated_at, p.created_at) AS updated_at
     FROM products p
     LEFT JOIN product_categories pc ON pc.id = p.category_id AND pc.company_id = p.company_id
-    WHERE p.company_id = $1 AND p.deleted_at IS NULL
+    WHERE p.company_id = $1
+      AND (
+        p.deleted_at IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM inventory_batches ib
+          WHERE ib.product_id = p.id
+            AND ib.company_id = p.company_id
+            AND ib.branch_id = $2
+            AND ib.operational_location_id = $3
+            AND ib.deleted_at IS NULL
+        )
+      )
     ORDER BY p.id
     `,
-    [context.companyId]
+    [context.companyId, context.branchId, context.operationalLocationId]
   );
   const suppliersResult = await client.query(
     `

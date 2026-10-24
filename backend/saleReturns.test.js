@@ -89,6 +89,22 @@ test("the refund is what the customer paid for the line: bill discount and Mandi
   assert.equal(Math.round(whole * 100) / 100, 959 - 50);
 });
 
+test("a combo-only bill's discount is shared over its lines, as the bill's profit took it", () => {
+  // No loose line to carry the bill discount: it is shared over every line on its net, so a full
+  // return refunds what the customer paid, not the discount on top (BE-9).
+  const sale = { invoice_discount_amount: "10.00", tax_amount: "0" };
+  const lines = [
+    { id: 1, quantity: "1", amount: "300", discount_amount: "0", net_amount: "300", combo_line_key: "k1", combo_id: "combo-3", combo_type: "FIXED" },
+    { id: 2, quantity: "1", amount: "200", discount_amount: "0", net_amount: "200", combo_line_key: "k1", combo_id: "combo-3", combo_type: "FIXED" },
+  ];
+  assert.equal(rules.linePaidAmount({ line: lines[0], saleLines: lines, sale }), 294);
+  assert.equal(rules.linePaidAmount({ line: lines[1], saleLines: lines, sale }), 196);
+  // With a loose line on the bill the combo still takes none of it.
+  const withLoose = [...lines, { id: 3, quantity: "1", amount: "100", discount_amount: "0", net_amount: "100" }];
+  assert.equal(rules.linePaidAmount({ line: withLoose[0], saleLines: withLoose, sale }), 300);
+  assert.equal(rules.linePaidAmount({ line: withLoose[2], saleLines: withLoose, sale }), 90);
+});
+
 test("a net_amount of 0 is a real 0, and a missing one falls back to amount less discount", () => {
   const free = { id: 1, quantity: "1", amount: "50", discount_amount: "50", net_amount: "0" };
   assert.equal(rules.refundPerUnit({ line: free, saleLines: [free], sale: {} }), 0);
@@ -363,14 +379,40 @@ test("a return request is refused cleanly: repeated line, malformed or future da
   await withDatabase(async ({ db }) => {
     let response = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 1 }, { sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400);
+    assert.equal(response.body.code, "SALE_RETURN_DUPLICATE_LINE");
     response = await postReturn({ return_date: "2026-13-01", items: [{ sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400, JSON.stringify(response.body));
     assert.match(response.body.message, /YYYY-MM-DD/);
+    assert.equal(response.body.code, "SALE_RETURN_DATE_INVALID");
     response = await postReturn({ return_date: "2999-01-01", items: [{ sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400);
+    assert.equal(response.body.code, "SALE_RETURN_DATE_INVALID");
     response = await postReturn({ return_date: "2026-01-09", items: [{ sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400, "before the bill");
+    // Every refusal carries a code the screen can map, not only words (BE-14).
+    response = await postReturn({ items: [] });
+    assert.equal(response.body.code, "SALE_RETURN_INVALID_REQUEST");
+    response = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: -1 }] });
+    assert.equal(response.body.code, "SALE_RETURN_QUANTITY_INVALID", JSON.stringify(response.body));
+    response = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 99 }] });
+    assert.equal(response.body.code, "SALE_RETURN_QUANTITY_EXCEEDS", JSON.stringify(response.body));
     assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_returns")).n), 0, "nothing written");
+  });
+});
+
+test("two returns in the same millisecond get different return numbers, not a 500", async (t) => {
+  // return_no is UNIQUE and was `RET-<ms>` alone (BE-13).
+  const frozen = Date.now();
+  t.mock.method(Date, "now", () => frozen);
+  await withDatabase(async ({ db }) => {
+    const first = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 1 }] });
+    const second = await postReturn({ items: [{ sale_item_id: 1001, return_quantity: 0.1 }] });
+    assert.equal(first.status, 201, JSON.stringify(first.body));
+    assert.equal(second.status, 201, JSON.stringify(second.body));
+    assert.notEqual(first.body.return_no, second.body.return_no);
+    assert.match(first.body.return_no, new RegExp(`^RET-${frozen}-[0-9a-f]{6}$`));
+    assert.ok(first.body.return_no.length <= 40, "fits sale_returns.return_no VARCHAR(40)");
+    assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_returns")).n), 2);
   });
 });
 

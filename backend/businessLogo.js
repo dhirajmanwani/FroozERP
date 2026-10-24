@@ -44,7 +44,10 @@ const LOGO_MESSAGES = Object.freeze({
  * @returns {{ ok: true, value: string | null } | { ok: false, code: string, message: string }}
  */
 const parseBusinessLogo = (value, storedValue = null) => {
-  if (value === undefined || value === null) return { ok: true, value: null };
+  // Not sent at all is "leave it": a partial save (another settings tab, a script) used to delete
+  // the shop's logo. `null` or "" sent on purpose still clears it.
+  if (value === undefined) return { ok: true, value: typeof storedValue === "string" ? storedValue : null };
+  if (value === null) return { ok: true, value: null };
   if (typeof value !== "string") {
     return { ok: false, code: "LOGO_INVALID", message: LOGO_MESSAGES.PHOTO_FORMAT_UNSUPPORTED };
   }
