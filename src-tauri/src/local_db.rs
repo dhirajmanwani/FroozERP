@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager};
 use crate::entitlement::{self, EntitlementState};
 use crate::machine_identity::{self, AnchorOutcome, AnchorWritePolicy, MachineContext};
 
-const CURRENT_SCHEMA_VERSION: &str = "029_frooz_pack";
+const CURRENT_SCHEMA_VERSION: &str = "030_dedupe_cached_sale_copies";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -39,6 +39,7 @@ const MIGRATION_026: &str = include_str!("../migrations/sqlite/026_sync_outbox_e
 const MIGRATION_027: &str = include_str!("../migrations/sqlite/027_product_pos_section.sql");
 const MIGRATION_028: &str = include_str!("../migrations/sqlite/028_combos.sql");
 const MIGRATION_029: &str = include_str!("../migrations/sqlite/029_frooz_pack.sql");
+const MIGRATION_030: &str = include_str!("../migrations/sqlite/030_dedupe_cached_sale_copies.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -141,9 +142,17 @@ pub struct ReferenceBootstrap {
     ///
     /// `#[serde(default)]` because an older server sends no such key, and a bootstrap without it
     /// must still apply. Without this field serde would silently DROP a `combos` array the server
-    /// did send — which is exactly what happens today to the bootstrap's top-level `charge_types`.
+    /// did send — which is what happened to the bootstrap's top-level `charge_types` until it got
+    /// its own field below.
     #[serde(default)]
     pub combos: Vec<serde_json::Value>,
+    /// The shop's charge types (crate, labour, delivery...), each with its `slabs[]`, in the same
+    /// shape as the `charge_type` sync change. Without this field serde dropped the array, and as
+    /// the bootstrap moves the cursor past every `charge_type` change logged before it, a rebuilt
+    /// counter had no charges at all until each one was edited again. `#[serde(default)]` for an
+    /// older server that sends no such key.
+    #[serde(default)]
+    pub charge_types: Vec<serde_json::Value>,
     /// Frooz Pack: the company's packing types, each a whole Type -> Design -> Size tree, in the
     /// same shape as the `packing_type` sync change. `#[serde(default)]` for the same reason as
     /// `combos`: an older server sends no such key.
@@ -305,8 +314,11 @@ pub fn apply_push_acks_at(
                 tx.execute(
                     "UPDATE local_pos_invoices
                      SET sync_status = 'synced',
-                         server_invoice_no = json_extract(?2, '$.result_payload.invoice_no'),
-                         server_sale_id = json_extract(?2, '$.result_payload.sale_id'),
+                         -- COALESCE: a `duplicate` acknowledgement (a resend answered from the
+                         -- server's processed-operations record) carries no result payload, and
+                         -- must not wipe the cloud invoice number an earlier `accepted` stored.
+                         server_invoice_no = COALESCE(json_extract(?2, '$.result_payload.invoice_no'), server_invoice_no),
+                         server_sale_id = COALESCE(json_extract(?2, '$.result_payload.sale_id'), server_sale_id),
                          synced_at = ?4,
                          updated_at = ?4,
                          entity_version = COALESCE(?3, entity_version)
@@ -739,6 +751,7 @@ fn apply_pull_changes_at(
         }
         apply_pulled_change_or_record(&tx, change)?;
     }
+    replay_unapplied_changes(&tx, &device_scope, changes)?;
     apply_settled_deferred_lot_quantities(&tx)?;
     let state_device = device_id.unwrap_or_else(|| "default".to_string());
     tx.execute(
@@ -798,6 +811,244 @@ fn is_storage_failure(error: &str) -> bool {
     ]
     .iter()
     .any(|needle| error.contains(needle))
+}
+
+/// Kept changes a later pull may now be able to apply: a type an older build had no arm for, a
+/// change that failed (a lot that arrived before its product), a slab that arrived before its
+/// charge type. The other reasons are refusals of the payload itself and would only fail again.
+const REPLAYABLE_UNAPPLIED_REASONS: [&str; 3] = [
+    "ENTITY_TYPE_NOT_SUPPORTED",
+    "CHANGE_NOT_APPLICABLE",
+    "CHARGE_TYPE_NOT_PRESENT",
+];
+
+/// The entity types `apply_change_with_tx` has an arm for. A kept change of any other type is still
+/// unsupported on this build, so replaying it would only record it again.
+const REPLAYABLE_ENTITY_TYPES: [&str; 13] = [
+    "product_category",
+    "product",
+    "sale_rate",
+    "supplier",
+    "location_product",
+    "inventory_lot",
+    "pos_sale",
+    "charge_type",
+    "charge_rate_slab",
+    "combo",
+    "packing_type",
+    "packing_stock",
+    "customer_order",
+];
+
+/// What this device already holds for the entity a kept change names.
+enum StoredEntity {
+    /// Nothing stored under that identity.
+    Absent,
+    /// Stored, at this version.
+    Version(i64),
+    /// Stored, but in a table with no version to compare against.
+    Unversioned,
+}
+
+fn stored_entity_for_change(tx: &rusqlite::Transaction, change: &PulledChange) -> Result<StoredEntity, String> {
+    // A stored row whose version is NULL is `Unversioned`, never a read error: a replay must not
+    // be what fails a pull.
+    let stored = |version: Option<Option<i64>>| match version {
+        None => StoredEntity::Absent,
+        Some(Some(version)) => StoredEntity::Version(version),
+        Some(None) => StoredEntity::Unversioned,
+    };
+    let version_of = |sql: &str, id: &str| -> Result<StoredEntity, String> {
+        let version: Option<Option<i64>> = tx
+            .query_row(sql, [id], |row| row.get(0))
+            .optional()
+            .map_err(to_error)?;
+        Ok(stored(version))
+    };
+    let entity_id = change.entity_id.as_str();
+    match change.entity_type.as_str() {
+        "product" | "sale_rate" => version_of("SELECT version FROM local_products WHERE id = ?1", entity_id),
+        "product_category" => version_of("SELECT version FROM local_categories WHERE id = ?1", entity_id),
+        "supplier" => version_of("SELECT version FROM local_supplier_references WHERE id = ?1", entity_id),
+        "charge_type" => version_of("SELECT version FROM local_charge_types WHERE id = ?1", entity_id),
+        "charge_rate_slab" => version_of("SELECT version FROM local_charge_rate_slabs WHERE id = ?1", entity_id),
+        "combo" => {
+            let combo_id = combo_identity(&change.payload, Some(entity_id)).unwrap_or_else(|| change.entity_id.clone());
+            version_of("SELECT version FROM local_combos WHERE id = ?1", &combo_id)
+        }
+        "packing_type" => match packing_type_identity(&change.payload, Some(entity_id)) {
+            Some(type_id) => version_of("SELECT version FROM local_packing_types WHERE id = ?1", &type_id),
+            None => Ok(StoredEntity::Absent),
+        },
+        "packing_stock" => {
+            let branch_id = optional_text(&change.payload, "branch_id");
+            let size_id = packing_identity(
+                optional_text(&change.payload, "size_global_id").or_else(|| optional_text(&change.payload, "size_id")),
+                PACKING_SIZE_PREFIX,
+            );
+            let (Some(branch_id), Some(size_id)) = (branch_id, size_id) else {
+                return Ok(StoredEntity::Absent);
+            };
+            let version: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT version FROM local_packing_stock WHERE branch_id = ?1 AND size_id = ?2",
+                    params![branch_id, size_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(to_error)?;
+            Ok(stored(version))
+        }
+        "inventory_lot" => {
+            let ids = local_lot_ids_for_keys(tx, &cloud_lot_identity_keys(entity_id, &change.payload))?;
+            let mut newest: Option<i64> = None;
+            for id in &ids {
+                let version: Option<i64> = tx
+                    .query_row("SELECT version FROM local_inventory_lots WHERE id = ?1", [id], |row| row.get(0))
+                    .optional()
+                    .map_err(to_error)?
+                    .flatten();
+                newest = newest.max(version);
+            }
+            Ok(match (ids.is_empty(), newest) {
+                (true, _) => StoredEntity::Absent,
+                (false, Some(version)) => StoredEntity::Version(version),
+                (false, None) => StoredEntity::Unversioned,
+            })
+        }
+        "location_product" => {
+            let location_id = change.payload.get("operational_location_id").and_then(json_number).map(|value| (value as i64).to_string());
+            let product_id = optional_text(&change.payload, "product_global_id");
+            let (Some(location_id), Some(product_id)) = (location_id, product_id) else {
+                return Ok(StoredEntity::Absent);
+            };
+            let present: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM local_operational_location_products WHERE operational_location_id = ?1 AND product_id = ?2)",
+                    params![location_id, product_id],
+                    |row| row.get(0),
+                )
+                .map_err(to_error)?;
+            Ok(if present == 1 { StoredEntity::Unversioned } else { StoredEntity::Absent })
+        }
+        // `pos_sale` and `customer_order` gate on their own stored version inside their arms.
+        _ => Ok(StoredEntity::Absent),
+    }
+}
+
+/// Offer the kept changes to this build again, at the end of a pull.
+///
+/// `local_unapplied_changes` was written so an upgraded build, or a later pull that brought the
+/// missing parent, could apply what an earlier one had to set aside - but nothing ever read it
+/// back, and the cursor had already moved past every row in it. A combo pulled by a build without
+/// migration 028, or a lot that arrived before its product, was therefore lost on that counter
+/// until somebody happened to edit it in the cloud again.
+///
+/// Each replayable row is rebuilt as the change it was and applied through the same savepoint the
+/// pull uses, parents first (categories, products and suppliers, then charge and packing types,
+/// then the rest), oldest first within that. The rules:
+///
+/// * **A newer applied version wins.** When this device already stores the entity at the kept
+///   change's version or later, the kept change is stale and its row is cleared without applying
+///   it. When the entity is stored but its version cannot be compared (an unversioned kept change,
+///   or a table with no version), nothing is applied and the row stays: overwriting is the one
+///   outcome that cannot be undone.
+/// * **A replay that lands clears its row.** One that is refused again stays recorded - the arm or
+///   the savepoint records it under the same id, which is how a failed replay is told apart from a
+///   successful one (`seen_count` moves).
+/// * Rows for the changes in this very page were just tried and are left for the next pull.
+fn replay_unapplied_changes(
+    tx: &rusqlite::Transaction,
+    device_scope: &DevicePullScope,
+    page: &[PulledChange],
+) -> Result<(), String> {
+    let reasons = REPLAYABLE_UNAPPLIED_REASONS
+        .iter()
+        .map(|reason| format!("'{reason}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let kept: Vec<(String, String, String, String, Option<i64>, String, Option<String>, i64)> = {
+        let mut statement = tx
+            .prepare(&format!(
+                "SELECT id, entity_type, entity_id, operation_type, version, payload, updated_at, seen_count
+                 FROM local_unapplied_changes
+                 WHERE reason IN ({reasons})
+                 ORDER BY CASE entity_type
+                            WHEN 'product_category' THEN 0
+                            WHEN 'product' THEN 1
+                            WHEN 'sale_rate' THEN 1
+                            WHEN 'supplier' THEN 1
+                            WHEN 'charge_type' THEN 2
+                            WHEN 'packing_type' THEN 2
+                            ELSE 3
+                          END,
+                          first_seen_at, id"
+            ))
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+    let just_tried: Vec<String> = page.iter().map(unapplied_record_id).collect();
+    for (record_id, entity_type, entity_id, operation_type, version, payload, updated_at, seen_before) in kept {
+        if just_tried.contains(&record_id) || !REPLAYABLE_ENTITY_TYPES.contains(&entity_type.as_str()) {
+            continue;
+        }
+        // A payload that no longer parses stays where it is, for a person to look at.
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        let change = PulledChange {
+            change_id: serde_json::Value::Null,
+            branch_id: None,
+            entity_type,
+            entity_id,
+            operation_type,
+            version,
+            payload,
+            updated_at,
+        };
+        match (stored_entity_for_change(tx, &change)?, change.version) {
+            (StoredEntity::Absent, _) => {}
+            (StoredEntity::Version(stored), Some(kept_version)) if kept_version > stored => {}
+            (StoredEntity::Version(_), Some(_)) => {
+                // Superseded: a version at least as new is already applied here.
+                tx.execute("DELETE FROM local_unapplied_changes WHERE id = ?1", [&record_id])
+                    .map_err(to_error)?;
+                continue;
+            }
+            (StoredEntity::Version(_), None) | (StoredEntity::Unversioned, _) => continue,
+        }
+        if change.entity_type == "inventory_lot" && device_scope.refusal_for_inventory_lot(&change).is_some() {
+            continue;
+        }
+        apply_pulled_change_or_record(tx, &change)?;
+        let seen_after: Option<i64> = tx
+            .query_row(
+                "SELECT seen_count FROM local_unapplied_changes WHERE id = ?1",
+                [&record_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_error)?;
+        if seen_after == Some(seen_before) {
+            tx.execute("DELETE FROM local_unapplied_changes WHERE id = ?1", [&record_id])
+                .map_err(to_error)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn apply_reference_bootstrap(
@@ -921,7 +1172,47 @@ fn apply_reference_bootstrap_at(
                 return Err(format!("Inventory lot {} is outside the canonical device scope", change.entity_id));
             }
         }
-        apply_change_with_tx(&tx, change)?;
+        // Through the pull path's savepoint, not straight into the transaction. A record this
+        // device cannot store (a lot whose product the server left out of `records`, say) used to
+        // fail with a FOREIGN KEY error and roll back the whole fill; the cursor stayed at "0", the
+        // next cycle asked for a bootstrap again and failed again, and a rebuilt counter never got
+        // past it. Now that record is kept in `local_unapplied_changes` and the rest lands. The
+        // scope checks above stay hard errors: those say the bootstrap is for another device.
+        apply_pulled_change_or_record(&tx, change)?;
+    }
+
+    // Charge types, through the same `charge_type` arm the pull feed uses, so a charge type whose
+    // slabs cannot be read is kept as an unapplied change rather than failing the fill. The id is
+    // resolved exactly as the sign-in cache resolves it, so both paths write the same row.
+    for charge_type in &bootstrap.charge_types {
+        let charge_type_id = optional_text(charge_type, "id")
+            .or_else(|| optional_text(charge_type, "global_id"))
+            .or_else(|| optional_text(charge_type, "charge_type_id"))
+            .ok_or_else(|| "Reference bootstrap charge type has no identity".to_string())?;
+        let change = PulledChange {
+            change_id: serde_json::Value::Null,
+            branch_id: Some(bootstrap.branch_id),
+            entity_type: "charge_type".to_string(),
+            entity_id: charge_type_id,
+            operation_type: "UPSERT".to_string(),
+            version: charge_type
+                .get("entity_version")
+                .or_else(|| charge_type.get("version"))
+                .and_then(|value| value.as_i64()),
+            payload: charge_type.clone(),
+            updated_at: optional_text(charge_type, "updated_at"),
+        };
+        let payload_company = charge_type.get("company_id").and_then(json_number).map(|value| value as i64);
+        if payload_company.is_some() && payload_company != Some(bootstrap.company_id) {
+            record_unapplied_change(
+                &tx,
+                &change,
+                "CHARGE_TYPE_OUTSIDE_COMPANY_SCOPE",
+                Some(format!("charge type belongs to company {:?}, this device to {}", payload_company, bootstrap.company_id)),
+            )?;
+            continue;
+        }
+        apply_pulled_change_or_record(&tx, &change)?;
     }
 
     // Combos travel as their own top-level array, each with its `items[]`. They go through the
@@ -955,7 +1246,7 @@ fn apply_reference_bootstrap_at(
             )?;
             continue;
         }
-        apply_change_with_tx(&tx, &change)?;
+        apply_pulled_change_or_record(&tx, &change)?;
     }
 
     // Frooz Pack: the packing catalogue (whole trees) and the cloud's counts, through the same
@@ -987,7 +1278,7 @@ fn apply_reference_bootstrap_at(
             )?;
             continue;
         }
-        apply_change_with_tx(&tx, &change)?;
+        apply_pulled_change_or_record(&tx, &change)?;
     }
     for stock in &bootstrap.packing_stock {
         let entity_id = optional_text(stock, "global_id").unwrap_or_else(|| {
@@ -1020,7 +1311,7 @@ fn apply_reference_bootstrap_at(
             )?;
             continue;
         }
-        apply_change_with_tx(&tx, &change)?;
+        apply_pulled_change_or_record(&tx, &change)?;
     }
 
     for location_product in &bootstrap.location_products {
@@ -1773,10 +2064,13 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     )
     .map_err(to_error)?;
 
+    // The lot each line actually sold from, written back into the outbox payload below.
+    let mut sold_lot_ids: Vec<String> = Vec::with_capacity(items.len());
     for (item, combo) in items.iter().zip(item_combos.iter()) {
         let item_id = required_text(item, "item_global_id")?;
         let product_id = required_text(item, "product_id")?;
-        let lot_id = required_text(item, "lot_id")?;
+        let lot_id = sale_line_lot_id(&tx, &required_text(item, "lot_id")?)?;
+        sold_lot_ids.push(lot_id.clone());
         let quantity = required_number(item, "quantity")?;
         let rate = required_number(item, "rate")?;
         let discount = number_or_zero(item, "discount");
@@ -1818,10 +2112,14 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
         tx.execute(
             "INSERT INTO local_products (id, cloud_id, branch_id, product_name, unit, sale_rate, sync_status, updated_at)
              VALUES (?1, ?1, ?2, ?3, ?4, ?5, 'synced', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             -- `sale_rate` is deliberately not updated on conflict. A line's rate is what this bill
+             -- charged, which a permitted cashier may override or confirm at 0; written back, one
+             -- such bill re-priced every later bill of the product on this counter (the product's
+             -- rate is the POS fallback when a lot has none) until the next pull. The rate only
+             -- seeds a product row this counter did not have.
              ON CONFLICT(id) DO UPDATE SET
                product_name = COALESCE(excluded.product_name, local_products.product_name),
                unit = COALESCE(excluded.unit, local_products.unit),
-               sale_rate = COALESCE(excluded.sale_rate, local_products.sale_rate),
                updated_at = excluded.updated_at",
             params![
                 product_id,
@@ -1977,6 +2275,14 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     // The outbox payload is the sale as it was stored, not as it arrived: the charges are put back
     // under the canonical keys so the cloud is handed the same shape whichever key the POS used.
     if let Some(object) = sale.as_object_mut() {
+        // The lot spelling the stock was taken from, so the cloud is told the row this device moved.
+        if let Some(lines) = object.get_mut("items").and_then(|value| value.as_array_mut()) {
+            for (line, lot_id) in lines.iter_mut().zip(sold_lot_ids.iter()) {
+                if let Some(line) = line.as_object_mut() {
+                    line.insert("lot_id".to_string(), serde_json::json!(lot_id));
+                }
+            }
+        }
         object.insert("other_charges".to_string(), serde_json::Value::Array(charge_lines.clone()));
         object.insert(
             "other_charges_amount".to_string(),
@@ -5177,6 +5483,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "027_product_pos_section", MIGRATION_027)?;
     apply_migration(&mut conn, "028_combos", MIGRATION_028)?;
     apply_migration(&mut conn, "029_frooz_pack", MIGRATION_029)?;
+    apply_migration(&mut conn, "030_dedupe_cached_sale_copies", MIGRATION_030)?;
     if first_open_in_this_process(path) {
         release_interrupted_syncing_at(&conn)?;
     }
@@ -5519,6 +5826,36 @@ fn live_lot_id_for(conn: &Connection, lot_id: &str) -> Result<String, String> {
             .map(|found| found == 1)
             .map_err(to_error)?;
         if live {
+            return Ok(candidate);
+        }
+    }
+    Ok(lot_id.to_string())
+}
+
+/// The live lot row a new bill line sells from, however the cart spelled the lot.
+///
+/// The cart can name a lot `"5"` while the shelf row is `"inventory-lot-5"` (the cloud's two names
+/// for one row, see `cloud_lot_identity_keys`), or name a spelling a pull has just retired. Looked
+/// up by `id` alone, the first created a second lot seeded from the cart's `available_qty` - stock
+/// on the shelf that is not there - and the second refused the sale for want of stock that is.
+/// Resolved the way the edit path resolves (`live_lot_id_for`), then through the lot's other
+/// spellings. A lot this device does not hold at all is returned unchanged.
+fn sale_line_lot_id(conn: &Connection, lot_id: &str) -> Result<String, String> {
+    let is_live = |candidate: &str| -> Result<bool, String> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM local_inventory_lots WHERE id = ?1 AND deleted_at IS NULL)",
+            [candidate],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|found| found == 1)
+        .map_err(to_error)
+    };
+    let resolved = live_lot_id_for(conn, lot_id)?;
+    if is_live(&resolved)? {
+        return Ok(resolved);
+    }
+    for candidate in local_lot_ids_for_keys(conn, &cloud_lot_identity_keys(lot_id, &serde_json::json!({})))? {
+        if is_live(&candidate)? {
             return Ok(candidate);
         }
     }
@@ -6147,6 +6484,28 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
             let sale_id = optional_text(sale, "global_id")
                 .or_else(|| optional_text(sale, "id").map(|id| format!("cloud-sale-{id}")))
                 .unwrap_or_else(|| format!("cloud-sale-{}", checksum(&sale.to_string())));
+            // A bill this counter already holds - its own, stored under its own id when it was
+            // made and given `server_sale_id` by the push acknowledgement, or one pulled as a
+            // `pos_sale` change under its global id - arrives here again without a `global_id`
+            // (GET /sales does not send one), so the id above is a new `cloud-sale-*`. Inserting
+            // it put a second copy of the bill on this counter, and every offline sales total
+            // counted it twice. The bill already here is left as it is: it was written from the
+            // sale itself or from a versioned change, both of which say more than this list row.
+            if sale_id.starts_with("cloud-sale-") {
+                if let Some(cloud_sale_id) = optional_text(sale, "id") {
+                    let already_held: bool = tx
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM local_pos_invoices WHERE server_sale_id = ?1 AND id <> ?2)",
+                            params![cloud_sale_id, sale_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map(|found| found == 1)
+                        .map_err(to_error)?;
+                    if already_held {
+                        continue;
+                    }
+                }
+            }
             let offline_ref = optional_text(sale, "offline_invoice_ref")
                 .unwrap_or_else(|| format!("CLOUD-{}", sale_id));
             let bill_date = optional_text(sale, "sale_date")
@@ -6966,7 +7325,9 @@ fn load_reference_snapshot_at(
         "SELECT last_successful_sync_at FROM sync_state ORDER BY updated_at DESC LIMIT 1",
         &[],
     )?;
-    let pending_operations = count_outbox_status(&conn, &["pending", "syncing", "failed"])?;
+    // The same definition as `status_at` and `pending_outbox_count_at`: waiting or on its way.
+    // A failed operation is reported once, under `failed_operations`, not in both counts.
+    let pending_operations = count_outbox_status(&conn, &["pending", "syncing"])?;
     let reference_ready = !products.is_empty() && !inventory_lots.is_empty();
     // §6.4 / Stage 8: additive only. `branch_context` above is untouched — whatever was last
     // cached stands exactly as it did before this field existed. `canonical_scope` is a second,
@@ -7065,9 +7426,12 @@ fn get_smoke_value_at(path: &Path) -> Result<Option<String>, String> {
     .map_err(to_error)
 }
 
+/// "Pending" everywhere it is reported: `pending` + `syncing`. A failed operation is counted under
+/// `failed_operations` only; counting it here too made the badge flip between N and N+1 depending
+/// on which refresh ran last.
 fn pending_outbox_count_at(conn: &Connection) -> Result<i64, String> {
     conn.query_row(
-        "SELECT COUNT(*) FROM sync_outbox WHERE LOWER(status) IN ('pending', 'failed')",
+        "SELECT COUNT(*) FROM sync_outbox WHERE LOWER(status) IN ('pending', 'syncing')",
         [],
         |row| row.get(0),
     )
@@ -8703,6 +9067,17 @@ const CUSTOMER_ORDER_PAYMENT_STATES: [&str; 3] = ["UNPAID", "PAID", "ON_DELIVERY
 /// page. And it is not a `sync_conflicts` row: that table feeds a conflict count a person is meant
 /// to act on, and "this build is older than the server" is not a conflict to resolve. It is written
 /// whole, so an upgraded build can read these back and apply them.
+/// The `local_unapplied_changes` id of a change. Derived from the change, not from the clock, so
+/// a replay updates the row it already wrote instead of piling up a copy per pull.
+fn unapplied_record_id(change: &PulledChange) -> String {
+    format!(
+        "{}::{}::{}",
+        change.entity_type,
+        change.entity_id,
+        change.version.unwrap_or(0)
+    )
+}
+
 fn record_unapplied_change(
     tx: &rusqlite::Transaction,
     change: &PulledChange,
@@ -8710,14 +9085,7 @@ fn record_unapplied_change(
     detail: Option<String>,
 ) -> Result<(), String> {
     let payload = serde_json::to_string(&change.payload).map_err(to_error)?;
-    // Derived from the change, not from the clock, so a replay updates the row it already wrote
-    // instead of piling up a copy per pull.
-    let record_id = format!(
-        "{}::{}::{}",
-        change.entity_type,
-        change.entity_id,
-        change.version.unwrap_or(0)
-    );
+    let record_id = unapplied_record_id(change);
     eprintln!(
         "local sync: change not applied ({reason}) entity_type={} entity_id={} version={:?}",
         change.entity_type, change.entity_id, change.version
@@ -9640,6 +10008,13 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             .map_err(to_error)?;
         }
         "customer_order" => apply_pulled_customer_order_with_tx(tx, change)?,
+        // Cloud-side aggregates a counter has no use for, acknowledged on purpose. Their stock
+        // effect already reaches the counter another way: every one of these routes writes
+        // `inventory_batches`, and cloud migration 011's trigger publishes that as the
+        // `inventory_lot` change the arm above applies. Recording them as unsupported added a row
+        // per counter for every online return, purchase and waste entry, to a table nothing reads.
+        // They are not replayable either (absent from `REPLAYABLE_ENTITY_TYPES`).
+        "sale_return" | "purchase" | "waste_entry" => {}
         // Not `_ => {}`. An unrecognised entity type used to be dropped here with no error and no
         // log, while the caller advanced the pull cursor in the same transaction — so the change
         // was never offered again and the loss was invisible on both ends. It is kept instead:
@@ -9762,7 +10137,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 28;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 29;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -9963,6 +10338,7 @@ mod tests {
                     updated_at: Some("2026-07-27T10:00:00.000Z".to_string()),
                 },
             ],
+            charge_types: Vec::new(),
             combos: Vec::new(),
             packing_types: Vec::new(),
             packing_stock: Vec::new(),
@@ -10460,13 +10836,6 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// Every status change queues its own whole-record UPSERT and moves the version on.
-    ///
-    /// Not a distinct operation type per status change: the server sorts a push batch by
-    /// `operation_id` string rather than by causality and permanently records any rejection, so a
-    /// status change that arrived before its own creation would be rejected once and never retried.
-    /// Whole-record UPSERT with last-writer-wins on version is order-independent.
-    #[test]
     #[test]
     fn an_acknowledged_order_stops_reporting_itself_as_pending() {
         // The seam between the two halves of this feature, and the one place neither half could
@@ -10559,6 +10928,13 @@ mod tests {
         );
     }
 
+    /// Every status change queues its own whole-record UPSERT and moves the version on.
+    ///
+    /// Not a distinct operation type per status change: the server sorts a push batch by
+    /// `operation_id` string rather than by causality and permanently records any rejection, so a
+    /// status change that arrived before its own creation would be rejected once and never retried.
+    /// Whole-record UPSERT with last-writer-wins on version is order-independent.
+    #[test]
     fn a_status_change_queues_its_own_upsert_and_moves_the_version_on() {
         let path = order_sync_test_path("status");
         initialize_at(&path).expect("initialize order sync database");
@@ -17730,7 +18106,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!((applied, total), (1, EXPECTED_APPLIED_MIGRATIONS));
-        assert_eq!(status_at(&path).expect("status").schema_version, "029_frooz_pack");
+        assert_eq!(status_at(&path).expect("status").schema_version, CURRENT_SCHEMA_VERSION);
         for table in [
             "local_packing_types", "local_packing_designs", "local_packing_sizes", "local_packing_stock",
             "local_combo_packing", "local_pos_invoice_packing",
@@ -18245,6 +18621,493 @@ mod tests {
         assert_eq!(sizes.len(), 3);
         assert_eq!(sizes["packing-size-1"]["qty_on_hand"], 25.0);
         assert_eq!(unapplied_reason(&path, "packing-type-9").as_deref(), Some("PACKING_OUTSIDE_COMPANY_SCOPE"));
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---- Desktop polish pins (DT-1 .. DT-9, DT-11 is the attribute fix above) ----
+
+    fn polish_path(tag: &str) -> PathBuf {
+        sync_fix_path(&format!("polish-{tag}"))
+    }
+
+    fn pull_changes(path: &Path, changes: &[PulledChange], cursor: &str) {
+        apply_pull_changes_at(
+            path,
+            changes,
+            cursor,
+            Some("device-x".to_string()),
+            Some("2026-10-20T10:00:00.000Z".to_string()),
+        )
+        .expect("a pull page applies");
+    }
+
+    fn unapplied_count(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM local_unapplied_changes", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// DT-1: a lot whose product the bootstrap left out of `records` (the cloud's product list skips
+    /// deactivated products, its lot list does not) is recorded, and the rest of the fill lands.
+    /// Before, the FOREIGN KEY failure rolled back the whole bootstrap on every cycle.
+    #[test]
+    fn bootstrap_records_a_lot_of_an_absent_product_and_fills_the_rest() {
+        let path = polish_path("boot-orphan-lot");
+        initialize_at(&path).unwrap();
+        let mut bootstrap = test_reference_bootstrap("device-bootstrap", 1001);
+        bootstrap.records.push(PulledChange {
+            change_id: serde_json::Value::Null,
+            branch_id: Some(1),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: "inventory-lot-77".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "company_id": 1, "branch_id": 1, "operational_location_id": 1001,
+                "product_global_id": "product-deactivated", "product_name": "Gone",
+                "purchase_qty": 3.0, "remaining_qty": 0.0, "purchase_rate": 10.0
+            }),
+            updated_at: None,
+        });
+        apply_reference_bootstrap_at(&path, &bootstrap, "device-bootstrap", Some("2026-07-27T10:01:00.000Z".to_string()))
+            .expect("one record the device cannot store must not fail the fill");
+        let conn = Connection::open(&path).unwrap();
+        let products: i64 = conn.query_row("SELECT COUNT(*) FROM local_products", [], |r| r.get(0)).unwrap();
+        assert!(products > 0, "the rest of the bootstrap is stored");
+        let orphan: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_inventory_lots WHERE id = 'inventory-lot-77'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphan, 0);
+        drop(conn);
+        assert_eq!(unapplied_reason(&path, "inventory-lot-77").as_deref(), Some("CHANGE_NOT_APPLICABLE"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-2: a bill this counter made and pushed comes back in the sign-in cache's `sales_history`
+    /// (GET /sales, no `global_id`). It must not be stored a second time as `cloud-sale-<id>`.
+    #[test]
+    fn sign_in_cache_does_not_store_a_second_copy_of_a_synced_bill() {
+        let path = polish_path("dup-bill");
+        initialize_at(&path).unwrap();
+        complete_local_pos_sale_at(&path, test_sale_payload("inv-own", "op-own", 2.0, 20.0)).unwrap();
+        ack(&path, "op-own", "accepted", None, serde_json::json!({"invoice_no": "INV-9", "sale_id": 9}));
+        let snapshot = serde_json::json!({
+            "device_identity": {"device_id": "device-test", "branch_id": "1"},
+            "branch_context": {"branch_id": "1"},
+            "sales_history": [
+                {"id": 9, "invoice_no": "INV-9", "sale_date": "2026-06-16", "payment_mode": "CASH", "amount": "20.00", "sale_status": "COMPLETED"},
+                {"id": 10, "invoice_no": "INV-10", "sale_date": "2026-06-16", "payment_mode": "CASH", "amount": "35.00", "sale_status": "COMPLETED"}
+            ]
+        });
+        cache_reference_snapshot_at(&path, &snapshot).unwrap();
+        cache_reference_snapshot_at(&path, &snapshot).unwrap();
+        let loaded = load_reference_snapshot_at(&path, None, Some("device-test")).unwrap();
+        let ids: Vec<String> = loaded["sales_history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(ids.iter().filter(|id| id.as_str() == "inv-own").count(), 1);
+        assert!(!ids.contains(&"cloud-sale-9".to_string()), "no second copy of INV-9: {ids:?}");
+        assert!(ids.contains(&"cloud-sale-10".to_string()), "a bill this counter does not hold is still cached");
+        let between = list_local_pos_sales_between_at(&path, "2026-06-16", "2026-06-16").unwrap();
+        assert_eq!(between.len(), 2, "offline totals count INV-9 once");
+        let own = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT net_total, bill_datetime FROM local_pos_invoices WHERE id = 'inv-own'", [], |row| {
+                Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        assert_eq!(own, (20.0, "2026-06-16T10:00".to_string()), "the bill itself is left as it was");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-2, migration 030: removes only a `cloud-sale-*` copy whose `server_sale_id` equals a
+    /// non-copy bill's, with its own child rows. A copy with no twin, a copy with local work, and
+    /// two copies that only twin each other are all left. Runs once; running the file again changes
+    /// nothing.
+    #[test]
+    fn migration_030_removes_only_cached_copies_of_bills_held_under_their_own_id() {
+        let path = polish_path("migration-030");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            apply_migrations_through_023(&mut conn);
+            for (version, sql) in [
+                ("024_other_charges", MIGRATION_024),
+                ("025_device_machine_fingerprint", MIGRATION_025),
+                ("026_sync_outbox_entity_and_deferred_lots", MIGRATION_026),
+                ("027_product_pos_section", MIGRATION_027),
+                ("028_combos", MIGRATION_028),
+                ("029_frooz_pack", MIGRATION_029),
+            ] {
+                apply_migration(&mut conn, version, sql).expect("apply pre-030 migration");
+            }
+            let bill = |id: &str, server_sale_id: Option<&str>| {
+                conn.execute(
+                    "INSERT INTO local_pos_invoices (id, offline_invoice_ref, branch_id, device_id, bill_date, bill_datetime, payment_mode, net_total, server_sale_id)
+                     VALUES (?1, ?2, '1', 'device-test', '2026-06-16', '2026-06-16T10:00', 'CASH', 20, ?3)",
+                    params![id, format!("REF-{id}"), server_sale_id],
+                )
+                .unwrap();
+            };
+            bill("inv-own", Some("9"));
+            bill("cloud-sale-9", Some("9")); // the copy: removed
+            bill("cloud-sale-11", Some("11")); // no twin: kept
+            bill("sale-global-12", Some("12"));
+            bill("cloud-sale-12", Some("12")); // twin, but edited on this counter: kept
+            bill("cloud-sale-13", Some("13"));
+            bill("cloud-sale-13b", Some("13")); // two copies twinning each other: both kept
+            bill("inv-unsynced", None);
+            conn.execute(
+                "INSERT INTO local_pos_invoice_items (id, invoice_id, product_id, lot_id, quantity, rate, stock_movement_id)
+                 VALUES ('line-copy-9', 'cloud-sale-9', 'product-test', 'lot-test', 1, 20, 'stock-copy-9')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO local_pos_invoice_items (id, invoice_id, product_id, lot_id, quantity, rate, stock_movement_id)
+                 VALUES ('line-own-9', 'inv-own', 'product-test', 'lot-test', 1, 20, 'stock-own-9')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_outbox (id, entity_type, entity_id, operation_type, payload)
+                 VALUES ('op-edit-12', 'pos_sale', 'cloud-sale-12', 'SALE_CANCEL', '{}')",
+                [],
+            )
+            .unwrap();
+        }
+        initialize_at(&path).expect("upgrade to 030");
+        simulate_restart(&path);
+        initialize_at(&path).expect("restart with the upgraded profile");
+
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM local_pos_invoices ORDER BY id").unwrap();
+        let ids: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap().map(|row| row.unwrap()).collect();
+        drop(stmt);
+        assert_eq!(
+            ids,
+            vec!["cloud-sale-11", "cloud-sale-12", "cloud-sale-13", "cloud-sale-13b", "inv-own", "inv-unsynced", "sale-global-12"]
+        );
+        let lines: Vec<String> = conn
+            .prepare("SELECT id FROM local_pos_invoice_items ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(lines, vec!["line-own-9"], "the copy's own line goes with it; the bill's stays");
+        let outbox: i64 = conn.query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0)).unwrap();
+        assert_eq!(outbox, 1, "no outbox row is touched");
+        let applied: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_schema_migrations WHERE version = '030_dedupe_cached_sale_copies'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(applied, 1);
+        conn.execute_batch(MIGRATION_030).expect("030 is idempotent on its own");
+        let after: i64 = conn.query_row("SELECT COUNT(*) FROM local_pos_invoices", [], |row| row.get(0)).unwrap();
+        assert_eq!(after, 7);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-3: the bootstrap's top-level `charge_types` is stored, slabs and all.
+    #[test]
+    fn reference_bootstrap_fills_charge_types_with_their_slabs() {
+        let path = polish_path("boot-charges");
+        initialize_at(&path).unwrap();
+        let mut bootstrap = test_reference_bootstrap("device-charges", 1001);
+        bootstrap.charge_types = vec![
+            serde_json::json!({
+                "id": 7, "company_id": 1, "charge_name": "Delivery charge", "charge_code": "DEL",
+                "basis": "SLAB", "measure_unit": "km", "flat_rate": null, "active": true, "entity_version": 3,
+                "updated_at": "2026-10-20T10:00:00.000Z",
+                "slabs": [
+                    { "id": 21, "charge_type_id": 7, "upto_value": "10.000", "rate": "100.00", "active": true },
+                    { "id": 22, "charge_type_id": 7, "upto_value": "15.000", "rate": "150.00", "active": true }
+                ]
+            }),
+            // Unreadable slab: recorded, never a reason to fail the fill.
+            serde_json::json!({ "id": 8, "company_id": 1, "charge_name": "Broken", "basis": "SLAB", "slabs": [{ "id": 30, "rate": "5.00" }] }),
+        ];
+        apply_reference_bootstrap_at(&path, &bootstrap, "device-charges", Some("2026-10-20T10:01:00.000Z".to_string()))
+            .expect("bootstrap with charge types");
+        let loaded = load_reference_snapshot_at(&path, None, Some("device-charges")).unwrap();
+        let charges = loaded["charge_types"].as_array().expect("charge types emitted");
+        let delivery = charges.iter().find(|row| row["id"] == "7").expect("the delivery charge is stored");
+        assert_eq!(delivery["charge_name"], "Delivery charge");
+        assert_eq!(delivery["slabs"].as_array().map(|rows| rows.len()), Some(2));
+        assert!(charges.iter().all(|row| row["id"] != "8"));
+        assert_eq!(unapplied_reason(&path, "8").as_deref(), Some("CHARGE_TYPE_NOT_USABLE"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-4: a combo an older build recorded as unsupported is applied by the next pull, and its
+    /// row is cleared.
+    #[test]
+    fn a_pull_replays_a_combo_an_older_build_could_not_apply() {
+        let path = polish_path("replay-combo");
+        initialize_at(&path).unwrap();
+        let combo = pulled_combo(
+            "combo-12",
+            serde_json::json!({
+                "id": 12, "global_id": "combo-12", "company_id": 1, "name": "Mango Shake", "kind": "juice",
+                "combo_type": "FIXED", "price": "60.00", "active": true, "entity_version": 2,
+                "items": [{ "product_global_id": "product-276", "product_name": "Langda", "quantity": "0.250" }]
+            }),
+        );
+        let combo = PulledChange { version: Some(2), ..combo };
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            // Exactly what a build without the `combo` arm wrote.
+            record_unapplied_change(&tx, &combo, "ENTITY_TYPE_NOT_SUPPORTED", Some("old build".to_string())).unwrap();
+            tx.commit().unwrap();
+        }
+        pull_changes(&path, &[pulled_product("product", "product-1", serde_json::json!({ "product_name": "Apple" }))], "20");
+        let combos = combo_snapshot_by_id(&path, "device-x");
+        assert_eq!(combos.get("combo-12").map(|row| row["name"].clone()), Some(serde_json::json!("Mango Shake")));
+        assert_eq!(unapplied_reason(&path, "combo-12"), None, "a replay that lands clears its row");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-4: a kept change older than what is stored never overwrites it; its row is cleared as
+    /// superseded.
+    #[test]
+    fn a_stale_kept_combo_never_overwrites_a_newer_one() {
+        let path = polish_path("replay-stale");
+        initialize_at(&path).unwrap();
+        let shaped = |name: &str, version: i64| PulledChange {
+            version: Some(version),
+            ..pulled_combo(
+                "combo-12",
+                serde_json::json!({
+                    "id": 12, "global_id": "combo-12", "company_id": 1, "name": name, "kind": "juice",
+                    "combo_type": "FIXED", "price": "60.00", "active": true, "entity_version": version,
+                    "items": [{ "product_global_id": "product-276", "quantity": "0.250" }]
+                }),
+            )
+        };
+        pull_changes(&path, &[shaped("Mango Shake v5", 5)], "30");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            record_unapplied_change(&tx, &shaped("Mango Shake v3", 3), "ENTITY_TYPE_NOT_SUPPORTED", None).unwrap();
+            tx.commit().unwrap();
+        }
+        pull_changes(&path, &[], "31");
+        let combos = combo_snapshot_by_id(&path, "device-x");
+        assert_eq!(combos["combo-12"]["name"], "Mango Shake v5");
+        assert_eq!(unapplied_count(&path), 0, "the superseded row is cleared");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-4: a lot that arrived before its product is applied by the pull that brings the product;
+    /// a lot whose product never arrives stays recorded.
+    #[test]
+    fn a_lot_kept_for_want_of_its_product_lands_once_the_product_does() {
+        let path = polish_path("replay-lot");
+        initialize_at(&path).unwrap();
+        let lot = |entity_id: &str, product: &str| PulledChange {
+            change_id: serde_json::json!(5),
+            branch_id: Some(1),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: entity_id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({ "branch_id": 1, "product_global_id": product, "purchase_qty": 4.0, "remaining_qty": 4.0 }),
+            updated_at: None,
+        };
+        pull_changes(&path, &[lot("inventory-lot-5", "product-new"), lot("inventory-lot-6", "product-never")], "5");
+        assert_eq!(unapplied_reason(&path, "inventory-lot-5").as_deref(), Some("CHANGE_NOT_APPLICABLE"));
+        pull_changes(&path, &[pulled_product("product", "product-new", serde_json::json!({ "product_name": "Kiwi" }))], "6");
+        assert_eq!(live_lots(&path, "product-new"), vec![("inventory-lot-5".to_string(), 4.0)]);
+        assert_eq!(unapplied_reason(&path, "inventory-lot-5"), None);
+        assert_eq!(
+            unapplied_reason(&path, "inventory-lot-6").as_deref(),
+            Some("CHANGE_NOT_APPLICABLE"),
+            "a replay that still fails stays recorded"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-5: a `duplicate` acknowledgement (no result payload) keeps the cloud invoice number.
+    #[test]
+    fn a_duplicate_ack_keeps_the_cloud_invoice_number() {
+        let path = polish_path("dup-ack");
+        initialize_at(&path).unwrap();
+        complete_local_pos_sale_at(&path, test_sale_payload("inv-dup", "op-dup", 2.0, 20.0)).unwrap();
+        ack(&path, "op-dup", "accepted", None, serde_json::json!({"invoice_no": "INV-9", "sale_id": 9}));
+        apply_push_acks_at(
+            &path,
+            &[SyncAck {
+                operation_id: "op-dup".to_string(),
+                status: "duplicate".to_string(),
+                server_entity_version: Some(1),
+                server_updated_at: None,
+                error_code: None,
+                message: None,
+                result_payload: None,
+            }],
+            None,
+            Some("2026-10-20T10:05:00.000Z".to_string()),
+        )
+        .unwrap();
+        let stored: (Option<String>, Option<String>) = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT server_invoice_no, server_sale_id FROM local_pos_invoices WHERE id = 'inv-dup'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(stored, (Some("INV-9".to_string()), Some("9".to_string())));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-6: a loose line billed at another rate does not become the product's rate here.
+    #[test]
+    fn a_loose_sale_does_not_overwrite_the_products_rate() {
+        let path = polish_path("loose-rate");
+        initialize_at(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute("INSERT INTO local_products (id, cloud_id, product_name, sale_rate, sync_status) VALUES ('product-test', 'product-test', 'Test', 100, 'synced')", [])
+            .unwrap();
+        let mut sale = test_sale_payload("inv-rate", "op-rate", 2.0, 160.0);
+        sale["items"][0]["rate"] = serde_json::json!(80.0);
+        complete_local_pos_sale_at(&path, sale).unwrap();
+        let rate: f64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT sale_rate FROM local_products WHERE id = 'product-test'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rate, 100.0);
+        // A product this counter did not have yet is still seeded from the line.
+        let mut first = test_sale_payload("inv-new-product", "op-new-product", 1.0, 30.0);
+        first["offline_invoice_ref"] = serde_json::json!("OFF-NEW-PRODUCT");
+        first["items"][0]["product_id"] = serde_json::json!("product-fresh");
+        first["items"][0]["lot_id"] = serde_json::json!("lot-fresh");
+        first["items"][0]["item_global_id"] = serde_json::json!("line-fresh");
+        first["items"][0]["stock_movement_id"] = serde_json::json!("stock-fresh");
+        first["items"][0]["rate"] = serde_json::json!(30.0);
+        first["payments"][0]["posting_id"] = serde_json::json!("posting-fresh");
+        complete_local_pos_sale_at(&path, first).unwrap();
+        let seeded: Option<f64> = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT sale_rate FROM local_products WHERE id = 'product-fresh'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seeded, Some(30.0));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-7: a cart line naming a lot by its other spelling sells from the shelf row, and a line
+    /// naming a retired spelling sells from the survivor. No phantom lot, no false refusal.
+    #[test]
+    fn a_sale_naming_a_lot_by_another_spelling_sells_from_the_shelf_row() {
+        let path = polish_path("bare-lot");
+        initialize_at(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("INSERT INTO local_products (id, product_name, sync_status) VALUES ('product-test','Test','synced')", []).unwrap();
+            conn.execute(
+                "INSERT INTO local_inventory_lots (id, cloud_id, branch_id, product_id, opening_qty, balance_qty, status, sync_status)
+                 VALUES ('inventory-lot-5','inventory-lot-5','1','product-test',5,5,'ACTIVE','synced')",
+                [],
+            )
+            .unwrap();
+            // A spelling a pull retired in favour of the shelf row.
+            conn.execute(
+                "INSERT INTO local_inventory_lots (id, cloud_id, branch_id, product_id, opening_qty, balance_qty, status, sync_status, deleted_at)
+                 VALUES ('lot-old-5','5','1','product-test',5,5,'ACTIVE','synced','2026-10-20T10:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let mut sale = test_sale_payload("inv-bare", "op-bare", 2.0, 20.0);
+        sale["items"][0]["lot_id"] = serde_json::json!("5");
+        let result = complete_local_pos_sale_at(&path, sale).expect("the fruit is on the shelf");
+        assert_eq!(result.invoice["items"][0]["lot_id"], "inventory-lot-5", "the outbox names the row that moved");
+        assert_eq!(live_lots(&path, "product-test"), vec![("inventory-lot-5".to_string(), 3.0)]);
+
+        let mut retired = sale_on_lot("inv-retired", "lot-old-5", "product-test", 1.0, "2026-06-16");
+        retired["items"][0]["available_qty"] = serde_json::json!(5.0);
+        complete_local_pos_sale_at(&path, retired).expect("a retired spelling sells from the survivor");
+        assert_eq!(live_lots(&path, "product-test"), vec![("inventory-lot-5".to_string(), 2.0)]);
+        let (line_lot, movement_lot): (String, String) = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT i.lot_id, m.lot_id FROM local_pos_invoice_items i JOIN local_stock_movements m ON m.item_id = i.id WHERE i.invoice_id = 'inv-retired'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((line_lot.as_str(), movement_lot.as_str()), ("inventory-lot-5", "inventory-lot-5"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// DT-9: one definition of "pending" (pending + syncing) in status, snapshot and sale result;
+    /// a failed operation is counted as failed only.
+    #[test]
+    fn pending_means_the_same_in_status_snapshot_and_sale_result() {
+        let path = polish_path("pending-count");
+        initialize_at(&path).unwrap();
+        queue_test_operation(&path, "op-will-fail");
+        set_outbox_status(&path, "op-will-fail", "failed");
+        let result = complete_local_pos_sale_at(&path, test_sale_payload("inv-count", "op-count", 1.0, 10.0)).unwrap();
+        assert_eq!(result.pending_operations, 1);
+        let status = status_at(&path).unwrap();
+        assert_eq!((status.pending_operations, status.failed_operations), (1, 1));
+        let loaded = load_reference_snapshot_at(&path, None, Some("device-test")).unwrap();
+        assert_eq!(loaded["pending_operations"], 1);
+        assert_eq!(loaded["failed_operations"], 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// BE-12: `sale_return`, `purchase` and `waste_entry` changes are acknowledged, not recorded:
+    /// the page lands, the cursor moves, `local_unapplied_changes` stays empty, and a row an older
+    /// build already recorded for one of them is not retried by the replay.
+    #[test]
+    fn cloud_only_aggregates_are_acknowledged_not_recorded_or_replayed() {
+        let path = polish_path("cloud-only-aggregates");
+        initialize_at(&path).unwrap();
+        let aggregate = |entity_type: &str, entity_id: &str| PulledChange {
+            change_id: serde_json::json!(40),
+            branch_id: Some(1),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({ "id": 3, "branch_id": 1 }),
+            updated_at: Some("2026-10-20T10:00:00.000Z".to_string()),
+        };
+        let old = aggregate("sale_return", "2");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            record_unapplied_change(&tx, &old, "ENTITY_TYPE_NOT_SUPPORTED", Some("older build".to_string())).unwrap();
+            tx.commit().unwrap();
+        }
+        pull_changes(
+            &path,
+            &[
+                aggregate("sale_return", "3"),
+                aggregate("purchase", "purchase-3"),
+                aggregate("waste_entry", "3"),
+                pulled_product("product", "product-1", serde_json::json!({ "product_name": "Apple" })),
+            ],
+            "41",
+        );
+        let conn = Connection::open(&path).unwrap();
+        let cursor: String = conn
+            .query_row("SELECT last_pull_cursor FROM sync_state WHERE device_id = 'device-x'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cursor, "41");
+        let products: i64 = conn.query_row("SELECT COUNT(*) FROM local_products WHERE id = 'product-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(products, 1);
+        let (rows, seen): (i64, i64) = conn
+            .query_row("SELECT COUNT(*), COALESCE(SUM(seen_count), 0) FROM local_unapplied_changes", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((rows, seen), (1, 1), "nothing new is recorded and the old row is not retried");
+        drop(conn);
         let _ = fs::remove_file(&path);
     }
 }
