@@ -22,9 +22,9 @@ import {
 } from "./orderLifecycle.js";
 
 export const ORDER_BOARD_COLUMNS = Object.freeze([
-  { key: ORDER_STATUS.RECEIVED, label: "Received", hint: "Stock is set aside for these." },
-  { key: ORDER_STATUS.PACKED, label: "Packed", hint: "Boxed and waiting to go out." },
-  { key: ORDER_STATUS.SENT, label: "Sent", hint: "On its way. Billed." },
+  { key: ORDER_STATUS.RECEIVED, label: "Received", hint: "Stock is set aside for these" },
+  { key: ORDER_STATUS.PACKED, label: "Packed", hint: "Boxed and waiting to go out" },
+  { key: ORDER_STATUS.SENT, label: "Sent", hint: "On its way, billed" },
 ]);
 
 /** Actions offered per status, in the order a person works through them. */
@@ -257,4 +257,44 @@ export const validateOrderAssignment = ({ orderId, branchId, currentBranchId } =
     problems.push("That shop is already handling this order.");
   }
   return { ok: problems.length === 0, problems };
+};
+
+const blank = (value) => value === null || value === undefined || String(value).trim() === "";
+
+/**
+ * The lines of a new order, or the first problem in words naming the line.
+ *
+ * A line with an item but no quantity used to be dropped without a word: an operator taking
+ * "Apple 2 kg and Kiwi" saved an order for Apple only. Now only a wholly blank line (the spare row)
+ * is left out; anything half-filled is refused, naming the item. A rate of zero is refused too: it
+ * is not "no rate given", it would show the customer as owing nothing.
+ */
+export const buildOrderDraftLines = (items = [], products = []) => {
+  const catalogue = Array.isArray(products) ? products : [];
+  const lines = [];
+  const rows = Array.isArray(items) ? items : [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const line = rows[index] || {};
+    if (blank(line.product_id) && blank(line.quantity) && blank(line.agreed_rate)) continue;
+    const label = `Line ${index + 1}`;
+    if (blank(line.product_id)) return { ok: false, lines: [], message: `${label}: choose an item, or remove the line.` };
+    const product = catalogue.find((candidate) => canonicalInventoryId(candidate?.id) !== "" && canonicalInventoryId(candidate.id) === canonicalInventoryId(line.product_id));
+    if (!product) return { ok: false, lines: [], message: `${label}: that item is no longer in the list. Choose it again.` };
+    const name = String(product.product_name || "").trim() || label;
+    const quantity = blank(line.quantity) ? Number.NaN : Number(line.quantity);
+    if (!Number.isFinite(quantity) || quantity <= 0) return { ok: false, lines: [], message: `${name}: enter a quantity, or remove the line.` };
+    const agreedRate = blank(line.agreed_rate) ? Number.NaN : Number(line.agreed_rate);
+    if (!(agreedRate > 0)) {
+      return { ok: false, lines: [], message: `${name}: enter the rate you quoted. It fills in from today's rate when you pick the item.` };
+    }
+    lines.push({
+      product_id: String(product.id),
+      product_name: product.product_name,
+      unit: product.unit || "",
+      quantity,
+      agreed_rate: agreedRate,
+    });
+  }
+  if (lines.length === 0) return { ok: false, lines: [], message: "Add at least one item with a quantity." };
+  return { ok: true, lines, message: "" };
 };

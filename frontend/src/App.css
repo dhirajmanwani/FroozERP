@@ -596,6 +596,12 @@ input[type="number"] {
   margin-top: 16px;
 }
 
+/* The heading on its own line: inline, it ran into the sentence ("Automatic UpdatesThis device"). */
+.maintenance-cleanup-panel > strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
 .cleanup-result-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1560,12 +1566,16 @@ td:last-child {
   border-right: 0;
 }
 
+/* Wraps between words only. `overflow-wrap: anywhere` (and `word-break: break-word`) also let the
+   table count a cell's narrowest width as one letter, so a squeezed table gave these columns that
+   width and printed "25/ 10/ 202 6" and "Walk-in Custome r". `break-word` still breaks a word too
+   long for the column, but only after the column has its longest word's width. */
 td.primary-cell,
 td.purchase-items-cell {
   max-width: 340px;
   white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 td .button-row {
@@ -2156,6 +2166,14 @@ td.origin-rate {
   color: var(--accent);
 }
 
+/* The minus makes the figure a character wider than its neighbours, and a tile sized for them
+   broke it ("−₹1,880.0" / "0"). A step smaller keeps it on one line at laptop widths; the
+   break-anywhere safety net below still applies to a figure too big for any tile. */
+.summary-metric strong.metric-negative {
+  color: var(--danger-ink);
+  font-size: clamp(13px, 1.3vw, 18px);
+}
+
 .sync-owner-summary {
   display: grid;
   grid-template-columns: 1fr;
@@ -2704,7 +2722,7 @@ td.origin-rate {
   color: var(--ink-faint);
   font-size: 10px;
   line-height: 1.25;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .product-result em {
@@ -3487,9 +3505,15 @@ tbody tr:has(> .empty-cell):hover {
   padding: 5px 9px;
 }
 
+/* No inner height: a short box cut the last product in half with no sign that it scrolled. The page
+   scrolls instead, and the header row stays sticky inside the wrap. */
 .stock-inventory-report .table-wrap {
   margin-top: 8px;
-  max-height: min(52vh, 470px);
+  max-height: none;
+}
+
+.stock-inventory-report {
+  min-width: 0;
 }
 
 .quick-filter-row,
@@ -3810,8 +3834,11 @@ tbody tr:has(> .empty-cell):hover {
   font-size: 14px;
 }
 
+/* minmax(0, 1fr): a grid item's own minimum is its content's, so a wide tile row or table pushed
+   the whole report past the card's right edge. */
 .report-paper {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -3959,6 +3986,29 @@ tbody tr:has(> .empty-cell):hover {
   border-color: rgba(251, 113, 133, 0.3);
 }
 
+/* UI-1: charges already inside the landed purchase cost, listed for information only. */
+.pl-included {
+  border-top: 1px dashed var(--line);
+}
+
+.pl-included-heading {
+  display: block;
+  padding: 8px 14px 2px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pl-line-info span,
+.pl-line-info strong {
+  color: var(--ink-muted);
+  font-weight: 600;
+}
+
+.pl-line-info strong.pl-negative {
+  color: var(--ink-muted) !important;
+}
+
 .pl-empty-note {
   padding: 12px 14px;
   border: 1px dashed var(--line);
@@ -3986,6 +4036,14 @@ tbody tr:has(> .empty-cell):hover {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+/* Each side's table needs about 570px. Side by side in a narrower card, the Bank column was cut
+   off with nothing to say it was there, so the sides stack until there is room for both. */
+@media (max-width: 1500px) {
+  .cash-book-sides {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .cash-book-panel {
@@ -4059,7 +4117,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .cash-book-panel .cell-note {
   white-space: normal;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .cash-book-closing {
@@ -5233,6 +5291,18 @@ tbody tr:has(> .empty-cell):hover {
   .startup-api-panel {
     padding: 7px 10px;
   }
+
+  /* On a 768-high laptop screen the menu scrolled, and All Shops, Branches & Counters and Settings
+     sat below a scrollbar that is easy to miss. Tighter rows fit the whole menu. */
+  .sidebar-nav {
+    gap: 1px;
+  }
+
+  .nav-item {
+    min-height: 30px;
+    padding-top: 5px;
+    padding-bottom: 5px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -5358,10 +5428,6 @@ tbody tr:has(> .empty-cell):hover {
 
 @media (max-width: 1100px) {
   .kpi-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .cash-book-sides {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -7656,11 +7722,16 @@ tbody tr:has(> .empty-cell):hover {
   border-left: 1px solid var(--accent-line);
   background: var(--ground);
   box-shadow: -24px 0 60px var(--shadow-strong);
-  transition: transform 180ms ease;
+  /* Closed, it is off the screen and also out of reach: no Tab stop, nothing for a screen reader,
+     and no panel showing over the page in a full-page capture. Hidden only once it has slid out. */
+  visibility: hidden;
+  transition: transform 180ms ease, visibility 0s linear 180ms;
 }
 
 .frost-drawer-open {
   transform: translateX(0);
+  visibility: visible;
+  transition: transform 180ms ease, visibility 0s;
 }
 
 .frost-drawer-header {
@@ -10690,8 +10761,26 @@ button.shortcut-sheet-row:focus-visible {
   }
 }
 .packing-add-here { margin: 10px 0 4px; }
+/* The keys hint on its own line under the button, not run into it. */
+.packing-browser > small.form-note { display: block; margin-top: 6px; }
 
 /* The bill dialog takes focus on open (so Escape closes it); the focus itself draws nothing. */
 .invoice-modal-bill:focus {
   outline: none;
+}
+
+/* Permission Matrix: dozens of columns in one card. The role column stays put while the rest
+   scrolls sideways, so a tick is never far from the role it belongs to. */
+.permission-matrix-table th:first-child,
+.permission-matrix-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--card);
+  box-shadow: 1px 0 0 var(--line);
+}
+
+.permission-matrix-table th:first-child {
+  z-index: 3;
+  background: linear-gradient(180deg, var(--card-veil-solid), var(--veil-solid));
 }

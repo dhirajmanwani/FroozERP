@@ -53,7 +53,6 @@ const finiteOrNull = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const DEFAULT_MINIMUM_STOCK = 5;
 
 /** Dashboard metrics this layer never computes; each is emitted as `null`, never 0. */
 export const LOCAL_UNCOMPUTED_METRICS = Object.freeze([
@@ -105,14 +104,33 @@ export function buildLocalDashboardSnapshot({
     return key && key >= bounds.from && key <= bounds.to;
   });
 
+  // Low stock is Products' rule (`isLowStock` in productMaster.js, and the server's
+  // DASHBOARD_LOW_STOCK_SQL): stock at or below the product's stored minimum; no minimum set is
+  // not low. Stock starts from the products, not the lots, so a product this branch holds none of
+  // is 0 against its minimum rather than missing (UI-3). There is no default minimum: a 5 used to
+  // stand in for a missing one, so the Dashboard called products low that Products did not.
+  const stockByProduct = new Map();
   const productMinimums = new Map();
+  const inactiveProducts = new Set();
   for (const product of Array.isArray(products) ? products : []) {
+    const productKey = canonicalInventoryId(product?.id);
+    if (!productKey) continue;
+    if (product.active === false) {
+      inactiveProducts.add(productKey);
+      continue;
+    }
     const minimum = finiteOrNull(product?.minimum_stock);
-    if (minimum !== null) productMinimums.set(canonicalInventoryId(product.id), minimum);
+    productMinimums.set(productKey, minimum);
+    stockByProduct.set(productKey, {
+      productId: product.id,
+      productName: product.product_name || product.name || "Unnamed product",
+      quantity: 0,
+      minimumStock: minimum,
+      unit: product.unit || "",
+    });
   }
 
   const stockLots = (Array.isArray(inventoryLots) ? inventoryLots : []).filter(isStockLot);
-  const stockByProduct = new Map();
   // Every lot's cost, cancelled ones included: a sale made before a cancellation still had a cost.
   const lotCosts = new Map();
   for (const lot of Array.isArray(inventoryLots) ? inventoryLots : []) {
@@ -132,15 +150,18 @@ export function buildLocalDashboardSnapshot({
     const productKey = canonicalInventoryId(lot.product_id) || String(lot.product_name || lot.id || "unknown");
     // The lot still counts as stock on hand — it is physically there — but not as value.
     if (!isProvisionalLot(lot)) stockValue += quantity * cost;
-    const minimumStock = finiteOrNull(lot.minimum_stock)
-      ?? productMinimums.get(canonicalInventoryId(lot.product_id))
-      ?? DEFAULT_MINIMUM_STOCK;
+    if (inactiveProducts.has(productKey)) continue;
+    // The product's stored minimum when the product is known; a lot's copy only otherwise.
+    const minimumStock = productMinimums.has(productKey)
+      ? productMinimums.get(productKey)
+      : finiteOrNull(lot.minimum_stock);
+    const current = stockByProduct.get(productKey);
     stockByProduct.set(productKey, {
-      productId: lot.product_id,
-      productName: lot.product_name || "Unnamed product",
-      quantity: numberValue(stockByProduct.get(productKey)?.quantity) + quantity,
+      productId: current?.productId ?? lot.product_id,
+      productName: current?.productName || lot.product_name || "Unnamed product",
+      quantity: numberValue(current?.quantity) + quantity,
       minimumStock,
-      unit: lot.unit || "",
+      unit: current?.unit || lot.unit || "",
     });
   }
 
@@ -190,7 +211,7 @@ export function buildLocalDashboardSnapshot({
   const todayProfit = todaySales.reduce((sum, sale) => sum + saleProfit(sale, unpricedToday), 0);
 
   const lowStockRows = [...stockByProduct.values()]
-    .filter((item) => item.quantity <= item.minimumStock)
+    .filter((item) => item.minimumStock !== null && item.quantity <= item.minimumStock)
     .sort((a, b) => a.quantity - b.quantity)
     .map((item) => ({ product_id: item.productId, product_name: item.productName, current_stock: item.quantity, remaining_qty: item.quantity, minimum_stock: item.minimumStock, unit: item.unit }));
   const salesTrend = [...daily.values()].sort((a, b) => a.date.localeCompare(b.date)).map((row) => ({ ...row, sales: roundMoney(row.sales), grossProfit: roundMoney(row.grossProfit) }));

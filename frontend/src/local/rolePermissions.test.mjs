@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import {
   OWNER_ONLY_VIEWS,
   accountMasterTypeOptions,
+  accountTabsFor,
   allowedPaymentAction,
   branchesScreenPlan,
   mayReadReports,
@@ -161,4 +162,16 @@ test("Expenses follows the server's `expenses` key, falling back to `reports` on
   assert.equal(open("Inventory Manager", { reports: false }), false);
   assert.equal(open("Admin", {}), true);
   assert.equal(open("Cashier", {}), false);
+});
+
+test("Accounts tabs follow the account authorities, not role names (BO-13)", () => {
+  const ids = (plan) => plan.tabs.map(([id]) => id);
+  const custom = accountTabsFor(resolveAccountPermissions({ role: "Delivery Lead", permissions: { supplier_accounts: true } }));
+  assert.deepEqual(ids(custom), ["master", "ledger", "payments", "outstanding"], "a custom role given Supplier Accounts gets Account Master");
+  assert.equal(custom.initial, "master");
+  const pm = accountTabsFor(resolveAccountPermissions({ role: "Purchase Manager", permissions: { supplier_accounts: false, customer_accounts: false } }));
+  assert.deepEqual(ids(pm), ["ledger", "payments"], "no Master tab with an empty Account Type list");
+  assert.equal(pm.initial, "payments");
+  assert.deepEqual(ids(accountTabsFor(resolveAccountPermissions({ role: "Owner" }))), ["master", "ledger", "payments", "outstanding"]);
+  assert.deepEqual(ids(accountTabsFor()), ["ledger", "payments"]);
 });

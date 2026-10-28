@@ -785,3 +785,21 @@ export const describeIssuedLicence = (response, { today, fallbackDeviceName, fal
       : `Issued for ${deviceName}, valid ${validity} — ${classification.detail}`,
   };
 };
+
+/**
+ * Where a device sits, for the licence list: its live assignment (Step 4, `device_assignments`)
+ * when there is one, since that is what decides its shop and counter. The device row's own
+ * `branch_name` / `counter_name` come from the older `authorized_devices` record, which is empty for a
+ * computer approved through Step 4, so the same computer read "Audit Counter" in Step 4 and "No counter
+ * assigned" in Step 5. A missing branch is said to be unknown, never "Main Branch".
+ */
+export const deviceBranchAndCounter = (row = {}, assignments = []) => {
+  const deviceId = canonicalInventoryId(row?.deviceId ?? row?.device_id);
+  const live = (Array.isArray(assignments) ? assignments : []).find((assignment) => (
+    assignment && assignment.active !== false && deviceId !== "" && inventoryIdsEqual(assignment.device_id, deviceId)
+  ));
+  return {
+    branch: firstText(live?.branch_name, row?.branchName, row?.branch_name) || "Branch not known",
+    counter: firstText(live?.location_name, row?.counterName, row?.counter_name) || "No counter assigned",
+  };
+};

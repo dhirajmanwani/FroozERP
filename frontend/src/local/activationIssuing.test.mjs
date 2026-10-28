@@ -950,3 +950,14 @@ test("the screen shows the distinction, not only the id", () => {
   assert.match(nameCell, /Last seen /, "and date a device the reader can place in time");
   assert.match(nameCell, /row\.deviceId/, "the id stays: this decides what has to be read, not what is shown");
 });
+
+test("the licence list names the counter Step 4 assigned, and never invents a branch (UI-8)", async () => {
+  const { deviceBranchAndCounter } = await import("./activationIssuing.js");
+  const assignments = [
+    { device_id: "audit-device-0001", branch_name: "Main Branch", location_name: "Audit Counter", active: true },
+    { device_id: "old-device", branch_name: "Ratanada", location_name: "Old Counter", active: false },
+  ];
+  assert.deepEqual(deviceBranchAndCounter({ deviceId: "audit-device-0001", branchName: "Main Branch", counterName: "" }, assignments), { branch: "Main Branch", counter: "Audit Counter" });
+  assert.deepEqual(deviceBranchAndCounter({ deviceId: "old-device", branchName: "", counterName: "" }, assignments), { branch: "Branch not known", counter: "No counter assigned" }, "a retired assignment is not where it is now");
+  assert.deepEqual(deviceBranchAndCounter({ deviceId: "x", branchName: "Shastri Nagar", counterName: "Front" }, []), { branch: "Shastri Nagar", counter: "Front" });
+});

@@ -518,15 +518,28 @@ test("switched-off and customer's-choice combos are never reported; another shop
 });
 
 test("the bell row names the combo and says what to do", () => {
-  const [row] = comboStockNotifications([{ key: "combo-stock:combo-7", comboName: "Mango Juice", missing: [{ productName: "Alphonso Mango", reason: "OUT_OF_STOCK" }] }]);
+  // A product switched off: still a warning.
+  const [row] = comboStockNotifications([{ key: "combo-stock:combo-7", comboName: "Mango Juice", missing: [{ productName: "Alphonso Mango", reason: "NOT_ON_SALE" }, { productName: "Kiwi", reason: "OUT_OF_STOCK" }] }]);
   assert.deepEqual(row, {
     severity: "warning",
     title: "Edit combo: Mango Juice",
-    message: "Alphonso Mango is out of stock. Edit Mango Juice in Frooz Menu, or add stock, before selling it.",
+    message: "Alphonso Mango is not on sale, Kiwi is out of stock. Edit Mango Juice in Frooz Menu, or add stock, before selling it.",
     source: "Frooz Menu",
     dedupeKey: "combo-stock:combo-7",
   });
   assert.deepEqual(comboStockNotifications(null), []);
+});
+
+test("a combo held up only by fruit that ran out is a dismissible Info Reminder, like the fruit's own row (BO-9)", () => {
+  const [row] = comboStockNotifications([{ key: "combo-stock:combo-7", comboName: "Mango Juice", missing: [{ productName: "Alphonso Mango", reason: "OUT_OF_STOCK" }, { productName: "Kiwi", reason: "NOT_ENOUGH" }] }]);
+  assert.deepEqual(row, {
+    severity: "info",
+    title: "Edit combo: Mango Juice",
+    message: "Alphonso Mango is out of stock, Kiwi is too low for one. Add stock, or if its season is over, edit Mango Juice in Frooz Menu or dismiss this.",
+    source: "Frooz Menu",
+    dedupeKey: "combo-stock-reminder:combo-stock:combo-7",
+    label: "Reminder",
+  });
 });
 
 test("an empty combo tab names the tabs that do hold combos, or says how a new one arrives", () => {

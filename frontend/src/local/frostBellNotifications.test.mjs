@@ -469,3 +469,25 @@ test("a dismissed stock reminder stays away after a restart, until the fruit com
   assert.equal(writeDismissedStockReminders(broken, dismissed), false);
   assert.equal(readDismissedStockReminders(null).size, 0);
 });
+
+test("a combo reminder's dismissal is remembered too, and each family prunes only its own (BO-9)", async () => {
+  const { comboStockNotifications } = await import("./combos.js");
+  const { isComboStockReminderKey } = await import("./frostBellNotifications.js");
+  const store = new Map();
+  const storage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem: (key) => store.delete(key) };
+  const [reminder, warning] = comboStockNotifications([
+    { key: "combo-stock:combo-7", comboName: "Mango Juice", missing: [{ productName: "Mango", reason: "OUT_OF_STOCK" }] },
+    { key: "combo-stock:combo-8", comboName: "Kiwi Bowl", missing: [{ productName: "Kiwi", reason: "NOT_ON_SALE" }] },
+  ]);
+  const fruit = build({ alerts: [zeroStock()] }).items[0];
+  assert.equal(isStockReminderKey(reminder.dedupeKey), true);
+  assert.equal(isStockReminderKey(warning.dedupeKey), false, "a switched-off product is a warning, never silenced for good");
+  const dismissed = withDismissedStockReminders(new Set(), [reminder, warning, fruit]);
+  assert.deepEqual([...dismissed].sort(), [reminder.dedupeKey, fruit.dedupeKey].sort());
+  writeDismissedStockReminders(storage, dismissed);
+  assert.equal(readDismissedStockReminders(storage).has(reminder.dedupeKey), true, "read back after a restart");
+  // FROST's list says nothing about combos, and the combo check nothing about FROST.
+  assert.deepEqual([...pruneDismissedStockReminders(dismissed, [])], [reminder.dedupeKey]);
+  assert.deepEqual([...pruneDismissedStockReminders(dismissed, [], isComboStockReminderKey)], [fruit.dedupeKey]);
+  assert.equal(pruneDismissedStockReminders(dismissed, [reminder.dedupeKey], isComboStockReminderKey).size, 2);
+});

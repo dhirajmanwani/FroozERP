@@ -118,18 +118,46 @@ test("today's profit is today's, whatever range is selected", () => {
   assert.equal(result.analytics.salesTrend.length, 0, "the range itself still excludes today");
 });
 
-test("low-stock threshold: lot, then product, then 5 — and a real 0 is kept", () => {
+test("low stock is Products' rule: stored minimum, no default, stock starts from products (UI-3)", async () => {
+  const { isLowStock } = await import("./productMaster.js");
+  const products = [
+    { id: "p1", product_name: "Apple", minimum_stock: 0 },
+    { id: "p2", product_name: "Banana", minimum_stock: 2 },
+    { id: "p3", product_name: "Cherry", minimum_stock: null },
+    { id: "p4", product_name: "Dates", minimum_stock: 5 },
+    { id: "p5", product_name: "Fig", minimum_stock: 1 },
+    { id: "p6", product_name: "Old Grape", minimum_stock: 9, active: false },
+  ];
   const lots = [
     { id: "1", product_id: "p1", remaining_qty: 3, minimum_stock: 0 },
     { id: "2", product_id: "p2", remaining_qty: 3 },
-    { id: "3", product_id: "p3", remaining_qty: 3, minimum_stock: null },
+    // A lot's own copy of the minimum does not override the product's (none set: not low).
+    { id: "3", product_id: "p3", remaining_qty: 3, minimum_stock: 5 },
+    { id: "4", product_id: "p4", remaining_qty: 2 },
+    { id: "4b", product_id: "p4", remaining_qty: 2 },
+    { id: "6", product_id: "p6", remaining_qty: 1 },
   ];
+  const result = buildLocalDashboardSnapshot({ today: "2026-07-15", inventoryLots: lots, products });
+  const flagged = result.analytics.lowStockItems.map((row) => row.product_id).sort();
+  assert.deepEqual(flagged, ["p4", "p5"], "p4 holds 4 of 5; p5 has no lot at all and is 0 of 1");
+  assert.equal(result.metrics.lowStockItems, 2, "the tile counts the same list");
+  const fig = result.analytics.lowStockItems.find((row) => row.product_id === "p5");
+  assert.equal(fig.current_stock, 0);
+  assert.equal(fig.product_name, "Fig");
+  // Same verdict as Products for every active product.
+  const stockOf = (id) => lots.filter((lot) => lot.product_id === id).reduce((sum, lot) => sum + lot.remaining_qty, 0);
+  for (const product of products.filter((row) => row.active !== false)) {
+    assert.equal(flagged.includes(product.id), isLowStock({ ...product, current_stock: stockOf(product.id) }), product.id);
+  }
+});
+
+test("a lot for a product not in the list uses the lot's minimum, and none means not low", () => {
   const result = buildLocalDashboardSnapshot({
     today: "2026-07-15",
-    inventoryLots: lots,
-    products: [{ id: "p2", minimum_stock: 2 }, { id: "p3", minimum_stock: null }],
+    inventoryLots: [
+      { id: "1", product_id: "x1", remaining_qty: 1, minimum_stock: 2 },
+      { id: "2", product_id: "x2", remaining_qty: 1 },
+    ],
   });
-  const flagged = result.analytics.lowStockItems.map((row) => row.product_id);
-  assert.deepEqual(flagged, ["p3"], "p1 (min 0) and p2 (product min 2) are fine; p3 falls back to 5");
-  assert.equal(result.analytics.lowStockItems[0].minimum_stock, 5);
+  assert.deepEqual(result.analytics.lowStockItems.map((row) => row.product_id), ["x1"]);
 });

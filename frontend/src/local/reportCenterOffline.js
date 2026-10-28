@@ -71,6 +71,9 @@ export const buildLocalOnlyReportsData = (current = {}, {
 export const OFFLINE_REPORT_NOTE =
   "Not available offline. This report is worked out by the server; switch to Auto mode with internet to see it. Only Sales History and the stock reports are worked out on this computer.";
 
+export const BALANCE_SHEET_UNAVAILABLE_NOTE =
+  "The balance sheet could not be worked out on the server just now, so no figures are shown. Refresh to try again.";
+
 /**
  * Whether a report's figures can be shown. `{ available: true }`, or a message and a tone
  * ("note" for offline, "error" for a failed read) to show in place of the tiles and the table.
@@ -87,6 +90,10 @@ export const resolveReportAvailability = (reportId, data = {}, { selfContained =
   }
   if (String(data?.serverReportsError || "").trim() && !OFFLINE_COMPUTED_REPORTS.includes(reportId)) {
     return { available: false, tone: "error", message: `This report could not be loaded from the server: ${data.serverReportsError}` };
+  }
+  // The server could not work the sheet out; its figures are placeholders, not a sheet of zeroes.
+  if (reportId === "balanceSheet" && data?.balanceSheet?.unavailable === true) {
+    return { available: false, tone: "error", message: BALANCE_SHEET_UNAVAILABLE_NOTE };
   }
   return { available: true };
 };

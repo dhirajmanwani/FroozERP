@@ -143,6 +143,25 @@ export const defaultAccountMasterType = (accountTypes = [], permissions = {}) =>
   return options[0]?.[0] || "SUPPLIER";
 };
 
+/**
+ * The Accounts screen's tabs and the one it opens on, from the account authorities
+ * (`resolveAccountPermissions`), not from role names: a custom role given Supplier Accounts gets
+ * Account Master, and a Purchase Manager whose Supplier Accounts box is unticked no longer gets a
+ * Master tab with an empty Account Type list. Outstanding goes with Master, as it always did.
+ */
+export const accountTabsFor = (permissions = {}) => {
+  const master = permissions?.customerAccounts === true || permissions?.supplierAccounts === true;
+  return {
+    tabs: [
+      ...(master ? [["master", "Account Master"]] : []),
+      ["ledger", "Ledger"],
+      ["payments", "Payments"],
+      ...(master ? [["outstanding", "Outstanding"]] : []),
+    ],
+    initial: master ? "master" : "payments",
+  };
+};
+
 export const canEditAccountRow = (account, permissions = {}) => {
   if (!account || account.system_account === true) return false;
   return account.account_type === "CUSTOMER" ? permissions.customerAccounts === true : permissions.supplierAccounts === true;

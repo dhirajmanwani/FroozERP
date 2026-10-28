@@ -59,6 +59,7 @@ import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import {
   ORDER_QUEUE_STATUS,
+  buildOrderDraftLines,
   buildOrdersBoard,
   resolveUnassignedQueue,
   validateOrderAction,
@@ -105,6 +106,7 @@ import {
 } from "./local/notificationCenter";
 import { sameIdentityRecord, buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot, localSalesWindow } from "./local/dashboardSnapshot";
+import { INCLUDED_IN_COST_HEADING, balanceSheetAsAtInput, ledgerWithRunningBalance, profitLossCostOfGoods, supplierLedgerOpening } from "./local/financialStatements";
 import { DASHBOARD_FILL, NULL_DASHBOARD_METRICS, fillUncomputedMetrics, shouldFetchCloudDashboardMetrics, unknownMetricNote } from "./local/dashboardCloudFill";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
@@ -164,6 +166,7 @@ import {
   buildActivationIssuingView,
   buildIssueRequest,
   describeIssueFailure,
+  deviceBranchAndCounter,
   describeIssuedLicence,
   describeLicenceFileFailure,
   describeValidity,
@@ -217,6 +220,7 @@ import {
 import {
   FROST_BELL_STATUS,
   buildFrostBellNotifications,
+  isComboStockReminderKey,
   pruneDismissedStockReminders,
   readDismissedStockReminders,
   withDismissedStockReminders,
@@ -317,12 +321,12 @@ import {
 import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
 import { describeInitialPullFailure } from "./local/freshDeviceOnboarding";
 import { plainRefusalMessage } from "./local/refusalMessages";
-import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
+import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, accountTabsFor, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, isRateManagerRole, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
 import { findPurchaseSupplier, findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation, supplierLedgerKey } from "./local/accountsPresentation";
 import { productStockKeyResolver, wasteEntryProductId } from "./local/wasteStock";
 import { UNDRAWN_TRANSFER_ACTION_NOTE, crateAllocationsForApproval, drawableTransferActions, transferActionId, transferItemsForSend } from "./local/distributionWrites";
 import { buildLocalOnlyReportsData, reportFlagsAfterServerLoad, resolveReportAvailability, shouldReloadReportsOnReconnect } from "./local/reportCenterOffline";
-import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, insightCardValue, pickDashboardMetric, unavailableBriefingNote } from "./local/figurePresentation";
+import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, insightCardValue, formatChartRupees, pickDashboardMetric, presentSignedFigure, unavailableBriefingNote } from "./local/figurePresentation";
 import { UPI_BANK_PAYMENT_MODES, dayBookVoucherLabel, paymentReportTotals, saleGrossAmount, salesHistoryMoneyTotals } from "./local/salesReportTotals";
 import { checkoutFingerprint, heldApprovalFor, resolveCheckoutRef } from "./local/checkoutRetry";
 import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
@@ -5317,11 +5321,23 @@ function App() {
     return read.status === "missing" ? { status: "invalid", types: [], message: "Packing stock could not be read: the server did not send a packing list." } : read;
   }, [connectivityMode, deviceInfo.device_id, user?.username]);
 
+  // Only the Owner and Admins can edit a combo, so only they are told to; everyone else sees the
+  // problem on the POS screen, where it stops the sale.
+  const comboBellAllowed = isRateManagerRole(user?.role);
   useEffect(() => {
+    if (!comboBellAllowed) {
+      for (const key of raisedComboRows.current.keys()) clearNotice(key);
+      raisedComboRows.current = new Map();
+      return;
+    }
     if (comboProblems === null) return;
     const rows = comboStockNotifications(comboProblems);
     const raised = raisedComboRows.current;
+    // A reminder dismissed on this computer stays quiet until the combo can be made again
+    // (the same memory as FROST's zero-stock reminders).
+    const dismissed = stockRemindersDismissed();
     for (const row of rows) {
+      if (dismissed.has(row.dedupeKey)) continue;
       // Raised once per wording, like the FROST rows above: a re-check is not a new problem.
       if (raised.get(row.dedupeKey) === row.message) continue;
       notify(row);
@@ -5333,7 +5349,12 @@ function App() {
       clearNotice(key);
       raised.delete(key);
     }
-  }, [comboProblems, notify, clearNotice]);
+    const kept = pruneDismissedStockReminders(dismissed, [...live], isComboStockReminderKey);
+    if (kept.size !== dismissed.size) {
+      dismissedStockReminders.current = kept;
+      writeDismissedStockReminders(deviceStorage(), kept);
+    }
+  }, [comboBellAllowed, comboProblems, notify, clearNotice, stockRemindersDismissed]);
 
   /**
    * Read today's payments: who to collect from and who to pay (`GET /api/ai/payments-due`).
@@ -10353,8 +10374,10 @@ function App() {
                   </div>
                 </div>
                 <div className="quick-grid">
-                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["accounts", "Accounts"], ["reports", "Stock Inventory"]].map(([view, label]) => (
-                    <button className="quick-action" key={view} onClick={() => navigate(view)}>
+                  {/* Only what this role may open; Stock Inventory lands on Report Center's inventory
+                      reports, as Ctrl K does, not on the Report Center index. */}
+                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["accounts", "Accounts"], ["reports", "Stock Inventory", "reports/inventory"]].filter(([view]) => hasModuleAccess(view)).map(([view, label, section]) => (
+                    <button className="quick-action" key={view} onClick={() => { navigate(view); if (section) setPendingSection(section); }}>
                       <Icon name={icons[view]} />
                       <span>{label}</span>
                     </button>
@@ -13664,7 +13687,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
 // to anyone else. Hiding the section from non-Owners is a courtesy, not the check.
 // ---------------------------------------------------------------------------
 
-function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onReload, user }) {
+function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, devicesError, onReload, user }) {
   const [licences, setLicences] = useState(null);
   const [licencesError, setLicencesError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -13902,7 +13925,11 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
                   )}
                   <small className="cell-note">{row.deviceId || "No device ID"}</small>
                 </td>
-                <td>{row.branchName || "Main Branch"}<small className="cell-note">{row.counterName || "No counter assigned"}</small></td>
+                {/* The live assignment (Step 4) first, so both steps name the same counter. */}
+                {(() => {
+                  const where = deviceBranchAndCounter(row, assignments);
+                  return <td>{where.branch}<small className="cell-note">{where.counter}</small></td>;
+                })()}
                 <td>
                   <span className={stateClass(row.state)}>{row.label}</span>
                   <small className="cell-note">{row.detail}</small>
@@ -15513,7 +15540,8 @@ const handlePackDrillKeys = (event, { rows, active, setHighlight, goIn, goBack, 
 function PackDrillHeader({ crumbs = [], disabled = false, level, onBack, onCrumb, title }) {
   return (
     <div className="packing-drill-head">
-      <button aria-label="Back one level" className="secondary-button compact-button" disabled={disabled || level === "types"} type="button" onClick={onBack}>← Back</button>
+      {/* Not drawn at the top level, where there is nothing to go back to. */}
+      {level !== "types" && <button aria-label="Back one level" className="secondary-button compact-button" disabled={disabled} type="button" onClick={onBack}>← Back</button>}
       <nav aria-label="Where you are" className="packing-crumbs">
         {crumbs.map((crumb, index) => (
           <React.Fragment key={`${crumb.level}-${crumb.id || "root"}`}>
@@ -16373,7 +16401,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                           <td className="primary-cell" data-label="Packing">{packingPathLabel(row) || MISSING_VALUE}</td>
                           <td data-label="What">{PACKING_MOVEMENT_LABELS[String(row.movement_type || "").toUpperCase()] || row.movement_type || MISSING_VALUE}</td>
                           <td className={Number.isFinite(quantity) && quantity < 0 ? "stock-low" : "stock-ok"} data-label="Qty">{Number.isFinite(quantity) ? `${quantity > 0 ? "+" : ""}${formatPackCount(quantity)}` : MISSING_VALUE}</td>
-                          <td data-label="Note">{row.reason || (row.sale_id ? `Bill ${row.sale_id}` : row.purchase_id ? `Purchase ${row.purchase_id}` : "")}</td>
+                          <td data-label="Note">{row.reason || (row.sale_id ? `Bill ${row.invoice_no || row.sale_id}` : row.purchase_id ? `Purchase ${row.purchase_id}` : "")}</td>
                         </tr>
                       );
                     })}
@@ -17712,7 +17740,18 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const ledgerNarration = (row) => ledgerPrintNarration || ledgerPrintNarrationRef.current ? row.narration || row.remarks || "-" : row.remarks || row.narration || "-";
   const customerLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "CUSTOMER")));
-  const supplierLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "SUPPLIER")), "PAYABLE");
+  // The Supplier Ledger runs on from the balance brought forward to the range's first day (UI-10);
+  // when that could not be read its balances are unknown, not counted from 0.
+  const supplierOpening = supplierLedgerOpening(data.ledgerOpeningBalances, { ...accountReportFilters, search: appliedSearch });
+  const supplierLedgerRows = ledgerWithRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "SUPPLIER")), {
+    mode: "PAYABLE",
+    opening: supplierOpening.rows,
+    openingUnavailable: supplierOpening.status === "unavailable",
+    dateKey: toDateKey,
+  });
+  const supplierOpeningTile = supplierOpening.status === "ready"
+    ? `${money(Math.abs(supplierOpening.total))} ${supplierOpening.total >= 0 ? "Cr" : "Dr"}`
+    : supplierOpening.status === "unavailable" ? "Could not be read" : "Not applied: filtered";
   const accountStatementRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows));
   const dayBookRows = clubRowsByDateAccount(filteredLedgerRows);
   const cashBookData = data.cashBookReport || {};
@@ -18497,7 +18536,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.discountReport),
       // `discount_amount` is item discounts plus each line's share of the bill discount, so the
       // total counts bill-total (slab) discounts too; they used to be left out of it.
-      summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Bill Discounts", money(totalOf(rows, "bill_discount_share"))], ["Gross Amount", money(totalOf(rows, "gross_amount"))], ["Net Amount", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
+      summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Bill Discounts", money(totalOf(rows, "bill_discount_share"))], ["Gross of Discounted Lines", money(totalOf(rows, "gross_amount"))], ["Net of Discounted Lines", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
       headers: ["Date", "Product", "Lot", "Discount Type", "Discount Value", "Qty Sold", "Gross Amount", "Item Discount", "Bill Discount Share", "Discount Amount", "Net Amount", "Profit Impact"],
       render: (row, index) => {
         // A field the server did not send is unknown, not ₹0.
@@ -18593,9 +18632,12 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     supplierLedger: {
       title: "Supplier Ledger",
       rows: supplierLedgerRows,
-      summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
+      summary: (rows) => {
+        const periodRows = rows.filter((row) => !row.is_opening);
+        return [["Opening b/f", supplierOpeningTile], ["Debits", money(totalOf(periodRows, "debit")), true], ["Credits", money(totalOf(periodRows, "credit"))], ["Rows", periodRows.length]];
+      },
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{row.running_balance === null ? MISSING_VALUE : `${money(Math.abs(Number(row.running_balance || 0)))} ${Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}`}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
@@ -18744,12 +18786,15 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: [
         { section: "Income", particular: "Sales Revenue", amount: Number(data.profitLoss?.salesRevenue || 0), emphasis: true },
         { section: "Income", particular: "Other Income", amount: 0 },
-        { section: "Cost of Goods Sold", particular: "Purchase Cost", amount: -Number(data.profitLoss?.purchaseCost || 0) },
-        { section: "Cost of Goods Sold", particular: "Mandi Tax", amount: -Number(data.profitLoss?.mandiTax || 0) },
-        { section: "Cost of Goods Sold", particular: "Freight", amount: -Number(data.profitLoss?.freightCharges || 0) },
-        { section: "Cost of Goods Sold", particular: "Labour", amount: -Number(data.profitLoss?.labourCharges || 0) },
-        { section: "Cost of Goods Sold", particular: "Other Purchase Charges", amount: -Number(data.profitLoss?.otherPurchaseCharges || 0) },
-        { section: "Cost of Goods Sold", particular: "Less Supplier Rebate Received", amount: Number(data.profitLoss?.supplierRebateReceived || 0) },
+        ...(() => {
+          // Charges inside the landed cost are listed for information, not as cost rows (UI-1).
+          const costOfGoods = profitLossCostOfGoods(data.profitLoss);
+          return [
+            ...costOfGoods.costLines.map((line) => ({ section: "Cost of Goods Sold", particular: line.label, amount: -line.value })),
+            { section: "Cost of Goods Sold", particular: "Total COGS", amount: -costOfGoods.cogs, emphasis: true },
+            ...costOfGoods.includedLines.map((line) => ({ section: INCLUDED_IN_COST_HEADING, particular: line.label, amount: -line.value, info: true })),
+          ];
+        })(),
         { section: "Result", particular: "Gross Profit", amount: Number(data.profitLoss?.grossProfit || 0), emphasis: true },
         ...(Array.isArray(data.profitLoss?.expenseCategories) ? data.profitLoss.expenseCategories : []).map((row) => ({ section: "Expenses", particular: row.category, amount: -Number(row.amount || 0) })),
         { section: "Result", particular: Number(data.profitLoss?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", amount: Number(data.profitLoss?.netProfit || 0), emphasis: true },
@@ -18761,7 +18806,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         [Number(data.profitLoss?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", money(Math.abs(Number(data.profitLoss?.netProfit || 0)))],
       ],
       headers: ["Section", "Particulars", "Amount"],
-      render: (row, index) => <tr className={row.emphasis ? "date-total-row" : ""} key={`${row.section}-${row.particular}-${index}`}><td>{row.section}</td><td className="primary-cell">{row.particular}</td><td className={row.amount < 0 ? "stock-low" : "profit-cell"}>{money(Math.abs(row.amount))}{row.amount < 0 ? " Dr" : ""}</td></tr>,
+      render: (row, index) => <tr className={row.emphasis ? "date-total-row" : ""} key={`${row.section}-${row.particular}-${index}`}><td>{row.section}</td><td className="primary-cell">{row.particular}</td>{row.info ? <td>{row.amount > 0 ? `(${money(row.amount)})` : money(Math.abs(row.amount))}</td> : <td className={row.amount < 0 ? "stock-low" : "profit-cell"}>{money(Math.abs(row.amount))}{row.amount < 0 ? " Dr" : ""}</td>}</tr>,
     },
     balanceSheet: {
       title: "Balance Sheet",
@@ -18825,7 +18870,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     const amountClass = numericValue < 0 ? "pl-negative" : options.positive ? "pl-positive" : "";
     const formattedAmount = numericValue < 0 ? `(${money(Math.abs(numericValue))})` : money(numericValue);
     return (
-      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""}`} key={label} data-report-line="">
+      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""} ${options.info ? "pl-line-info" : ""}`} key={label} data-report-line="">
         <span>{label}</span>
         <strong className={amountClass}>{formattedAmount}</strong>
       </div>
@@ -18843,7 +18888,9 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     const labourCharges = amount("labourCharges");
     const otherPurchaseCharges = amount("otherPurchaseCharges");
     const supplierRebateReceived = amount("supplierRebateReceived");
-    const cogs = Number(pl.costOfGoodsSold ?? (purchaseCost + mandiTax + freightCharges + labourCharges + otherPurchaseCharges - supplierRebateReceived));
+    // Landed purchase cost already holds the charges; they are listed apart when the server says so (UI-1).
+    const costOfGoods = profitLossCostOfGoods(pl);
+    const cogs = costOfGoods.cogs;
     const grossProfit = Number(pl.grossProfit ?? (totalIncome - cogs));
     const totalExpenses = amount("expenses");
     const netProfit = Number(pl.netProfit ?? (grossProfit - totalExpenses));
@@ -18893,13 +18940,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         </section>
         <section className="pl-section">
           <h3>LESS: COST OF GOODS SOLD</h3>
-          {profitLossLine("Purchase Cost", purchaseCost, { indent: true })}
-          {profitLossLine("Mandi Tax", mandiTax, { indent: true })}
-          {profitLossLine("Freight", freightCharges, { indent: true })}
-          {profitLossLine("Labour", labourCharges, { indent: true })}
-          {profitLossLine("Other Purchase Charges", otherPurchaseCharges, { indent: true })}
-          {profitLossLine("Less Supplier Rebate Received", -supplierRebateReceived, { indent: true })}
+          {costOfGoods.costLines.map((line) => profitLossLine(line.label, line.value, { indent: true }))}
           {profitLossLine("TOTAL COGS", cogs, { total: true })}
+          {costOfGoods.includedLines.length > 0 && (
+            <div className="pl-included" data-report-note="">
+              <small className="pl-included-heading">{INCLUDED_IN_COST_HEADING}: this period's bills, already inside Purchase Cost for the goods sold, not added again.</small>
+              {costOfGoods.includedLines.map((line) => profitLossLine(line.label, line.value, { indent: true, info: true }))}
+            </div>
+          )}
         </section>
         <section className="pl-section pl-result-section">
           {profitLossLine("GROSS PROFIT", grossProfit, { highlight: true, positive: grossProfit >= 0 })}
@@ -18922,19 +18970,36 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     </div>
   ) : (
     <div className={selectedReport === "purchaseHistory" ? "ledger-toolbar purchase-history-toolbar" : "ledger-toolbar"}>
-      <Field label="Report Range">
-        <select value={range} onChange={(event) => setRange(event.target.value)}>
-          <option value="today">Today</option>
-          <option value="yesterday">Yesterday</option>
-          <option value="week">This Week</option>
-          <option value="month">This Month</option>
-          <option value="custom">Custom Date Range</option>
-        </select>
-      </Field>
-      {range === "custom" && (
+      {selectedReport === "balanceSheet" ? (
+        // The balance sheet is as at one day, so it asks for that day only, and the input always
+        // shows the day in force (a preset range's last day) rather than looking empty (UI-9).
+        <Field label="As at date">
+          <input
+            type="date"
+            value={balanceSheetAsAtInput({ range, customRange, resolve: resolveReportDateRange })}
+            onChange={(event) => {
+              setRange("custom");
+              setCustomRange({ ...customRange, date_from: event.target.value, date_to: event.target.value });
+            }}
+          />
+        </Field>
+      ) : (
         <>
-          <Field label="Date From"><input type="date" value={customRange.date_from} onChange={(event) => setCustomRange({ ...customRange, date_from: event.target.value })} /></Field>
-          <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
+          <Field label="Report Range">
+            <select value={range} onChange={(event) => setRange(event.target.value)}>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="week">This Week</option>
+              <option value="month">This Month</option>
+              <option value="custom">Custom Date Range</option>
+            </select>
+          </Field>
+          {range === "custom" && (
+            <>
+              <Field label="Date From"><input type="date" value={customRange.date_from} onChange={(event) => setCustomRange({ ...customRange, date_from: event.target.value })} /></Field>
+              <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
+            </>
+          )}
         </>
       )}
       <Field label="Search / Filter"><input placeholder="Search this report" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
@@ -19159,10 +19224,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
               <option value="CANCELLED">Cancelled</option>
             </select>
           </Field>
-          <label className="check-field report-check-field">
-            <input checked={search.trim().length > 0} readOnly type="checkbox" />
-            <span>{search.trim() ? "Showing matched items only where applicable" : "Item-level search ready"}</span>
-          </label>
+          {/* A note, not a checkbox: nothing here can be ticked; it says what the search box does. */}
+          <p className="form-note">{search.trim() ? "Showing only the items that match the search, where a bill has several" : "The search also matches item names inside each bill"}</p>
           <button className="secondary-button" onClick={() => setSalesFilters({ date: "", status: "ACTIVE", viewMode: "INVOICE", customerMode: "ALL", customer: "", selectedCustomers: [], product: "", lot: "", paymentMode: "", userMode: "ALL", user: "", selectedUsers: [] })}>Clear Sales Filters</button>
         </>
       )}
@@ -19516,7 +19579,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       const from = formatFileDate(appliedQuery.date_from || data.dateFrom);
       const to = formatFileDate(appliedQuery.date_to || data.dateTo);
       const title = safeFileName(currentReport.title);
-      if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
+      if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${data.balanceSheet?.asAtDate ? formatFileDate(data.balanceSheet.asAtDate) : to}.pdf`;
       if (selectedReport === "cashBook") {
         const mode = cashBookFilters.bookAccount || cashBookFilters.paymentMode || "All";
         return `${mode === "BANK" ? "Bank_Book" : "Cash_Book"}_${cashBookFilters.paymentMode || mode}_${from}_to_${to}.pdf`;
@@ -19525,7 +19588,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     })();
     const reportFilterSummary = (() => {
       const parts = [];
-      if (selectedReport !== "stockInventory" && (appliedQuery.date_from || appliedQuery.date_to)) {
+      if (selectedReport === "balanceSheet" && (data.balanceSheet?.asAtDate || appliedQuery.date_from || appliedQuery.date_to)) {
+        // The server reads the balance sheet as at one day, every line cumulative, and names it
+        // (`balanceSheet.asAtDate`); a "from" date changes nothing and is not shown.
+        parts.push(`As at ${formatIndianReportDate(data.balanceSheet?.asAtDate || appliedQuery.date_to || appliedQuery.date_from)}`);
+      } else if (selectedReport !== "stockInventory" && (appliedQuery.date_from || appliedQuery.date_to)) {
         parts.push(`Range: ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}`);
       }
       if (selectedReport !== "stockInventory" && appliedSearch) parts.push(`Search: ${appliedSearch}`);
@@ -20711,6 +20778,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
               <td>{entry.remarks || "-"}</td>
             </tr>
           ))}
+          {entries.length === 0 && !loadFailed && <tr><td className="empty-cell" colSpan={6}>No waste entries yet.</td></tr>}
         </DataTable>
       </ModuleCard>
     </section>
@@ -20906,6 +20974,10 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
           )}
         </div>
       </div>
+
+      {board.status === DISTRIBUTION_BOARD_STATUS.READY && destinations.length === 0 && (
+        <p className="form-note">Sending stock needs a second shop or a warehouse to send it to. Add one in Branches &amp; Counters; if there is one already, press Refresh.</p>
+      )}
 
       {board.message && (
         <div className="startup-status-panel startup-status-error" role="alert">
@@ -21134,24 +21206,11 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     // Validated here rather than only in the store, so the operator is told which field is missing
     // instead of being handed the storage layer's message about the first one it happened to reach.
     if (!draft.customer_name.trim()) return setDraftError("Enter the customer's name, even for a first-time caller.");
-    const lines = draft.items
-      .map((line) => {
-        const product = products.find((candidate) => canonicalInventoryId(candidate.id) === canonicalInventoryId(line.product_id));
-        return product ? {
-          product_id: String(product.id),
-          product_name: product.product_name,
-          unit: product.unit || "",
-          quantity: Number(line.quantity),
-          agreed_rate: Number(line.agreed_rate),
-        } : null;
-      })
-      .filter((line) => line && Number.isFinite(line.quantity) && line.quantity > 0);
-    if (lines.length === 0) return setDraftError("Add at least one item with a quantity.");
-    // A rate of zero is not "no rate given" — it is a real number on a real order, and it would
-    // show the customer as owing nothing. Refused rather than stored.
-    if (lines.some((line) => !(line.agreed_rate > 0))) {
-      return setDraftError("Every item needs the rate you quoted. It fills in from today's rate when you pick the item.");
-    }
+    // A half-filled line (an item with no quantity, a zero rate) is refused naming it, never
+    // dropped from the order without a word (local/ordersBoard.js).
+    const built = buildOrderDraftLines(draft.items, products);
+    if (!built.ok) return setDraftError(built.message);
+    const lines = built.lines;
     setDraftError("");
     // Only clear the form once the order is actually saved. It used to reset unconditionally while
     // `takeOrder` swallowed the failure into a toast, so a rejected order wiped the customer, the
@@ -21805,7 +21864,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     active: true,
     notes: "",
   };
-  const [tab, setTab] = useState(() => (["Owner", "Admin", "Purchase Manager"].includes(user.role) ? "master" : "payments"));
+  // Tabs follow the account authorities, not role names (local/rolePermissions.js).
+  const accountTabPlan = accountTabsFor(accountPermissions);
+  const [tab, setTab] = useState(() => accountTabPlan.initial);
   const [search, setSearch] = useState("");
   const [draft, setDraft] = useState(emptyAccount);
   const [editingKey, setEditingKey] = useState("");
@@ -21828,17 +21889,11 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
   const [ledgerExporting, setLedgerExporting] = useState(false);
   const [ledgerWhatsappOpen, setLedgerWhatsappOpen] = useState(false);
   const ledgerPrintRef = useRef(null);
-  const canManageAllAccounts = ["Owner", "Admin"].includes(user.role);
   // From the role's permission map (Owner always), as the server decides them -- a Cashier whose
   // Customer Payments box is unticked no longer gets a form that can only be refused.
   const canUseSupplierPayments = accountPermissions.supplierPayments === true;
   const canUseCustomerPayments = accountPermissions.customerPayments === true;
-  const accountTabs = [
-    ...(canManageAllAccounts || user.role === "Purchase Manager" ? [["master", "Account Master"]] : []),
-    ["ledger", "Ledger"],
-    ["payments", "Payments"],
-    ...(canManageAllAccounts || user.role === "Purchase Manager" ? [["outstanding", "Outstanding"]] : []),
-  ];
+  const accountTabs = accountTabPlan.tabs;
   const paymentActionOptions = accountPaymentActions.filter(([value]) =>
     value === "RECEIVE_CUSTOMER" ? canUseCustomerPayments : canUseSupplierPayments
   );
@@ -22147,12 +22202,12 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               <Field label="Search"><input placeholder="Search account or mobile" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
               <button className="secondary-button" onClick={onReload}>Refresh</button>
             </div>
-            <DataTable headers={["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", ""]}>
+            <DataTable headers={["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", "Actions"]}>
               {filteredAccounts.map((account) => (
                 <tr key={account.account_key}>
                   <td className="primary-cell">
                     {account.account_name}
-                    <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address || "-"}</small>
+                    {(account.system_account || account.firm_name || account.city || account.address) && <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address}</small>}
                   </td>
                   <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
                   <td>{account.mobile_number || "-"}</td>
@@ -23816,7 +23871,8 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
   };
   return (
     <ModuleCard eyebrow="Role Management" title="Permission Matrix" subtitle="Owner/Admin can control access to billing, settings, tax, rebates, payments, reports and inventory functions.">
-      <DataTable headers={["Role", ...permissionLabels.map(([, label]) => label), ""]}>
+      <p className="form-note">{`${permissionLabels.length} permissions, one column each: scroll the table sideways to see them all. The role stays in view.`}</p>
+      <DataTable className="permission-matrix-table" headers={["Role", ...permissionLabels.map(([, label]) => label), ""]}>
         {(roles || []).map((role) => (
           <tr key={role.role_name}>
             <td className="primary-cell">{role.role_name}</td>
@@ -25785,6 +25841,7 @@ function OperationalScopeManagement({
         <div className="scope-anchor" id={scopeSectionDomId("branches/activation-licences")}>
           <SettingsSectionErrorBoundary eyebrow="Step 5" fallbackNote="The licence list could not be drawn. Approving machines above still works." sectionName="Activation licences">
             <DeviceActivationIssuingSection
+              assignments={data.device_assignments}
               canIssue={isOwnerAccount}
               devices={settingsData.authorizedDevices}
               devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
@@ -25859,7 +25916,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
           <tr key={device.device_id}>
             <td className="primary-cell">{device.device_name}<small className="cell-note device-id-note">{device.device_id}</small></td>
             <td>{labelFor("deviceType", device.device_type || "Browser")}</td>
-            <td>{device.branch_name || "Main Branch"}<small className="cell-note">{device.counter_name || "No counter assigned"}</small></td>
+            <td>{device.branch_name || "Branch not known"}<small className="cell-note">{device.counter_name || "Counter: see Branches & Counters"}</small></td>
             <td><span className={statusClass("deviceStatus", device.status)}>{labelFor("deviceStatus", device.status)}</span></td>
             <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
             <td>{device.last_sync_at ? new Date(device.last_sync_at).toLocaleString("en-IN") : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
@@ -26037,9 +26094,8 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
         <button className="primary-button" disabled={!canManage || busy} onClick={() => backupNow("Manual")}>Backup Now</button>
         <button className="secondary-button" disabled={!canManage || busy} onClick={save}>Save Backup Settings</button>
         <button className="secondary-button" disabled={!canManage || busy} onClick={safeShutdown}>Close Software Safely</button>
-        <button className="remove-button" disabled>Restore Prepared - Disabled</button>
       </div>
-      <p className="form-note">Restore requires Owner permission and remains disabled until backup verification testing is completed.</p>
+      <p className="form-note">A backup is restored by FroozERP support, not from this screen. If you need one back, contact support and name the file from the list below.</p>
       <DataTable headers={["File", "Type", "Size", "Started", "Completed", "Status", "Error"]}>
         {backupLogs.map((log) => (
           <tr key={log.id}>
@@ -26052,6 +26108,7 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
             <td>{log.error_message || "-"}</td>
           </tr>
         ))}
+        {backupLogs.length === 0 && <tr><td className="empty-cell" colSpan={7}>No backups recorded yet. Backup Now makes the first one.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -26088,8 +26145,10 @@ function SystemInfoSection({ systemInfo }) {
         <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>
         <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
         <tr><td>Current Device Type</td><td>{labelFor("deviceType", device.device_type || "Browser")}</td></tr>
-        <tr><td>Current Branch</td><td>{branch.branch_name || "Main Branch"}</td></tr>
-        <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "Not assigned"}</td></tr>
+        {/* This reads the older device record, which a computer approved in Branches & Counters
+            (Step 4) leaves empty: say where to look rather than "Not assigned" or a made-up branch. */}
+        <tr><td>Current Branch</td><td>{branch.branch_name || "Not known here"}</td></tr>
+        <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "See Branches & Counters, Step 4"}</td></tr>
         <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
         <tr><td>Backup Location</td><td>{systemInfo.backupLocation || "-"}</td></tr>
       </DataTable>
@@ -26099,7 +26158,7 @@ function SystemInfoSection({ systemInfo }) {
           <li>Connect the Android phone or tablet to the same Wi-Fi as the FroozERP server computer.</li>
           <li>Open Chrome and enter <strong>{androidUrl}</strong>.</li>
           <li>Login with your FroozERP user. If device approval appears, approve it from an already approved Owner device.</li>
-          <li>For counter tablets, assign the device as Retail Counter Tablet from Authorized Devices.</li>
+          <li>For counter tablets, approve the device in Branches &amp; Counters, Step 4 (Computers &amp; phones).</li>
           <li>Use Chrome menu → Add to Home screen to install the FroozERP shortcut.</li>
         </ol>
         <p>Phones and tablets opened this way use the same server and the same data as this computer. No separate phone or tablet database is created.</p>
@@ -30358,7 +30417,7 @@ function PurchaseSummary({ summary }) {
         <SummaryMetric label="Labour Charges" value={currency.format(summary.labourCharges)} />
         <SummaryMetric label="Other Charges" value={currency.format(summary.otherCharges)} />
         <SummaryMetric label="Gross Amount" value={currency.format(summary.grossAmount)} />
-        <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={`-${currency.format(summary.rebateAmount)}`} positive />
+        <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={Number(summary.rebateAmount) > 0 ? `-${currency.format(summary.rebateAmount)}` : currency.format(0)} positive />
         <SummaryMetric label="Net Payable" value={currency.format(summary.netPayable)} featured />
         <SummaryMetric label="Pending Balance" value={currency.format(summary.balanceAmount)} />
         <SummaryMetric label="Payment Status" value={summary.paymentStatus} />
@@ -30369,15 +30428,11 @@ function PurchaseSummary({ summary }) {
 }
 
 const chartSize = { width: 640, height: 250, padding: 34 };
-const chartCurrency = new Intl.NumberFormat("en-IN", {
-  maximumFractionDigits: 0,
-  notation: "compact",
-});
-
 const formatChartDate = (date) =>
   new Date(`${date}T00:00:00`).toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
 
-const formatChartMoney = (value) => `INR ${chartCurrency.format(Number(value || 0))}`;
+// The axis is short (₹1.2K, ₹4.5 L); a point's tooltip carries the exact amount.
+const formatChartMoney = (value) => formatChartRupees(value);
 
 const getChartPoints = (data, valueKey, maxValue) => {
   const innerWidth = chartSize.width - chartSize.padding * 2;
@@ -30426,7 +30481,7 @@ function LineChart({ color = "#f59e0b", data, subtitle, title, valueKey }) {
         <polyline className="chart-line" points={pointString} style={{ stroke: color }} />
         {points.map((point) => (
           <circle className="chart-point" cx={point.x} cy={point.y} key={`${point.date}-${point.x}`} r="4" style={{ fill: color }}>
-            <title>{`${formatChartDate(point.date)}: ${formatChartMoney(point.value)}`}</title>
+            <title>{`${formatChartDate(point.date)}: ${currency.format(Number(point.value || 0))}`}</title>
           </circle>
         ))}
         <text className="chart-axis-label" x={chartSize.padding} y={chartSize.height - 8}>{rows[0] ? formatChartDate(rows[0].date) : ""}</text>
@@ -30463,7 +30518,7 @@ function BarChart({ color = "#f59e0b", data, subtitle, title, valueKey }) {
           const y = chartSize.height - chartSize.padding - height;
           return (
             <rect className="chart-bar" height={Math.max(height, value > 0 ? 3 : 0)} key={row.date} rx="5" style={{ fill: color }} width={barSlot * 0.64} x={x} y={y}>
-              <title>{`${formatChartDate(row.date)}: ${formatChartMoney(value)}`}</title>
+              <title>{`${formatChartDate(row.date)}: ${currency.format(Number(value || 0))}`}</title>
             </rect>
           );
         })}
@@ -30501,7 +30556,7 @@ function DualLineChart({ data, firstKey, firstLabel, secondKey, secondLabel, sub
         <polyline className="chart-line" points={secondPoints.map((point) => `${point.x},${point.y}`).join(" ")} style={{ stroke: "#38bdf8" }} />
         {[...firstPoints, ...secondPoints].map((point, index) => (
           <circle className="chart-point" cx={point.x} cy={point.y} key={`${point.date}-${index}`} r="3.5" style={{ fill: index < firstPoints.length ? "#f59e0b" : "#38bdf8" }}>
-            <title>{`${formatChartDate(point.date)}: ${formatChartMoney(point.value)}`}</title>
+            <title>{`${formatChartDate(point.date)}: ${currency.format(Number(point.value || 0))}`}</title>
           </circle>
         ))}
         <text className="chart-axis-label" x={chartSize.padding} y={chartSize.height - 8}>{rows[0] ? formatChartDate(rows[0].date) : ""}</text>
@@ -31060,10 +31115,12 @@ function DashboardHighlights({ insights, lowStockItems, onNavigate, topProducts 
 
 function SummaryMetric({ featured = false, label, positive = false, value }) {
   const displayValue = value ?? "-";
+  // A negative amount stays on one line, with a true minus, in the loss colour.
+  const signed = presentSignedFigure(displayValue);
   return (
     <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"} title={`${label}: ${displayValue}`}>
       <span>{label}</span>
-      <strong className={positive ? "metric-value profit-cell" : "metric-value"}>{displayValue}</strong>
+      <strong className={positive ? "metric-value profit-cell" : signed.negative ? "metric-value metric-negative" : "metric-value"}>{signed.text}</strong>
     </div>
   );
 }
@@ -31132,7 +31189,7 @@ function DataTable({ children, className = "", headers }) {
   return (
     <div className={`table-wrap ${className}`.trim()}>
       <table>
-        <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? header : index}>{header}</th>)}</tr></thead>
+        <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? `${index}:${header}` : index}>{header}</th>)}</tr></thead>
         <tbody>{children}</tbody>
       </table>
     </div>

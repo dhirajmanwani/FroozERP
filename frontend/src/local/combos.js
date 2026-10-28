@@ -26,6 +26,7 @@ import { filterLotsForScope } from "./locationScope.js";
 import { lotAvailableQuantity } from "./posInventory.js";
 import { parseTargetMargin, roundSuggestedRate, suggestSaleRate } from "./saleRateUpdate.js";
 import { packingCostOf } from "./froozPack.js";
+import { COMBO_STOCK_REMINDER_KEY_PREFIX, FROST_STOCK_REMINDER_LABEL } from "./frostBellNotifications.js";
 
 export const COMBO_KINDS = Object.freeze(["COMBO_OFFER", "THE_CUTTING", "JUICE", "GIFTING"]);
 export const COMBO_TYPES = Object.freeze(["FIXED", "CUSTOM"]);
@@ -1056,17 +1057,36 @@ export const describeComboStockProblem = (problem) => (problem?.missing || [])
   .map((entry) => `${entry.productName} ${MISSING_REASON_WORDS[entry.reason] || "is not available"}`)
   .join(", ");
 
+const STOCK_ONLY_REASONS = Object.freeze(["OUT_OF_STOCK", "NOT_ENOUGH"]);
+
+/** True when only fruit running out holds the combo up (nothing switched off). */
+export const comboHeldUpByStockOnly = (problem) => {
+  const missing = Array.isArray(problem?.missing) ? problem.missing : [];
+  return missing.length > 0 && missing.every((entry) => STOCK_ONLY_REASONS.includes(entry?.reason));
+};
+
 /**
- * The bell's rows for `comboStockProblems`: a warning per combo, telling the owner what to do.
- * Keys are the problems' own, so a combo that is fixed (stock added or the combo edited) drops out.
+ * The bell's rows for `comboStockProblems`, one per combo, telling the owner what to do. Keys are
+ * the problems' own, so a combo that is fixed (stock added or the combo edited) drops out.
+ *
+ * A combo held up only by fruit that ran out is a season ending, not an alarm (owner, 23 Oct 2026,
+ * the same rule as the fruit's own zero-stock row): an Info "Reminder", under its own key so the
+ * dismissal can be remembered on this computer until the combo can be made again. A product switched
+ * off stays a warning. The caller raises these only for the Owner and Admins, who can edit combos.
  */
-export const comboStockNotifications = (problems) => (Array.isArray(problems) ? problems : []).map((problem) => ({
-  severity: "warning",
-  title: `Edit combo: ${problem.comboName}`,
-  message: `${describeComboStockProblem(problem)}. Edit ${problem.comboName} in Frooz Menu, or add stock, before selling it.`,
-  source: "Frooz Menu",
-  dedupeKey: problem.key,
-}));
+export const comboStockNotifications = (problems) => (Array.isArray(problems) ? problems : []).map((problem) => {
+  const reminder = comboHeldUpByStockOnly(problem);
+  return {
+    severity: reminder ? "info" : "warning",
+    title: `Edit combo: ${problem.comboName}`,
+    message: reminder
+      ? `${describeComboStockProblem(problem)}. Add stock, or if its season is over, edit ${problem.comboName} in Frooz Menu or dismiss this.`
+      : `${describeComboStockProblem(problem)}. Edit ${problem.comboName} in Frooz Menu, or add stock, before selling it.`,
+    source: "Frooz Menu",
+    dedupeKey: reminder ? `${COMBO_STOCK_REMINDER_KEY_PREFIX}${problem.key}` : problem.key,
+    ...(reminder ? { label: FROST_STOCK_REMINDER_LABEL } : {}),
+  };
+});
 
 /**
  * What an empty combo tab says. With combos on other tabs it names them, so a combo saved under
