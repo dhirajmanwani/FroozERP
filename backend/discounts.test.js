@@ -1761,3 +1761,31 @@ test("Discount Report: a combo's lines (FIXED or CUSTOM) are not discounts, and 
     await db.close();
   }
 });
+
+// --- Bill date is the India business day (UI-2) -----------------------------------------------
+
+test("checkout: between 00:00 and 05:30 IST a Cashier billing at today's date is not 'changing the bill date'", async (t) => {
+  // 23:00 UTC on the 24th is 04:30 IST on the 25th. The process runs in UTC, so the old
+  // `toDateKey(new Date())` said the 24th and refused the Cashier's own today as a date change.
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-24T23:00:00Z") });
+  const line = { product_id: PRODUCT_ID, inventory_batch_id: LOT_ID, quantity: 4, discount_amount: 0 };
+  const today = await checkout({ items: [line], bill_date: "2026-10-25", payments: [{ mode: "CASH", amount: 400 }] }, { slabsOn: false });
+  assert.equal(today.response.status, 201, today.response.text);
+  const sale = columnsOf(find(today.statements, /^INSERT INTO sales/)[0]);
+  assert.equal(sale.backdated_bill, false);
+
+  const undated = await checkout({ items: [line], payments: [{ mode: "CASH", amount: 400 }] }, { slabsOn: false });
+  assert.equal(undated.response.status, 201, undated.response.text);
+
+  // The UTC day is yesterday in the shop: that one is a date change, and this Cashier may not make it.
+  const utcDay = await checkout({ items: [line], bill_date: "2026-10-24", payments: [{ mode: "CASH", amount: 400 }] }, { slabsOn: false });
+  assert.equal(utcDay.response.status, 403);
+  assert.equal(utcDay.response.body.message, "You do not have permission to change bill date");
+  assert.equal(find(utcDay.statements, /^INSERT INTO sales/).length, 0);
+});
+
+test("checkout: the bill-date check reads the India day, never the process clock", () => {
+  const handler = SOURCE.slice(SOURCE.indexOf("const createSaleHandler"), SOURCE.indexOf("const isBackdatedBill = transactionDate < todayDate;"));
+  assert.match(handler, /const todayDate = saleReturnRules\.indiaBusinessDateKey\(\);/);
+  assert.doesNotMatch(handler, /const todayDate = toDateKey\(new Date\(\)\)/);
+});
