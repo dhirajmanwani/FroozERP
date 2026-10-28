@@ -22,6 +22,8 @@
  * Local only: a COM port is not the network, so none of this touches LOCAL_ONLY.
  */
 
+import { isFixedComboLine } from "./combos.js";
+
 export const SCALE_PORT_STORAGE_KEY = "froozerp.weighingScale.port";
 /** The same reading for this long is a steady weight. */
 export const SCALE_STEADY_MS = 700;
@@ -213,6 +215,19 @@ export const scaleQuantityFor = (unit, view, takenReadingId = null) => {
   if (!(typeof view.kg === "number" && view.kg > 0)) return null;
   if (takenReadingId !== null && view.readingId === takenReadingId) return null;
   return roundKg(view.kg);
+};
+
+/**
+ * The cart line F6 puts the weight on: the line whose quantity box has focus, or else the last
+ * line sold by the kg that can take a weight. A fixed combo's line is priced by its combo and takes
+ * no typed quantity, so it is never the target; choosing it used to report "1.250 kg from the
+ * scale" while nothing on the bill changed.
+ */
+export const scaleTargetLine = (cart, focusedLineId = "") => {
+  const lines = Array.isArray(cart) ? cart : [];
+  const focused = focusedLineId ? lines.find((item) => item?.line_id === focusedLineId) : null;
+  if (focused) return focused;
+  return [...lines].reverse().find((item) => isWeighedUnit(item?.unit) && !isFixedComboLine(item)) || null;
 };
 
 const PORT_KIND_ORDER = { bluetooth: 0, unknown: 1, usb: 2, pci: 3 };

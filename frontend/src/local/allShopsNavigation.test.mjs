@@ -282,6 +282,7 @@ test("a seeded cart replaces the cart rather than merging into it", () => {
   const start = app.indexOf("const seedLines = Array.isArray(seedCart?.lines)");
   assert.ok(start > 0, "POS must accept a seeded cart");
   const body = app.slice(start, start + 1600);
-  assert.match(body, /setCart\(seedLines\.map/);
+  // Replaced wholesale (`setCart(...)` of the seed alone), not appended to `items`.
+  assert.match(body, /setCart\(seedLinesToCart\(seedLines, /);
   assert.match(body, /onSeedConsumed\?\.\(\)/);
 });

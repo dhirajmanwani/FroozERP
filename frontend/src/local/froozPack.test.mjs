@@ -871,3 +871,112 @@ test("delete: only what the owner's list says is unused; unknown (the counter's 
   assert.equal(packingDeletable(snapshot.types[0]), false, "no answer about use is not 'unused'");
   for (const odd of [undefined, null, {}, { in_use: "false" }, { in_use: 0 }]) assert.equal(packingDeletable(odd), false);
 });
+
+// --- Fixes from the back-office audit ---------------------------------------------------------
+
+import {
+  checkPackingNodeForm,
+  newPackingPurchaseClientRef,
+  packingNodeRef,
+  packingSetupStart,
+  startPackingNodeForm,
+} from "./froozPack.js";
+import { readFileSync as readAppSource } from "node:fs";
+
+const packApp = readAppSource(new URL("../App.jsx", import.meta.url), "utf8");
+const packModule = packApp.slice(packApp.indexOf("function FroozPackModule("), packApp.indexOf("function FroozPackModule(") + 40000);
+
+const twoDesigns = () => ({
+  type: { id: "packing-type-1", global_id: "packing-type-1", name: "Gift Box" },
+  windowBox: { id: "packing-design-3", global_id: "packing-design-3", name: "Window Box" },
+  round: { id: "packing-design-4", global_id: "packing-design-4", name: "Round" },
+});
+
+test("a size form opened under one design saves under it, even after browsing to another (BO-2)", () => {
+  const { type, windowBox, round } = twoDesigns();
+  const opened = { level: "sizes", type, design: windowBox, crumbs: [{ label: "Packing" }, { label: "Gift Box" }, { label: "Window Box" }] };
+  const size = { id: "packing-size-9", global_id: "packing-size-9", size_name: "GRAND", capacity: "1 kg", unit_cost: 40, sort_order: 2, active: true, in_use: true };
+  const form = startPackingNodeForm("size", size, opened);
+  assert.deepEqual(form.parent, { design_id: "packing-design-3" });
+  assert.equal(form.where, "Gift Box › Window Box");
+  assert.equal(form.ref, "packing-size-9");
+  assert.equal(form.inUse, true);
+  assert.deepEqual(form.draft, { sort_order: "2", active: true, size_name: "GRAND", capacity: "1 kg", unit_cost: "40" });
+  // The owner now browses into Round; the form still holds Window Box.
+  void round;
+  const check = checkPackingNodeForm(form);
+  assert.equal(check.ok, true, check.message);
+  assert.equal(check.payload.design_id, "packing-design-3");
+
+  const design = startPackingNodeForm("design", { id: "packing-design-3", name: "Window Box", sort_order: 0 }, { level: "designs", type, crumbs: [{ label: "Packing" }, { label: "Gift Box" }] });
+  assert.deepEqual(design.parent, { type_id: "packing-type-1" });
+  assert.equal(checkPackingNodeForm(design).payload.type_id, "packing-type-1");
+  const top = startPackingNodeForm("type", null, { level: "types", crumbs: [{ label: "Packing" }] });
+  assert.deepEqual(top.parent, {});
+  assert.equal(top.where, "");
+  assert.equal(packingNodeRef({ id: 12, global_id: "packing-size-12" }), "packing-size-12");
+  assert.equal(packingNodeRef({ id: "004" }), "004");
+});
+
+test("Frooz Pack saves a node against the parent it opened in, and holds the list still while a form is open", () => {
+  const saveNode = packModule.slice(packModule.indexOf("const saveNode = async"), packModule.indexOf("const startRemoval"));
+  assert.ok(saveNode.length > 0);
+  assert.doesNotMatch(saveNode, /view\.(design|type)/, "the parent used to be read from the drill-down at Save time");
+  assert.match(saveNode, /checkPackingNodeForm\(nodeForm\)/);
+  assert.match(packModule, /setNodeForm\(startPackingNodeForm\(kind, node, view\)\)/);
+  assert.match(packModule, /<PackDrillHeader\s+crumbs=\{view\.crumbs\}\s+disabled=\{busy\}/);
+  assert.match(packModule, /disabled=\{row\.leaf \|\| busy\}/);
+  assert.match(packModule, /const goBack = \(\) => \{\s+if \(busy\) return;/);
+  assert.match(packModule, /if \(!row \|\| row\.leaf \|\| busy\) return;/);
+  assert.match(packModule, /Correct the count: \$\{adjust\.path\}/);
+});
+
+test("purchase errors name the line by its place in the table, blank spare lines included (BO-15)", () => {
+  const draft = { payment_mode: "CASH", lines: [
+    { size_id: "packing-size-4", quantity: "1", rate: "1" },
+    { size_id: "", quantity: "", rate: "" },
+    { size_id: "packing-size-9", quantity: "", rate: "2" },
+  ] };
+  assert.match(buildPackingPurchasePayload(draft).message, /^Line 3: enter a quantity/);
+});
+
+test("a packing purchase sends its form's client_ref, the same on every retry (BE-4)", () => {
+  const ref = newPackingPurchaseClientRef({ randomUUID: () => "0f8e3c1a-1111-4222-8333-444455556666" });
+  assert.equal(ref, "pack-purchase:0f8e3c1a-1111-4222-8333-444455556666");
+  assert.match(ref, /^[A-Za-z0-9._:-]{1,80}$/, "the server's CLIENT_REF_PATTERN");
+  const fallback = newPackingPurchaseClientRef({ randomUUID: null, now: () => 1_700_000_000_000, random: () => 0.5 });
+  assert.match(fallback, /^pack-purchase:[a-z0-9]+-[a-z0-9]+$/);
+  assert.notEqual(newPackingPurchaseClientRef(), newPackingPurchaseClientRef(), "a new form gets a new key");
+
+  const draft = { payment_mode: "CASH", client_ref: ref, lines: [{ size_id: "packing-size-4", quantity: "2", rate: "5" }] };
+  assert.equal(buildPackingPurchasePayload(draft).payload.client_ref, ref);
+  assert.equal(buildPackingPurchasePayload(draft).payload.client_ref, buildPackingPurchasePayload(draft).payload.client_ref);
+  assert.equal(Object.hasOwn(buildPackingPurchasePayload({ ...draft, client_ref: "" }).payload, "client_ref"), false);
+  assert.equal(buildPackingPurchasePayload({ ...draft, client_ref: "bad ref!" }).ok, false);
+
+  const startPurchase = packModule.slice(packModule.indexOf("const startPurchase = () =>"), packModule.indexOf("const updatePurchase ="));
+  assert.match(startPurchase, /client_ref: newPackingPurchaseClientRef\(\)/, "made once, when the form opens");
+  const savePurchase = packModule.slice(packModule.indexOf("const savePurchase = async"), packModule.indexOf("const startAdjust"));
+  assert.doesNotMatch(savePurchase, /newPackingPurchaseClientRef/, "a retry must not make a new key");
+});
+
+test("New packing inside a switched-off type or design starts where the form can follow, and says why (BO-17)", () => {
+  const catalogue = readPackingCatalogue({ types: [
+    { id: 1, global_id: "packing-type-1", name: "Gift Box", active: true, designs: [
+      { id: 3, global_id: "packing-design-3", name: "Window Box", active: false, sizes: [] },
+      { id: 4, global_id: "packing-design-4", name: "Round", active: true, sizes: [] },
+    ] },
+    { id: 2, global_id: "packing-type-2", name: "Basket", active: false, designs: [] },
+  ] });
+  const offType = packingSetupStart(catalogue, { typeId: "packing-type-2" });
+  assert.equal(offType.draft.type_id, "");
+  assert.equal(offType.note, "Basket is switched off. Switch it on (Edit) to add packing under it.");
+  const offDesign = packingSetupStart(catalogue, { typeId: "packing-type-1", designId: "packing-design-3" });
+  assert.equal(offDesign.draft.type_id, "packing-type-1");
+  assert.equal(offDesign.draft.design_id, "");
+  assert.match(offDesign.note, /^Window Box is switched off/);
+  const on = packingSetupStart(catalogue, { typeId: "packing-type-1", designId: "packing-design-4" });
+  assert.equal(on.draft.design_id, "packing-design-4");
+  assert.equal(on.note, "");
+  assert.equal(packingSetupStart(catalogue).note, "");
+});

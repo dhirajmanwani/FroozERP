@@ -324,7 +324,9 @@ test("checkout asks whether the customer paid before it saves, prints or sends a
   assert.ok(gate > 0, "the paid gate must be inside checkout");
   assert.ok(gate < checkoutSlice.indexOf("setSaving(true);"), "asked before the save starts");
   assert.ok(gate < checkoutSlice.indexOf("completeLocalPosSale(localSale)"), "before the desktop save");
-  assert.ok(gate < checkoutSlice.indexOf("window.print()"), "before any print");
+  // Printing goes through the invoice's own print path, handed the saved bill after the save.
+  assert.ok(gate < checkoutSlice.indexOf("onInvoice(invoice, { print:"), "before any print");
+  assert.doesNotMatch(checkoutSlice, /window\.print\(\)/, "POS never prints behind the invoice's back");
   assert.match(checkoutSlice, /buildPosPayments\(\{ paymentMode, mixedPayments, total: totals\.total \}\)/);
 });
 

@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  RETURN_INVOICE_DEFAULT_DAYS,
   buildSaleReturnDraft,
   filterReturnInvoices,
+  returnInvoiceListParams,
   quantityToThousandths,
   refundPerUnit,
   saleReturnFingerprint,
@@ -124,4 +126,16 @@ test("a combo item cannot be returned one by one", () => {
   assert.equal(draft.canSave, false);
   assert.match(draft.lineProblems.i1, /Combo items can't be returned one by one/);
   assert.equal(draft.lines.length, 0);
+});
+
+test("the Returns bill list asks for the last 30 days, and Load older bills drops the window", () => {
+  assert.equal(RETURN_INVOICE_DEFAULT_DAYS, 30);
+  assert.deepEqual(returnInvoiceListParams(), { days: 30 });
+  assert.deepEqual(returnInvoiceListParams({ allBills: true }), {});
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf("function SaleReturnModule(");
+  const body = app.slice(start, app.indexOf("\nfunction ", start + 10));
+  assert.match(body, /axios\.get\(`\$\{API_URL\}\/sales`, \{ params: returnInvoiceListParams\(\{ allBills: older \}\) \}\)/);
+  assert.match(body, />Load older bills</);
+  assert.match(body, /Bills from the last \$\{RETURN_INVOICE_DEFAULT_DAYS\} days are listed/, "the window is said, never silent");
 });

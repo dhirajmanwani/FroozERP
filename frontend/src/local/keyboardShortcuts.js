@@ -42,7 +42,9 @@ const ANYWHERE_ROWS = Object.freeze([
 const POS_ROWS = Object.freeze([
   Object.freeze({ keys: "F2", label: "Go to product search" }),
   Object.freeze({ keys: "F3", label: "Go to barcode scan" }),
-  Object.freeze({ keys: "F4", label: "Checkout the bill" }),
+  // F4 is Checkout & Print: it saves the bill and prints it, so it is not called plain "Checkout".
+  Object.freeze({ keys: "F4", label: "Checkout & Print the bill" }),
+  Object.freeze({ keys: "F6", label: "Read the scale weight (Weighing Scale mode)" }),
 ]);
 
 export const SHORTCUT_SHEET_STATUS = Object.freeze({

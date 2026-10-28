@@ -10317,6 +10317,11 @@ button.shortcut-sheet-row:focus-visible {
   width: min(420px, calc(100vw - 32px));
 }
 
+/* "Leave POS?" -- asked before a bill in progress is cleared. */
+.pos-leave-modal {
+  width: min(420px, calc(100vw - 32px));
+}
+
 .pos-combo-ask-body {
   display: grid;
   gap: 12px;
@@ -10685,3 +10690,8 @@ button.shortcut-sheet-row:focus-visible {
   }
 }
 .packing-add-here { margin: 10px 0 4px; }
+
+/* The bill dialog takes focus on open (so Escape closes it); the focus itself draws nothing. */
+.invoice-modal-bill:focus {
+  outline: none;
+}

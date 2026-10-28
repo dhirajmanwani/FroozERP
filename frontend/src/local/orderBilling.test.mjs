@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ORDER_BILLING_PROBLEM, buildOrderCartSeed, describeOrderBillingProblems } from "./orderBilling.js";
+import { ORDER_BILLING_PROBLEM, buildOrderCartSeed, describeOrderBillingProblems, seedLinesToCart } from "./orderBilling.js";
 
 const products = [
   { id: "004", product_name: "Apple", unit: "kg", selling_rate: 210 },
@@ -116,4 +116,26 @@ test("problems are summarised in one sentence for the operator", () => {
   const seed = buildOrderCartSeed(order({ items: [{ product_id: "004", quantity: 99, agreed_rate: 180 }] }), { products, lots });
   assert.match(describeOrderBillingProblems(seed), /short/);
   assert.equal(describeOrderBillingProblems({ problems: [] }), "");
+});
+
+test("seedLinesToCart: a sent order's line can grow at the till up to its lot's balance", () => {
+  let next = 0;
+  const seeded = seedLinesToCart(
+    [{ product_id: "004", inventory_batch_id: "lot-new", quantity: 2, selling_rate: 180 }],
+    { lots: [{ id: "lot-new", product_id: "004", remaining_qty: 30 }], newLineId: () => `line-${++next}` },
+  );
+  assert.equal(seeded.length, 1);
+  assert.equal(seeded[0].available_qty, 30, "the lot's balance, not the order's 2 kg");
+  assert.equal(seeded[0].line_id, "line-1");
+  assert.equal(seeded[0].keep_price, true);
+  assert.equal(seeded[0].default_selling_rate, 180);
+});
+
+test("seedLinesToCart: ids compare as text, and an unknown lot keeps the order's quantity", () => {
+  const [line] = seedLinesToCart([{ product_id: "004", inventory_batch_id: 7, quantity: 2, selling_rate: 1 }], { lots: [{ id: "7", remaining_qty: 9 }] });
+  assert.equal(line.available_qty, 9);
+  const [missing] = seedLinesToCart([{ product_id: "004", inventory_batch_id: "gone", quantity: 2, selling_rate: 1 }], { lots: [] });
+  assert.equal(missing.available_qty, 2);
+  const [lowLot] = seedLinesToCart([{ product_id: "004", inventory_batch_id: "7", quantity: 2, selling_rate: 1 }], { lots: [{ id: "7", remaining_qty: 1 }] });
+  assert.equal(lowLot.available_qty, 2, "never below what the order already put on the line");
 });

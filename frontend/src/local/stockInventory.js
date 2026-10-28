@@ -341,3 +341,16 @@ export const activeStockFilterLabels = (filters, { sortBy = "PRODUCT_ASC" } = {}
   if (sortBy !== "PRODUCT_ASC") labels.push(["sortBy", `Sort: ${sortBy.replaceAll("_", " ")}`]);
   return labels;
 };
+
+/**
+ * The Lot View's page: the first `pageSize` rows, or all of them when `pageSize` is 0 ("All") or
+ * not a positive number. `truncated` is what the screen says out loud ("Showing 50 of 80 lots"):
+ * the tiles count every filtered lot, and a table quietly showing fewer looked like missing stock.
+ * Exports and print pass 0, so a file always carries every lot its totals count.
+ */
+export const paginateLots = (rows, pageSize) => {
+  const all = Array.isArray(rows) ? rows : [];
+  const size = Number(pageSize);
+  const shown = Number.isInteger(size) && size > 0 ? all.slice(0, size) : all;
+  return { shown, total: all.length, truncated: shown.length < all.length };
+};

@@ -54,3 +54,19 @@ export const resolveCheckoutRef = (pending, fingerprint, freshRef) => {
   const next = { fingerprint, ref: freshRef };
   return { ref: freshRef, pending: next, reused: false };
 };
+
+/**
+ * An Owner or Admin's discount approval kept across "Not yet".
+ *
+ * The approval is single-use and bound to the bill reference it was issued for, and it is only
+ * spent when the bill is saved. So when the customer is not ready to pay and the cashier presses
+ * Checkout again on the same bill, the approval (and its reference) still stand: asking the Owner
+ * for their password a second time for the bill they already approved was the old behaviour. Any
+ * change to the bill is a different bill, and the held approval is not used for it.
+ */
+export const heldApprovalFor = (held, fingerprint) => {
+  if (!held || held.fingerprint !== fingerprint) return null;
+  const approvalId = String(held.approvalId || "").trim();
+  const saleRef = String(held.saleRef || "").trim();
+  return approvalId && saleRef ? { approvalId, saleRef } : null;
+};

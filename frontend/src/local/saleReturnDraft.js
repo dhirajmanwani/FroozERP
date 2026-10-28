@@ -148,3 +148,16 @@ export const saleReturnFingerprint = (payload) => JSON.stringify([
   payload?.return_reason || "",
   (payload?.items || []).map((item) => [canonicalInventoryId(item.sale_item_id), item.return_quantity]),
 ]);
+
+/** How far back the Returns screen lists bills until "Load older bills" is pressed. */
+export const RETURN_INVOICE_DEFAULT_DAYS = 30;
+
+/**
+ * The query for the Returns screen's bill list. By default only the last 30 days: the list used to
+ * download the branch's whole bill history on every open, and returns of older bills are rare.
+ * `allBills` (after "Load older bills") drops the window. A server that does not know `days` yet
+ * ignores it and sends everything, as before.
+ */
+export const returnInvoiceListParams = ({ allBills = false, days = RETURN_INVOICE_DEFAULT_DAYS } = {}) => (
+  allBills ? {} : { days }
+);
