@@ -5488,6 +5488,7 @@ const parseDashboardRange = (query = {}) => {
  * a missing minimum as 5, so a product with no minimum and 4 kg in hand was low on the
  * Dashboard and not on Products. A product this branch holds none of is still counted (the branch
  * is in the JOIN, not the WHERE): stock 0 against a minimum of 0 is low, as Products shows it.
+ * Only this branch's company's products count, and never a deleted one, as on the offline tile.
  */
 const DASHBOARD_LOW_STOCK_SQL = `
   SELECT *
@@ -5503,6 +5504,8 @@ const DASHBOARD_LOW_STOCK_SQL = `
       AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
       AND ib.branch_id = $1
     WHERE p.active IS DISTINCT FROM FALSE
+      AND p.deleted_at IS NULL
+      AND (p.company_id IS NULL OR p.company_id = (SELECT company_id FROM branches WHERE id = $1))
     GROUP BY p.id, p.product_name, p.unit, p.minimum_stock
   ) stock_position
   WHERE stock_position.minimum_stock IS NOT NULL
@@ -7000,7 +7003,8 @@ const chargeRequestsIncludeManualAmount = (requests) =>
  */
 const resolveSaleCharges = async (client, { requests, companyId = null, allowManualAmount = false } = {}) => {
   const parsed = chargeRequestsFrom(requests).map((request) => ({
-    chargeTypeId: parsePositiveInteger(request?.charge_type_id ?? request?.chargeTypeId ?? request?.id),
+    // A counter on an older build names a charge it pulled as `charge-type-7` (its change id).
+    chargeTypeId: parsePositiveInteger(String(request?.charge_type_id ?? request?.chargeTypeId ?? request?.id ?? "").replace(/^charge-type-/, "")),
     measurement: request?.measurement ?? request?.measure ?? null,
     quantity: request?.quantity ?? request?.qty ?? 1,
     manualAmount: parseManualChargeAmount(request),
@@ -7294,8 +7298,9 @@ const buildSalePayload = async (
   let customerAccount;
   if (selectedCustomerId) {
     const customerResult = await client.query(
-      "SELECT * FROM customers WHERE id = $1 AND (active = TRUE OR $2::BOOLEAN) FOR SHARE",
-      [selectedCustomerId, allowInactiveProducts]
+      `SELECT * FROM customers WHERE id = $1 AND (active = TRUE OR $2::BOOLEAN)
+         AND (company_id IS NULL OR $3::INTEGER IS NULL OR company_id = $3) FOR SHARE`,
+      [selectedCustomerId, allowInactiveProducts, companyId]
     );
     if (customerResult.rows.length === 0) {
       return { error: { status: 400, message: "Selected customer account is not active" } };
@@ -21127,8 +21132,9 @@ const resolveReportTask = async (task, index) => {
  *   - a completed purchase bill credits the supplier its gross amount (goods + mandi tax + freight
  *     + labour + other), and its bill rebate is a separate debit. This used to credit `net_payable`,
  *     which is already net of that rebate, and then debit the rebate again;
- *   - money paid at the time of purchase is a debit on the day it was paid. It was missing, so a
- *     bill paid in cash at the mandi read as owed in the ledger while Accounts said settled;
+ *   - money paid at the time of purchase is a debit on the day it was paid, never before the
+ *     bill's own date. It was missing, so a bill paid in cash at the mandi read as owed in the
+ *     ledger while Accounts said settled;
  *   - a pending purchase bill (`purchase_bill_status` not BILL_COMPLETED) is not yet owed, as in
  *     Accounts;
  *   - a supplier payment debits the amount paid plus the rebate taken with it.
@@ -21178,7 +21184,10 @@ const supplierLedgerEntriesSql = ({ onDate, branchParam }) => `
             AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             AND COALESCE(p.rebate_amount, 0) > 0
           UNION ALL
-          SELECT COALESCE(p.payment_date, p.purchase_date) AS date, 'Supplier Payment' AS transaction_type,
+          -- Money paid with the bill is entered no earlier than the bill: a payment dated before
+          -- its purchase (an advance) would otherwise sit in a period whose bill is not there yet,
+          -- so the ledger's b/f and Accounts' as-at payable disagreed.
+          SELECT GREATEST(COALESCE(p.payment_date, p.purchase_date), p.purchase_date) AS date, 'Supplier Payment' AS transaction_type,
             p.supplier_name AS party_name,
             'SUPPLIER' AS account_type,
             'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
@@ -21191,7 +21200,7 @@ const supplierLedgerEntriesSql = ({ onDate, branchParam }) => `
             'Paid against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS remarks,
             'Paid against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS narration
           FROM purchases p
-          WHERE ${onDate("COALESCE(p.payment_date, p.purchase_date)")} AND p.branch_id = ${branchParam}
+          WHERE ${onDate("GREATEST(COALESCE(p.payment_date, p.purchase_date), p.purchase_date)")} AND p.branch_id = ${branchParam}
             AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
             AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             AND COALESCE(p.paid_amount, 0) > 0
@@ -25821,8 +25830,6 @@ app.get("/sales", async (req, res) => {
     const result = await pool.query(`
       SELECT
         s.id,
-        s.global_id,
-        s.offline_invoice_ref,
         s.invoice_no,
         s.sale_date,
         s.created_at,

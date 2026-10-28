@@ -245,9 +245,9 @@ const inactiveMasterClient = async () => {
   const db = new PGlite();
   await db.exec(`
     CREATE TABLE products (id INTEGER PRIMARY KEY, product_name TEXT, selling_rate NUMERIC, unit TEXT, active BOOLEAN, deleted_at TIMESTAMP);
-    CREATE TABLE customers (id INTEGER PRIMARY KEY, customer_name TEXT, active BOOLEAN);
+    CREATE TABLE customers (id INTEGER PRIMARY KEY, customer_name TEXT, active BOOLEAN, company_id INTEGER);
     INSERT INTO products VALUES (11, 'Mango', 100, 'KG', FALSE, CURRENT_TIMESTAMP);
-    INSERT INTO customers VALUES (5, 'Ravi', FALSE), (6, 'Sita', TRUE);
+    INSERT INTO customers VALUES (5, 'Ravi', FALSE, 1), (6, 'Sita', TRUE, NULL), (7, 'Other shop', FALSE, 2);
   `);
   const fallback = rateClient();
   return {
@@ -277,6 +277,9 @@ test("a desktop bill naming a product and a customer switched off since is recor
     assert.equal(recorded.customerName, "Ravi");
     assert.equal(recorded.invoiceItems[0].productId, 11);
     assert.equal(recorded.totalAmount, 100);
+    // Switched off is allowed on this path; another company's customer is not.
+    const foreign = await bill({ allowInactiveProducts: true, customer: { account_id: 7 } });
+    assert.equal(foreign.error?.status, 400, "another shop's customer is not this shop's bill");
   } finally {
     await client.db.close();
   }
@@ -584,7 +587,10 @@ test("GET /sales with no window runs the same unbounded read; with one it filter
   const [unbounded] = plain.statements.filter(listRead);
   assert.deepEqual(unbounded.values, [3]);
   assert.doesNotMatch(unbounded.sql, /sale_date >=/);
-  assert.match(unbounded.sql, /s\.global_id, s\.offline_invoice_ref,/, "a counter files a cached bill under its own id");
+  // The desktop sign-in cache files a row without `global_id` as `cloud-sale-<id>` and skips it
+  // when the counter already holds that bill (local_db.rs). Sending `global_id` here would make it
+  // overwrite the counter's own synced bill with this thinner list row instead.
+  assert.doesNotMatch(unbounded.sql, /global_id|offline_invoice_ref/, "the list must not hand the desktop cache a bill's own id");
 
   const windowed = await call("GET", "/sales?date_from=2026-09-25");
   assert.equal(windowed.response.status, 200);

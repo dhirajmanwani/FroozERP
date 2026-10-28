@@ -16055,7 +16055,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     try {
       response = await axios.post(`${API_URL}/api/v3/packing/purchases`, check.payload);
     } catch (error) {
-      setPurchase((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "The purchase could not be saved. Nothing was changed.") } : current));
+      setPurchase((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "The save could not be confirmed. Press Save again: this purchase will not be saved twice.") } : current));
       return;
     }
     const sent = response?.data?.purchase?.amount;

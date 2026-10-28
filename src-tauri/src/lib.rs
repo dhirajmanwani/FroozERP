@@ -2868,7 +2868,7 @@ fn sync_outbox_enqueue(app: AppHandle, operation: SyncOperation) -> Result<i64, 
 }
 #[tauri::command]
 fn sync_outbox_count(app: AppHandle) -> Result<i64, String> {
-    local_db::pending_outbox_count(&app)
+    local_db::unsent_outbox_count(&app)
 }
 #[tauri::command]
 fn sync_outbox_pending(

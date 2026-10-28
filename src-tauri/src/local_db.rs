@@ -870,7 +870,7 @@ fn stored_entity_for_change(tx: &rusqlite::Transaction, change: &PulledChange) -
         "product" | "sale_rate" => version_of("SELECT version FROM local_products WHERE id = ?1", entity_id),
         "product_category" => version_of("SELECT version FROM local_categories WHERE id = ?1", entity_id),
         "supplier" => version_of("SELECT version FROM local_supplier_references WHERE id = ?1", entity_id),
-        "charge_type" => version_of("SELECT version FROM local_charge_types WHERE id = ?1", entity_id),
+        "charge_type" => version_of("SELECT version FROM local_charge_types WHERE id = ?1", &canonical_charge_type_id(entity_id)),
         "charge_rate_slab" => version_of("SELECT version FROM local_charge_rate_slabs WHERE id = ?1", entity_id),
         "combo" => {
             let combo_id = combo_identity(&change.payload, Some(entity_id)).unwrap_or_else(|| change.entity_id.clone());
@@ -2276,10 +2276,15 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     // under the canonical keys so the cloud is handed the same shape whichever key the POS used.
     if let Some(object) = sale.as_object_mut() {
         // The lot spelling the stock was taken from, so the cloud is told the row this device moved.
+        // The server reads `inventory_batch_id` before `lot_id`, so the cart's own spelling there is
+        // replaced too; left alone, it won and this resolution never reached the cloud.
         if let Some(lines) = object.get_mut("items").and_then(|value| value.as_array_mut()) {
             for (line, lot_id) in lines.iter_mut().zip(sold_lot_ids.iter()) {
                 if let Some(line) = line.as_object_mut() {
                     line.insert("lot_id".to_string(), serde_json::json!(lot_id));
+                    if line.contains_key("inventory_batch_id") {
+                        line.insert("inventory_batch_id".to_string(), serde_json::json!(lot_id));
+                    }
                 }
             }
         }
@@ -3489,17 +3494,46 @@ fn read_charge_types(conn: &Connection) -> Result<Vec<serde_json::Value>, String
             }))
         })
         .map_err(to_error)?;
-    let mut charge_types = Vec::new();
+    let mut charge_types: Vec<serde_json::Value> = Vec::new();
+    // One charge can be held under two ids: the bootstrap and sign-in cache store the cloud's bare
+    // id (`7`), and an older build stored pulls under the change id (`charge-type-7`). The POS is
+    // handed one -- the newer -- under the bare id, so the charge is not offered twice with one copy
+    // going stale, and a bill naming it is not refused by the cloud, which reads only the number.
+    let mut position_by_charge: HashMap<String, usize> = HashMap::new();
     for row in rows {
         let mut charge_type = row.map_err(to_error)?;
         let id = optional_text(&charge_type, "id").unwrap_or_default();
         let slabs = slabs_by_type.remove(&id).unwrap_or_default();
+        let charge_key = canonical_charge_type_id(&id);
         if let Some(object) = charge_type.as_object_mut() {
             object.insert("slabs".to_string(), serde_json::Value::Array(slabs));
+            object.insert("id".to_string(), serde_json::json!(charge_key));
         }
-        charge_types.push(charge_type);
+        match position_by_charge.get(&charge_key) {
+            Some(&position) => {
+                if charge_type_is_newer(&charge_type, &charge_types[position]) {
+                    charge_types[position] = charge_type;
+                }
+            }
+            None => {
+                position_by_charge.insert(charge_key, charge_types.len());
+                charge_types.push(charge_type);
+            }
+        }
     }
     Ok(charge_types)
+}
+
+/// The cloud's own id for a charge type. The pull feed names one `charge-type-7`; the bootstrap, the
+/// sign-in cache, every slab's `charge_type_id` and the server's sale-charge check all use `7`.
+fn canonical_charge_type_id(id: &str) -> String {
+    id.strip_prefix("charge-type-").unwrap_or(id).to_string()
+}
+
+fn charge_type_is_newer(candidate: &serde_json::Value, held: &serde_json::Value) -> bool {
+    let version = |value: &serde_json::Value| value.get("entity_version").and_then(|v| v.as_i64()).unwrap_or(0);
+    let updated = |value: &serde_json::Value| optional_text(value, "updated_at").unwrap_or_default();
+    (version(candidate), updated(candidate)) > (version(held), updated(held))
 }
 
 /// The charge types carried by an online reference snapshot, wherever the server put them.
@@ -5403,11 +5437,19 @@ fn enqueue_sync_operation_with_conn(conn: &Connection, operation: &SyncOperation
     Ok(())
 }
 
-pub fn pending_outbox_count(app: &AppHandle) -> Result<i64, String> {
+/// Every operation not yet accepted by the cloud: `pending` + `syncing` + `failed`. This backs
+/// `sync_outbox_count`, which the updater asks as its last check before installing. A failed sale
+/// is still unsent, so it has to hold an install back even though the "Pending" badge
+/// (`pending_outbox_count_at`) leaves it to `failed_operations`.
+pub fn unsent_outbox_count(app: &AppHandle) -> Result<i64, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
     let conn = Connection::open(path).map_err(to_error)?;
-    pending_outbox_count_at(&conn)
+    unsent_outbox_count_at(&conn)
+}
+
+fn unsent_outbox_count_at(conn: &Connection) -> Result<i64, String> {
+    count_outbox_status(conn, &["pending", "syncing", "failed"])
 }
 
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -9863,9 +9905,10 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
         // Its slabs travel nested inside it, because a charge is only ever priced with all of its
         // slabs in hand and applying half of them would change what the shop charges.
         "charge_type" => {
-            if let Err(detail) = upsert_charge_type_with_tx(
+            let charge_type_id = canonical_charge_type_id(&change.entity_id);
+            match upsert_charge_type_with_tx(
                 tx,
-                &change.entity_id,
+                &charge_type_id,
                 &change.payload,
                 change.updated_at.clone(),
                 change.version.unwrap_or(1),
@@ -9874,7 +9917,20 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 // Kept, named and replayable rather than applied-in-part or dropped. `Err` here
                 // means nothing was written — every check in that function runs before its first
                 // statement — so the transaction is clean and the rest of the pull still lands.
-                record_unapplied_change(tx, change, "CHARGE_TYPE_NOT_USABLE", Some(detail))?;
+                Err(detail) => record_unapplied_change(tx, change, "CHARGE_TYPE_NOT_USABLE", Some(detail))?,
+                // An older build stored this change under its `charge-type-N` id, beside the bare
+                // id the bootstrap and sign-in cache use. That copy is retired now that the bare
+                // row carries the change, so a delete here cannot leave it offered on the POS.
+                Ok(()) if charge_type_id != change.entity_id => {
+                    tx.execute(
+                        "UPDATE local_charge_types
+                         SET deleted_at = COALESCE(deleted_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                         WHERE id = ?1",
+                        params![change.entity_id],
+                    )
+                    .map_err(to_error)?;
+                }
+                Ok(()) => {}
             }
         }
         "charge_rate_slab" => {
@@ -15186,6 +15242,60 @@ mod tests {
         })
     }
 
+    /// LOW-9: a charge held under both the bootstrap's bare id and the pull feed's `charge-type-N`
+    /// is offered to the POS once, as its newer copy.
+    #[test]
+    fn a_charge_held_under_two_ids_is_offered_once_as_its_newer_copy() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-charge-twins-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO local_charge_types (id, cloud_id, charge_name, basis, flat_rate, active, version, updated_at)
+               VALUES ('7', '7', 'Crate', 'FLAT', 10, 1, 1, '2026-10-01T00:00:00Z'),
+                      ('charge-type-7', 'charge-type-7', 'Crate charge', 'FLAT', 12, 1, 2, '2026-10-20T00:00:00Z'),
+                      ('8', '8', 'Delivery', 'FLAT', 30, 1, 1, '2026-10-01T00:00:00Z');",
+        )
+        .unwrap();
+        let charges = read_charge_types(&conn).unwrap();
+        let names: Vec<&str> = charges.iter().map(|c| c["charge_name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Crate charge", "Delivery"]);
+        assert_eq!(charges[0]["flat_rate"], 12.0);
+        assert_eq!(charges[0]["id"], "7", "the POS sends the id the cloud can read");
+        drop(conn);
+
+        // A pull of the same charge now lands on the bare row and retires the prefixed copy.
+        let mut conn = Connection::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let change = PulledChange {
+            change_id: serde_json::json!(901),
+            branch_id: Some(1),
+            entity_type: "charge_type".to_string(),
+            entity_id: "charge-type-7".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(3),
+            updated_at: Some("2026-10-25T00:00:00Z".to_string()),
+            payload: serde_json::json!({ "id": 7, "charge_name": "Crate charge", "basis": "FLAT", "flat_rate": 15, "active": true }),
+        };
+        apply_change_with_tx(&tx, &change).unwrap();
+        tx.commit().unwrap();
+        let live: Vec<String> = conn
+            .prepare("SELECT id FROM local_charge_types WHERE deleted_at IS NULL ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(live, vec!["7".to_string(), "8".to_string()]);
+        assert_eq!(read_charge_types(&conn).unwrap()[0]["flat_rate"], 15.0);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
     /// A counter with no internet still knows what a crate costs.
     ///
     /// The snapshot has to carry every slab, not a summary of them, because the refusal above the
@@ -19024,8 +19134,11 @@ mod tests {
         }
         let mut sale = test_sale_payload("inv-bare", "op-bare", 2.0, 20.0);
         sale["items"][0]["lot_id"] = serde_json::json!("5");
+        sale["items"][0]["inventory_batch_id"] = serde_json::json!("5");
         let result = complete_local_pos_sale_at(&path, sale).expect("the fruit is on the shelf");
         assert_eq!(result.invoice["items"][0]["lot_id"], "inventory-lot-5", "the outbox names the row that moved");
+        // The server reads `inventory_batch_id` first, so it carries the same resolved spelling.
+        assert_eq!(result.invoice["items"][0]["inventory_batch_id"], "inventory-lot-5");
         assert_eq!(live_lots(&path, "product-test"), vec![("inventory-lot-5".to_string(), 3.0)]);
 
         let mut retired = sale_on_lot("inv-retired", "lot-old-5", "product-test", 1.0, "2026-06-16");
@@ -19059,6 +19172,10 @@ mod tests {
         let loaded = load_reference_snapshot_at(&path, None, Some("device-test")).unwrap();
         assert_eq!(loaded["pending_operations"], 1);
         assert_eq!(loaded["failed_operations"], 1);
+        // The updater's last check before installing counts the failed sale too: it is unsent.
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(unsent_outbox_count_at(&conn).unwrap(), 2);
+        drop(conn);
         let _ = fs::remove_file(&path);
     }
 

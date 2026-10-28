@@ -59,6 +59,7 @@ const CODES = Object.freeze({
   IN_USE: "PACKING_IN_USE",
   INPUT_INVALID: "PACKING_INPUT_INVALID",
   PURCHASE_INVALID: "PACKING_PURCHASE_INVALID",
+  PURCHASE_ALREADY_SAVED: "PACKING_PURCHASE_ALREADY_SAVED",
   ADJUSTMENT_INVALID: "PACKING_ADJUSTMENT_INVALID",
   PURCHASE_EXPENSE: "PACKING_PURCHASE_EXPENSE",
   USAGE_SKIPPED: "PACKING_USAGE_SKIPPED",
@@ -1297,6 +1298,23 @@ const storedPurchaseAnswer = async (client, { companyId, clientRef }) => {
 };
 
 /**
+ * Whether a retry carries what the stored purchase holds. A form keeps its `client_ref` for life, so
+ * a save whose answer was lost and then edited before Save is pressed again arrives with the same ref
+ * and different content; answering it with the first purchase would report the edit as saved.
+ * Lines are compared by quantity and rate, since the retry may name a size by id or by global id.
+ */
+const sameStoredPurchase = (stored, retry) => {
+  const lineKeys = (lines) => lines.map((line) => `${Number(line.quantity)}@${roundMoney(line.rate)}`).sort().join("|");
+  return roundMoney(stored.amount) === roundMoney(retry.amount)
+    && stored.payment_mode === retry.payment_mode
+    && stored.purchase_date === retry.purchase_date
+    && (stored.supplier_name || null) === (retry.supplier_name || null)
+    && (stored.reference_number || null) === (retry.reference_number || null)
+    && stored.lines.length === retry.lines.length
+    && lineKeys(stored.lines) === lineKeys(retry.lines);
+};
+
+/**
  * POST /api/v3/packing/purchases. One transaction: the purchase and its lines, each size's count up
  * at the session's branch with a PURCHASE movement, each size's unit cost set to the line's rate,
  * one 'Packing Material' expense for the total (its id stored on the purchase), then the counts
@@ -1305,8 +1323,10 @@ const storedPurchaseAnswer = async (client, { companyId, clientRef }) => {
  * Idempotent on `client_ref`: a save whose answer was lost (a timeout after COMMIT) used to be
  * saved again on retry -- a second purchase, a second expense and the count raised twice. Now a
  * repeat of a stored `client_ref` answers 200 with the first purchase (`replayed: true`) and writes
- * nothing. A transaction-scoped advisory lock serialises two copies arriving at once, so the second
- * waits and then finds the first; the unique index (026) is the backstop. Without a `client_ref`
+ * nothing; a repeat whose content differs (edited after the lost answer) is refused with 409
+ * PURCHASE_ALREADY_SAVED, also writing nothing. A transaction-scoped advisory lock serialises two
+ * copies arriving at once, so the second waits and then finds the first; the unique index (026) is
+ * the backstop. Without a `client_ref`
  * the behaviour is what it always was.
  */
 const recordPackingPurchase = async (client, { companyId, branchId, actorId, body }, deps) => {
@@ -1316,7 +1336,14 @@ const recordPackingPurchase = async (client, { companyId, branchId, actorId, bod
   if (purchase.client_ref) {
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`packing-purchase:${companyId}:${purchase.client_ref}`]);
     const replay = await storedPurchaseAnswer(client, { companyId, clientRef: purchase.client_ref });
-    if (replay) return replay;
+    if (replay) {
+      if (sameStoredPurchase(replay.body.purchase, purchase)) return replay;
+      return answer(409, {
+        code: CODES.PURCHASE_ALREADY_SAVED,
+        message: `This purchase form was already saved once, for ₹${replay.body.purchase.amount.toFixed(2)}, and the changes made after that were not saved. Check Expenses → Packing Material, then close this form and open a new purchase for anything still missing.`,
+        purchase: replay.body.purchase,
+      });
+    }
   }
   const sizes = await resolveSizes(client, { companyId, refs: purchase.lines.map((line) => line.size_ref) });
   for (const line of purchase.lines) {
@@ -1623,7 +1650,7 @@ const packingErrorResponse = (error) => {
   if (error?.code === "23505") {
     if (/packing_purchases_client_ref/.test(String(error.constraint || ""))) {
       // Only reachable if the advisory lock was bypassed; the purchase is already saved once.
-      return answer(409, { code: CODES.PURCHASE_INVALID, message: "This purchase was already saved. Check Expenses and the packing counts before saving it again." });
+      return answer(409, { code: CODES.PURCHASE_ALREADY_SAVED, message: "This purchase was already saved. Check Expenses and the packing counts before saving it again." });
     }
     if (/packing_sizes/.test(String(error.constraint || ""))) {
       return answer(409, { code: CODES.SIZE_TAKEN, message: "This design already has an active size with this name and capacity." });

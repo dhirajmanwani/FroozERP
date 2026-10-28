@@ -480,6 +480,8 @@ test("dashboard low stock is Products' 'Low': stock at or below the product's ow
     await db.exec(`
       ALTER TABLE products ADD COLUMN minimum_stock NUMERIC(14,3);
       ALTER TABLE products ADD COLUMN active BOOLEAN DEFAULT TRUE;
+      ALTER TABLE products ADD COLUMN company_id INTEGER;
+      ALTER TABLE products ADD COLUMN deleted_at TIMESTAMP;
       UPDATE products SET minimum_stock = 0 WHERE id = 10;
       INSERT INTO products (id, product_name, unit, minimum_stock, active) VALUES
         (11, 'Mango', 'KG', 0, TRUE),    -- no stock at all, minimum 0: low (Products shows "0.000 Kg Low")
@@ -487,6 +489,9 @@ test("dashboard low stock is Products' 'Low': stock at or below the product's ow
         (13, 'Grapes', 'KG', 5, TRUE),    -- 3 kg against 5: low
         (14, 'Kiwi', 'KG', 2, TRUE),      -- 10 kg against 2: not low
         (15, 'Plum', 'KG', 5, FALSE);     -- inactive
+      INSERT INTO products (id, product_name, unit, minimum_stock, active, company_id, deleted_at) VALUES
+        (16, 'Lychee', 'KG', 5, TRUE, 2, NULL),             -- another company's: not this shop's tile
+        (17, 'Fig', 'KG', 5, TRUE, NULL, CURRENT_TIMESTAMP); -- deleted: gone from Products, gone here
       INSERT INTO inventory_batches (id, product_id, branch_id, remaining_qty, batch_status) VALUES
         (1, 10, 1, 8, 'ACTIVE'), (2, 12, 1, 4, 'ACTIVE'), (3, 13, 1, 3, 'ACTIVE'), (4, 14, 1, 10, 'ACTIVE'),
         (5, 11, 2, 50, 'ACTIVE'), (6, 13, 1, 40, 'CANCELLED');
@@ -500,6 +505,7 @@ test("dashboard low stock is Products' 'Low': stock at or below the product's ow
         COALESCE((SELECT SUM(remaining_qty) FROM inventory_batches ib WHERE ib.product_id = p.id AND ib.branch_id = 1
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'), 0) AS current_stock
       FROM products p
+      WHERE p.deleted_at IS NULL AND (p.company_id IS NULL OR p.company_id = 1)
     `)).rows;
     const productsLow = products.filter((row) => row.active !== false && isLowStock(row)).map((row) => row.product_name).sort();
     assert.deepEqual(dashboard, productsLow);

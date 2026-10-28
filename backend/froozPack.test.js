@@ -970,6 +970,14 @@ test("routes: a purchase retried with the same client_ref is answered with the f
     assert.equal(await count(db, "SELECT COUNT(*) AS n FROM expenses"), 1, "one expense");
     assert.equal(Number((await db.query("SELECT qty_on_hand FROM packing_stock")).rows[0].qty_on_hand), 10, "the count raised once");
 
+    // The same form edited after the lost answer is refused, not reported as saved, and writes nothing.
+    const edited = await call("POST", "/api/v3/packing/purchases", { ...body, lines: [{ size_id: grand.global_id, quantity: 12, rate: 12 }] });
+    assert.equal(edited.status, 409, JSON.stringify(edited.body));
+    assert.equal(edited.body.code, CODES.PURCHASE_ALREADY_SAVED);
+    assert.match(edited.body.message, /already saved once, for ₹120\.00/);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_purchases"), 1);
+    assert.equal(Number((await db.query("SELECT qty_on_hand FROM packing_stock")).rows[0].qty_on_hand), 10, "the edit raised nothing");
+
     // A different form is a different purchase, and no client_ref behaves as it always did.
     assert.equal((await call("POST", "/api/v3/packing/purchases", { ...body, client_ref: "pack-form-other" })).status, 201);
     const { client_ref: _dropped, ...withoutRef } = body;
