@@ -14,6 +14,7 @@ import {
   plainScaleError,
   readSavedScalePort,
   saveScalePort,
+  scaleLineQuantity,
   scaleQuantityFor,
   scaleTargetLine,
 } from "./weighingScale.js";
@@ -176,4 +177,12 @@ test("scaleTargetLine: the focused line first, else the last kg line that can ta
   assert.equal(scaleTargetLine([...cart, { line_id: "d", unit: "kg", combo_line_key: "C1", combo_type: "CUSTOM" }], "").line_id, "d", "a customer's-choice combo line takes a typed weight");
   assert.equal(scaleTargetLine([{ line_id: "b", unit: "PIECE" }], ""), null);
   assert.equal(scaleTargetLine(null), null);
+});
+
+test("POS-8: a scale weight sets the line to the pan's weight; a plain tap adds one", () => {
+  // 1.200 kg of apples billed, more apples join the pan, it now reads 1.500 kg: the line is 1.5.
+  assert.equal(scaleLineQuantity({ existing: 1.2, added: 1.5, fromScale: true }), 1.5);
+  assert.equal(scaleLineQuantity({ existing: 0, added: 1.25, fromScale: true }), 1.25, "a new line takes the weight");
+  assert.equal(scaleLineQuantity({ existing: 2, added: 1, fromScale: false }), 3, "no weight: one more unit, as before");
+  assert.equal(scaleLineQuantity({ existing: 0.89, added: 1, fromScale: false }), 1.89, "3 decimals, no float tail");
 });

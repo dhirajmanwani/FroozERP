@@ -218,6 +218,17 @@ export const scaleQuantityFor = (unit, view, takenReadingId = null) => {
 };
 
 /**
+ * The quantity a tap leaves on a cart line. A steady scale weight is the whole amount on the pan,
+ * so a line that already exists is set to it, as F6 does (owner's choice, 30 Oct 2026). Adding it
+ * billed the first weighing twice when more fruit joined a pan that was never emptied. A tap with
+ * no weight still adds one unit.
+ */
+export const scaleLineQuantity = ({ existing = 0, added = 1, fromScale = false } = {}) => {
+  if (fromScale) return roundKg(Number(added));
+  return roundKg(Number(existing || 0) + Number(added));
+};
+
+/**
  * The cart line F6 puts the weight on: the line whose quantity box has focus, or else the last
  * line sold by the kg that can take a weight. A fixed combo's line is priced by its combo and takes
  * no typed quantity, so it is never the target; choosing it used to report "1.250 kg from the

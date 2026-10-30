@@ -330,7 +330,7 @@ import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure,
 import { UPI_BANK_PAYMENT_MODES, dayBookVoucherLabel, paymentReportTotals, saleGrossAmount, salesHistoryMoneyTotals } from "./local/salesReportTotals";
 import { checkoutFingerprint, heldApprovalFor, resolveCheckoutRef } from "./local/checkoutRetry";
 import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
-import { SCALE_STATES, createSteadiness, describeScale, findScalePort, formatKg, isWeighedUnit, nextSteadiness, readSavedScalePort, saveScalePort, scaleQuantityFor, scaleTargetLine } from "./local/weighingScale";
+import { SCALE_STATES, createSteadiness, describeScale, findScalePort, formatKg, isWeighedUnit, nextSteadiness, readSavedScalePort, saveScalePort, scaleLineQuantity, scaleQuantityFor, scaleTargetLine } from "./local/weighingScale";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 // The phone app is a Tauri runtime too, so `isDesktopShell()` is true there as well. What differs on
@@ -27141,23 +27141,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const saleUnit = lot.unit || product.unit;
     const weighed = effectiveQuantityMode === "SCALE" ? scaleQuantityFor(saleUnit, scale, takenScaleReading) : null;
     const addQuantity = weighed ?? 1;
-    // Stock promised to orders is not the counter's to sell. Checked at product level and before
-    // the per-lot arithmetic below, which is left exactly as it was — it handles money, and this
-    // is not the change to disturb it with.
-    const counterStock = describeCounterStock({
-      onHand: productOnHand(product.id),
-      reserved: reservedForProduct(reservedIndex, product.id),
-      // What is already in the cart, not that plus a whole unit. Asking for +1 made any fractional
-      // remainder unsellable: with 0.4 kg free the first add was refused, and there was then no line
-      // to type 0.4 into. Produce is sold by weight, so the operator sets the quantity next anyway,
-      // and the quantity handler re-checks with the real number.
-      requested: getCartQuantityForProduct(product.id) + (weighed ?? 0),
-      unit: lot.unit || product.unit || "",
-    });
-    if (counterStock.status !== COUNTER_STOCK.FREE) {
-      alert(counterStock.message);
-      return;
-    }
     const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
     // While a customer's-choice combo is open, the product joins it (local/combos.js): priced by the
@@ -27168,9 +27151,29 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const comboKey = comboTag?.combo_line_key || "";
     const cartIdentity = `${buildCartIdentity({ product, lot, unit: lot.unit || product.unit, sellingRate: discounted.sellingRate })}${comboKey ? `|combo:${comboKey}` : ""}`;
     const currentItem = cart.find((item) => item.cart_identity === cartIdentity && String(item.combo_line_key || "") === comboKey);
-    // Quantities carry 3 decimals; a weight added to a line must not leave 1.8900000000000001.
-    const nextQuantity = Math.round((Number(currentItem?.quantity || 0) + addQuantity) * 1000) / 1000;
-    const nextLotQuantity = getCartQuantityForLot(lot.id) + addQuantity;
+    // A scale weight sets the line (the pan holds all of it); a plain tap adds one. 3 decimals.
+    const currentQuantity = Number(currentItem?.quantity || 0);
+    const nextQuantity = scaleLineQuantity({ existing: currentQuantity, added: addQuantity, fromScale: weighed !== null });
+    const quantityChange = nextQuantity - currentQuantity;
+    // Stock promised to orders is not the counter's to sell. Checked at product level and before
+    // the per-lot arithmetic below, which is left exactly as it was — it handles money, and this
+    // is not the change to disturb it with.
+    const counterStock = describeCounterStock({
+      onHand: productOnHand(product.id),
+      reserved: reservedForProduct(reservedIndex, product.id),
+      // What is already in the cart, not that plus a whole unit. Asking for +1 made any fractional
+      // remainder unsellable: with 0.4 kg free the first add was refused, and there was then no line
+      // to type 0.4 into. Produce is sold by weight, so the operator sets the quantity next anyway,
+      // and the quantity handler re-checks with the real number. A scale weight asks for what it
+      // changes the line by, since it replaces the line's quantity.
+      requested: getCartQuantityForProduct(product.id) + (weighed !== null ? quantityChange : 0),
+      unit: lot.unit || product.unit || "",
+    });
+    if (counterStock.status !== COUNTER_STOCK.FREE) {
+      alert(counterStock.message);
+      return;
+    }
+    const nextLotQuantity = getCartQuantityForLot(lot.id) + quantityChange;
     if (availableStock < nextLotQuantity) {
       const moreAvailable = Math.max(availableStock - getCartQuantityForLot(lot.id), 0);
       alert(`Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${lotStableName(lot) || lot.id}.`);
@@ -27206,7 +27209,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     ));
     if (weighed !== null) {
       setTakenScaleReading(scale.readingId);
-      setScaleMessage(`${product.product_name}: ${formatKg(weighed)} from the scale.`);
+      setScaleMessage(currentItem
+        ? `${product.product_name}: line set to ${formatKg(weighed)} from the scale.`
+        : `${product.product_name}: ${formatKg(weighed)} from the scale.`);
     } else if (effectiveQuantityMode === "SCALE" && isWeighedUnit(saleUnit)) {
       setScaleMessage(`${product.product_name}: no steady weight on the scale, so the quantity is 1. Press F6 once the weight holds, or type it.`);
     }

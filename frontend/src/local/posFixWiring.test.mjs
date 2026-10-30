@@ -67,6 +67,13 @@ test("POS-7: F6 says the weight was taken only when the line took it", () => {
   assert.match(update, /return true;\n  \};\s*$/);
 });
 
+test("POS-8: tapping a fruit again with the scale on sets its line, and stock is checked by the change", () => {
+  const add = slice("const addProduct = (product, selectedLot = null) => {", "const updateCartItem = ");
+  assert.match(add, /scaleLineQuantity\(\{ existing: currentQuantity, added: addQuantity, fromScale: weighed !== null \}\)/);
+  assert.match(add, /const nextLotQuantity = getCartQuantityForLot\(lot\.id\) \+ quantityChange;/);
+  assert.doesNotMatch(add, /Number\(currentItem\?\.quantity \|\| 0\) \+ addQuantity/);
+});
+
 test("POS-13: packing that could not be counted is said on the bill", () => {
   assert.match(pos, /\{packingEnabled && packingUsage\.message && \(/);
 });
