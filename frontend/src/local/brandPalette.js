@@ -1,8 +1,17 @@
-// The Frooz palette, read out of the official logo artwork rather than invented.
+// The PEP palette ("THE PEP - Pulp Eat Up"), read out of the official logo artwork
+// rather than invented.
 //
-// frontend/public/branding/frooz-logo.svg carries exactly three colours: a deep
-// green, a mid green and a gold. Everything below is those three plus the ramp
-// needed to build a usable interface out of them, and nothing else.
+// The PEP logo carries exactly three colours: a forest-green ground (#102f20), a
+// mustard for the letters (#eab43f) and a cream for the leaf, the letter counters,
+// "THE" and the tagline (#f6f4e5). Everything below is those three, one mid green
+// stepped up from the ground for cards, and the ramps needed to build a usable
+// interface out of them, and nothing else.
+//
+// The ramps were retuned from the earlier Frooz palette rather than redrawn: each
+// step was moved onto the PEP logo's hue and chroma in OKLCH and then re-solved so
+// its WCAG luminance is unchanged. That is why every contrast number documented here
+// and in theme.css held through the rebrand - the hue moved, the lightness did not.
+// The mapping old -> new is kept in tools/apply-brand-palette.mjs.
 //
 // Why this file exists: App.css is 6,300 lines with ~700 hardcoded colour values.
 // Without a written-down palette the next edit picks whatever hex looks close, and
@@ -10,83 +19,88 @@
 // brandPalette.test.mjs reads the stylesheets and fails if a colour appears in them
 // that is not listed here, so drift stops being possible rather than being noticed.
 
-// --- The three colours that are actually in the logo -------------------------
+// --- The colours that are actually in the logo --------------------------------
 
 export const BRAND = Object.freeze({
-  greenDeep: "#0a2d1c",
-  greenMid: "#123623",
-  gold: "#c29030",
+  greenDeep: "#102f20", // the logo's ground, measured off the artwork
+  greenMid: "#153525", // one step up from the ground at the same hue - the card surface
+  gold: "#eab43f", // the logo's mustard (the letters)
 });
 
-// The reversed logo variants ink in warm cream, not white. Cream is the app's
-// brightest text for the same reason: white on deep green is a harsh pairing and
-// staff look at this screen for a full shift.
-export const CREAM = "#f6f3ea";
+// The logo inks its leaf, counters, "THE" and tagline in warm cream, not white. Cream
+// is the app's brightest text for the same reason: white on deep green is a harsh
+// pairing and staff look at this screen for a full shift.
+export const CREAM = "#f6f4e5";
 
-// The reversed logo files ink in two creams, not one: the brighter for the deep
-// green's role and this dimmer one for the mid green's, so the artwork keeps its
-// internal contrast when it is flipped. tools/build-brand-assets.mjs uses both.
-export const CREAM_DIM = "#e8e3d3";
+// A second, dimmer cream at the logo cream's hue: the light theme's page ground, and
+// the second ink tools/build-brand-assets.mjs uses where artwork has to keep its
+// internal contrast when it is flipped.
+export const CREAM_DIM = "#e7e4ce";
 
 // --- Ground ramp -------------------------------------------------------------
 // Darkest to lightest. Named by the job each step does, not by a number, so a
 // later change to the ramp does not require renaming every use site.
 
 export const GROUND = Object.freeze({
-  abyss: "#03110b", // scrim behind modals, deepest shadow
-  canvas: "#082116", // the page itself
-  panel: "#092318", // deep panels sitting on the canvas
-  track: "#0c2b1d", // scrollbar troughs, inset wells
-  raised: "#0d2e1f", // a surface lifted off the canvas
-  raisedHigh: "#0f3222", // a surface lifted off a raised surface
-  card: "#123623", // cards - lands exactly on the logo's mid green
-  border: "#1e4a34", // a visible divider
-  borderStrong: "#2c5d43", // a divider that has to carry weight
+  abyss: "#04100b", // scrim behind modals, deepest shadow
+  canvas: "#0a2017", // the page itself
+  panel: "#0b2219", // deep panels sitting on the canvas
+  track: "#0f2b1e", // scrollbar troughs, inset wells
+  raised: "#102e20", // a surface lifted off the canvas
+  raisedHigh: "#123124", // a surface lifted off a raised surface
+  card: "#153525", // cards - lands exactly on BRAND.greenMid
+  border: "#224a36", // a visible divider
+  borderStrong: "#305c46", // a divider that has to carry weight
 });
 
 // --- Text ramp ---------------------------------------------------------------
 
 export const INK = Object.freeze({
-  faint: "#4a7a61", // a divider that has to carry weight on the dark ground
-  placeholder: "#7aa48f", // disabled and placeholder text. `faint` was 2.69:1 on a card - below the
+  faint: "#4e7964", // a divider that has to carry weight on the dark ground
+  placeholder: "#7da391", // disabled and placeholder text. `faint` was 2.69:1 on a card - below the
   // 4.5:1 a person needs to read it at all - so placeholders were decorative rather than legible.
   // This clears 4.5:1 on every dark surface while staying dimmer than `muted`, which is the whole
   // point of the step: quieter than a label, still readable.
-  muted: "#8fab9c", // labels, secondary detail
-  mutedWarm: "#97ada1", // the same weight where the surroundings are warmer
-  body: "#c8d8ce", // ordinary reading text
+  muted: "#91ab9d", // labels, secondary detail
+  mutedWarm: "#98aca2", // the same weight where the surroundings are warmer
+  body: "#c9d7cf", // ordinary reading text
   bodyWarm: "#cedbd3",
   bright: "#dfe9e2", // emphasised text
-  brightWarm: "#e2eae5",
+  brightWarm: "#e2e9e5",
   paper: "#eef2ef", // near-white surfaces, printed output
   paperWarm: "#f7f9f7",
   brightest: CREAM, // headings, primary values, the logo's own ink
 });
 
-// --- Gold ramp ---------------------------------------------------------------
-// The accent. `accent` is the gold that reads on a dark ground; `brandGold` is the
-// artwork's own value, which is correct on paper and too dark on screen.
+// --- Mustard ramp ------------------------------------------------------------
+// The accent, every step on the logo mustard's hue. `accent` is the working accent
+// on a dark ground, and with the PEP logo that is the artwork's own mustard: it is
+// bright enough to read on every dark surface (7.1:1 at worst, on a card) where the old Frooz
+// gold was too muddy to. The flip side is that the mustard is far too light for
+// paper (1.9:1 on white), so on a light surface the `deep*` steps do the work.
 
 export const ACCENT = Object.freeze({
-  deepShadow: "#2b1f06", // gold text's shadow well
-  deep: "#8a6520", // gold on a light surface, e.g. an invoice
+  deepShadow: "#2c1e02", // gold text's shadow well
+  deep: "#896613", // gold on a light surface, e.g. an invoice
   // Hover/focus for `deep`. On a dark ground the accent brightens on hover; on a
   // light one it has to darken instead, because brightening a gold that is already
   // sitting on white is how you end up with an unreadable hover state. 7.8:1 on white.
-  deepStrong: "#6b4d18", // the light theme's working accent. `deep` clears 4.5:1 on a white card but
-  // only 3.6:1 on the tinted sidebar, and gold labels sit there - so the working value has to be the
-  // one that survives every light surface, not just the lightest. 7.8:1 on white, 5.3:1 on the sidebar.
-  deepHover: "#573c11", // hover/focus for `deepStrong`. On light, hover goes darker: brightening a
+  deepStrong: "#6a4e0c", // the light theme's working accent. `deep` clears 4.5:1 on a white card (5.3:1) but
+  // only 3.5:1 on the tinted sidebar, and gold labels sit there - so the working value has to be the
+  // one that survives every light surface, not just the lightest. 7.8:1 on white, 5.2:1 on the sidebar.
+  // A dark mustard, not a brighter one: moving it toward the logo's hue was free, moving it toward
+  // the logo's lightness would have failed the sidebar.
+  deepHover: "#553d07", // hover/focus for `deepStrong`. On light, hover goes darker: brightening a
   // gold that is already on a pale ground removes the only contrast it had. 10.2:1 on white.
-  brandGold: BRAND.gold, // the logo's value - print, light surfaces
-  accent: "#d9ac52", // the working accent on dark ground
-  deepMuted: "#4a3a14", // an accent surface that is switched on but unavailable
-  bright: "#e6c274", // hover, focus
-  soft: "#eed08d",
-  softer: "#f2dfae",
-  glow: "#efd47f",
-  wash: "#f6ecd3", // a gold-tinted light surface
-  washWarm: "#faf6ea",
+  brandGold: BRAND.gold, // the logo's value - print, the price-list picture, artwork
+  accent: BRAND.gold, // the working accent on dark ground - the logo mustard itself
+  deepMuted: "#4e3806", // an accent surface that is switched on but unavailable
+  bright: "#facb6c", // hover, focus - 1.25:1 above `accent`, the same step the Frooz ramp had
+  soft: "#f7cd7e",
+  softer: "#fbdda4",
+  glow: "#fdcf75",
+  wash: "#fbebce", // a gold-tinted light surface
+  washWarm: "#fdf6e8",
 });
 
 // --- Semantic signals --------------------------------------------------------

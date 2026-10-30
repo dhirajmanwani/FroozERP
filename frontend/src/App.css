@@ -523,8 +523,9 @@ input[type="number"] {
   color: var(--ink-strong-warm);
 }
 
-/* `--ink-muted-warm`, not `--ink-muted`: on the gold fill the plainer muted ink measures 4.44:1 in
-   dark, just under the 4.5:1 this 12px line needs. The warm one clears it at 4.62:1. */
+/* `--ink-muted-warm`, not `--ink-muted`: on the gold fill the plainer muted ink measured 4.44:1 in
+   dark, just under the 4.5:1 this 12px line needs (4.50:1 on the PEP palette - on the line, not
+   past it). The warm one clears it at 4.63:1. */
 .local-only-banner span {
   color: var(--ink-muted-warm);
   font-size: 12px;
@@ -558,8 +559,8 @@ input[type="number"] {
    identical to a working one, so the only feedback is the cursor — which is why AUTO read as
    "restricted" rather than "unavailable" when App Mode pins the device to Local Only. */
 .connectivity-segmented button:disabled {
-  background: #03110b;
-  color: #4a7a61;
+  background: #04100b;
+  color: #4e7964;
   cursor: not-allowed;
   opacity: 0.6;
 }
@@ -770,7 +771,7 @@ input[type="number"] {
 }
 
 .startup-details-toggle:hover {
-  color: #f2dfae;
+  color: #fbdda4;
   transform: none;
   box-shadow: none;
 }
@@ -1064,7 +1065,7 @@ input[type="number"] {
   display: grid;
   gap: 10px;
   padding: 14px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid rgba(234, 180, 63, 0.16);
   border-radius: 12px;
   background: var(--veil);
 }
@@ -1077,7 +1078,7 @@ input[type="number"] {
 
 .purchase-print-narration article {
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid rgba(145, 171, 157, 0.1);
   border-radius: 9px;
   background: var(--card-veil-soft);
 }
@@ -1747,9 +1748,9 @@ tbody tr:last-child td {
   align-items: center;
   gap: 10px;
   padding: 26px 34px;
-  border: 1px solid rgba(217, 172, 82, 0.28);
+  border: 1px solid rgba(234, 180, 63, 0.28);
   border-radius: 14px;
-  background: #092318;
+  background: #0b2219;
   color: #f7f9f7;
   text-align: center;
 }
@@ -1761,14 +1762,14 @@ tbody tr:last-child td {
 
 .pdf-export-overlay-card span {
   font-size: 12px;
-  color: #97ada1;
+  color: #98aca2;
 }
 
 .pdf-export-overlay-spinner {
   width: 26px;
   height: 26px;
-  border: 3px solid rgba(217, 172, 82, 0.25);
-  border-top-color: #e6c274;
+  border: 3px solid rgba(234, 180, 63, 0.25);
+  border-top-color: #facb6c;
   border-radius: 50%;
   animation: pdf-export-spin 0.8s linear infinite;
 }
@@ -1858,7 +1859,7 @@ tbody tr:last-child td {
 
 .pdf-export-mode th {
   color: #000000 !important;
-  background: #e2eae5 !important;
+  background: #e2e9e5 !important;
   font-weight: 900 !important;
   font-size: clamp(9.5pt, calc(10.5pt * var(--font-scale)), 12.5pt) !important;
 }
@@ -3848,7 +3849,7 @@ tbody tr:has(> .empty-cell):hover {
   justify-content: space-between;
   gap: 20px;
   padding-bottom: 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.16);
+  border-bottom: 1px solid rgba(145, 171, 157, 0.16);
 }
 
 .report-print-header strong,
@@ -4549,7 +4550,7 @@ tbody tr:has(> .empty-cell):hover {
 .invoice-paper {
   margin: 0 16px 16px;
   padding: 28px;
-  color: #123623;
+  color: #153525;
   background: #fff;
 }
 
@@ -4563,20 +4564,20 @@ tbody tr:has(> .empty-cell):hover {
 .brand-lockup-invoice .brand-monogram {
   width: 68px;
   height: 68px;
-  border-color: #c29030;
+  border-color: #eab43f;
   border-radius: 8px;
   background: #fff;
   box-shadow: none;
 }
 
 .brand-lockup-invoice .brand-copy strong {
-  color: #082116;
+  color: #0a2017;
   font-size: 16px;
   letter-spacing: 1.2px;
 }
 
 .brand-lockup-invoice .brand-copy small {
-  color: #4a7a61;
+  color: #4e7964;
   font-size: 10px;
   letter-spacing: 1.4px;
 }
@@ -4588,7 +4589,7 @@ tbody tr:has(> .empty-cell):hover {
 .invoice-footer small {
   display: block;
   margin-top: 3px;
-  color: #4a7a61;
+  color: #4e7964;
   font-size: 11px;
 }
 
@@ -4616,7 +4617,7 @@ tbody tr:has(> .empty-cell):hover {
   padding: 10px;
   border: 1px solid #dfe9e2;
   border-radius: 12px;
-  color: #082116;
+  color: #0a2017;
   background: #fff;
 }
 
@@ -4630,7 +4631,7 @@ tbody tr:has(> .empty-cell):hover {
 .upi-qr-box span,
 .upi-qr-box small {
   display: block;
-  color: #082116;
+  color: #0a2017;
 }
 
 /* A long bill number wraps inside the box instead of pushing it past the bill's edge. */
@@ -4665,12 +4666,12 @@ tbody tr:has(> .empty-cell):hover {
 .invoice-footer {
   margin-top: 28px;
   padding-top: 14px;
-  border-top: 1px dashed #c8d8ce;
+  border-top: 1px dashed #c9d7cf;
   text-align: center;
 }
 
 .invoice-footer strong {
-  color: #082116;
+  color: #0a2017;
   font-size: 12px;
 }
 
@@ -5262,7 +5263,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .recovery-link-button:hover {
-  color: #f2dfae;
+  color: #fbdda4;
   transform: none;
   box-shadow: none;
 }
@@ -6857,7 +6858,7 @@ tbody tr:has(> .empty-cell):hover {
     margin: 0;
     padding: 18px;
     box-sizing: border-box;
-    color: #092318;
+    color: #0b2219;
     background: #ffffff;
     border: 0 !important;
     box-shadow: none !important;
@@ -6896,7 +6897,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.print-target th,
   .print-section.print-target td {
     padding: 4px 5px !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     border: 1px solid #cedbd3 !important;
     font-size: 10pt !important;
@@ -6936,7 +6937,7 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-section.print-target .purchase-items-cell span {
     max-width: none !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     text-decoration: none !important;
     white-space: pre-wrap !important;
     word-break: break-word !important;
@@ -7034,13 +7035,13 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   .print-section.print-target .date-total-row td {
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #eef2ef !important;
     font-weight: 800 !important;
   }
 
   .print-section.print-target .report-filter-summary span {
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     border: 1px solid #111111 !important;
     font-size: clamp(8.5pt, calc(9pt * var(--font-scale)), 11pt) !important;
@@ -7066,14 +7067,14 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.cash-book-print-report.print-target .cash-book-closing span {
     border-color: #cedbd3 !important;
     border-radius: 0 !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     box-shadow: none !important;
   }
 
   .print-section.cash-book-print-report.print-target .cash-book-panel h3 {
     padding: 5px 6px !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #eef2ef !important;
     border-bottom: 1px solid #cedbd3 !important;
     font-size: 10pt !important;
@@ -7089,7 +7090,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.cash-book-print-report.print-target .cash-book-title span,
   .print-section.cash-book-print-report.print-target .cash-book-title h2,
   .print-section.cash-book-print-report.print-target .cash-book-title p {
-    color: #092318 !important;
+    color: #0b2219 !important;
   }
 
   .print-section.cash-book-print-report.print-target .cash-book-closing span {
@@ -7110,7 +7111,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.profit-loss-print-report.print-target .profit-loss-statement {
     gap: 8px !important;
     padding: 0 !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
   }
 
@@ -7121,7 +7122,7 @@ tbody tr:has(> .empty-cell):hover {
     page-break-inside: avoid !important;
     border-color: #cedbd3 !important;
     border-radius: 0 !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     box-shadow: none !important;
   }
@@ -7138,7 +7139,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.profit-loss-print-report.print-target .pl-line span,
   .print-section.profit-loss-print-report.print-target .pl-line strong,
   .print-section.profit-loss-print-report.print-target .pl-empty-note {
-    color: #092318 !important;
+    color: #0b2219 !important;
   }
 
   .print-section.profit-loss-print-report.print-target .pl-title-block h2 {
@@ -7155,8 +7156,8 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-section.profit-loss-print-report.print-target .pl-line {
     padding: 5px 8px !important;
-    border-bottom: 1px solid #e2eae5 !important;
-    color: #092318 !important;
+    border-bottom: 1px solid #e2e9e5 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
   }
 
@@ -7167,7 +7168,7 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-section.profit-loss-print-report.print-target .pl-line-total,
   .print-section.profit-loss-print-report.print-target .pl-line-highlight {
-    background: #f6f3ea !important;
+    background: #f6f4e5 !important;
   }
 
   body:has(.invoice-paper) .erp-shell {
@@ -7308,7 +7309,7 @@ tbody tr:has(> .empty-cell):hover {
 
   .invoice-paper.invoice-thermal .brand-copy strong,
   .invoice-paper.invoice-thermal .invoice-meta strong {
-    color: #092318;
+    color: #0b2219;
     font-size: 14px;
     font-weight: 900;
     letter-spacing: 0.2px;
@@ -7319,7 +7320,7 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .invoice-meta span,
   .invoice-paper.invoice-thermal .invoice-customer small,
   .invoice-paper.invoice-thermal .invoice-customer span {
-    color: #092318 !important;
+    color: #0b2219 !important;
     font-size: 11.5px !important;
     font-weight: 700 !important;
     letter-spacing: 0;
@@ -7347,7 +7348,7 @@ tbody tr:has(> .empty-cell):hover {
     margin: 5px 0 0;
     padding: 3px 0;
     border: 0;
-    color: #092318 !important;
+    color: #0b2219 !important;
     page-break-inside: avoid;
     break-inside: avoid;
   }
@@ -7365,7 +7366,7 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .upi-qr-box strong,
   .invoice-paper.invoice-thermal .upi-qr-box span,
   .invoice-paper.invoice-thermal .upi-qr-box small {
-    color: #092318 !important;
+    color: #0b2219 !important;
     font-size: 10px;
     font-weight: 800;
     line-height: 1.12;
@@ -7374,9 +7375,9 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .invoice-footer {
     margin: 5px 0 0;
     padding: 4px 0 0;
-    color: #092318 !important;
+    color: #0b2219 !important;
     text-align: center;
-    border-top: 1px dashed #092318;
+    border-top: 1px dashed #0b2219;
     page-break-after: avoid;
     break-after: avoid;
   }
@@ -7384,7 +7385,7 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .invoice-footer strong,
   .invoice-paper.invoice-thermal .invoice-footer span,
   .invoice-paper.invoice-thermal .invoice-footer small {
-    color: #092318 !important;
+    color: #0b2219 !important;
     font-size: 11px;
     font-weight: 800;
     line-height: 1.15;
@@ -7397,7 +7398,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-area table,
   .print-area th,
   .print-area td {
-    color: #092318;
+    color: #0b2219;
     border-color: #cedbd3;
   }
 
@@ -7409,7 +7410,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-area .table-wrap,
   .print-area .invoice-customer,
   .print-area .total-line {
-    color: #092318;
+    color: #0b2219;
     border-color: #cedbd3;
     background: #ffffff;
   }
@@ -7419,13 +7420,13 @@ tbody tr:has(> .empty-cell):hover {
   .print-area h3,
   .print-area .primary-cell,
   .print-area .balance-cell {
-    color: #092318;
+    color: #0b2219;
   }
 
   .print-area span,
   .print-area small,
   .print-area p {
-    color: #1e4a34;
+    color: #224a36;
   }
 
   .brand-lockup-invoice .brand-monogram {
@@ -7486,7 +7487,7 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-area th,
   .invoice-paper th {
-    background: #e2eae5 !important;
+    background: #e2e9e5 !important;
     font-weight: 900 !important;
   }
 
@@ -7637,13 +7638,13 @@ tbody tr:has(> .empty-cell):hover {
   height: 62px;
   display: grid;
   place-items: center;
-  border: 1px solid rgba(230, 194, 116, 0.58);
+  border: 1px solid rgba(250, 203, 108, 0.58);
   border-radius: 50%;
-  color: #faf6ea;
+  color: #fdf6e8;
   background:
     radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.24), transparent 21%),
-    conic-gradient(from 140deg, #d9ac52, #082116, #2c5d43, #d9ac52);
-  box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.09);
+    conic-gradient(from 140deg, #eab43f, #0a2017, #305c46, #eab43f);
+  box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(234, 180, 63, 0.09);
   cursor: pointer;
 }
 
@@ -7698,8 +7699,8 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 @keyframes frostPulse {
-  0%, 100% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.1); }
-  50% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 15px rgba(217, 172, 82, 0.18); }
+  0%, 100% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(234, 180, 63, 0.1); }
+  50% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 15px rgba(234, 180, 63, 0.18); }
 }
 
 .frost-drawer-backdrop,

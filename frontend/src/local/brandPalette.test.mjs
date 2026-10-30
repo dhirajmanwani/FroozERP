@@ -80,12 +80,16 @@ const approvedTriples = new Set(
 );
 
 test("the palette is built out of the logo's own three colours", () => {
-  assert.equal(BRAND.greenDeep, "#0a2d1c");
-  assert.equal(BRAND.greenMid, "#123623");
-  assert.equal(BRAND.gold, "#c29030");
+  // Measured off the PEP logo ("THE PEP - Pulp Eat Up"): its ground, its mustard, its cream.
+  // The mid green is not in the artwork; it is the ground stepped up for cards.
+  assert.equal(BRAND.greenDeep, "#102f20");
+  assert.equal(BRAND.greenMid, "#153525");
+  assert.equal(BRAND.gold, "#eab43f");
+  assert.equal(CREAM, "#f6f4e5");
+  assert.ok(!isBrandColour("#0a2d1c") && !isBrandColour("#c29030"), "the old Frooz logo colours are retired");
   // The card surface is the logo's mid green rather than something near it.
   assert.equal(GROUND.card, BRAND.greenMid);
-  // The brightest text is the reversed logo's ink.
+  // The brightest text is the logo's own cream.
   assert.equal(INK.brightest, CREAM);
   assert.ok(isBrandColour(BRAND.gold));
   assert.ok(isBrandColour(CREAM_DIM), "the reversed logo's second cream is part of the palette");

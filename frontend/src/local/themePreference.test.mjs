@@ -650,7 +650,7 @@ for (const [themeName, theme] of [["light", lightTokens], ["dark", mediaDarkToke
 
   test(`${themeName}: --ink-faint is dimmer than --ink-muted and is not a reading colour`, () => {
     // Deliberately not held to 4.5:1 - it is the disabled/placeholder step, and on light it
-    // measures 4.37:1 against --ground. What must hold is that the ramp is still a ramp: a
+    // measures 3.3:1 at worst (against --panel). What must hold is that the ramp is still a ramp: a
     // faint step that is not fainter than muted means one of them is doing the other's job.
     const faint = worstAgainstSurfaces(theme, "--ink-faint");
     const muted = worstAgainstSurfaces(theme, "--ink-muted");
@@ -692,16 +692,20 @@ test("the dark theme's surfaces are the palette's own ground ramp", () => {
   // Not "near enough". If these drift, the themed app and the parts of App.css that have
   // not been converted yet stop matching, and the seam is visible.
   //
-  // `--ground` was `#082116` until the contrast pass moved it one step deeper to `GROUND.abyss`.
+  // `--ground` was GROUND.canvas (`#082116` then, `#0a2017` on the PEP palette) until the contrast
+  // pass moved it one step deeper to `GROUND.abyss`.
   // The seam this test guards against needs a literal painting the *same role*: a background of
-  // the old value sitting beside a background of the new one. Every remaining `#082116` in
+  // the old value sitting beside a background of the new one. Every remaining canvas literal in
   // App.css is a `color:` -- text, and mostly invoice text that is deliberately never themed --
   // so there is nothing left to disagree with. Checked before the value was changed, not assumed.
-  assert.equal(mediaDarkTokens.get("--ground"), "#03110b");
-  assert.equal(mediaDarkTokens.get("--panel"), "#092318");
-  assert.equal(mediaDarkTokens.get("--card"), "#123623");
-  assert.equal(mediaDarkTokens.get("--ink"), "#f6f3ea");
-  assert.equal(mediaDarkTokens.get("--accent"), "#d9ac52");
+  //
+  // Re-pinned for the PEP rebrand: the same roles (GROUND.abyss, GROUND.panel, GROUND.card, CREAM,
+  // ACCENT.accent), retuned to the PEP logo. The dark accent is now the logo's mustard itself.
+  assert.equal(mediaDarkTokens.get("--ground"), "#04100b");
+  assert.equal(mediaDarkTokens.get("--panel"), "#0b2219");
+  assert.equal(mediaDarkTokens.get("--card"), "#153525");
+  assert.equal(mediaDarkTokens.get("--ink"), "#f6f4e5");
+  assert.equal(mediaDarkTokens.get("--accent"), "#eab43f");
 });
 
 test("no remaining literal paints a surface that a moved token also paints", () => {
@@ -715,7 +719,9 @@ test("no remaining literal paints a surface that a moved token also paints", () 
   // because nothing else is that colour anywhere near it.
   const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8");
   const surfacePainted = (appCss.match(
-    /(background|border|box-shadow|outline)[^;{}]*#(082116|1e4a34|2c5d43|4a7a61)\b/gi,
+    // GROUND.canvas, GROUND.border, GROUND.borderStrong, INK.faint - on the PEP palette. Was
+    // 082116|1e4a34|2c5d43|4a7a61 on the Frooz one; the rule is the roles, not those hexes.
+    /(background|border|box-shadow|outline)[^;{}]*#(0a2017|224a36|305c46|4e7964)\b/gi,
   ) || []).filter((declaration) => !/gradient\(/i.test(declaration));
   assert.deepEqual(
     surfacePainted,
@@ -726,16 +732,18 @@ test("no remaining literal paints a surface that a moved token also paints", () 
 });
 
 test("the light theme does not reuse the dark theme's gold", () => {
-  // #d9ac52 measures 2.87:1 on white. ACCENT.deep exists precisely so that the light theme
+  // The dark accent is the PEP logo's mustard, #eab43f, and it measures 1.89:1 on white (the Frooz
+  // gold it replaced, #d9ac52, measured 2.1:1). ACCENT.deep exists precisely so that the light theme
   // has a gold that survives paper, and reaching for the dark one here is the single
   // easiest way to ship an unreadable light theme.
   assert.notEqual(lightTokens.get("--accent"), mediaDarkTokens.get("--accent"));
-  // `ACCENT.deepStrong`, not `deep`. #8a6520 clears 4.5:1 on a white card and only 3.6:1 on the
+  // `ACCENT.deepStrong`, not `deep`. #896613 clears 4.5:1 on a white card and only 3.5:1 on the
   // light theme's sidebar -- and gold labels sit on the sidebar. The working accent has to survive
   // every light surface, not just the lightest one, so `deep` stays available as `--accent-deep`
   // for the places that are always on white.
-  assert.equal(lightTokens.get("--accent"), "#6b4d18");
-  assert.ok(contrast("#d9ac52", "#ffffff") < 4.5, "the premise of this test still holds");
+  // Re-pinned for PEP: #6b4d18 retuned onto the mustard's hue at the same luminance.
+  assert.equal(lightTokens.get("--accent"), "#6a4e0c");
+  assert.ok(contrast("#eab43f", "#ffffff") < 4.5, "the premise of this test still holds");
 });
 
 
@@ -831,9 +839,11 @@ test("each cut of the mark reads on the ground it is shown against", () => {
   // would be a mark nobody can see, which is what shipped before the switch existed.
   const darkGround = mediaDarkTokens.get("--ground");
   const lightSurfaces = [lightTokens.get("--ground"), lightTokens.get("--panel"), lightTokens.get("--card")];
-  assert.ok(contrast("#f6f3ea", darkGround) >= 7, "the cream cut must read on the dark page");
+  // CREAM and BRAND.greenDeep on the PEP palette: the reversed cut's cream parts and the light
+  // cut's green parts (tools/build-brand-assets.mjs). Were #f6f3ea / #0a2d1c on the Frooz palette.
+  assert.ok(contrast("#f6f4e5", darkGround) >= 7, "the cream cut must read on the dark page");
   for (const surface of lightSurfaces) {
-    assert.ok(contrast("#0a2d1c", surface) >= 7, `the green cut must read on ${surface}`);
+    assert.ok(contrast("#102f20", surface) >= 7, `the green cut must read on ${surface}`);
   }
 });
 
