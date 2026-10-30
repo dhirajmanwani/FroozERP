@@ -75,6 +75,7 @@
      against a white card), not the lightest, or cards would have nothing to sit on. */
   --ground: #e7e4ce;              /* the page itself */
   --panel: #c9d7cf;               /* sidebar and deep panels sitting on the page */
+  --nav-rule: #98aca2;            /* the hairline between sidebar modules; --line is the panel's own colour */
   --card: #ffffff;                /* a content card */
   --raised: #ffffff;              /* a surface lifted off the page (dropdown, popover) */
   --raised-high: #ffffff;         /* a surface lifted off a raised surface (modal) */
@@ -236,6 +237,12 @@
   --radius-sm: 6px;
   --radius-md: 8px;
   --radius-lg: 12px;
+  /* The module frame (30 Oct 2026): every top-level box on a screen -- a card, a dashboard tile, a
+     report or settings tile, the checkout -- shares one edge, one corner, one shadow, and sits
+     --module-gap from its neighbours. The owner found the old mix (three corners, three shadows,
+     two edges, 16px gaps) messy. The edge itself is --line: visible, but a hairline. */
+  --radius-card: 14px;
+  --module-gap: 24px;
   --radius-pill: 999px;
   --shadow-card: 0 1px 2px var(--shadow-faint), 0 8px 24px var(--shadow-faint);
   /* One height scale for every control: inputs and ordinary buttons share the tall step, row
@@ -254,6 +261,7 @@
 
     --ground: #04100b;
     --panel: #0b2219;
+    --nav-rule: #305c46;
     --card: #153525;
     --raised: #102e20;
     --raised-high: #123124;
@@ -350,6 +358,7 @@
 
   --ground: #04100b;
   --panel: #0b2219;
+  --nav-rule: #305c46;
   --card: #153525;
   --raised: #102e20;
   --raised-high: #123124;
