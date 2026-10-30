@@ -1004,7 +1004,7 @@ test("an id is never called old while it is placed, licensed, this computer, or 
 });
 
 test("the screen shows the distinction, not only the id", () => {
-  const cell = sectionSource.slice(sectionSource.indexOf('<td className="primary-cell">'));
+  const cell = sectionSource.slice(sectionSource.indexOf('<td className="device-cell">'));
   const nameCell = cell.slice(0, cell.indexOf("</td>"));
   assert.match(nameCell, /row\.nameIsAmbiguous/, "the name cell must react to a shared name");
   assert.match(nameCell, /Last seen /, "and date a device the reader can place in time");
