@@ -233,7 +233,7 @@ export function buildCatalogue({
     stockTrustedForHours: STOCK_TRUSTED_FOR_HOURS,
     ratesSetOn: shopDateString(nowMs, shopUtcOffsetMinutes),
     shop: {
-      name: String(shop?.name ?? "Frooz"),
+      name: String(shop?.name ?? "THE PEP"),
       branch: String(shop?.branch ?? ""),
       phone: String(shop?.phone ?? ""),
       address: String(shop?.address ?? ""),

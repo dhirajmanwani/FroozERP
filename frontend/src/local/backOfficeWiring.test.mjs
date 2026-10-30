@@ -60,6 +60,6 @@ test("purchase ids are compared as opaque strings, never Number() (BO-16)", () =
   assert.equal((app.match(/purchases\.find\(\(purchase\) => inventoryIdsEqual\(purchase\.id, editingPurchaseId\)\)/g) || []).length, 2);
 });
 
-test("Frooz Pack movements name a bill by its invoice number (BO-18)", () => {
+test("PEP Pack movements name a bill by its invoice number (BO-18)", () => {
   assert.match(app, /Bill \$\{row\.invoice_no \|\| row\.sale_id\}/);
 });

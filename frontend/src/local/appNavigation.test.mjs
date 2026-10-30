@@ -614,15 +614,15 @@ test("a section target that no screen recognises is still cleared", () => {
   assert.match(settingsEffect, /if \(!section\) \{\s*\n\s*onFocusSectionHandled\?\.\(\);/);
 });
 
-test("Frooz Pack sits right after Frooz Menu, on Alt+P, and is found by what packing is called", () => {
+test("PEP Pack sits right after PEP Menu, on Alt+P, and is found by what packing is called", () => {
   const ids = navigationRegistry.map((item) => item.id);
   assert.equal(ids.indexOf("frooz-pack"), ids.indexOf("combos") + 1);
   const pack = navigationRegistry.find((item) => item.id === "frooz-pack");
-  assert.equal(pack.label, "Frooz Pack");
+  assert.equal(pack.label, "PEP Pack");
   assert.equal(pack.icon, "package");
   assert.equal(pack.shortcut, "P");
   for (const word of ["packing", "basket", "gift box", "bottle", "bowl", "packaging"]) {
-    assert.ok(pack.keywords.includes(word), `Frooz Pack must be found by "${word}"`);
+    assert.ok(pack.keywords.includes(word), `PEP Pack must be found by "${word}"`);
   }
   assert.equal(resolveShortcutTarget(shortcutEvent("P")).id, "frooz-pack");
   assert.equal(resolveNavigationTarget("frooz-pack").status, NAVIGATION_LOOKUP.FOUND);

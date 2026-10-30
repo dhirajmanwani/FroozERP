@@ -22,7 +22,7 @@ import {
 const app = () => readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
 
 test("the three shelves are the owner's names, in his order", () => {
-  assert.deepEqual(POS_SECTIONS.map((section) => section.label), ["Frooz Retail", "Frooz Bar", "Frooz Moments"]);
+  assert.deepEqual(POS_SECTIONS.map((section) => section.label), ["PEP Market", "Bar by PEP", "PEP Presents"]);
   assert.equal(DEFAULT_POS_SECTION, "retail");
 });
 
@@ -30,8 +30,8 @@ test("the three shelves are the owner's names, in his order", () => {
 // Fruits purchased -> Retail, Juices, Gift hampers, Offers (the owner, 22 Oct 2026)
 // ---------------------------------------------------------------------------------------------
 
-test("only Frooz Retail lists products; the other tabs list combos of their kinds", () => {
-  assert.deepEqual(POS_TABS.map((tab) => tab.label), ["Frooz Retail", "Frooz Bar", "Frooz Moments", "Combos & Offers"]);
+test("only PEP Market lists products; the other tabs list combos of their kinds", () => {
+  assert.deepEqual(POS_TABS.map((tab) => tab.label), ["PEP Market", "Bar by PEP", "PEP Presents", "PEP Drops"]);
   assert.deepEqual(POS_TABS.filter((tab) => tab.products).map((tab) => tab.key), ["retail"]);
   assert.deepEqual(POS_TABS.find((tab) => tab.key === "retail").comboKinds, []);
   assert.deepEqual(POS_TABS.find((tab) => tab.key === "bar").comboKinds, ["JUICE", "THE_CUTTING"]);
@@ -63,10 +63,10 @@ test("Product Master no longer offers a POS section, and a save no longer sends 
   const save = source.slice(source.indexOf("const addProduct = async () =>"), source.indexOf("const resetProductForm = () =>"));
   // Left out entirely, so the server keeps whatever an older build stored (PUT without the key).
   assert.doesNotMatch(save, /pos_section/);
-  assert.match(source, /Every product is sold on the Frooz Retail tab\./);
+  assert.match(source, /Every product is sold on the PEP Market tab\./);
 });
 
-test("an empty combo tab points at Frooz Menu, never at a product setting", () => {
+test("an empty combo tab points at PEP Menu, never at a product setting", () => {
   const source = app();
   assert.doesNotMatch(source, /its POS section is/);
   assert.match(source, /emptyComboTabMessage\(\{/);
@@ -90,7 +90,7 @@ test("the remembered shelf survives bad or missing storage", () => {
   assert.equal(readPosSection(broken), "retail");
   assert.doesNotThrow(() => writePosSection(broken, "bar"));
   assert.equal(normalizePosSection(" MOMENTS "), "moments");
-  assert.equal(posSectionLabel("nope"), "Frooz Retail");
+  assert.equal(posSectionLabel("nope"), "PEP Market");
 });
 
 test("a tile shows the fruit's colour and first letter, readable on either", () => {

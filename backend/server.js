@@ -1196,7 +1196,7 @@ const buildOtpEmailHtml = ({ code, purpose }) => `
       <p style="margin:0 0 18px;color:#cbd5e1">Use this code to ${purpose === "username" ? "recover your username" : purpose === "contact" ? "verify your recovery contact" : "reset your password"}.</p>
       <div style="font-size:32px;letter-spacing:8px;font-weight:800;color:#fbbf24">${code}</div>
       <p style="margin:18px 0 0;color:#94a3b8">This code expires in 10 minutes. If you did not request this, contact your Owner/Admin.</p>
-      <p style="margin:14px 0 0;color:#94a3b8">FroozERP - Feel the Freakin' Frooz<br/>SRT Company</p>
+      <p style="margin:14px 0 0;color:#94a3b8">THE PEP - Pulp Eat Up.<br/>SRT Company</p>
     </div>
   </div>
 `;

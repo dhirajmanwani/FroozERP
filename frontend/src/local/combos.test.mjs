@@ -523,8 +523,8 @@ test("the bell row names the combo and says what to do", () => {
   assert.deepEqual(row, {
     severity: "warning",
     title: "Edit combo: Mango Juice",
-    message: "Alphonso Mango is not on sale, Kiwi is out of stock. Edit Mango Juice in Frooz Menu, or add stock, before selling it.",
-    source: "Frooz Menu",
+    message: "Alphonso Mango is not on sale, Kiwi is out of stock. Edit Mango Juice in PEP Menu, or add stock, before selling it.",
+    source: "PEP Menu",
     dedupeKey: "combo-stock:combo-7",
   });
   assert.deepEqual(comboStockNotifications(null), []);
@@ -535,8 +535,8 @@ test("a combo held up only by fruit that ran out is a dismissible Info Reminder,
   assert.deepEqual(row, {
     severity: "info",
     title: "Edit combo: Mango Juice",
-    message: "Alphonso Mango is out of stock, Kiwi is too low for one. Add stock, or if its season is over, edit Mango Juice in Frooz Menu or dismiss this.",
-    source: "Frooz Menu",
+    message: "Alphonso Mango is out of stock, Kiwi is too low for one. Add stock, or if its season is over, edit Mango Juice in PEP Menu or dismiss this.",
+    source: "PEP Menu",
     dedupeKey: "combo-stock-reminder:combo-stock:combo-7",
     label: "Reminder",
   });
@@ -544,14 +544,14 @@ test("a combo held up only by fruit that ran out is a dismissible Info Reminder,
 
 test("an empty combo tab names the tabs that do hold combos, or says how a new one arrives", () => {
   assert.equal(
-    emptyComboTabMessage({ nothingHere: "No combo offers are set up yet.", elsewhere: [{ label: "Frooz Bar", count: 1, names: ["Mango Juice"] }, { label: "Frooz Moments", count: 0, names: [] }] }),
-    "No combo offers are set up yet. Combos on this computer are on other tabs: Frooz Bar (Mango Juice).",
+    emptyComboTabMessage({ nothingHere: "No combo offers are set up yet.", elsewhere: [{ label: "Bar by PEP", count: 1, names: ["Mango Juice"] }, { label: "PEP Presents", count: 0, names: [] }] }),
+    "No combo offers are set up yet. Combos on this computer are on other tabs: Bar by PEP (Mango Juice).",
   );
   assert.match(emptyComboTabMessage({ nothingHere: "No gift hampers are set up yet.", elsewhere: [] }), /press Sync now, then open POS again\.$/);
 });
 
 // ---------------------------------------------------------------------------------------------
-// Frooz Pack: a combo's packing
+// PEP Pack: a combo's packing
 // ---------------------------------------------------------------------------------------------
 
 const packedCombo = () => ({
@@ -577,7 +577,7 @@ test("a combo's packing is read in one shape, in its order, from either id field
   assert.equal(combo.packing[1].size_name, "PETITE");
   assert.equal(combo.packing[1].unit_cost, 3.5);
   assert.equal(combo.packing[1].quantity, 2);
-  // A row from before Frooz Pack: no packing key is "not told", not "none".
+  // A row from before PEP Pack: no packing key is "not told", not "none".
   const { packing: _ignored, ...older } = packedCombo();
   const plain = normaliseCombo(older);
   assert.equal(plain.packing_known, false);

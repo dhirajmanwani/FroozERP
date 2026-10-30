@@ -152,7 +152,7 @@ const normaliseItem = (item, index) => ({
 });
 
 /**
- * One packing row of a combo (Frooz Pack). The API names the size `packing_size_id` (its global
+ * One packing row of a combo (PEP Pack). The API names the size `packing_size_id` (its global
  * id); the snapshot's `local_combo_packing` row may say `size_id`. Either is read.
  */
 const normalisePackingRow = (row, index) => ({
@@ -171,7 +171,7 @@ const normalisePackingRow = (row, index) => ({
  * One combo row as the snapshot or the API sent it, in one shape.
  *
  * `packing` is always an array; `packing_known` says whether the source actually carried one. A
- * row from before Frooz Pack has no `packing` key, and "not told" must not become "none": an edit
+ * row from before PEP Pack has no `packing` key, and "not told" must not become "none": an edit
  * built from it leaves the stored packing alone (`comboDraftFrom` / `buildComboPayload`).
  */
 export const normaliseCombo = (row) => {
@@ -207,7 +207,7 @@ export const normaliseCombo = (row) => {
 };
 
 /**
- * Delete is for a combo nothing was billed with (owner, 23 Oct 2026; the same rule as Frooz Pack).
+ * Delete is for a combo nothing was billed with (owner, 23 Oct 2026; the same rule as PEP Pack).
  * One on a bill is switched off instead, so old bills and reports can still name it.
  */
 export const comboDeletable = (combo) => combo?.in_use === false;
@@ -287,7 +287,7 @@ export const validateComboDraft = (draft = {}, { products = null } = {}) => {
       }
       seen.push(key);
     });
-    // Packing (Frooz Pack): optional, but each row must name a size and a quantity, once.
+    // Packing (PEP Pack): optional, but each row must name a size and a quantity, once.
     const seenSizes = [];
     (Array.isArray(draft.packing) ? draft.packing : []).forEach((entry, index) => {
       const row = index + 1;
@@ -485,7 +485,7 @@ const costForProduct = (rates, product, item) => {
  * the shop's rounding rule (`suggestSaleRate`). An item with
  * no known cost means no cost and no suggestion -- a part-sum would suggest a loss.
  *
- * Its packing (Frooz Pack) is part of the cost: fruit + Σ packing quantity × unit cost (the row's
+ * Its packing (PEP Pack) is part of the cost: fruit + Σ packing quantity × unit cost (the row's
  * own, else `catalogue`'s). A packing row with no known cost is treated like a fruit with none.
  */
 export const suggestComboPrice = ({ items = [], rates = [], products = [], marginPercent = null, targetMargin, roundingRule, packing = [], catalogue = null } = {}) => {
@@ -964,7 +964,7 @@ export const combosForTab = (combos, tabKey) => sortCombos(
 );
 
 /**
- * Why the Frooz Menu screen cannot load or save here, or null. Combos are kept on the server
+ * Why the PEP Menu screen cannot load or save here, or null. Combos are kept on the server
  * (like discounts and sale rates), so Local Only, no cloud and offline each say so instead of
  * trying; POS keeps selling the combos its snapshot already has.
  */
@@ -1080,9 +1080,9 @@ export const comboStockNotifications = (problems) => (Array.isArray(problems) ? 
     severity: reminder ? "info" : "warning",
     title: `Edit combo: ${problem.comboName}`,
     message: reminder
-      ? `${describeComboStockProblem(problem)}. Add stock, or if its season is over, edit ${problem.comboName} in Frooz Menu or dismiss this.`
-      : `${describeComboStockProblem(problem)}. Edit ${problem.comboName} in Frooz Menu, or add stock, before selling it.`,
-    source: "Frooz Menu",
+      ? `${describeComboStockProblem(problem)}. Add stock, or if its season is over, edit ${problem.comboName} in PEP Menu or dismiss this.`
+      : `${describeComboStockProblem(problem)}. Edit ${problem.comboName} in PEP Menu, or add stock, before selling it.`,
+    source: "PEP Menu",
     dedupeKey: reminder ? `${COMBO_STOCK_REMINDER_KEY_PREFIX}${problem.key}` : problem.key,
     ...(reminder ? { label: FROST_STOCK_REMINDER_LABEL } : {}),
   };
@@ -1099,5 +1099,5 @@ export const emptyComboTabMessage = ({ nothingHere = "", elsewhere = [] } = {}) 
     const where = others.map((entry) => `${entry.label} (${entry.names.join(", ")})`).join("; ");
     return `${nothingHere} Combos on this computer are on other tabs: ${where}.`;
   }
-  return `${nothingHere} The Owner or an Admin adds them in Frooz Menu. One just saved reaches this computer with the next sync: press Sync now, then open POS again.`;
+  return `${nothingHere} The Owner or an Admin adds them in PEP Menu. One just saved reaches this computer with the next sync: press Sync now, then open POS again.`;
 };

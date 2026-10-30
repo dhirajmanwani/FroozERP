@@ -489,12 +489,12 @@ test("a shortage is matched to its size by the API's numeric id too", () => {
   ]);
 });
 
-test("the bell row is a warning from Frooz Pack, keyed by size", () => {
+test("the bell row is a warning from PEP Pack, keyed by size", () => {
   const rows = packingShortageNotifications([{ key: "packing-short:packing-size-4", label: "Gift Box › Window Box › Grand · 1 kg", needed: 4, onHand: 3 }]);
   assert.equal(rows.length, 1);
   const [row] = rows;
   assert.equal(row.severity, "warning");
-  assert.equal(row.source, "Frooz Pack");
+  assert.equal(row.source, "PEP Pack");
   assert.equal(row.dedupeKey, "packing-short:packing-size-4");
   assert.match(row.title, /Gift Box › Window Box › Grand · 1 kg/);
   assert.match(row.message, /4 needed, 3 on hand/);
@@ -615,7 +615,7 @@ test("a type, design or size form is checked as the server checks it", () => {
 // Availability
 // ---------------------------------------------------------------------------------------------
 
-test("Frooz Pack writes need the cloud: Local Only, no cloud and offline each say so", () => {
+test("PEP Pack writes need the cloud: Local Only, no cloud and offline each say so", () => {
   assert.match(resolvePackAvailability({ connectivityMode: "LOCAL_ONLY", online: true, isTauri: true }), /Local Only/);
   // Local Only wins even when the machine is online and has a cloud set up.
   assert.match(resolvePackAvailability({ connectivityMode: "LOCAL_ONLY", online: true, isTauri: true, cloudConfigured: true }), /Local Only/);
@@ -628,7 +628,7 @@ test("Frooz Pack writes need the cloud: Local Only, no cloud and offline each sa
   assert.equal(resolvePackAvailability(), null);
 });
 
-test("the Frooz Pack screen shows everything the picker hides, marked, and falls back up a level", () => {
+test("the PEP Pack screen shows everything the picker hides, marked, and falls back up a level", () => {
   const catalogue = readPackingCatalogue(snapshotPacking());
   const top = packingManageView(catalogue, createPackingDrill());
   assert.equal(top.level, "types");
@@ -667,18 +667,18 @@ test("the Frooz Pack screen shows everything the picker hides, marked, and falls
 });
 
 test("an empty picker names the packing types that still need a design and a size", () => {
-  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }), "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.");
+  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }), "No packing set up yet. The Owner or an Admin adds it in PEP Pack.");
   assert.equal(
     packingEmptyPickerMessage({ status: "ready", types: [
       { id: "packing-type-1", name: "Bottle", active: true, designs: [] },
       { id: "packing-type-2", name: "Box", active: true, designs: [{ id: "packing-design-1", name: "Window", active: true, sizes: [] }] },
       { id: "packing-type-3", name: "Old", active: false, designs: [] },
     ] }),
-    "Bottle, Box have no size yet. In Frooz Pack, press New packing, choose each one, name a design and tick its sizes."
+    "Bottle, Box have no size yet. In PEP Pack, press New packing, choose each one, name a design and tick its sizes."
   );
   assert.equal(
     packingEmptyPickerMessage([{ id: "packing-type-1", name: "Bottle", designs: [] }]),
-    "Bottle has no size yet. In Frooz Pack, press New packing, choose it, name a design and tick its sizes."
+    "Bottle has no size yet. In PEP Pack, press New packing, choose it, name a design and tick its sizes."
   );
 });
 
@@ -918,7 +918,7 @@ test("a size form opened under one design saves under it, even after browsing to
   assert.equal(packingNodeRef({ id: "004" }), "004");
 });
 
-test("Frooz Pack saves a node against the parent it opened in, and holds the list still while a form is open", () => {
+test("PEP Pack saves a node against the parent it opened in, and holds the list still while a form is open", () => {
   const saveNode = packModule.slice(packModule.indexOf("const saveNode = async"), packModule.indexOf("const startRemoval"));
   assert.ok(saveNode.length > 0);
   assert.doesNotMatch(saveNode, /view\.(design|type)/, "the parent used to be read from the drill-down at Save time");

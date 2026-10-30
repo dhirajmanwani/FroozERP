@@ -1065,7 +1065,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2,
 });
 const APP_VERSION = "1.0.76";
-const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
+const APP_DISPLAY_NAME = "THE PEP - Pulp Eat Up.";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
 const FROST_ACTIVE_TAB_STORAGE_KEY = "froozerp_frost_active_tab";
@@ -1225,8 +1225,8 @@ const navigationItems = [
   ["waste", "Waste Management"],
   ["sales", "POS Billing"],
   ["discounts", "Discounts"],
-  ["combos", "Frooz Menu"],
-  ["frooz-pack", "Frooz Pack"],
+  ["combos", "PEP Menu"],
+  ["frooz-pack", "PEP Pack"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["orders", "Orders"],
@@ -2471,7 +2471,7 @@ function App() {
   // and by nothing else, for the same reason as the shelf above. `missing` until it has been read:
   // a counter that has not been told its combos must not say it has none.
   const [posCombos, setPosCombos] = useState({ status: "missing", combos: [] });
-  // Frooz Pack: the packing this counter knows (counts and costs), from the same snapshot as the
+  // PEP Pack: the packing this counter knows (counts and costs), from the same snapshot as the
   // combos. Desktop only; "missing" until the snapshot has been read.
   const [posPacking, setPosPacking] = useState(() => readPackingCatalogue(null));
   // Which shop this machine is standing in, as the local snapshot reports it.
@@ -5304,7 +5304,7 @@ function App() {
   const raisedComboRows = useRef(new Map());
 
   /**
-   * Report Center → Inventory's packing panel (Frooz Pack), read-only. The desktop reads its own
+   * Report Center → Inventory's packing panel (PEP Pack), read-only. The desktop reads its own
    * snapshot and touches no network; a browser asks the server, and in Local Only asks nothing.
    */
   const loadPackingStock = useCallback(async () => {
@@ -9643,7 +9643,7 @@ function App() {
     (row) => String(row?.id ?? "") === String(user?.branch_id ?? ""),
   );
   const websiteShopDetails = {
-    name: "Frooz",
+    name: "THE PEP",
     branch: String(websiteShopBranch?.branch_name ?? user?.branch ?? ""),
     phone: String(websiteShopBranch?.phone_number ?? ""),
     address: String(websiteShopBranch?.address ?? websiteShopBranch?.location ?? ""),
@@ -9665,7 +9665,7 @@ function App() {
     offline: offlineMode,
     noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
   });
-  // Frooz Pack keeps its packing on the server: Local Only, offline or no cloud say so and send nothing.
+  // PEP Pack keeps its packing on the server: Local Only, offline or no cloud say so and send nothing.
   const packUnavailableReason = resolvePackAvailability({
     connectivityMode,
     online: !offlineMode,
@@ -9942,7 +9942,7 @@ function App() {
   });
 
   // What the sidebar shows this person, computed once so the shortcut list names the same screens.
-  // Owner/Admin-only screens (Sale Rate Update, Frooz Menu, Frooz Pack) are refused inside
+  // Owner/Admin-only screens (Sale Rate Update, PEP Menu, PEP Pack) are refused inside
   // hasModuleAccess, so the sidebar, Ctrl K, Alt shortcuts and navigate share one rule.
   const visibleNavigationItems = navigationItems.filter(([view]) => hasModuleAccess(view));
 
@@ -9952,7 +9952,7 @@ function App() {
         <div className="sidebar-brand">
           {/* Collapsed, the mark stands alone. `compact` is the existing mode built for exactly
               this - it drops the wordmark rather than letting CSS clip it, so the accessible name
-              becomes "Frooz" instead of a full title nobody can see. */}
+              becomes the mark's name instead of a full title nobody can see. */}
           <BrandLogo compact={sidebarCollapsed} />
         </div>
         <span className="sidebar-section">Main Menu</span>
@@ -10592,7 +10592,7 @@ function App() {
                           </select>
                         </Field>
                       </div>
-                      <p className="pm-hint">Every product is sold on the Frooz Retail tab. Juices, The Cutting, gift hampers and offers are made from products in Frooz Menu.</p>
+                      <p className="pm-hint">Every product is sold on the PEP Market tab. Juices, The Cutting, gift hampers and offers are made from products in PEP Menu.</p>
                       <div className="product-photo-field">
                         <span className="product-photo-label">Photo</span>
                         <div className="product-photo-row">
@@ -11139,7 +11139,7 @@ function App() {
               // Combos are sold from the counter app only (v1); the browser POS shows no combo tabs.
               combos={isTauriRuntime() ? posCombos : null}
               comboProblems={comboProblems}
-              // Frooz Pack: the counter's packing counts, from the snapshot; none in the browser.
+              // PEP Pack: the counter's packing counts, from the snapshot; none in the browser.
               packing={isTauriRuntime() ? posPacking : null}
               onPackingShortages={(rows) => rows.forEach((row) => notify(row))}
               customers={customers.filter((customer) => customer.active !== false)}
@@ -15487,7 +15487,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
  * comes from local/discounts.js, which POS and the server share.
  */
 // ---------------------------------------------------------------------------------------------
-// Frooz Pack: packing (baskets, gift boxes, bottles, bowls) as stock. Every rule lives in
+// PEP Pack: packing (baskets, gift boxes, bottles, bowls) as stock. Every rule lives in
 // local/froozPack.js; these components only show it and send what it builds.
 // ---------------------------------------------------------------------------------------------
 
@@ -15558,11 +15558,11 @@ function PackDrillHeader({ crumbs = [], disabled = false, level, onBack, onCrumb
 }
 
 /**
- * Frooz Pack's picker: Type → Design → Size, one level at a time, the way the owner thinks of it
+ * PEP Pack's picker: Type → Design → Size, one level at a time, the way the owner thinks of it
  * ("Gift Box › Window Box › Grand · 1 kg"). Only what is switched on and has a size is shown.
  * `onPick(sizeRow, quantity)`; with `quantity`, a "How many" box rides along. With `onCreate`, a
  * "+ New packing" button opens the New-packing form (the purchase table uses it). Used by the Frooz
- * Pack purchase form, the combo form in Frooz Menu and POS. Each size row says its count and last
+ * Pack purchase form, the combo form in PEP Menu and POS. Each size row says its count and last
  * rate (local/froozPack.js `packingLeafSublabel`).
  */
 function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = false, title = "" }) {
@@ -15632,7 +15632,7 @@ function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = f
       ) : rows.length === 0 ? (
         <p className="form-note">{packingEmptyPickerMessage(catalogue)}</p>
       ) : view.level === "types" && packingTypesWithoutSize(catalogue).length > 0 ? (
-        <p className="form-note">{`Not shown until it has a size: ${packingTypesWithoutSize(catalogue).join(", ")}. Give it a design and sizes with New packing in Frooz Pack.`}</p>
+        <p className="form-note">{`Not shown until it has a size: ${packingTypesWithoutSize(catalogue).join(", ")}. Give it a design and sizes with New packing in PEP Pack.`}</p>
       ) : null}
       {status === "ready" && rows.length > 0 && (
         <ul
@@ -15736,7 +15736,7 @@ function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChan
 }
 
 /**
- * Frooz Pack: the Owner's or an Admin's packing, kept on the server (`/api/v3/packing`). The tree
+ * PEP Pack: the Owner's or an Admin's packing, kept on the server (`/api/v3/packing`). The tree
  * (Type → Design → Size, each editable), each size's count at this branch and its unit cost, the
  * purchase form (which also books the expense under Packing Material) and count corrections.
  * Local Only, offline and no cloud each say so and send nothing.
@@ -16104,7 +16104,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     <section className="settings-layout">
       <ModuleCard
         eyebrow="Stock"
-        title="Frooz Pack"
+        title="PEP Pack"
         subtitle="The baskets, gift boxes, bottles and bowls combos go out in. Each size is counted here; buying it books the expense under Packing Material, and selling a combo takes it off. Running out is only a warning: bills always go through."
         actions={canManage && !unavailableReason && !failed
           ? (
@@ -16463,7 +16463,7 @@ function PackingStockPanel({ loadPacking }) {
       ) : state.status === "unavailable" ? (
         <p className="warning-note" role="status">{state.message}</p>
       ) : state.status !== "ready" ? (
-        <p className="form-note">No packing on this computer yet. If packing is set up in Frooz Pack, press Sync now.</p>
+        <p className="form-note">No packing on this computer yet. If packing is set up in PEP Pack, press Sync now.</p>
       ) : rows.length === 0 ? (
         <p className="form-note">No packing set up yet.</p>
       ) : (
@@ -16484,7 +16484,7 @@ function PackingStockPanel({ loadPacking }) {
 }
 
 /**
- * Frooz Menu (the Combos & Offers module): the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
+ * PEP Menu (the Combos & Offers module): the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
  * either a fixed set of items at one price or the customer's choice priced from the items' rates.
  * Kept on the server (`/api/v3/combos`); a desktop's POS gets them through its SQLite snapshot.
  */
@@ -16493,7 +16493,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
   const [combos, setCombos] = useState([]);
   const [products, setProducts] = useState([]);
   const [costs, setCosts] = useState({ status: "idle", rows: [] });
-  // Frooz Pack's list, for the packing a fixed combo goes out in. Without it the combo still saves.
+  // PEP Pack's list, for the packing a fixed combo goes out in. Without it the combo still saves.
   const [packing, setPacking] = useState({ status: "idle", catalogue: null, message: "" });
   const [packPicking, setPackPicking] = useState(false);
   const [draft, setDraft] = useState(null);
@@ -16727,8 +16727,8 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     <section className="settings-layout">
       <ModuleCard
         eyebrow="Pricing"
-        title="Frooz Menu"
-        subtitle="Juices, The Cutting, gift hampers and combo offers, made from your fruits and sold at one price. Each shows on its own POS tab: Frooz Bar, Frooz Moments or Combos & Offers."
+        title="PEP Menu"
+        subtitle="Juices, The Cutting, gift hampers and combo offers, made from your fruits and sold at one price. Each shows on its own POS tab: Bar by PEP, PEP Presents or PEP Drops."
         actions={canManage && !unavailableReason && !failed && !draft && !removal
           ? <button className="primary-button" disabled={firstLoad} type="button" onClick={startNew}><Icon name="add" size={16} />Add combo</button>
           : null}
@@ -16802,7 +16802,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                         <p className="form-note">Only fruits with stock are listed. A fruit with no stock appears here again once it arrives.</p>
                       </fieldset>
                       <fieldset className="combo-items combo-packing" disabled={disabled}>
-                        <legend>Packing (Frooz Pack)</legend>
+                        <legend>Packing (PEP Pack)</legend>
                         {!Array.isArray(draft.packing) && (
                           <p className="form-note">This combo's packing was not sent with it, so saving leaves its packing as it is. Adding packing here replaces it.</p>
                         )}
@@ -16811,7 +16811,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                           <div className="combo-item-row" key={`packing-${entry.packing_size_id || index}`}>
                             <span className="packing-path">
                               {packingPathLabel(entry) || entry.packing_size_id || MISSING_VALUE}
-                              {entry.size_active === false && <small className="cell-note inline-error">Switched off in Frooz Pack.</small>}
+                              {entry.size_active === false && <small className="cell-note inline-error">Switched off in PEP Pack.</small>}
                             </span>
                             <input aria-label={`Packing ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={entry.quantity} onChange={(event) => updatePackingRow(index, event.target.value)} />
                             <button aria-label={`Remove packing ${index + 1}`} className="remove-button" type="button" onClick={() => removePackingRow(index)}><Icon name="trash" size={16} /></button>
@@ -16851,7 +16851,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                         <p className="form-note">
                           {packingCost.known
                             ? `Cost today includes ${currency.format(packingCost.cost)} of packing.`
-                            : "No suggestion: a packing size has no cost yet. Its first purchase in Frooz Pack sets it, or set it there by hand."}
+                            : "No suggestion: a packing size has no cost yet. Its first purchase in PEP Pack sets it, or set it there by hand."}
                         </p>
                       )}
                       {costs.status === "ready" && suggestion?.cost === null && packingCost?.known !== false && draft.items.some((item) => String(item.product_id || "") !== "") && (
@@ -16861,7 +16861,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                   ) : (
                     <>
                       <p className="form-note">The margin is added on top of the items' sale rates. Empty means 0%.</p>
-                      <p className="form-note">Packing for a customer's-choice combo is picked by the cashier at billing, from Frooz Pack.</p>
+                      <p className="form-note">Packing for a customer's-choice combo is picked by the cashier at billing, from PEP Pack.</p>
                       <Field label="Extra charge per combo (₹)">
                         <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.extra_charge} onChange={(event) => updateDraft("extra_charge", event.target.value)} />
                       </Field>
@@ -16986,7 +16986,7 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
     .map((combo) => ({
       combo,
       key: combo.global_id || combo.id,
-      // Its packing (Frooz Pack) is part of its cost; each row carries its own unit cost.
+      // Its packing (PEP Pack) is part of its cost; each row carries its own unit cost.
       ...suggestComboPrice({ items: combo.items, rates, products, marginPercent: combo.margin_percent, targetMargin, roundingRule, packing: combo.packing }),
     }));
   const changes = rows
@@ -17029,7 +17029,7 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
       {load.status !== "failed" && (
         <DataTable className="pm-table combo-table" headers={["Combo", "Margin", "Cost today", "Suggested", "Current price", "New price"]}>
           {load.status !== "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>Loading combos…</td></tr>}
-          {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in Frooz Menu.</td></tr>}
+          {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in PEP Menu.</td></tr>}
           {rows.map((row) => (
             <tr key={row.key}>
               <td className="primary-cell">{row.combo.name}<small className="cell-note">{COMBO_KIND_LABELS[row.combo.kind] || row.combo.kind}</small></td>
@@ -21823,7 +21823,7 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
               <td>
                 <div className="button-row table-actions-row">
                   {expense.packing_purchase === true ? (
-                    <span className="tag" title="This expense belongs to a Frooz Pack purchase. Correct the count in Frooz Pack.">Frooz Pack</span>
+                    <span className="tag" title="This expense belongs to a PEP Pack purchase. Correct the count in PEP Pack.">PEP Pack</span>
                   ) : (
                     <>
                       <button className="table-action" disabled={status === "CANCELLED"} onClick={() => editExpense(expense)}>Edit</button>
@@ -22809,10 +22809,10 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
             >
               {previewIdentity.logo
                 ? <img alt="" src={previewIdentity.logo} />
-                : <span>Frooz mark (no logo chosen)</span>}
+                : <span>PEP mark (no logo chosen)</span>}
             </div>
             <div className="product-photo-actions">
-              <p>Choose your logo picture (PNG with a clear background looks best), or copy it and press Ctrl+V on the box. With no logo chosen, the Frooz mark is shown.</p>
+              <p>Choose your logo picture (PNG with a clear background looks best), or copy it and press Ctrl+V on the box. With no logo chosen, the PEP mark is shown.</p>
               <div className="button-row">
                 <label className="secondary-button product-photo-file">
                   Choose logo
@@ -22824,7 +22824,7 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
                   />
                 </label>
                 {(previewIdentity.logo || unusableLogo) && (
-                  <button className="danger-text-button" disabled={!canManage} onClick={() => { updateDraft("logo_url", ""); setLogoMessage("The Frooz mark comes back when you press Save."); }} type="button">Use the Frooz mark</button>
+                  <button className="danger-text-button" disabled={!canManage} onClick={() => { updateDraft("logo_url", ""); setLogoMessage("The PEP mark comes back when you press Save."); }} type="button">Use the PEP mark</button>
                 )}
               </div>
               {unusableLogo && <small className="product-photo-message product-photo-message-error">The saved logo is a file path or web address, which cannot be shown. Choose a logo picture instead.</small>}
@@ -26604,7 +26604,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   // which shows no combo tabs at all (v1).
   const combosEnabled = combos !== null && combos !== undefined;
   // Which tab the counter is looking at. Remembered per machine, so the juice counter opens
-  // on Frooz Bar every morning. Reading storage can throw (site data blocked); Retail then.
+  // on Bar by PEP every morning. Reading storage can throw (site data blocked); Retail then.
   const [posSection, setPosSection] = useState(() => {
     try { return readPosTab(window.localStorage, { combosEnabled }); } catch { return readPosTab(null); }
   });
@@ -26612,7 +26612,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const [comboAsk, setComboAsk] = useState(null);
   // A CUSTOM combo being filled ({ key, combo }): while it is open, every product added joins it.
   const [customBuild, setCustomBuild] = useState(null);
-  // Frooz Pack, desktop only (`packing` is null in the browser): what the cashier picked for each
+  // PEP Pack, desktop only (`packing` is null in the browser): what the cashier picked for each
   // customer's-choice combo ({ [combo_line_key]: rows }), and which combo the picker is open for.
   const [customPacking, setCustomPacking] = useState({});
   const [packPickFor, setPackPickFor] = useState(null);
@@ -26912,7 +26912,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       : ""),
     [counterScope, inventory, products, shelf],
   );
-  // Frooz Retail shows every sellable product; the other tabs show only combos of their kinds
+  // PEP Market shows every sellable product; the other tabs show only combos of their kinds
   // (local/posSections.js). While a customer's-choice combo is being filled, every sellable product
   // is offered, whatever the tab.
   const searchResults = useMemo(() => {
@@ -27451,7 +27451,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   };
 
   /**
-   * Frooz Pack on this bill (desktop only): what packing its combos use -- a fixed combo's own, a
+   * PEP Pack on this bill (desktop only): what packing its combos use -- a fixed combo's own, a
    * customer's-choice combo's as the cashier picked it -- and what this branch is short of. Packing
    * never stops a bill: a row that cannot be read is left out, a shortage is only a warning.
    */
@@ -27553,7 +27553,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
        */
       other_charges: (totals.chargeLines || []).map((line) => ({ ...line })),
       other_charges_amount: Number(totals.otherChargesAmount || 0),
-      // Frooz Pack: the packing this bill's combos use. Read fresh from the cart; a row that cannot
+      // PEP Pack: the packing this bill's combos use. Read fresh from the cart; a row that cannot
       // be read is left out (local/froozPack.js) and never stops the bill.
       packing_usage: packingEnabled
         ? buildSalePackingUsage({ lines: cart, combos: combos?.combos || [], customPacking }).usage
@@ -28431,11 +28431,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <Icon name="alert" size={14} />
               {` ${comboProblems.length === 1 ? "1 combo cannot" : `${comboProblems.length} combos cannot`} be sold right now: `}
               {comboProblems.map((problem) => `${problem.comboName} (${describeComboStockProblem(problem)})`).join("; ")}
-              . Edit {comboProblems.length === 1 ? "it" : "them"} in Frooz Menu, or add stock.
+              . Edit {comboProblems.length === 1 ? "it" : "them"} in PEP Menu, or add stock.
             </p>
           )}
           {combosEnabled && combos?.status !== "ready" && (
-            <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Frooz Bar, Frooz Moments and Combos &amp; Offers tabs are empty. Press Sync now, then open POS again.</p>
+            <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Bar by PEP, PEP Presents and PEP Drops tabs are empty. Press Sync now, then open POS again.</p>
           )}
           <div className="product-results">
             {searchResults.map((option, index) => {
@@ -28512,7 +28512,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               // An empty shelf is not an empty shop: say how a product gets onto it.
               <div className="cart-empty">
                 {posSection === "retail"
-                  ? (posEmptyReason || "Nothing in Frooz Retail has stock right now.")
+                  ? (posEmptyReason || "Nothing in PEP Market has stock right now.")
                   : emptyComboTabMessage({
                     nothingHere: `No ${posSection === "bar" ? "juices or The Cutting" : posSection === "moments" ? "gift hampers" : "combo offers"} are set up yet.`,
                     elsewhere: posTabs
@@ -28551,7 +28551,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           )}
           {packingEnabled && packingUsage.message && (
             // Packing that could not be counted (a combo this computer does not list, a quantity it
-            // cannot read) is said, not dropped: Frooz Pack stock would drift with nobody told.
+            // cannot read) is said, not dropped: PEP Pack stock would drift with nobody told.
             <p className="warning-note pos-packing-short" role="status">{`${packingUsage.message} The bill can still be saved.`}</p>
           )}
           {cart.length === 0 ? (

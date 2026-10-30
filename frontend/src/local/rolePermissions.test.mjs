@@ -141,7 +141,7 @@ test("a held payment action the role may not use moves to the first one it may",
   assert.match(effect, /\[canUseCustomerPayments, canUseSupplierPayments, payment\.payment_action\]/);
 });
 
-test("Sale Rate Update, Frooz Menu and Frooz Pack open for Owner and Admin only, whatever the map says", () => {
+test("Sale Rate Update, PEP Menu and PEP Pack open for Owner and Admin only, whatever the map says", () => {
   const map = { ...modulePermissionMap, "sale-rates": "discounts", discounts: "discounts" };
   const open = (role, view, permissions) => resolveModuleAccess({ view, role, permissions, defaultPermissions: defaults[role] || {}, modulePermissionMap: map });
   for (const view of ["sale-rates", "combos", "frooz-pack"]) {

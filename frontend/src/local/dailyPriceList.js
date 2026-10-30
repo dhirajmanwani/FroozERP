@@ -232,7 +232,7 @@ export const buildPriceListHeader = ({ businessSettings = {}, branchName = "", n
   const settings = businessSettings && typeof businessSettings === "object" ? businessSettings : {};
   const branch = text(branchName);
   return {
-    title: text(settings.business_name) || text(settings.brand_name) || text(settings.company_name) || "FroozERP",
+    title: text(settings.business_name) || text(settings.brand_name) || text(settings.company_name) || "THE PEP",
     subtitle: branch ? `Today's prices · ${branch}` : "Today's prices",
     phone: text(settings.phone_number) || text(settings.phone),
     address: text(settings.address),
@@ -403,7 +403,7 @@ export const shouldPreparePriceList = ({ now = new Date(), schedule, lastPrepare
 export const priceListCaption = ({ header = {}, rows = [] } = {}) => {
   const list = isList(rows) ? rows : [];
   const lines = [
-    text(header?.title) || "FroozERP",
+    text(header?.title) || "THE PEP",
     `Today's prices – ${text(header?.dateLabel) || priceListDateLabel(new Date())}`,
     "",
   ];
@@ -416,8 +416,8 @@ export const priceListCaption = ({ header = {}, rows = [] } = {}) => {
   return lines.join("\n").trim();
 };
 
-/** `Frooz_PriceList_2026-10-03.png`, dated by the device's own day. */
-export const priceListFileName = (now = new Date()) => `Frooz_PriceList_${localDateString(now)}.png`;
+/** `PEP_PriceList_2026-10-03.png`, dated by the device's own day. */
+export const priceListFileName = (now = new Date()) => `PEP_PriceList_${localDateString(now)}.png`;
 
 /**
  * How the Share button hands the picture over.

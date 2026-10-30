@@ -3,11 +3,11 @@
 //                      Fruits purchased
 //        ________________|________________________________
 //       |              |                  |               |
-//    Frooz Retail   Frooz Bar        Frooz Moments    Combos & Offers
+//    PEP Market   Bar by PEP   PEP Presents   PEP Drops
 //    (the fruit)    (juices, cutting) (gift hampers)   (offers)
 //
-// Every product is a fruit the shop bought, so every product sits on Frooz Retail. Frooz Bar, Frooz
-// Moments and Combos & Offers sell things *made from* those fruits -- combos (local/combos.js) -- and
+// Every product is a fruit the shop bought, so every product sits on PEP Market. Bar by PEP, Frooz
+// Moments and Combos & Offers (now PEP Market, Bar by PEP, PEP Presents and PEP Drops) sell things *made from* those fruits -- combos (local/combos.js) -- and
 // never a product on its own. Selling a combo takes its fruits out of the same stock Retail sells.
 //
 // `products.pos_section` (migration 023) is no longer read here: it once filed a product on Bar or
@@ -18,9 +18,9 @@
 import { tintFor } from "./catalogueExport.js";
 
 export const POS_SECTIONS = Object.freeze([
-  Object.freeze({ key: "retail", label: "Frooz Retail", blurb: "Loose fruit by weight or piece" }),
-  Object.freeze({ key: "bar", label: "Frooz Bar", blurb: "Juices and The Cutting, made from the fruit" }),
-  Object.freeze({ key: "moments", label: "Frooz Moments", blurb: "Gift hampers, made from the fruit" }),
+  Object.freeze({ key: "retail", label: "PEP Market", blurb: "Loose fruit by weight or piece" }),
+  Object.freeze({ key: "bar", label: "Bar by PEP", blurb: "Juices and The Cutting, made from the fruit" }),
+  Object.freeze({ key: "moments", label: "PEP Presents", blurb: "Gift hampers, made from the fruit" }),
 ]);
 
 export const DEFAULT_POS_SECTION = "retail";
@@ -40,20 +40,20 @@ export function normalizePosSection(value) {
 export const POS_SECTION_STORAGE_KEY = "froozerp_pos_section";
 
 /**
- * The tabs the POS counter shows. Only Frooz Retail lists products; the other three list combos of
+ * The tabs the POS counter shows. Only PEP Market lists products; the other three list combos of
  * their kinds. Those three are `combosOnly`: they exist only where combos are sold (the counter
- * app), so the browser POS, which cannot sell combos, shows Frooz Retail alone.
+ * app), so the browser POS, which cannot sell combos, shows PEP Market alone.
  */
 export const POS_TABS = Object.freeze([
-  Object.freeze({ key: "retail", label: "Frooz Retail", blurb: "Loose fruit by weight or piece", products: true, comboKinds: Object.freeze([]), combosOnly: false }),
-  Object.freeze({ key: "bar", label: "Frooz Bar", blurb: "Juices and The Cutting, made from the fruit", products: false, comboKinds: Object.freeze(["JUICE", "THE_CUTTING"]), combosOnly: true }),
-  Object.freeze({ key: "moments", label: "Frooz Moments", blurb: "Gift hampers, made from the fruit", products: false, comboKinds: Object.freeze(["GIFTING"]), combosOnly: true }),
-  Object.freeze({ key: "combos", label: "Combos & Offers", blurb: "Combo offers at one price", products: false, comboKinds: Object.freeze(["COMBO_OFFER"]), combosOnly: true }),
+  Object.freeze({ key: "retail", label: "PEP Market", blurb: "Loose fruit by weight or piece", products: true, comboKinds: Object.freeze([]), combosOnly: false }),
+  Object.freeze({ key: "bar", label: "Bar by PEP", blurb: "Juices and The Cutting, made from the fruit", products: false, comboKinds: Object.freeze(["JUICE", "THE_CUTTING"]), combosOnly: true }),
+  Object.freeze({ key: "moments", label: "PEP Presents", blurb: "Gift hampers, made from the fruit", products: false, comboKinds: Object.freeze(["GIFTING"]), combosOnly: true }),
+  Object.freeze({ key: "combos", label: "PEP Drops", blurb: "Combo offers at one price", products: false, comboKinds: Object.freeze(["COMBO_OFFER"]), combosOnly: true }),
 ]);
 
 const TAB_KEYS = new Set(POS_TABS.map((tab) => tab.key));
 
-/** The tabs this counter shows: all four where combos are sold, Frooz Retail alone elsewhere. */
+/** The tabs this counter shows: all four where combos are sold, PEP Market alone elsewhere. */
 export const posTabsFor = ({ combosEnabled = false } = {}) => POS_TABS.filter((tab) => combosEnabled || !tab.combosOnly);
 
 export const posTabFor = (key) => POS_TABS.find((tab) => tab.key === key) || POS_TABS[0];

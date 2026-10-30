@@ -1,5 +1,5 @@
 /**
- * Frooz Pack: the packing a combo goes out in (baskets, gift boxes, bottles, bowls), as stock.
+ * PEP Pack: the packing a combo goes out in (baskets, gift boxes, bottles, bowls), as stock.
  *
  * The hierarchy is Type → Design → Size, all the owner's own words ("Gift Box" › "Window Box" ›
  * "Grand · 1 kg"). Each Size is a stock item with a count on hand and a unit cost (its last
@@ -168,7 +168,7 @@ export const packingDeletable = (node) => node?.in_use === false;
 
 export const PACKING_IN_USE_NOTE = 'Already used (bought, billed, counted or in a combo), so it cannot be deleted. Untick "In use" to hide it from billing and combos; its old bills and expenses stay as they are.';
 
-export const PACKING_MISSING_MESSAGE = "The packing list has not reached this computer yet. It arrives with the next sync once the Owner or an Admin sets packing up in Frooz Pack.";
+export const PACKING_MISSING_MESSAGE = "The packing list has not reached this computer yet. It arrives with the next sync once the Owner or an Admin sets packing up in PEP Pack.";
 
 /**
  * The packing catalogue, from the snapshot's `packing` ({ status, types }) or the
@@ -332,12 +332,12 @@ export const packingTypesWithoutSize = (catalogue) => (Array.isArray(catalogue) 
 export const packingEmptyPickerMessage = (catalogue) => {
   const types = (Array.isArray(catalogue) ? catalogue : Array.isArray(catalogue?.types) ? catalogue.types : [])
     .filter((type) => type && type.active !== false);
-  if (types.length === 0) return "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.";
+  if (types.length === 0) return "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
   const unfinished = types
     .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
     .map((type) => text(type.name) || "A packing type");
-  if (unfinished.length === 0) return "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.";
-  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. In Frooz Pack, press New packing, choose ${unfinished.length === 1 ? "it" : "each one"}, name a design and tick its sizes.`;
+  if (unfinished.length === 0) return "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
+  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. In PEP Pack, press New packing, choose ${unfinished.length === 1 ? "it" : "each one"}, name a design and tick its sizes.`;
 };
 
 const ROOT_CRUMB_LABEL = "Packing";
@@ -433,7 +433,7 @@ export const packingDrillView = (catalogue, state) => {
 };
 
 /**
- * The Frooz Pack screen's own view of the tree, for the Owner or Admin who keeps it. Unlike the
+ * The PEP Pack screen's own view of the tree, for the Owner or Admin who keeps it. Unlike the
  * picker it shows everything: switched-off entries (marked, so they can be switched back on) and
  * a type or design with no sizes yet (otherwise a type just added would vanish before it could be
  * given a design). Takes the same state as the picker (`createPackingDrill`, `enterPackingDrill`
@@ -516,7 +516,7 @@ export const packingManageView = (catalogue, state) => {
   };
 };
 
-/** How a stock movement reads on the Frooz Pack screen. */
+/** How a stock movement reads on the PEP Pack screen. */
 export const PACKING_MOVEMENT_LABELS = Object.freeze({
   PURCHASE: "Bought",
   SALE: "Sold with a combo",
@@ -692,8 +692,8 @@ export const packingShortages = ({ usage = [], catalogue = null } = {}) => {
 export const packingShortageNotifications = (shortages) => (Array.isArray(shortages) ? shortages : []).map((shortage) => ({
   severity: "warning",
   title: `Packing running short: ${shortage.label}`,
-  message: `${formatCount(shortage.needed)} needed, ${formatCount(shortage.onHand)} on hand. The bill still goes through; buy more in Frooz Pack, or correct the count with an adjustment.`,
-  source: "Frooz Pack",
+  message: `${formatCount(shortage.needed)} needed, ${formatCount(shortage.onHand)} on hand. The bill still goes through; buy more in PEP Pack, or correct the count with an adjustment.`,
+  source: "PEP Pack",
   dedupeKey: shortage.key,
 }));
 
@@ -816,7 +816,7 @@ const NODE_WORDS = Object.freeze({ type: "packing type", design: "design", size:
 export const packingNodeRef = (node) => text(node?.global_id) || text(node?.id);
 
 /**
- * Opening a type, design or size form on the Frooz Pack screen (`view` is `packingManageView`).
+ * Opening a type, design or size form on the PEP Pack screen (`view` is `packingManageView`).
  *
  * The parent is recorded here, when the form opens, and the form is saved against it. It used to be
  * read from the drill-down at Save time, so pressing Edit on a size, browsing into another design
@@ -1109,11 +1109,11 @@ export const advancePackingPurchaseLine = (lines, key, field, makeLine) => {
 };
 
 // ---------------------------------------------------------------------------------------------
-// Where Frooz Pack can work
+// Where PEP Pack can work
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Why the Frooz Pack screen cannot load or save here, or null. Packing is kept on the server, like
+ * Why the PEP Pack screen cannot load or save here, or null. Packing is kept on the server, like
  * combos (`resolveComboAvailability`): Local Only, no cloud and offline each say so instead of
  * trying. Local Only is checked first and never reaches for the network. POS keeps selling, and
  * keeps counting the packing it already knows about.
