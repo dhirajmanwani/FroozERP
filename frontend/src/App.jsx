@@ -13687,7 +13687,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
 // to anyone else. Hiding the section from non-Owners is a courtesy, not the check.
 // ---------------------------------------------------------------------------
 
-function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, devicesError, onReload, user }) {
+function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDeviceId = "", devices, devicesError, onReload, user }) {
   const [licences, setLicences] = useState(null);
   const [licencesError, setLicencesError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -13725,8 +13725,8 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, d
   // Summary tiles and both tables come out of this one call, so a tile can never
   // disagree with the row it is counting (CLAUDE.md, "summary vs detail").
   const view = useMemo(
-    () => buildActivationIssuingView({ devices, licences, devicesError, licencesError }),
-    [devices, licences, devicesError, licencesError],
+    () => buildActivationIssuingView({ devices, licences, devicesError, licencesError, assignments, currentDeviceId }),
+    [devices, licences, devicesError, licencesError, assignments, currentDeviceId],
   );
   const orderedRows = useMemo(() => (view.ok ? orderDevicesForIssuing(view.rows) : []), [view]);
   const selectedRow = orderedRows.find((row) => inventoryIdsEqual(row.deviceId, selectedDeviceId)) || null;
@@ -13811,6 +13811,32 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, d
   // follows the one file export the app already has, `WebsiteCatalogueExport`: a blob
   // the webview downloads. Copy is not a consolation prize: a `.lic` is plain text by
   // design (src-tauri/src/activation.rs) and pasting it into a file works exactly as well.
+  // Earlier installs' ids (see splitOldDeviceIds). Retired through the same Owner route as Step 4's
+  // "Retire this id": marked RETIRED, never deleted, so bills and audit rows keep their device.
+  const [retiringOld, setRetiringOld] = useState(false);
+  const retireOldIds = async () => {
+    const old = view.ok ? view.oldIds : [];
+    if (!old.length) return;
+    if (!window.confirm(`Retire ${old.length} old ${old.length === 1 ? "id" : "ids"} left by earlier installs?\n\nNone of them is placed at a counter or has ever had a licence, and each machine keeps the id it uses now. Bills stay in the books.`)) return;
+    setRetiringOld(true);
+    const failed = [];
+    for (const row of old) {
+      try {
+        await axios.post(`${API_URL}/api/v3/admin/devices/${encodeURIComponent(row.deviceId)}/retire`, {
+          reason: "Owner retired an id left by an earlier install (one machine, one id)",
+        });
+      } catch (error) {
+        failed.push(`${row.deviceId}: ${error?.response?.data?.message || error?.message || "not retired"}`);
+      }
+    }
+    setRetiringOld(false);
+    setOutcome(failed.length
+      ? { tone: "error", text: `${old.length - failed.length} of ${old.length} old ids retired. Not retired: ${failed.join("; ")}` }
+      : { tone: "ok", text: `${old.length} old ${old.length === 1 ? "id" : "ids"} retired. Each machine now shows once.` });
+    await loadLicences();
+    onReload?.();
+  };
+
   const saveLicenceFile = () => {
     if (!issued) return;
     try {
@@ -13895,7 +13921,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, d
             <SummaryMetric label="Expired" value={view.summary.expired} />
             {view.summary.unreadable > 0 && <SummaryMetric label="Cannot Be Read" value={view.summary.unreadable} />}
           </div>
-          <DataTable headers={["", "Device", "Branch / Counter", "Activation", "Expires", "Last Seen"]}>
+          <DataTable className="licence-table" headers={["", "Device", "Branch / Counter", "Activation", "Expires", "Last Seen"]}>
             {orderedRows.map((row) => (
               <tr key={row.deviceId || row.deviceName}>
                 <td>
@@ -13923,7 +13949,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, d
                           : "Same name as another device — check the ID below before issuing"}
                     </small>
                   )}
-                  <small className="cell-note">{row.deviceId || "No device ID"}</small>
+                  <small className="cell-note device-id-note">{row.deviceId || "No device ID"}</small>
                 </td>
                 {/* The live assignment (Step 4) first, so both steps name the same counter. */}
                 {(() => {
@@ -13942,6 +13968,34 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, d
               <tr><td className="empty-cell" colSpan="6">No device has registered with this shop yet. A device appears here after it has connected once.</td></tr>
             )}
           </DataTable>
+
+          {view.oldIds.length > 0 && (
+            <div className="device-old-ids">
+              <div>
+                <strong>{view.oldIds.length} old {view.oldIds.length === 1 ? "id" : "ids"} from earlier installs</strong>
+                <p>
+                  {[...new Set(view.oldIds.map((row) => row.deviceName))].join(", ")} now {new Set(view.oldIds.map((row) => row.deviceName)).size === 1 ? "uses" : "use"} the id shown in the table.
+                  These are not placed at a counter and never had a licence.
+                </p>
+                <details>
+                  <summary>Show the old ids</summary>
+                  <ul>
+                    {view.oldIds.map((row) => (
+                      <li key={row.deviceId}>
+                        <span className="device-id-note">{row.deviceId}</span>
+                        <small className="cell-note">{row.lastActiveAt ? `Last seen ${new Date(row.lastActiveAt).toLocaleString("en-IN")}` : "Never seen"}</small>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              </div>
+              {canIssue && (
+                <button className="secondary-button" disabled={retiringOld} onClick={retireOldIds} type="button">
+                  {retiringOld ? "Retiring..." : `Retire ${view.oldIds.length} old ${view.oldIds.length === 1 ? "id" : "ids"}`}
+                </button>
+              )}
+            </div>
+          )}
 
           <div className="form-grid supplier-form-grid">
             <Field label="Selected Device">
@@ -25843,6 +25897,7 @@ function OperationalScopeManagement({
             <DeviceActivationIssuingSection
               assignments={data.device_assignments}
               canIssue={isOwnerAccount}
+              currentDeviceId={currentDeviceId}
               devices={settingsData.authorizedDevices}
               devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
               onReload={onReloadSettings}

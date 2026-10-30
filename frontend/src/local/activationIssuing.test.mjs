@@ -22,6 +22,7 @@ import {
   VALID_DAYS_MIN,
   WIRE_VALID_DAYS_MAX,
   buildActivationIssuingView,
+  splitOldDeviceIds,
   markAmbiguousDeviceNames,
   buildIssueRequest,
   classifyLicence,
@@ -938,9 +939,68 @@ test("the view marks ambiguity, so every screen reading rows gets it", () => {
     ],
     licences: [],
     today: "2026-09-19",
+    // Both placed at counters, so both are machines in use, not one machine's old id.
+    assignments: [
+      { device_id: "FZDEV-A", location_name: "Counter 1", active: true },
+      { device_id: "FZDEV-B", location_name: "Counter 2", active: true },
+    ],
   });
   assert.equal(view.ok, true);
+  assert.equal(view.rows.length, 2);
   assert.equal(view.rows.every((row) => row.nameIsAmbiguous), true);
+});
+
+// 30 Oct 2026: the shop's list held eight "DELL - FroozERP" rows and three "RADHIKA" rows for two
+// laptops. One row per machine in the table; earlier installs' ids listed apart, for retiring.
+const shopList = {
+  devices: [
+    { device_id: "FZDEV-DELL-NOW", device_name: "DELL - FroozERP", status: "APPROVED", last_active_at: "2026-10-30T10:28:28Z" },
+    { device_id: "FZDEV-DELL-1781852580596", device_name: "DELL - FroozERP", status: "APPROVED", last_active_at: "2026-07-15T04:27:38Z" },
+    { device_id: "FZDEV-DELL-NEVER", device_name: "DELL - FroozERP", status: "PENDING", last_active_at: null },
+    { device_id: "FZDEV-DELL-SEP", device_name: "DELL - FroozERP", status: "APPROVED", last_active_at: "2026-09-02T15:34:52Z" },
+    { device_id: "FZDEV-DELL-GONE", device_name: "DELL - FroozERP", status: "RETIRED", last_active_at: "2026-08-01T00:00:00Z" },
+    { device_id: "FZDEV-RADHIKA-NOW", device_name: "RADHIKA - FroozERP", status: "APPROVED", last_active_at: "2026-10-02T18:21:56Z" },
+    { device_id: "FZDEV-RADHIKA-OLD", device_name: "RADHIKA - FroozERP", status: "APPROVED", last_active_at: "2026-07-26T15:51:51Z" },
+    { device_id: "FZDEV-PHONE", device_name: "Android Device 303F - FroozERP", status: "APPROVED", last_active_at: "2026-09-27T03:00:13Z" },
+  ],
+  licences: [{ device_id: "FZDEV-PHONE", serial: "S1", issued_on: "2026-09-27", expires_on: "2027-09-27", valid_days: 365 }],
+  today: "2026-10-30",
+  assignments: [
+    { device_id: "FZDEV-DELL-NOW", location_name: "Main Branch Counter", active: true },
+    { device_id: "FZDEV-RADHIKA-NOW", location_name: "Main Branch Counter", active: true },
+    { device_id: "FZDEV-PHONE", location_name: "Main Branch Counter", active: true },
+  ],
+  currentDeviceId: "FZDEV-DELL-NOW",
+};
+
+test("one row per machine: earlier installs' ids are listed apart, retired ids not at all", () => {
+  const view = buildActivationIssuingView(shopList);
+  assert.equal(view.ok, true);
+  assert.deepEqual(view.rows.map((row) => row.deviceId).sort(), ["FZDEV-DELL-NOW", "FZDEV-PHONE", "FZDEV-RADHIKA-NOW"]);
+  assert.deepEqual(
+    view.oldIds.map((row) => row.deviceId).sort(),
+    ["FZDEV-DELL-1781852580596", "FZDEV-DELL-NEVER", "FZDEV-DELL-SEP", "FZDEV-RADHIKA-OLD"],
+  );
+  assert.ok(!view.rows.some((row) => row.nameIsAmbiguous), "with one row per machine no name is shared");
+  // The tiles count what the table shows.
+  assert.equal(view.summary.total, view.rows.length);
+  assert.equal(view.summary.needsLicence, 2);
+});
+
+test("an id is never called old while it is placed, licensed, this computer, or the newest of its name", () => {
+  const { inUse, oldIds } = splitOldDeviceIds([
+    { deviceId: "A", deviceName: "PC", lastActiveAt: "2026-10-30T00:00:00Z", licenceCount: 0, state: "needs-licence" },
+    { deviceId: "B", deviceName: "PC", lastActiveAt: "2026-07-01T00:00:00Z", licenceCount: 0, state: "needs-licence" },
+    { deviceId: "C", deviceName: "PC", lastActiveAt: "2026-06-01T00:00:00Z", licenceCount: 1, state: "active" },
+    { deviceId: "D", deviceName: "PC", lastActiveAt: "2026-05-01T00:00:00Z", licenceCount: 0, state: "needs-licence" },
+    { deviceId: "E", deviceName: "PC", lastActiveAt: "2026-04-01T00:00:00Z", licenceCount: 0, state: "needs-licence" },
+    { deviceId: "F", deviceName: "Lonely", lastActiveAt: "", licenceCount: 0, state: "needs-licence" },
+  ], {
+    assignments: [{ device_id: "D", location_name: "Counter 2", active: true }],
+    currentDeviceId: "E",
+  });
+  assert.deepEqual(oldIds.map((row) => row.deviceId), ["B"]);
+  assert.deepEqual(inUse.map((row) => row.deviceId), ["A", "C", "D", "E", "F"]);
 });
 
 test("the screen shows the distinction, not only the id", () => {

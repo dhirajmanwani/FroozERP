@@ -10329,6 +10329,79 @@ button.shortcut-sheet-row:focus-visible {
   margin-top: var(--space-3);
 }
 
+/* Step 5's licence list (30 Oct 2026: "words boundaries ke bahar dusre cell me ghus rahe"). Every
+   cell starts at the top, the notes under a value wrap inside their own column instead of
+   stretching it, and the id under a name breaks inside its cell. */
+.licence-table td {
+  vertical-align: top;
+}
+
+.licence-table td:first-child {
+  width: 36px;
+}
+
+/* The picker is a radio, not a text box: the app-wide input height drew it as a 38px ring. */
+.licence-table input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 2px 0 0;
+}
+
+.licence-table td.primary-cell {
+  min-width: 220px;
+  max-width: 300px;
+}
+
+.licence-table td:nth-child(3),
+.licence-table td:nth-child(4) {
+  min-width: 160px;
+  max-width: 260px;
+  white-space: normal;
+}
+
+.licence-table .cell-note {
+  margin-top: 3px;
+}
+
+/* The ids earlier installs left behind, apart from the table (splitOldDeviceIds). */
+.device-old-ids {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin: var(--space-2) 0 var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--card-veil-soft);
+}
+
+.device-old-ids p {
+  margin: 4px 0 8px;
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.device-old-ids ul {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.device-old-ids summary {
+  cursor: pointer;
+  color: var(--accent-deep);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.device-old-ids > button {
+  flex-shrink: 0;
+}
+
 /* A device id is one long unbroken word (FZDEV-XXXXXXXX-XXXX-...). Under a computer's name it must
    wrap inside its box rather than run out of it (3 Oct 2026). */
 .device-id-note {

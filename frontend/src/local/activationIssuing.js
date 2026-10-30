@@ -543,14 +543,64 @@ export const markAmbiguousDeviceNames = (rows) => {
   });
 };
 
+/** Registration states that are finished with: the same four Step 4 hides (backend/scopeManagement.js). */
+export const HIDDEN_REGISTRATION_STATUSES = Object.freeze(["REVOKED", "RETIRED", "DISABLED", "REJECTED"]);
+
+const seenAt = (row) => {
+  const time = Date.parse(firstText(row?.lastActiveAt));
+  return Number.isFinite(time) ? time : 0;
+};
+
+/**
+ * Split the licence list into the machines in use and the ids their earlier installs left behind.
+ *
+ * On 30 Oct 2026 the shop's list held eight "DELL - FroozERP" rows and three "RADHIKA - FroozERP"
+ * rows: two laptops, eleven ids, from installs before one-machine-one-id (PR #35). The owner's rule
+ * is one box per machine, so the table shows one, and the rest are offered for retiring.
+ *
+ * A row is an old id only when every one of these holds, so a machine in use can never land here:
+ * another row has the same name; it is not that name's most recently seen row; it is not placed at
+ * a counter; no licence was ever issued to it; and it is not this computer. Anything else stays in
+ * the table, so two genuinely different machines that share a name are both still shown.
+ */
+export const splitOldDeviceIds = (rows, { assignments = [], currentDeviceId = "" } = {}) => {
+  const list = Array.isArray(rows) ? rows : [];
+  const nameOf = (row) => firstText(row?.deviceName).trim().toLowerCase();
+  const groups = new Map();
+  for (const row of list) {
+    const key = nameOf(row);
+    if (key) groups.set(key, [...(groups.get(key) || []), row]);
+  }
+  const isPlaced = (row) => deviceBranchAndCounter(row, assignments).counter !== "No counter assigned";
+  const current = canonicalInventoryId(currentDeviceId);
+
+  const inUse = [];
+  const oldIds = [];
+  for (const row of list) {
+    const group = groups.get(nameOf(row)) || [];
+    const newest = group.reduce((best, other) => (seenAt(other) > seenAt(best) ? other : best), group[0]);
+    const old = group.length > 1
+      && row !== newest
+      && seenAt(row) < seenAt(newest)
+      && !isPlaced(row)
+      && row.licenceCount === 0
+      && row.state === DEVICE_ACTIVATION_STATE.NEEDS_LICENCE
+      && (current === "" || !inventoryIdsEqual(row.deviceId, current));
+    (old ? oldIds : inUse).push(row);
+  }
+  return { inUse, oldIds };
+};
+
 export const buildActivationIssuingView = ({
   devices,
   licences,
   devicesError = null,
   licencesError = null,
   today,
+  assignments = [],
+  currentDeviceId = "",
 } = {}) => {
-  const failure = (code, message) => ({ ok: false, error: { code, message }, rows: [], history: [], summary: EMPTY_SUMMARY });
+  const failure = (code, message) => ({ ok: false, error: { code, message }, rows: [], oldIds: [], history: [], summary: EMPTY_SUMMARY });
 
   if (devicesError) {
     return failure(
@@ -571,7 +621,13 @@ export const buildActivationIssuingView = ({
     return failure("LICENCES_UNAVAILABLE", "The issued licences have not loaded yet, so it is not known which devices already have one.");
   }
 
-  const rows = markAmbiguousDeviceNames(devices.map((device) => describeDeviceActivation(device, licences, { today })));
+  // Retired and refused ids are finished with, and earlier installs' ids are listed apart, so the
+  // table holds one row per machine in use. The summary folds the same `rows` the table maps.
+  const described = devices
+    .filter((device) => !HIDDEN_REGISTRATION_STATUSES.includes(firstText(device?.status).toUpperCase()))
+    .map((device) => describeDeviceActivation(device, licences, { today }));
+  const { inUse, oldIds } = splitOldDeviceIds(described, { assignments, currentDeviceId });
+  const rows = markAmbiguousDeviceNames(inUse);
 
   const summary = rows.reduce((totals, row) => ({
     total: totals.total + 1,
@@ -611,7 +667,7 @@ export const buildActivationIssuingView = ({
       };
     });
 
-  return { ok: true, error: null, rows, history, summary };
+  return { ok: true, error: null, rows, oldIds, history, summary };
 };
 
 /** The devices the Owner is most likely to be here for, first. */
