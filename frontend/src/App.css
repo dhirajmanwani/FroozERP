@@ -227,8 +227,11 @@ input[type="number"] {
 }
 
 .brand-monogram {
-  width: 42px;
+  /* Sized by height alone; the width follows the aspect ratio. The shipped PEP mark is about twice
+     as wide as it is tall, so a box drawing it (`.brand-monogram-wide`) widens; an owner's own logo
+     keeps the square. */
   height: 42px;
+  aspect-ratio: 1 / 1;
   display: grid;
   flex: 0 0 auto;
   place-items: center;
@@ -276,7 +279,6 @@ input[type="number"] {
 }
 
 .brand-lockup-compact .brand-monogram {
-  width: 36px;
   height: 36px;
   border-radius: 9px;
 }
@@ -839,7 +841,6 @@ input[type="number"] {
 }
 
 .welcome-banner .brand-monogram {
-  width: 72px;
   height: 72px;
 }
 
@@ -2321,7 +2322,6 @@ td.origin-rate {
 }
 
 .about-frooz-panel .brand-monogram {
-  width: 76px;
   height: 76px;
   background: #fff;
 }
@@ -4562,7 +4562,6 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .brand-lockup-invoice .brand-monogram {
-  width: 68px;
   height: 68px;
   border-color: #eab43f;
   border-radius: 8px;
@@ -4747,13 +4746,11 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .bill-head .brand-lockup-invoice .brand-monogram {
-  width: 44px;
   height: 44px;
   border-radius: 10px;
 }
 
 .bill-paper.invoice-thermal .bill-head .brand-lockup-invoice .brand-monogram {
-  width: 30px;
   height: 30px;
   border-radius: 6px;
 }
@@ -5190,7 +5187,6 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .login-brand .brand-monogram {
-  width: 64px;
   height: 64px;
 }
 
@@ -5546,7 +5542,6 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   .brand-lockup-compact .brand-monogram {
-    width: 33px;
     height: 33px;
     border-radius: 8px;
   }
@@ -7302,7 +7297,6 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   .invoice-paper.invoice-thermal .brand-monogram {
-    width: 28px;
     height: 28px;
     border-radius: 5px;
   }
@@ -8410,6 +8404,15 @@ button.shortcut-sheet-row:focus-visible {
    Follows theme.css's three-block shape for the same reason it does: the un-stamped document is
    the System state, and only `prefers-color-scheme` separates it there.
    --------------------------------------------------------------------------------------------- */
+
+.brand-monogram.brand-monogram-wide {
+  aspect-ratio: 1.6 / 1;
+}
+
+/* The collapsed rail is 48px inside its padding: the wide mark fits it at a smaller height. */
+.sidebar-rail .brand-monogram.brand-monogram-wide {
+  height: 28px;
+}
 
 /* Every rule here is scoped under `.brand-monogram`, and that is load-bearing rather than tidy.
    `.brand-monogram img` sets `display: block` and scores 0,1,1; a bare `.brand-art-on-dark` scores

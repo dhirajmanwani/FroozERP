@@ -123,9 +123,9 @@ console.log(`wrote ${TOKENS.filter(([, v]) => v !== null).length + ALPHAS.length
 // The shared files. Only the reversed logo cuts: this site is dark throughout, and
 // the normal cut is deep green, which disappears on it.
 const SHARED = [
-  ["frontend/public/branding/frooz-logo-reversed.svg", "website/public/branding/frooz-logo-reversed.svg"],
-  ["frontend/public/branding/frooz-mark-reversed.svg", "website/public/branding/frooz-mark-reversed.svg"],
-  ["frontend/public/branding/frooz-wordmark-reversed.svg", "website/public/branding/frooz-wordmark-reversed.svg"],
+  ["frontend/public/branding/pep-logo-reversed.svg", "website/public/branding/pep-logo-reversed.svg"],
+  ["frontend/public/branding/pep-mark-reversed.svg", "website/public/branding/pep-mark-reversed.svg"],
+  ["frontend/public/branding/pep-wordmark-reversed.svg", "website/public/branding/pep-wordmark-reversed.svg"],
   ["frontend/public/favicon.svg", "website/public/branding/favicon.svg"],
   ["frontend/src/assets/fonts/inter-latin.woff2", "website/public/fonts/inter-latin.woff2"],
   ["frontend/src/assets/fonts/inter-latin-ext.woff2", "website/public/fonts/inter-latin-ext.woff2"],

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Renders the Android launcher icon from the same vector mark the desktop icon uses
-// (4 Oct 2026).
+// (4 Oct 2026; THE PEP mark from 30 Oct 2026).
 //
 // `tauri android init` writes Tauri's own placeholder icon into the generated project, and that
 // project is regenerated on every CI run, so the phone showed a different icon from every other
@@ -63,8 +63,12 @@ function findChrome() {
   return found;
 }
 
-const markSvg = readFileSync(join(brandingDir, "frooz-mark-reversed.svg"), "utf8");
-const markDataUri = `data:image/svg+xml;base64,${Buffer.from(markSvg).toString("base64")}`;
+// The generated SVG carries only a viewBox; give the canvas copy an explicit size from it
+// so the browser rasterises it at its true proportions.
+const markSvg = readFileSync(join(brandingDir, "pep-mark-reversed.svg"), "utf8");
+const [, , markWidth, markHeight] = markSvg.match(/viewBox="([^"]+)"/)[1].split(/\s+/).map(Number);
+const sizedMark = markSvg.replace(/<svg\b/, `<svg width="${markWidth}" height="${markHeight}"`);
+const markDataUri = `data:image/svg+xml;base64,${Buffer.from(sizedMark).toString("base64")}`;
 
 const drawPage = `<!doctype html><html><body><pre id="out"></pre><script>
 const JOBS = ${JSON.stringify(jobs)};
@@ -77,12 +81,13 @@ mark.onload = () => {
     canvas.width = size;
     canvas.height = size;
     const ctx = canvas.getContext("2d");
+    // markBox is the longest the mark's diagonal may be. THE PEP mark is about 2:1, so a
+    // diagonal limit keeps its corners inside a circle whatever its proportions.
     let markBox;
     if (job.shape === "foreground") {
-      // The 66dp safe zone is a circle of diameter 66/108 of the canvas. A square that fits in
-      // it is 66/108/sqrt(2) = 43% of the canvas; the mark is a little taller than wide, so
-      // 46% of the canvas still keeps every corner inside.
-      markBox = size * 0.46;
+      // The 66dp safe zone is a circle of diameter 66/108 (61%) of the canvas; 58% keeps every
+      // corner of the mark inside it with a little to spare.
+      markBox = size * 0.58;
     } else {
       const fill = ctx.createLinearGradient(0, 0, size, size);
       fill.addColorStop(0, ${JSON.stringify(BRAND.greenMid)});
@@ -101,9 +106,9 @@ mark.onload = () => {
       ctx.lineWidth = hairline;
       ctx.stroke();
       ctx.globalAlpha = 1;
-      markBox = size * (job.shape === "round" ? 0.56 : 0.62);
+      markBox = size * (job.shape === "round" ? 0.86 : 0.9);
     }
-    const scale = Math.min(markBox / mark.naturalWidth, markBox / mark.naturalHeight);
+    const scale = Math.min(markBox / Math.hypot(mark.naturalWidth, mark.naturalHeight), (size * 0.84) / mark.naturalWidth);
     const width = mark.naturalWidth * scale;
     const height = mark.naturalHeight * scale;
     ctx.drawImage(mark, (size - width) / 2, (size - height) / 2, width, height);
@@ -114,7 +119,7 @@ mark.onload = () => {
 mark.src = ${JSON.stringify(markDataUri)};
 </script></body></html>`;
 
-const work = join(tmpdir(), `frooz-android-icons-${process.pid}`);
+const work = join(tmpdir(), `pep-android-icons-${process.pid}`);
 mkdirSync(work, { recursive: true });
 const page = join(work, "draw.html");
 writeFileSync(page, drawPage);

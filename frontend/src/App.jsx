@@ -2020,9 +2020,9 @@ function BrandLogo({ compact = false, invoice = false, splash = false, identity:
   const identity = identityOverride || storedIdentity;
   const assetBase = import.meta.env.BASE_URL || "/";
   const assetPath = (path) => `${assetBase}${path}`.replace(/([^:]\/)\/+/g, "$1");
-  // The mark is a square crop of the official lockup, which is what fits the badge.
-  // Screen chrome is dark, so it takes the reversed (cream) cut; an invoice prints on
-  // white paper, so it takes the green cut. Both are generated from one vector source
+  // The mark is the "pép" letters and leaf cropped from THE PEP lockup, about twice as wide as
+  // tall, so its box widens (`brand-monogram-wide`). Screen chrome is dark, so it takes the reversed
+  // cut; an invoice prints on white paper, so it takes the light cut. Both are generated from one vector source
   // by tools/build-brand-assets.mjs - do not point this at a hand-made file.
   const alt = identity.title;
   return (
@@ -2041,16 +2041,16 @@ function BrandLogo({ compact = false, invoice = false, splash = false, identity:
         of the accessibility tree, and a name attached to whichever image happened to be hidden
         would disappear in one theme.
       */}
-      <span aria-label={alt} className="brand-monogram" role="img">
+      <span aria-label={alt} className={identity.logo ? "brand-monogram" : "brand-monogram brand-monogram-wide"} role="img">
         {identity.logo ? (
           // The owner's own logo: one picture, drawn as it is on every ground.
           <img alt="" aria-hidden="true" className="brand-custom-logo" src={identity.logo} />
         ) : invoice ? (
-          <img alt="" aria-hidden="true" src={assetPath("branding/frooz-mark.svg")} />
+          <img alt="" aria-hidden="true" src={assetPath("branding/pep-mark.svg")} />
         ) : (
           <>
-            <img alt="" aria-hidden="true" className="brand-art-on-dark" src={assetPath("branding/frooz-mark-reversed.svg")} />
-            <img alt="" aria-hidden="true" className="brand-art-on-light" src={assetPath("branding/frooz-mark.svg")} />
+            <img alt="" aria-hidden="true" className="brand-art-on-dark" src={assetPath("branding/pep-mark-reversed.svg")} />
+            <img alt="" aria-hidden="true" className="brand-art-on-light" src={assetPath("branding/pep-mark.svg")} />
           </>
         )}
       </span>

@@ -160,7 +160,7 @@ button { font: inherit; cursor: pointer; }
 }
 
 .site-logo { display: flex; align-items: center; }
-.site-logo img { height: 26px; width: auto; }
+.site-logo img { height: 34px; width: auto; }
 
 .header-link {
   font-size: var(--step-small);
