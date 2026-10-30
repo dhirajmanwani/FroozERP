@@ -40,7 +40,38 @@ const OPS_COMMANDS = [
   "multibranch/export-production-snapshot-readonly.js",
 ];
 
+/**
+ * Commands that deliberately read `DATABASE_URL` alone, and refuse while `DATABASE_PUBLIC_URL` is
+ * set to something different.
+ *
+ * The opposite rule from the list above, on purpose, and only for commands that empty tables. The
+ * fallback above exists so a person is never told a variable is unset when the right value sits
+ * under the other name. For a destructive command that convenience is the hazard: preferring
+ * DATABASE_PUBLIC_URL is how the migration runner once reached the wrong database. So these read
+ * one name, and a second, different value in the shell is a refusal that says which to clear --
+ * still actionable, which is what this file protects.
+ */
+const DATABASE_URL_ONLY_COMMANDS = [
+  "cloud/go-live-reset.mjs",
+];
+
 const read = (name) => fs.readFileSync(path.join(SCRIPTS_DIR, name), "utf8");
+
+test("single-variable commands read DATABASE_URL only and refuse a different DATABASE_PUBLIC_URL", () => {
+  for (const name of DATABASE_URL_ONLY_COMMANDS) {
+    const source = read(name);
+    const code = source
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//") && !line.trim().startsWith("*"))
+      .join("\n");
+    assert.doesNotMatch(code, /DATABASE_PUBLIC_URL\s*\|\|/, `${name} must not fall back to DATABASE_PUBLIC_URL`);
+    assert.doesNotMatch(code, /process\.env\.DATABASE_PUBLIC_URL/, `${name} must not read DATABASE_PUBLIC_URL as a connection`);
+    assert.match(code, /env\.DATABASE_URL/, `${name} must read DATABASE_URL`);
+    assert.match(code, /publicUrl\s*&&\s*publicUrl\s*!==\s*url/, `${name} must refuse a DATABASE_PUBLIC_URL that differs`);
+    assert.match(source, /Remove-Item Env:DATABASE_PUBLIC_URL/, `${name} must say how to clear the other variable`);
+    assert.ok(!OPS_COMMANDS.includes(name), `${name} cannot be in both lists`);
+  }
+});
 
 test("every ops command accepts DATABASE_PUBLIC_URL as well as DATABASE_URL", () => {
   for (const name of OPS_COMMANDS) {
@@ -89,7 +120,7 @@ test("the refusal names both variables, so it is actionable", () => {
 
 test("every ops command listed here exists", () => {
   // A rename that leaves this list stale would silently stop checking that command.
-  const missing = OPS_COMMANDS.filter((name) => !fs.existsSync(path.join(SCRIPTS_DIR, name)));
+  const missing = [...OPS_COMMANDS, ...DATABASE_URL_ONLY_COMMANDS].filter((name) => !fs.existsSync(path.join(SCRIPTS_DIR, name)));
   assert.deepEqual(missing, [], `listed but missing: ${missing.join(", ")}`);
 });
 
@@ -124,7 +155,7 @@ test("no script that connects to a database is missing from the list", () => {
     .filter((name) => /new Pool\(|new Client\(/.test(read(name)))
     .filter((name) => !isStagingHarness(read(name)));
   assert.ok(candidates.length >= 8, `expected the ops commands to be found, got ${candidates.length}`);
-  const unchecked = candidates.filter((name) => !OPS_COMMANDS.includes(name));
+  const unchecked = candidates.filter((name) => !OPS_COMMANDS.includes(name) && !DATABASE_URL_ONLY_COMMANDS.includes(name));
   assert.deepEqual(
     unchecked,
     [],
