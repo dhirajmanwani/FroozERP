@@ -814,36 +814,48 @@ test("every token App.css uses has a value in the light theme", () => {
 });
 
 
-test("the mark has no tile of its own", () => {
-  // Ruled by the maintainer, after two attempts at a badge: no box behind the symbol. It sits
-  // directly on whatever it is placed on and carries its own colour. Both earlier versions -- a
-  // gold wash, then a solid tile -- were a container the logo never asked for, and the second was
-  // competing with it. Asserted on the rule rather than on a token, because the failure mode is
-  // somebody adding a background back to make it "stand out".
-  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8");
+test("the wrapper has no tile; only the shipped mark's light cut does", () => {
+  // The maintainer first ruled out any box behind the mark (a gold wash, then a solid tile). On
+  // 30 Oct 2026 he chose the opposite for the light theme only: the original PEP logo, mustard and
+  // cream, in a small tile of its own green. So the wrapper -- which also holds an owner's uploaded
+  // logo -- still paints nothing, and the tile lives on the shipped mark's light-theme image alone.
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
   const start = appCss.indexOf(".brand-monogram {");
   assert.ok(start > 0, "the mark's wrapper must still exist");
-  const rule = appCss.slice(start, appCss.indexOf("}", start)).replace(/\/\*[\s\S]*?\*\//g, "");
+  const rule = appCss.slice(start, appCss.indexOf("}", start));
   for (const property of ["background", "border", "box-shadow"]) {
     assert.doesNotMatch(
       rule,
       new RegExp(`\\b${property}\\s*:`),
-      `the mark must not paint a ${property}; it sits on the app, not in a box`,
+      `the wrapper must not paint a ${property}; an owner's own logo sits on the app, not in a box`,
     );
   }
+  const tile = appCss.match(/\.brand-monogram \.brand-art-on-light\s*\{([^}]*)\}/);
+  assert.ok(tile, "the light cut's rule must exist");
+  assert.match(tile[1], /background:\s*var\(--brand-mark-tile\)/, "the light cut sits in the green tile");
+  const jsx = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(
+    jsx,
+    /className="brand-art-on-light" src=\{assetPath\("branding\/pep-mark-reversed\.svg"\)\}/,
+    "the light theme shows the original mustard-and-cream logo, not a recoloured cut",
+  );
 });
 
 test("each cut of the mark reads on the ground it is shown against", () => {
-  // With no tile, the surface behind the mark is the app itself -- so the cut has to suit the
-  // theme, and the theme switch is the only thing making it legible. The cream cut on a light page
-  // would be a mark nobody can see, which is what shipped before the switch existed.
+  // Dark theme: the reversed cut sits on the app itself. Light theme: the same cut sits in its own
+  // green tile, so what has to read is the logo on the tile, and the tile on the light page.
+  // CREAM and BRAND.gold on the PEP palette are the reversed cut's colours
+  // (tools/build-brand-assets.mjs).
   const darkGround = mediaDarkTokens.get("--ground");
-  const lightSurfaces = [lightTokens.get("--ground"), lightTokens.get("--panel"), lightTokens.get("--card")];
-  // CREAM and BRAND.greenDeep on the PEP palette: the reversed cut's cream parts and the light
-  // cut's green parts (tools/build-brand-assets.mjs). Were #f6f3ea / #0a2d1c on the Frooz palette.
   assert.ok(contrast("#f6f4e5", darkGround) >= 7, "the cream cut must read on the dark page");
+  const tile = lightTokens.get("--brand-mark-tile");
+  assert.ok(tile, "the light theme must define the tile colour");
+  assert.ok(contrast("#f6f4e5", tile) >= 7, "cream must read on the tile");
+  assert.ok(contrast("#eab43f", tile) >= 4.5, "mustard must read on the tile");
+  const lightSurfaces = [lightTokens.get("--ground"), lightTokens.get("--panel"), lightTokens.get("--card")];
   for (const surface of lightSurfaces) {
-    assert.ok(contrast("#102f20", surface) >= 7, `the green cut must read on ${surface}`);
+    assert.ok(contrast(tile, surface) >= 7, `the tile must stand out on ${surface}`);
   }
 });
 

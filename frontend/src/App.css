@@ -235,10 +235,8 @@ input[type="number"] {
   display: grid;
   flex: 0 0 auto;
   place-items: center;
-  /* No tile. The mark sits directly on whatever it is placed on and carries its own colour: the
-     green cut on a light ground, the cream cut on a dark one. It had a gold-washed badge, then a
-     solid one; both were a box the logo never asked for. A mark drawn this well does not need
-     something behind it to be legible, and the box was competing with it. */
+  /* The wrapper paints nothing: an owner's own logo sits directly on the app. The shipped mark's
+     light-theme tile belongs to its own image (`.brand-art-on-light`, further down), not here. */
 }
 
 .brand-monogram img {
@@ -8420,7 +8418,16 @@ button.shortcut-sheet-row:focus-visible {
    mark twice, overlapping. Dark mode hid its spare only by accident -- the themed rules below
    carry an extra selector and were already winning. Keep these at 0,2,0 or higher. */
 .brand-monogram .brand-art-on-dark { display: none; }
-.brand-monogram .brand-art-on-light { display: block; }
+.brand-monogram .brand-art-on-light {
+  display: block;
+  /* In a light theme the shipped mark is the original logo -- the reversed, mustard-and-cream cut --
+     in a small tile of its own green. The owner chose this over a recoloured cut on 30 Oct 2026.
+     Only the shipped mark gets it: an owner's own logo and the bill keep no tile. */
+  background: var(--brand-mark-tile);
+  border-radius: 8px;
+  box-sizing: border-box;
+  padding: 10% 9%;
+}
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .brand-monogram .brand-art-on-dark { display: block; }

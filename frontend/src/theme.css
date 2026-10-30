@@ -192,6 +192,10 @@
   --price-list-band-2: #153525;
   --price-list-gold: #eab43f;
   --price-list-cream: #f6f4e5;
+  /* The green tile the shipped mark sits in on a light page: the logo's own ground, so the light
+     theme shows the original mustard-and-cream logo instead of a recoloured cut. Owner's choice,
+     30 Oct 2026. Mustard on it 7.7:1, cream 13.1:1. */
+  --brand-mark-tile: #102f20;
   --accent-deep: #896613;         /* accent text where it must survive a light surface */
   /* The customer bill's saving: success green that reads on white paper (7.1:1), with a wash and
      rule built from it. Paper colours like the rest of this group, so never re-themed. Printed and

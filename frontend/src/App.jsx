@@ -2050,7 +2050,7 @@ function BrandLogo({ compact = false, invoice = false, splash = false, identity:
         ) : (
           <>
             <img alt="" aria-hidden="true" className="brand-art-on-dark" src={assetPath("branding/pep-mark-reversed.svg")} />
-            <img alt="" aria-hidden="true" className="brand-art-on-light" src={assetPath("branding/pep-mark.svg")} />
+            <img alt="" aria-hidden="true" className="brand-art-on-light" src={assetPath("branding/pep-mark-reversed.svg")} />
           </>
         )}
       </span>
