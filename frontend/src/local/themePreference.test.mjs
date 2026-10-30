@@ -882,3 +882,24 @@ test("only one cut of the mark can be visible at a time", () => {
     "these rules do not out-rank `.brand-monogram img { display: block }` and will not hide anything",
   );
 });
+
+test("every module on a screen shares one frame and one gap", () => {
+  // The owner found the screens messy (30 Oct 2026): three corner sizes, three shadows, two edge
+  // colours and 16px between boxes. One frame now: --line edge, --radius-card corner, and
+  // --module-gap between the boxes a screen stacks. This pins it so a new card cannot drift back.
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  const ruleFor = (selector) => {
+    const start = appCss.indexOf(`${selector} {`);
+    assert.ok(start >= 0, `${selector} must still exist`);
+    return appCss.slice(start, appCss.indexOf("}", start));
+  };
+  for (const selector of [".kpi-card", ".chart-card", ".checkout-card", ".report-menu-card"]) {
+    const rule = ruleFor(selector);
+    assert.match(rule, /border: 1px solid var\(--line\)/, `${selector} takes the shared edge`);
+    assert.match(rule, /border-radius: var\(--radius-card\)/, `${selector} takes the shared corner`);
+  }
+  for (const selector of [".settings-layout", ".scope-page", ".dashboard-blocks", ".chart-grid", ".pos-layout", ".pos-main"]) {
+    assert.match(ruleFor(selector), /gap: var\(--module-gap\)/, `${selector} spaces its modules by --module-gap`);
+  }
+});
