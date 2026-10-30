@@ -59,6 +59,7 @@ import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import {
   ORDER_QUEUE_STATUS,
+  buildOrderDraftLines,
   buildOrdersBoard,
   resolveUnassignedQueue,
   validateOrderAction,
@@ -70,14 +71,16 @@ import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, des
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
 import { WHATSAPP_OPENED, describeChatHandoff, initialWhatsappSelection } from "./local/whatsappHandoff";
-import { buildSaleReturnDraft, filterReturnInvoices, refundPerUnit, saleReturnFingerprint, saleReturnPayload } from "./local/saleReturnDraft";
+import { RETURN_INVOICE_DEFAULT_DAYS, buildSaleReturnDraft, filterReturnInvoices, refundPerUnit, returnInvoiceListParams, saleReturnFingerprint, saleReturnPayload } from "./local/saleReturnDraft";
+import { cartEntryFits, cartLineProblem, chargeRefusalProblem, describeMandiTaxPanel, describeSavedBillRefreshFailure, editLineAmount, editedBillDateTime, lotLeftAfterCart, resolvePosBillDateTime, saleEditTotals } from "./local/posCheckout";
+import { POS_LEAVE_PROMPT, shouldConfirmLeavingPos } from "./local/posLeaveGuard";
 import { canRetireDeviceId, normalizeMachineFingerprint, previousIdsNote, retireDeviceConfirmText, waitingIdsNote } from "./local/deviceBoxes";
 import { DASHBOARD_BLOCKS, DEFAULT_DASHBOARD_ORDER, dashboardDropIndex, isDefaultDashboardOrder, moveDashboardBlock, nudgeDashboardBlock, readDashboardOrder, writeDashboardOrder } from "./local/dashboardLayout";
 import { PRICE_LIST_SHARE_ROUTE, PRICE_LIST_SHARE_TIMEOUT_MS, PRICE_LIST_STATUS, buildPriceList, buildPriceListHeader, choosePriceListShareRoute, parseWhatsappGroupInvite, priceListCaption, priceListCopySaveOutcome, priceListFileName, priceListGroupLink, priceListGroupOutcome, readLastPreparedOn, readPriceListGroup, readPriceListSchedule, shouldPreparePriceList, writeLastPreparedOn, writePriceListGroup, writePriceListSchedule } from "./local/dailyPriceList";
 import { buildPosPayments, buildUpiPayload, describePaymentConfirmation, invoiceUpiNote, resolveInvoiceUpiQr } from "./local/posPaymentConfirmation";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
-import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
+import { buildOrderCartSeed, describeOrderBillingProblems, seedLinesToCart } from "./local/orderBilling";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 // Only the consuming half is used now. `stashSessionForReload` existed so that saving an API mode
@@ -103,6 +106,7 @@ import {
 } from "./local/notificationCenter";
 import { sameIdentityRecord, buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot, localSalesWindow } from "./local/dashboardSnapshot";
+import { INCLUDED_IN_COST_HEADING, balanceSheetAsAtInput, ledgerWithRunningBalance, profitLossCostOfGoods, supplierLedgerOpening } from "./local/financialStatements";
 import { DASHBOARD_FILL, NULL_DASHBOARD_METRICS, fillUncomputedMetrics, shouldFetchCloudDashboardMetrics, unknownMetricNote } from "./local/dashboardCloudFill";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
@@ -145,6 +149,7 @@ import {
   normalizeInventoryStatus,
   normalizeLocalInventorySnapshot,
   normalizeStockViewMode,
+  paginateLots,
   resolveInventoryPresentation,
   resolveInventoryAuditEndpoint,
   resolveInventoryHydrationPolicy,
@@ -161,6 +166,7 @@ import {
   buildActivationIssuingView,
   buildIssueRequest,
   describeIssueFailure,
+  deviceBranchAndCounter,
   describeIssuedLicence,
   describeLicenceFileFailure,
   describeValidity,
@@ -172,11 +178,12 @@ import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./loc
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
 import { findDuplicateProductName, isSameProduct, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
+import { expenseRecordStatus, expenseTotalExcludingCancelled } from "./local/expenses";
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
 import { COMBO_EDIT_REFUSAL, COMBO_IN_USE_NOTE, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboDeletable, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
-import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingTypesWithoutSize, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, validatePackingNode } from "./local/froozPack";
+import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, checkPackingNodeForm, newPackingPurchaseClientRef, packingSetupStart, startPackingNodeForm, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingTypesWithoutSize, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -213,6 +220,7 @@ import {
 import {
   FROST_BELL_STATUS,
   buildFrostBellNotifications,
+  isComboStockReminderKey,
   pruneDismissedStockReminders,
   readDismissedStockReminders,
   withDismissedStockReminders,
@@ -313,16 +321,16 @@ import {
 import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
 import { describeInitialPullFailure } from "./local/freshDeviceOnboarding";
 import { plainRefusalMessage } from "./local/refusalMessages";
-import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
+import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, accountTabsFor, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, isRateManagerRole, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
 import { findPurchaseSupplier, findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation, supplierLedgerKey } from "./local/accountsPresentation";
 import { productStockKeyResolver, wasteEntryProductId } from "./local/wasteStock";
 import { UNDRAWN_TRANSFER_ACTION_NOTE, crateAllocationsForApproval, drawableTransferActions, transferActionId, transferItemsForSend } from "./local/distributionWrites";
 import { buildLocalOnlyReportsData, reportFlagsAfterServerLoad, resolveReportAvailability, shouldReloadReportsOnReconnect } from "./local/reportCenterOffline";
-import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, insightCardValue, pickDashboardMetric, unavailableBriefingNote } from "./local/figurePresentation";
+import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, insightCardValue, formatChartRupees, pickDashboardMetric, presentSignedFigure, unavailableBriefingNote } from "./local/figurePresentation";
 import { UPI_BANK_PAYMENT_MODES, dayBookVoucherLabel, paymentReportTotals, saleGrossAmount, salesHistoryMoneyTotals } from "./local/salesReportTotals";
-import { checkoutFingerprint, resolveCheckoutRef } from "./local/checkoutRetry";
+import { checkoutFingerprint, heldApprovalFor, resolveCheckoutRef } from "./local/checkoutRetry";
 import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
-import { SCALE_STATES, createSteadiness, describeScale, findScalePort, formatKg, isWeighedUnit, nextSteadiness, readSavedScalePort, saveScalePort, scaleQuantityFor } from "./local/weighingScale";
+import { SCALE_STATES, createSteadiness, describeScale, findScalePort, formatKg, isWeighedUnit, nextSteadiness, readSavedScalePort, saveScalePort, scaleLineQuantity, scaleQuantityFor, scaleTargetLine } from "./local/weighingScale";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 // The phone app is a Tauri runtime too, so `isDesktopShell()` is true there as well. What differs on
@@ -1057,7 +1065,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2,
 });
 const APP_VERSION = "1.0.76";
-const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
+const APP_DISPLAY_NAME = "THE PEP - Pulp Eat Up.";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
 const FROST_ACTIVE_TAB_STORAGE_KEY = "froozerp_frost_active_tab";
@@ -1217,8 +1225,8 @@ const navigationItems = [
   ["waste", "Waste Management"],
   ["sales", "POS Billing"],
   ["discounts", "Discounts"],
-  ["combos", "Frooz Menu"],
-  ["frooz-pack", "Frooz Pack"],
+  ["combos", "PEP Menu"],
+  ["frooz-pack", "PEP Pack"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["orders", "Orders"],
@@ -1228,9 +1236,6 @@ const navigationItems = [
   ["branches", "Branches & Counters"],
   ["settings", "Settings"],
 ];
-
-// Screens only an Owner or Admin opens, whatever a role's module permissions say: prices are theirs.
-const RATE_MANAGER_VIEWS = Object.freeze(["sale-rates", "combos", "frooz-pack"]);
 
 const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings", "orders"]);
 const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "combos", "frooz-pack", "sale-rates", "expenses", "all-shops"]);
@@ -1856,7 +1861,9 @@ const modulePermissionMap = {
   sales: "billing",
   discounts: "discounts",
   "sale-rates": "discounts",
-  expenses: "reports",
+  // The server checks `expenses` on every expense write (a map without the key falls back to
+  // `reports`, which opened the screen before the keys were split: local/rolePermissions.js).
+  expenses: "expenses",
   orders: "billing",
   reports: "reports",
   settings: "settings",
@@ -2013,9 +2020,9 @@ function BrandLogo({ compact = false, invoice = false, splash = false, identity:
   const identity = identityOverride || storedIdentity;
   const assetBase = import.meta.env.BASE_URL || "/";
   const assetPath = (path) => `${assetBase}${path}`.replace(/([^:]\/)\/+/g, "$1");
-  // The mark is a square crop of the official lockup, which is what fits the badge.
-  // Screen chrome is dark, so it takes the reversed (cream) cut; an invoice prints on
-  // white paper, so it takes the green cut. Both are generated from one vector source
+  // The mark is the "pép" letters and leaf cropped from THE PEP lockup, about twice as wide as
+  // tall, so its box widens (`brand-monogram-wide`). Screen chrome is dark, so it takes the reversed
+  // cut; an invoice prints on white paper, so it takes the light cut. Both are generated from one vector source
   // by tools/build-brand-assets.mjs - do not point this at a hand-made file.
   const alt = identity.title;
   return (
@@ -2034,16 +2041,16 @@ function BrandLogo({ compact = false, invoice = false, splash = false, identity:
         of the accessibility tree, and a name attached to whichever image happened to be hidden
         would disappear in one theme.
       */}
-      <span aria-label={alt} className="brand-monogram" role="img">
+      <span aria-label={alt} className={identity.logo ? "brand-monogram" : "brand-monogram brand-monogram-wide"} role="img">
         {identity.logo ? (
           // The owner's own logo: one picture, drawn as it is on every ground.
           <img alt="" aria-hidden="true" className="brand-custom-logo" src={identity.logo} />
         ) : invoice ? (
-          <img alt="" aria-hidden="true" src={assetPath("branding/frooz-mark.svg")} />
+          <img alt="" aria-hidden="true" src={assetPath("branding/pep-mark.svg")} />
         ) : (
           <>
-            <img alt="" aria-hidden="true" className="brand-art-on-dark" src={assetPath("branding/frooz-mark-reversed.svg")} />
-            <img alt="" aria-hidden="true" className="brand-art-on-light" src={assetPath("branding/frooz-mark.svg")} />
+            <img alt="" aria-hidden="true" className="brand-art-on-dark" src={assetPath("branding/pep-mark-reversed.svg")} />
+            <img alt="" aria-hidden="true" className="brand-art-on-light" src={assetPath("branding/pep-mark-reversed.svg")} />
           </>
         )}
       </span>
@@ -2464,7 +2471,7 @@ function App() {
   // and by nothing else, for the same reason as the shelf above. `missing` until it has been read:
   // a counter that has not been told its combos must not say it has none.
   const [posCombos, setPosCombos] = useState({ status: "missing", combos: [] });
-  // Frooz Pack: the packing this counter knows (counts and costs), from the same snapshot as the
+  // PEP Pack: the packing this counter knows (counts and costs), from the same snapshot as the
   // combos. Desktop only; "missing" until the snapshot has been read.
   const [posPacking, setPosPacking] = useState(() => readPackingCatalogue(null));
   // Which shop this machine is standing in, as the local snapshot reports it.
@@ -2573,6 +2580,10 @@ function App() {
     profitLoss: {},
   });
   const [expenses, setExpenses] = useState([]);
+  // Whether the Expenses and Waste lists loaded: a failed read is shown as one, never as an empty
+  // register and ₹0.00.
+  const [expensesLoad, setExpensesLoad] = useState({ status: "idle", message: "" });
+  const [wasteLoad, setWasteLoad] = useState({ status: "idle", message: "" });
   // Kept as one object rather than three pieces of state so the view can never render a stale
   // payload beside a fresh error, which is how a failed refresh ends up looking like real figures.
   const [allShopsState, setAllShopsState] = useState({ loadState: "idle", loadError: "", payload: null, dateTo: "" });
@@ -2821,6 +2832,12 @@ function App() {
    * store: a fresh object on every render would restart the effects below on every keystroke.
    */
   const [posWork, setPosWork] = useState({ cartLines: 0, saving: false });
+  /*
+   * "Leave POS? The bill in progress will be cleared." Leaving the POS screen throws its cart away
+   * and there is no held bill, so the sidebar, Ctrl K, the Alt keys and Back/Forward ask first
+   * (local/posLeaveGuard.js). Holds where the cashier was going: { view } or { history }.
+   */
+  const [posLeavePrompt, setPosLeavePrompt] = useState(null);
   const [backupBusy, setBackupBusy] = useState(false);
   const handlePosWorkChange = useCallback((next) => {
     setPosWork((current) => (
@@ -4413,7 +4430,7 @@ function App() {
       "Inventory Manager": ["reports", "products", "waste"],
     };
     const candidates = [...(preferredByRole[roleName] || []), ...navigationItems.map(([view]) => view)];
-    return candidates.find((view) => hasModuleAccess(view) && (roleName === "Owner" || roleName === "Admin" || !RATE_MANAGER_VIEWS.includes(view))) || "sales";
+    return candidates.find((view) => hasModuleAccess(view)) || "sales";
   };
 
   useEffect(() => {
@@ -4683,8 +4700,10 @@ function App() {
     setAccountOutstanding(bundle.offlineAccountOutstanding || {});
     if (resolveOutstandingPresentation(bundle.offlineAccountOutstanding).kind === "ready") setAccountOutstandingError("");
     setExpenses(bundle.offlineExpenses || []);
+    if (Array.isArray(bundle.offlineExpenses)) setExpensesLoad({ status: "ready", message: "" });
     setSaleReturns(bundle.offlineSaleReturns || []);
     setWasteEntries(bundle.offlineWasteEntries || []);
+    if (Array.isArray(bundle.offlineWasteEntries)) setWasteLoad({ status: "ready", message: "" });
     applySettingsBundle(bundle);
     setOfflineMode(offline);
     setOfflineReady(Boolean(snapshot?.reference_ready));
@@ -5285,7 +5304,7 @@ function App() {
   const raisedComboRows = useRef(new Map());
 
   /**
-   * Report Center → Inventory's packing panel (Frooz Pack), read-only. The desktop reads its own
+   * Report Center → Inventory's packing panel (PEP Pack), read-only. The desktop reads its own
    * snapshot and touches no network; a browser asks the server, and in Local Only asks nothing.
    */
   const loadPackingStock = useCallback(async () => {
@@ -5302,11 +5321,23 @@ function App() {
     return read.status === "missing" ? { status: "invalid", types: [], message: "Packing stock could not be read: the server did not send a packing list." } : read;
   }, [connectivityMode, deviceInfo.device_id, user?.username]);
 
+  // Only the Owner and Admins can edit a combo, so only they are told to; everyone else sees the
+  // problem on the POS screen, where it stops the sale.
+  const comboBellAllowed = isRateManagerRole(user?.role);
   useEffect(() => {
+    if (!comboBellAllowed) {
+      for (const key of raisedComboRows.current.keys()) clearNotice(key);
+      raisedComboRows.current = new Map();
+      return;
+    }
     if (comboProblems === null) return;
     const rows = comboStockNotifications(comboProblems);
     const raised = raisedComboRows.current;
+    // A reminder dismissed on this computer stays quiet until the combo can be made again
+    // (the same memory as FROST's zero-stock reminders).
+    const dismissed = stockRemindersDismissed();
     for (const row of rows) {
+      if (dismissed.has(row.dedupeKey)) continue;
       // Raised once per wording, like the FROST rows above: a re-check is not a new problem.
       if (raised.get(row.dedupeKey) === row.message) continue;
       notify(row);
@@ -5318,7 +5349,12 @@ function App() {
       clearNotice(key);
       raised.delete(key);
     }
-  }, [comboProblems, notify, clearNotice]);
+    const kept = pruneDismissedStockReminders(dismissed, [...live], isComboStockReminderKey);
+    if (kept.size !== dismissed.size) {
+      dismissedStockReminders.current = kept;
+      writeDismissedStockReminders(deviceStorage(), kept);
+    }
+  }, [comboBellAllowed, comboProblems, notify, clearNotice, stockRemindersDismissed]);
 
   /**
    * Read today's payments: who to collect from and who to pay (`GET /api/ai/payments-due`).
@@ -6984,8 +7020,14 @@ function App() {
   }, [user?.id, reportsConnectivityOnline, connectivityMode, reportsData.offlineUnavailable]);
 
   const loadExpenses = async () => {
-    const response = await axios.get(`${API_URL}/expenses`);
-    setExpenses(response.data);
+    try {
+      const response = await axios.get(`${API_URL}/expenses`);
+      setExpenses(response.data);
+      setExpensesLoad({ status: "ready", message: "" });
+    } catch (error) {
+      setExpensesLoad({ status: "failed", message: getErrorMessage(error, "The expenses could not be loaded.") });
+      throw error;
+    }
   };
 
   /**
@@ -7435,8 +7477,14 @@ function App() {
   };
 
   const loadWasteEntries = async () => {
-    const response = await axios.get(`${API_URL}/waste-entries`);
-    setWasteEntries(response.data);
+    try {
+      const response = await axios.get(`${API_URL}/waste-entries`);
+      setWasteEntries(response.data);
+      setWasteLoad({ status: "ready", message: "" });
+    } catch (error) {
+      setWasteLoad({ status: "failed", message: getErrorMessage(error, "The waste entries could not be loaded.") });
+      throw error;
+    }
   };
 
   const getDashboardParams = (range = dashboardRange, customRange = dashboardCustomRange) => {
@@ -8655,7 +8703,7 @@ function App() {
         alert("Purchase saved locally — pending cloud acknowledgement.");
         return;
       }
-      if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
+      if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
         // Several fruits: every fruit's final rate goes together, so the bill is never half done.
         const completionWrite = createOperationalWrite(
           user,
@@ -9260,7 +9308,14 @@ function App() {
     await loadSaleForEdit(saleId);
   };
 
-  const navigate = async (view) => {
+  const navigate = async (view, { posLeaveConfirmed = false } = {}) => {
+    // A bill on the POS counter is asked about before it is thrown away. The question is answered
+    // in the dialog, which comes back here with `posLeaveConfirmed`.
+    if (!posLeaveConfirmed && shouldConfirmLeavingPos({ activeView, nextView: view, cartLines: posWork.cartLines })) {
+      setCommandPaletteOpen(false);
+      setPosLeavePrompt({ view });
+      return;
+    }
     if (!hasModuleAccess(view)) {
       alert("Your role does not have access to this module.");
       return;
@@ -9588,7 +9643,7 @@ function App() {
     (row) => String(row?.id ?? "") === String(user?.branch_id ?? ""),
   );
   const websiteShopDetails = {
-    name: "Frooz",
+    name: "THE PEP",
     branch: String(websiteShopBranch?.branch_name ?? user?.branch ?? ""),
     phone: String(websiteShopBranch?.phone_number ?? ""),
     address: String(websiteShopBranch?.address ?? websiteShopBranch?.location ?? ""),
@@ -9610,7 +9665,7 @@ function App() {
     offline: offlineMode,
     noCloud: isTauriRuntime() && !CLOUD_CONFIGURED,
   });
-  // Frooz Pack keeps its packing on the server: Local Only, offline or no cloud say so and send nothing.
+  // PEP Pack keeps its packing on the server: Local Only, offline or no cloud say so and send nothing.
   const packUnavailableReason = resolvePackAvailability({
     connectivityMode,
     online: !offlineMode,
@@ -9789,7 +9844,7 @@ function App() {
   const paletteShowsOwnerSections = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
   const commandIndex = commandPaletteOpen
     ? buildCommandIndex(navigationRegistry
-      .filter((item) => hasModuleAccess(item.id) && (canManageRates || !RATE_MANAGER_VIEWS.includes(item.id)))
+      .filter((item) => hasModuleAccess(item.id))
       // A section the screen will not draw for this person or this machine is not offered either:
       // the licence card is the Owner's, and a phone has no screen lock.
       .map((item) => ({
@@ -9887,7 +9942,9 @@ function App() {
   });
 
   // What the sidebar shows this person, computed once so the shortcut list names the same screens.
-  const visibleNavigationItems = navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || !RATE_MANAGER_VIEWS.includes(view)));
+  // Owner/Admin-only screens (Sale Rate Update, PEP Menu, PEP Pack) are refused inside
+  // hasModuleAccess, so the sidebar, Ctrl K, Alt shortcuts and navigate share one rule.
+  const visibleNavigationItems = navigationItems.filter(([view]) => hasModuleAccess(view));
 
   return (
     <main className="erp-shell">
@@ -9895,7 +9952,7 @@ function App() {
         <div className="sidebar-brand">
           {/* Collapsed, the mark stands alone. `compact` is the existing mode built for exactly
               this - it drops the wordmark rather than letting CSS clip it, so the accessible name
-              becomes "Frooz" instead of a full title nobody can see. */}
+              becomes the mark's name instead of a full title nobody can see. */}
           <BrandLogo compact={sidebarCollapsed} />
         </div>
         <span className="sidebar-section">Main Menu</span>
@@ -10017,7 +10074,7 @@ function App() {
                 aria-label="Back"
                 className="chrome-button"
                 disabled={navPosition.index <= 0}
-                onClick={() => window.history.back()}
+                onClick={() => (shouldConfirmLeavingPos({ activeView, cartLines: posWork.cartLines }) ? setPosLeavePrompt({ history: "back" }) : window.history.back())}
                 title="Back"
                 type="button"
               >
@@ -10027,7 +10084,7 @@ function App() {
                 aria-label="Forward"
                 className="chrome-button"
                 disabled={navPosition.index >= navPosition.max}
-                onClick={() => window.history.forward()}
+                onClick={() => (shouldConfirmLeavingPos({ activeView, cartLines: posWork.cartLines }) ? setPosLeavePrompt({ history: "forward" }) : window.history.forward())}
                 title="Forward"
                 type="button"
               >
@@ -10317,8 +10374,10 @@ function App() {
                   </div>
                 </div>
                 <div className="quick-grid">
-                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["accounts", "Accounts"], ["reports", "Stock Inventory"]].map(([view, label]) => (
-                    <button className="quick-action" key={view} onClick={() => navigate(view)}>
+                  {/* Only what this role may open; Stock Inventory lands on Report Center's inventory
+                      reports, as Ctrl K does, not on the Report Center index. */}
+                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["accounts", "Accounts"], ["reports", "Stock Inventory", "reports/inventory"]].filter(([view]) => hasModuleAccess(view)).map(([view, label, section]) => (
+                    <button className="quick-action" key={view} onClick={() => { navigate(view); if (section) setPendingSection(section); }}>
                       <Icon name={icons[view]} />
                       <span>{label}</span>
                     </button>
@@ -10333,12 +10392,15 @@ function App() {
 
           {activeView === "products" && (
             <section className="settings-layout product-master">
+              {/* Adding or switching off a product, categories and sale prices are Owner/Admin on the
+                  server (`requireRateManager`), so nobody else is handed a button that can only fail. */}
               <ModuleCard
-                actions={<button className="primary-button" onClick={startNewProduct} type="button"><Icon name="add" size={16} />Add product</button>}
+                actions={canManageRates ? <button className="primary-button" onClick={startNewProduct} type="button"><Icon name="add" size={16} />Add product</button> : null}
                 eyebrow="Product Master"
                 subtitle="Everything you sell: its price, unit, photo and stock."
                 title="Products"
               >
+                {!canManageRates && <p className="pm-hint">Only the Owner or an Admin can add or switch off products, manage categories or change sale prices.</p>}
                 {productDuplicateWarning && <p className="pm-notice" role="status">{productDuplicateWarning}</p>}
                 <div className="purchase-summary-grid pm-summary">
                   <SummaryMetric featured label="Products" value={productCounts.note} />
@@ -10362,12 +10424,14 @@ function App() {
 
               {productMasterTab === "categories" && (
                 <ModuleCard eyebrow="Categories" title="Product categories" subtitle="Group products for the POS and reports. A category that has products can only be deactivated, never deleted.">
-                  <div className="pm-inline-form">
-                    <Field label="New category">
-                      <input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
-                    </Field>
-                    <button className="primary-button" onClick={saveProductCategory} type="button">Add category</button>
-                  </div>
+                  {canManageRates && (
+                    <div className="pm-inline-form">
+                      <Field label="New category">
+                        <input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
+                      </Field>
+                      <button className="primary-button" onClick={saveProductCategory} type="button">Add category</button>
+                    </div>
+                  )}
                   <DataTable className="pm-table pm-category-table" headers={["Category", <span className="pm-num-head" key="products">Products</span>, "Status", "Actions"]}>
                     {productCategories.map((category) => (
                       <tr key={category.id}>
@@ -10375,10 +10439,12 @@ function App() {
                         <td className="pm-num">{formatOptionalCount(category.item_count)}</td>
                         <td><span className={isActiveRecord(category) ? "stock-ok" : "tag"}>{isActiveRecord(category) ? "Active" : "Inactive"}</span></td>
                         <td>
-                          <div className="pm-row-actions">
-                            <button className="table-action" onClick={() => editProductCategory(category)} type="button">Rename</button>
-                            {isActiveRecord(category) && <button className="danger-text-button" onClick={() => deactivateProductCategory(category)} type="button">Deactivate</button>}
-                          </div>
+                          {canManageRates ? (
+                            <div className="pm-row-actions">
+                              <button className="table-action" onClick={() => editProductCategory(category)} type="button">Rename</button>
+                              {isActiveRecord(category) && <button className="danger-text-button" onClick={() => deactivateProductCategory(category)} type="button">Deactivate</button>}
+                            </div>
+                          ) : MISSING_VALUE}
                         </td>
                       </tr>
                     ))}
@@ -10473,7 +10539,7 @@ function App() {
                               <div className="pm-row-actions">
                                 <button className="table-action" onClick={() => editProduct(product)} type="button">Edit</button>
                                 <button className="table-action" onClick={() => openProductStockLots(product)} type="button">Stock lots</button>
-                                {productActiveNow && <button className="danger-text-button" onClick={() => deactivateProduct(product)} type="button">Deactivate</button>}
+                                {productActiveNow && canManageRates && <button className="danger-text-button" onClick={() => deactivateProduct(product)} type="button">Deactivate</button>}
                               </div>
                             </td>
                           </tr>
@@ -10489,6 +10555,8 @@ function App() {
                     </DataTable>
                   </ModuleCard>
 
+                  {/* A new product is Owner/Admin only; anyone else gets this form for Edit. */}
+                  {(canManageRates || Boolean(editingProductId)) && (
                   <ModuleCard id="product-item-form" eyebrow={editingProductId ? "Edit product" : "New product"} title={editingProductId ? `Edit ${productEditingName}` : "Add product"} subtitle="Used by the POS, purchases, stock and reports.">
                     <div className="pm-form-section">
                       <h3>Basics</h3>
@@ -10505,10 +10573,12 @@ function App() {
                               {activeProductCategories.map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
                             </select>
                           </Field>
-                          <button aria-expanded={showInlineCategoryForm} className="pm-link-button" onClick={() => setShowInlineCategoryForm((current) => !current)} type="button">
-                            {showInlineCategoryForm ? "Close new category" : "+ New category"}
-                          </button>
-                          {showInlineCategoryForm && (
+                          {canManageRates && (
+                            <button aria-expanded={showInlineCategoryForm} className="pm-link-button" onClick={() => setShowInlineCategoryForm((current) => !current)} type="button">
+                              {showInlineCategoryForm ? "Close new category" : "+ New category"}
+                            </button>
+                          )}
+                          {canManageRates && showInlineCategoryForm && (
                             <div className="pm-inline-form pm-inline-form-compact">
                               <Field label="New category name"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
                               <button className="secondary-button" onClick={saveProductCategory} type="button">Save category</button>
@@ -10522,7 +10592,7 @@ function App() {
                           </select>
                         </Field>
                       </div>
-                      <p className="pm-hint">Every product is sold on the Frooz Retail tab. Juices, The Cutting, gift hampers and offers are made from products in Frooz Menu.</p>
+                      <p className="pm-hint">Every product is sold on the PEP Market tab. Juices, The Cutting, gift hampers and offers are made from products in PEP Menu.</p>
                       <div className="product-photo-field">
                         <span className="product-photo-label">Photo</span>
                         <div className="product-photo-row">
@@ -10565,8 +10635,9 @@ function App() {
                     <div className="pm-form-section">
                       <h3>Price</h3>
                       <div className="form-grid supplier-form-grid">
-                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
+                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input readOnly={!canManageRates} type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => { if (canManageRates) setSellingRate(event.target.value); }} /></Field>
                       </div>
+                      {!canManageRates && <p className="pm-hint">Only the Owner or an Admin changes sale prices (Sale Rate Update).</p>}
                     </div>
 
                     <div className="pm-form-section">
@@ -10628,6 +10699,7 @@ function App() {
                       <span className="pm-required-legend"><span aria-hidden="true" className="pm-required">*</span> Required</span>
                     </div>
                   </ModuleCard>
+                  )}
 
                   {lotPanelProduct && (
                     <ModuleCard id="product-lots-card" eyebrow="Stock lots" title={`Stock lots — ${lotPanelProduct.product_name}`} subtitle="Each delivery or opening count is its own lot. A lot's quantity cannot go below what has already been sold or used.">
@@ -10828,7 +10900,7 @@ function App() {
               <ModuleCard eyebrow="Procurement" title={editingPurchaseId ? `Add / Edit Purchase #${editingPurchaseId}` : "Purchase Entry"} subtitle={editingPurchaseId ? "Amend one historical purchase item with inventory protection." : "Select supplier once, add multiple fruit items, then save one purchase workflow."}>
                 <div className="form-grid supplier-form-grid">
                   <Field label="Entry Type">
-                    <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(completionLines) || Boolean(editingPurchaseId && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
+                    <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(completionLines) || Boolean(editingPurchaseId && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
                       <option value="BILL_COMPLETED">Completed Bill</option>
                       <option value="BILL_PENDING">Stock Arrival / Pending Bill</option>
                     </select>
@@ -11050,6 +11122,7 @@ function App() {
             <WasteManagementModule
               entries={wasteEntries}
               inventory={inventory}
+              loadState={wasteLoad}
               onReload={async () => {
                 await Promise.all([loadWasteEntries(), loadDashboardData()]);
               }}
@@ -11066,7 +11139,7 @@ function App() {
               // Combos are sold from the counter app only (v1); the browser POS shows no combo tabs.
               combos={isTauriRuntime() ? posCombos : null}
               comboProblems={comboProblems}
-              // Frooz Pack: the counter's packing counts, from the snapshot; none in the browser.
+              // PEP Pack: the counter's packing counts, from the snapshot; none in the browser.
               packing={isTauriRuntime() ? posPacking : null}
               onPackingShortages={(rows) => rows.forEach((row) => notify(row))}
               customers={customers.filter((customer) => customer.active !== false)}
@@ -11079,7 +11152,13 @@ function App() {
               onDiscountsStale={reloadPosDiscounts}
               inventory={posShelf.loaded ? posShelf.inventoryLots : inventory}
               counterScope={counterScope}
-              onInvoice={setSelectedInvoice}
+              // A saved bill opens on screen; `print` prints it through the invoice's own print path
+              // (its PDF name, page profile and drawn QR), in the print mode the invoice would pick.
+              onInvoice={(invoice, options = {}) => {
+                setSelectedInvoice(invoice);
+                setSelectedInvoicePrintMode(options.print ? "DEFAULT" : null);
+              }}
+              shortcutsPaused={Boolean(selectedInvoice) || commandPaletteOpen || Boolean(posLeavePrompt) || Boolean(editingSale) || Boolean(cancelDraft)}
               onSaved={async (result) => {
                 // Link the bill back to the order that produced it. Done before anything else can
                 // fail: the storage layer treats a written sale_id as the thing that makes an order
@@ -11405,6 +11484,7 @@ function App() {
             <ExpensesModule
               canCancel={canCancelSales}
               expenses={expenses}
+              loadState={expensesLoad}
               onReload={loadExpenses}
               user={user}
             />
@@ -11681,6 +11761,18 @@ function App() {
         />
       )}
       {profileOpen && <UserProfilePanel onClose={() => setProfileOpen(false)} onLogout={() => setUser(null)} user={user} />}
+      {posLeavePrompt && (
+        <PosLeaveDialog
+          onLeave={() => {
+            const target = posLeavePrompt;
+            setPosLeavePrompt(null);
+            if (target.history === "back") window.history.back();
+            else if (target.history === "forward") window.history.forward();
+            else navigateRef.current?.(target.view, { posLeaveConfirmed: true });
+          }}
+          onStay={() => setPosLeavePrompt(null)}
+        />
+      )}
     </main>
   );
 }
@@ -13595,7 +13687,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
 // to anyone else. Hiding the section from non-Owners is a courtesy, not the check.
 // ---------------------------------------------------------------------------
 
-function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onReload, user }) {
+function DeviceActivationIssuingSection({ assignments = [], canIssue, devices, devicesError, onReload, user }) {
   const [licences, setLicences] = useState(null);
   const [licencesError, setLicencesError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -13833,7 +13925,11 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
                   )}
                   <small className="cell-note">{row.deviceId || "No device ID"}</small>
                 </td>
-                <td>{row.branchName || "Main Branch"}<small className="cell-note">{row.counterName || "No counter assigned"}</small></td>
+                {/* The live assignment (Step 4) first, so both steps name the same counter. */}
+                {(() => {
+                  const where = deviceBranchAndCounter(row, assignments);
+                  return <td>{where.branch}<small className="cell-note">{where.counter}</small></td>;
+                })()}
                 <td>
                   <span className={stateClass(row.state)}>{row.label}</span>
                   <small className="cell-note">{row.detail}</small>
@@ -14897,6 +14993,10 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   );
 }
 
+// True while PrintableReport is printing or exporting, so a report showing one page of its rows on
+// screen hands the file all of them (Stock Inventory's Lot View).
+const ReportExportContext = React.createContext(false);
+
 function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false, children, fileName, reportClassName = "", title, user, whatsappRecipients = [] }) {
   const [printTarget, setPrintTarget] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -15000,7 +15100,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
             <span>{new Date().toLocaleString("en-IN")}</span>
           </div>
         </header>
-        {children}
+        <ReportExportContext.Provider value={printTarget}>{children}</ReportExportContext.Provider>
       </div>
       {pdfPreview && (
         <PdfPreviewModal
@@ -15387,7 +15487,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
  * comes from local/discounts.js, which POS and the server share.
  */
 // ---------------------------------------------------------------------------------------------
-// Frooz Pack: packing (baskets, gift boxes, bottles, bowls) as stock. Every rule lives in
+// PEP Pack: packing (baskets, gift boxes, bottles, bowls) as stock. Every rule lives in
 // local/froozPack.js; these components only show it and send what it builds.
 // ---------------------------------------------------------------------------------------------
 
@@ -15437,17 +15537,18 @@ const handlePackDrillKeys = (event, { rows, active, setHighlight, goIn, goBack, 
 };
 
 /** The ← button and the breadcrumb, at the top of every drill-down. */
-function PackDrillHeader({ crumbs = [], level, onBack, onCrumb, title }) {
+function PackDrillHeader({ crumbs = [], disabled = false, level, onBack, onCrumb, title }) {
   return (
     <div className="packing-drill-head">
-      <button aria-label="Back one level" className="secondary-button compact-button" disabled={level === "types"} type="button" onClick={onBack}>← Back</button>
+      {/* Not drawn at the top level, where there is nothing to go back to. */}
+      {level !== "types" && <button aria-label="Back one level" className="secondary-button compact-button" disabled={disabled} type="button" onClick={onBack}>← Back</button>}
       <nav aria-label="Where you are" className="packing-crumbs">
         {crumbs.map((crumb, index) => (
           <React.Fragment key={`${crumb.level}-${crumb.id || "root"}`}>
             {index > 0 && <span aria-hidden="true" className="packing-crumb-sep">›</span>}
             {index === crumbs.length - 1
               ? <strong>{crumb.label}</strong>
-              : <button className="table-link-button" type="button" onClick={() => onCrumb(crumb)}>{crumb.label}</button>}
+              : <button className="table-link-button" disabled={disabled} type="button" onClick={() => onCrumb(crumb)}>{crumb.label}</button>}
           </React.Fragment>
         ))}
       </nav>
@@ -15457,11 +15558,11 @@ function PackDrillHeader({ crumbs = [], level, onBack, onCrumb, title }) {
 }
 
 /**
- * Frooz Pack's picker: Type → Design → Size, one level at a time, the way the owner thinks of it
+ * PEP Pack's picker: Type → Design → Size, one level at a time, the way the owner thinks of it
  * ("Gift Box › Window Box › Grand · 1 kg"). Only what is switched on and has a size is shown.
  * `onPick(sizeRow, quantity)`; with `quantity`, a "How many" box rides along. With `onCreate`, a
  * "+ New packing" button opens the New-packing form (the purchase table uses it). Used by the Frooz
- * Pack purchase form, the combo form in Frooz Menu and POS. Each size row says its count and last
+ * Pack purchase form, the combo form in PEP Menu and POS. Each size row says its count and last
  * rate (local/froozPack.js `packingLeafSublabel`).
  */
 function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = false, title = "" }) {
@@ -15531,7 +15632,7 @@ function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = f
       ) : rows.length === 0 ? (
         <p className="form-note">{packingEmptyPickerMessage(catalogue)}</p>
       ) : view.level === "types" && packingTypesWithoutSize(catalogue).length > 0 ? (
-        <p className="form-note">{`Not shown until it has a size: ${packingTypesWithoutSize(catalogue).join(", ")}. Give it a design and sizes with New packing in Frooz Pack.`}</p>
+        <p className="form-note">{`Not shown until it has a size: ${packingTypesWithoutSize(catalogue).join(", ")}. Give it a design and sizes with New packing in PEP Pack.`}</p>
       ) : null}
       {status === "ready" && rows.length > 0 && (
         <ul
@@ -15585,6 +15686,7 @@ function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChan
   return (
     <div className="discount-block combo-form packing-setup">
       <h3>{title}</h3>
+      {setup.note && <p className="warning-note" role="status">{setup.note}</p>}
       <div className="discount-form">
         <Field label="Type">
           <select disabled={disabled} value={draft.type_id} onChange={(event) => onChange({ type_id: event.target.value, design_id: "", design_name: "" })}>
@@ -15634,7 +15736,7 @@ function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChan
 }
 
 /**
- * Frooz Pack: the Owner's or an Admin's packing, kept on the server (`/api/v3/packing`). The tree
+ * PEP Pack: the Owner's or an Admin's packing, kept on the server (`/api/v3/packing`). The tree
  * (Type → Design → Size, each editable), each size's count at this branch and its unit cost, the
  * purchase form (which also books the expense under Packing Material) and count corrections.
  * Local Only, offline and no cloud each say so and send nothing.
@@ -15716,7 +15818,8 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const firstLoad = (load.status === "idle" || load.status === "loading") && catalogue.status !== "ready";
   const disabled = !canManage || Boolean(unavailableReason) || failed;
   // An open purchase does not block building the list: a size can be added mid-purchase and is
-  // pickable as soon as the list reloads. Only one edit, New-packing or count form at a time.
+  // pickable as soon as the list reloads. Only one edit, New-packing or count form at a time, and
+  // while one is open the list stays where it is: no going in, back or along the breadcrumb.
   const busy = Boolean(nodeForm || adjust || setup || removal);
   const view = packingManageView(catalogue, drill);
   const rows = view.rows;
@@ -15724,11 +15827,12 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const levelKind = PACK_LEVEL_KIND[view.level] || "type";
 
   const goIn = (row) => {
-    if (!row || row.leaf) return;
+    if (!row || row.leaf || busy) return;
     setDrill((current) => enterPackingDrill(current, row.id));
     setHighlight(0);
   };
   const goBack = () => {
+    if (busy) return;
     setDrill((current) => backPackingDrill(current));
     setHighlight(0);
   };
@@ -15743,18 +15847,10 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
 
   // --- Type, design and size forms ---------------------------------------------------------
 
+  // The parent (and the heading's path) is fixed when the form opens: local/froozPack.js.
   const startNode = (kind, node = null) => {
     setNotice(null);
-    const common = { sort_order: node ? String(node.sort_order ?? 0) : "0", active: node ? node.active !== false : true };
-    const draft = kind === "size"
-      ? {
-        ...common,
-        size_name: node?.size_name || "CLASSIC",
-        capacity: node?.capacity || "",
-        unit_cost: node && Number.isFinite(node.unit_cost) && node.unit_cost > 0 ? String(node.unit_cost) : "",
-      }
-      : { ...common, name: node?.name || "" };
-    setNodeForm({ kind, ref: node ? packNodeRef(node) : "", draft, inUse: node?.in_use === true, error: "", saving: false });
+    setNodeForm(startPackingNodeForm(kind, node, view));
   };
 
   const updateNode = (field, value) => setNodeForm((current) => (current
@@ -15763,10 +15859,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
 
   const saveNode = async () => {
     if (!nodeForm || nodeForm.saving || disabled) return;
-    const parent = nodeForm.kind === "design"
-      ? { type_id: packNodeRef(view.type) }
-      : nodeForm.kind === "size" ? { design_id: packNodeRef(view.design) } : {};
-    const check = validatePackingNode(nodeForm.kind, { ...nodeForm.draft, ...parent });
+    const check = checkPackingNodeForm(nodeForm);
     if (!check.ok) {
       setNodeForm((current) => (current ? { ...current, error: check.message } : current));
       return;
@@ -15813,10 +15906,10 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   /** From the module, start where the owner is (inside a type or design); from a purchase line, blank. */
   const startSetup = (forLine = null) => {
     setNotice(null);
-    const draft = forLine
-      ? createPackingSetupDraft()
-      : createPackingSetupDraft({ typeId: view.type?.id || "", designId: view.design?.id || "" });
-    setSetup({ draft, error: "", saving: false, forLine });
+    const start = forLine
+      ? { draft: createPackingSetupDraft(), note: "" }
+      : packingSetupStart(catalogue, { typeId: view.type?.id || "", designId: view.design?.id || "" });
+    setSetup({ draft: start.draft, note: start.note, error: "", saving: false, forLine });
   };
 
   const updateSetup = (patch) => setSetup((current) => (current
@@ -15923,7 +16016,9 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const startPurchase = () => {
     setNotice(null);
     setPurchase({
-      draft: { supplier_name: "", purchase_date: toDateKey(new Date()), payment_mode: "CASH", reference_number: "", remarks: "", lines: [newPurchaseLine()] },
+      // client_ref: one per form, sent again on every retry of it, so a save whose answer was lost
+      // is not booked twice. A saved purchase closes the form; the next one gets a new key.
+      draft: { supplier_name: "", purchase_date: toDateKey(new Date()), payment_mode: "CASH", reference_number: "", remarks: "", lines: [newPurchaseLine()], client_ref: newPackingPurchaseClientRef() },
       pickingLine: null,
       error: "",
       saving: false,
@@ -15960,7 +16055,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     try {
       response = await axios.post(`${API_URL}/api/v3/packing/purchases`, check.payload);
     } catch (error) {
-      setPurchase((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "The purchase could not be saved. Nothing was changed.") } : current));
+      setPurchase((current) => (current ? { ...current, saving: false, error: getErrorMessage(error, "The save could not be confirmed. Press Save again: this purchase will not be saved twice.") } : current));
       return;
     }
     const sent = response?.data?.purchase?.amount;
@@ -15973,7 +16068,9 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
 
   const startAdjust = (row) => {
     setNotice(null);
-    setAdjust({ row, draft: { quantity: "", reason: "" }, error: "", saving: false });
+    // The heading's path is fixed now, like a node form's parent.
+    const path = packingPathLabel({ type_name: view.type?.name, design_name: view.design?.name, size_name: row.node?.size_name, capacity: row.node?.capacity });
+    setAdjust({ row, path, draft: { quantity: "", reason: "" }, error: "", saving: false });
   };
 
   const saveAdjust = async () => {
@@ -16007,7 +16104,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     <section className="settings-layout">
       <ModuleCard
         eyebrow="Stock"
-        title="Frooz Pack"
+        title="PEP Pack"
         subtitle="The baskets, gift boxes, bottles and bowls combos go out in. Each size is counted here; buying it books the expense under Packing Material, and selling a combo takes it off. Running out is only a warning: bills always go through."
         actions={canManage && !unavailableReason && !failed
           ? (
@@ -16058,7 +16155,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
 
             {nodeForm && !failed && (
               <div className="discount-block combo-form">
-                <h3>{nodeForm.ref ? `Edit ${PACK_NODE_WORDS[nodeForm.kind]}` : `New ${PACK_NODE_WORDS[nodeForm.kind]}`}{nodeForm.kind !== "type" && view.crumbs.length > 1 ? ` in ${view.crumbs.slice(1).map((crumb) => crumb.label).join(" › ")}` : ""}</h3>
+                <h3>{nodeForm.ref ? `Edit ${PACK_NODE_WORDS[nodeForm.kind]}` : `New ${PACK_NODE_WORDS[nodeForm.kind]}`}{nodeForm.where ? ` in ${nodeForm.where}` : ""}</h3>
                 <div className="discount-form">
                   {nodeForm.kind === "size" ? (
                     <>
@@ -16209,7 +16306,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
 
             {adjust && !failed && (
               <div className="discount-block combo-form">
-                <h3>{`Correct the count: ${packingPathLabel({ type_name: view.type?.name, design_name: view.design?.name, size_name: adjust.row.node?.size_name, capacity: adjust.row.node?.capacity })}`}</h3>
+                <h3>{`Correct the count: ${adjust.path}`}</h3>
                 <div className="discount-form">
                   <p className="form-note">{`Now ${packCountText(adjust.row)}. Enter how many to add, or with a minus how many to take off (for example -3 for torn boxes).`}</p>
                   <Field label="Change">
@@ -16231,9 +16328,10 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
               <div className="discount-block packing-browser">
                 <PackDrillHeader
                   crumbs={view.crumbs}
+                  disabled={busy}
                   level={view.level}
                   onBack={goBack}
-                  onCrumb={(crumb) => { setDrill(packCrumbState(crumb)); setHighlight(0); }}
+                  onCrumb={(crumb) => { if (busy) return; setDrill(packCrumbState(crumb)); setHighlight(0); }}
                 />
                 {firstLoad ? (
                   <p className="form-note" role="status">Loading packing…</p>
@@ -16250,7 +16348,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                   >
                     {rows.map((row, index) => (
                       <li aria-selected={index === active} className={`packing-row${index === active ? " packing-row-active" : ""}${row.active ? "" : " discount-row-past"}`} key={row.id} role="option">
-                        <button disabled={row.leaf} tabIndex={-1} type="button" onClick={() => { setHighlight(index); goIn(row); }}>
+                        <button disabled={row.leaf || busy} tabIndex={-1} type="button" onClick={() => { setHighlight(index); goIn(row); }}>
                           <span className="packing-row-label">
                             <strong>{row.label}</strong>
                             <small>{row.sublabel}{row.active ? "" : " · switched off"}</small>
@@ -16303,7 +16401,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                           <td className="primary-cell" data-label="Packing">{packingPathLabel(row) || MISSING_VALUE}</td>
                           <td data-label="What">{PACKING_MOVEMENT_LABELS[String(row.movement_type || "").toUpperCase()] || row.movement_type || MISSING_VALUE}</td>
                           <td className={Number.isFinite(quantity) && quantity < 0 ? "stock-low" : "stock-ok"} data-label="Qty">{Number.isFinite(quantity) ? `${quantity > 0 ? "+" : ""}${formatPackCount(quantity)}` : MISSING_VALUE}</td>
-                          <td data-label="Note">{row.reason || (row.sale_id ? `Bill ${row.sale_id}` : row.purchase_id ? `Purchase ${row.purchase_id}` : "")}</td>
+                          <td data-label="Note">{row.reason || (row.sale_id ? `Bill ${row.invoice_no || row.sale_id}` : row.purchase_id ? `Purchase ${row.purchase_id}` : "")}</td>
                         </tr>
                       );
                     })}
@@ -16365,7 +16463,7 @@ function PackingStockPanel({ loadPacking }) {
       ) : state.status === "unavailable" ? (
         <p className="warning-note" role="status">{state.message}</p>
       ) : state.status !== "ready" ? (
-        <p className="form-note">No packing on this computer yet. If packing is set up in Frooz Pack, press Sync now.</p>
+        <p className="form-note">No packing on this computer yet. If packing is set up in PEP Pack, press Sync now.</p>
       ) : rows.length === 0 ? (
         <p className="form-note">No packing set up yet.</p>
       ) : (
@@ -16386,7 +16484,7 @@ function PackingStockPanel({ loadPacking }) {
 }
 
 /**
- * Frooz Menu (the Combos & Offers module): the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
+ * PEP Menu (the Combos & Offers module): the owner's list of combos (Juice, The Cutting, Gifting, Combo / Offer), each
  * either a fixed set of items at one price or the customer's choice priced from the items' rates.
  * Kept on the server (`/api/v3/combos`); a desktop's POS gets them through its SQLite snapshot.
  */
@@ -16395,7 +16493,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
   const [combos, setCombos] = useState([]);
   const [products, setProducts] = useState([]);
   const [costs, setCosts] = useState({ status: "idle", rows: [] });
-  // Frooz Pack's list, for the packing a fixed combo goes out in. Without it the combo still saves.
+  // PEP Pack's list, for the packing a fixed combo goes out in. Without it the combo still saves.
   const [packing, setPacking] = useState({ status: "idle", catalogue: null, message: "" });
   const [packPicking, setPackPicking] = useState(false);
   const [draft, setDraft] = useState(null);
@@ -16629,8 +16727,8 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     <section className="settings-layout">
       <ModuleCard
         eyebrow="Pricing"
-        title="Frooz Menu"
-        subtitle="Juices, The Cutting, gift hampers and combo offers, made from your fruits and sold at one price. Each shows on its own POS tab: Frooz Bar, Frooz Moments or Combos & Offers."
+        title="PEP Menu"
+        subtitle="Juices, The Cutting, gift hampers and combo offers, made from your fruits and sold at one price. Each shows on its own POS tab: Bar by PEP, PEP Presents or PEP Drops."
         actions={canManage && !unavailableReason && !failed && !draft && !removal
           ? <button className="primary-button" disabled={firstLoad} type="button" onClick={startNew}><Icon name="add" size={16} />Add combo</button>
           : null}
@@ -16704,7 +16802,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                         <p className="form-note">Only fruits with stock are listed. A fruit with no stock appears here again once it arrives.</p>
                       </fieldset>
                       <fieldset className="combo-items combo-packing" disabled={disabled}>
-                        <legend>Packing (Frooz Pack)</legend>
+                        <legend>Packing (PEP Pack)</legend>
                         {!Array.isArray(draft.packing) && (
                           <p className="form-note">This combo's packing was not sent with it, so saving leaves its packing as it is. Adding packing here replaces it.</p>
                         )}
@@ -16713,7 +16811,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                           <div className="combo-item-row" key={`packing-${entry.packing_size_id || index}`}>
                             <span className="packing-path">
                               {packingPathLabel(entry) || entry.packing_size_id || MISSING_VALUE}
-                              {entry.size_active === false && <small className="cell-note inline-error">Switched off in Frooz Pack.</small>}
+                              {entry.size_active === false && <small className="cell-note inline-error">Switched off in PEP Pack.</small>}
                             </span>
                             <input aria-label={`Packing ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={entry.quantity} onChange={(event) => updatePackingRow(index, event.target.value)} />
                             <button aria-label={`Remove packing ${index + 1}`} className="remove-button" type="button" onClick={() => removePackingRow(index)}><Icon name="trash" size={16} /></button>
@@ -16753,7 +16851,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                         <p className="form-note">
                           {packingCost.known
                             ? `Cost today includes ${currency.format(packingCost.cost)} of packing.`
-                            : "No suggestion: a packing size has no cost yet. Its first purchase in Frooz Pack sets it, or set it there by hand."}
+                            : "No suggestion: a packing size has no cost yet. Its first purchase in PEP Pack sets it, or set it there by hand."}
                         </p>
                       )}
                       {costs.status === "ready" && suggestion?.cost === null && packingCost?.known !== false && draft.items.some((item) => String(item.product_id || "") !== "") && (
@@ -16763,7 +16861,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                   ) : (
                     <>
                       <p className="form-note">The margin is added on top of the items' sale rates. Empty means 0%.</p>
-                      <p className="form-note">Packing for a customer's-choice combo is picked by the cashier at billing, from Frooz Pack.</p>
+                      <p className="form-note">Packing for a customer's-choice combo is picked by the cashier at billing, from PEP Pack.</p>
                       <Field label="Extra charge per combo (₹)">
                         <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.extra_charge} onChange={(event) => updateDraft("extra_charge", event.target.value)} />
                       </Field>
@@ -16888,7 +16986,7 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
     .map((combo) => ({
       combo,
       key: combo.global_id || combo.id,
-      // Its packing (Frooz Pack) is part of its cost; each row carries its own unit cost.
+      // Its packing (PEP Pack) is part of its cost; each row carries its own unit cost.
       ...suggestComboPrice({ items: combo.items, rates, products, marginPercent: combo.margin_percent, targetMargin, roundingRule, packing: combo.packing }),
     }));
   const changes = rows
@@ -16931,7 +17029,7 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
       {load.status !== "failed" && (
         <DataTable className="pm-table combo-table" headers={["Combo", "Margin", "Cost today", "Suggested", "Current price", "New price"]}>
           {load.status !== "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>Loading combos…</td></tr>}
-          {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in Frooz Menu.</td></tr>}
+          {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in PEP Menu.</td></tr>}
           {rows.map((row) => (
             <tr key={row.key}>
               <td className="primary-cell">{row.combo.name}<small className="cell-note">{COMBO_KIND_LABELS[row.combo.kind] || row.combo.kind}</small></td>
@@ -17642,7 +17740,18 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const ledgerNarration = (row) => ledgerPrintNarration || ledgerPrintNarrationRef.current ? row.narration || row.remarks || "-" : row.remarks || row.narration || "-";
   const customerLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "CUSTOMER")));
-  const supplierLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "SUPPLIER")), "PAYABLE");
+  // The Supplier Ledger runs on from the balance brought forward to the range's first day (UI-10);
+  // when that could not be read its balances are unknown, not counted from 0.
+  const supplierOpening = supplierLedgerOpening(data.ledgerOpeningBalances, { ...accountReportFilters, search: appliedSearch });
+  const supplierLedgerRows = ledgerWithRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "SUPPLIER")), {
+    mode: "PAYABLE",
+    opening: supplierOpening.rows,
+    openingUnavailable: supplierOpening.status === "unavailable",
+    dateKey: toDateKey,
+  });
+  const supplierOpeningTile = supplierOpening.status === "ready"
+    ? `${money(Math.abs(supplierOpening.total))} ${supplierOpening.total >= 0 ? "Cr" : "Dr"}`
+    : supplierOpening.status === "unavailable" ? "Could not be read" : "Not applied: filtered";
   const accountStatementRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows));
   const dayBookRows = clubRowsByDateAccount(filteredLedgerRows);
   const cashBookData = data.cashBookReport || {};
@@ -18427,7 +18536,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.discountReport),
       // `discount_amount` is item discounts plus each line's share of the bill discount, so the
       // total counts bill-total (slab) discounts too; they used to be left out of it.
-      summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Bill Discounts", money(totalOf(rows, "bill_discount_share"))], ["Gross Amount", money(totalOf(rows, "gross_amount"))], ["Net Amount", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
+      summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Bill Discounts", money(totalOf(rows, "bill_discount_share"))], ["Gross of Discounted Lines", money(totalOf(rows, "gross_amount"))], ["Net of Discounted Lines", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
       headers: ["Date", "Product", "Lot", "Discount Type", "Discount Value", "Qty Sold", "Gross Amount", "Item Discount", "Bill Discount Share", "Discount Amount", "Net Amount", "Profit Impact"],
       render: (row, index) => {
         // A field the server did not send is unknown, not ₹0.
@@ -18523,9 +18632,12 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     supplierLedger: {
       title: "Supplier Ledger",
       rows: supplierLedgerRows,
-      summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
+      summary: (rows) => {
+        const periodRows = rows.filter((row) => !row.is_opening);
+        return [["Opening b/f", supplierOpeningTile], ["Debits", money(totalOf(periodRows, "debit")), true], ["Credits", money(totalOf(periodRows, "credit"))], ["Rows", periodRows.length]];
+      },
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{row.running_balance === null ? MISSING_VALUE : `${money(Math.abs(Number(row.running_balance || 0)))} ${Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}`}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
@@ -18674,12 +18786,15 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: [
         { section: "Income", particular: "Sales Revenue", amount: Number(data.profitLoss?.salesRevenue || 0), emphasis: true },
         { section: "Income", particular: "Other Income", amount: 0 },
-        { section: "Cost of Goods Sold", particular: "Purchase Cost", amount: -Number(data.profitLoss?.purchaseCost || 0) },
-        { section: "Cost of Goods Sold", particular: "Mandi Tax", amount: -Number(data.profitLoss?.mandiTax || 0) },
-        { section: "Cost of Goods Sold", particular: "Freight", amount: -Number(data.profitLoss?.freightCharges || 0) },
-        { section: "Cost of Goods Sold", particular: "Labour", amount: -Number(data.profitLoss?.labourCharges || 0) },
-        { section: "Cost of Goods Sold", particular: "Other Purchase Charges", amount: -Number(data.profitLoss?.otherPurchaseCharges || 0) },
-        { section: "Cost of Goods Sold", particular: "Less Supplier Rebate Received", amount: Number(data.profitLoss?.supplierRebateReceived || 0) },
+        ...(() => {
+          // Charges inside the landed cost are listed for information, not as cost rows (UI-1).
+          const costOfGoods = profitLossCostOfGoods(data.profitLoss);
+          return [
+            ...costOfGoods.costLines.map((line) => ({ section: "Cost of Goods Sold", particular: line.label, amount: -line.value })),
+            { section: "Cost of Goods Sold", particular: "Total COGS", amount: -costOfGoods.cogs, emphasis: true },
+            ...costOfGoods.includedLines.map((line) => ({ section: INCLUDED_IN_COST_HEADING, particular: line.label, amount: -line.value, info: true })),
+          ];
+        })(),
         { section: "Result", particular: "Gross Profit", amount: Number(data.profitLoss?.grossProfit || 0), emphasis: true },
         ...(Array.isArray(data.profitLoss?.expenseCategories) ? data.profitLoss.expenseCategories : []).map((row) => ({ section: "Expenses", particular: row.category, amount: -Number(row.amount || 0) })),
         { section: "Result", particular: Number(data.profitLoss?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", amount: Number(data.profitLoss?.netProfit || 0), emphasis: true },
@@ -18691,7 +18806,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         [Number(data.profitLoss?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", money(Math.abs(Number(data.profitLoss?.netProfit || 0)))],
       ],
       headers: ["Section", "Particulars", "Amount"],
-      render: (row, index) => <tr className={row.emphasis ? "date-total-row" : ""} key={`${row.section}-${row.particular}-${index}`}><td>{row.section}</td><td className="primary-cell">{row.particular}</td><td className={row.amount < 0 ? "stock-low" : "profit-cell"}>{money(Math.abs(row.amount))}{row.amount < 0 ? " Dr" : ""}</td></tr>,
+      render: (row, index) => <tr className={row.emphasis ? "date-total-row" : ""} key={`${row.section}-${row.particular}-${index}`}><td>{row.section}</td><td className="primary-cell">{row.particular}</td>{row.info ? <td>{row.amount > 0 ? `(${money(row.amount)})` : money(Math.abs(row.amount))}</td> : <td className={row.amount < 0 ? "stock-low" : "profit-cell"}>{money(Math.abs(row.amount))}{row.amount < 0 ? " Dr" : ""}</td>}</tr>,
     },
     balanceSheet: {
       title: "Balance Sheet",
@@ -18755,7 +18870,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     const amountClass = numericValue < 0 ? "pl-negative" : options.positive ? "pl-positive" : "";
     const formattedAmount = numericValue < 0 ? `(${money(Math.abs(numericValue))})` : money(numericValue);
     return (
-      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""}`} key={label} data-report-line="">
+      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""} ${options.info ? "pl-line-info" : ""}`} key={label} data-report-line="">
         <span>{label}</span>
         <strong className={amountClass}>{formattedAmount}</strong>
       </div>
@@ -18773,7 +18888,9 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     const labourCharges = amount("labourCharges");
     const otherPurchaseCharges = amount("otherPurchaseCharges");
     const supplierRebateReceived = amount("supplierRebateReceived");
-    const cogs = Number(pl.costOfGoodsSold ?? (purchaseCost + mandiTax + freightCharges + labourCharges + otherPurchaseCharges - supplierRebateReceived));
+    // Landed purchase cost already holds the charges; they are listed apart when the server says so (UI-1).
+    const costOfGoods = profitLossCostOfGoods(pl);
+    const cogs = costOfGoods.cogs;
     const grossProfit = Number(pl.grossProfit ?? (totalIncome - cogs));
     const totalExpenses = amount("expenses");
     const netProfit = Number(pl.netProfit ?? (grossProfit - totalExpenses));
@@ -18823,13 +18940,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         </section>
         <section className="pl-section">
           <h3>LESS: COST OF GOODS SOLD</h3>
-          {profitLossLine("Purchase Cost", purchaseCost, { indent: true })}
-          {profitLossLine("Mandi Tax", mandiTax, { indent: true })}
-          {profitLossLine("Freight", freightCharges, { indent: true })}
-          {profitLossLine("Labour", labourCharges, { indent: true })}
-          {profitLossLine("Other Purchase Charges", otherPurchaseCharges, { indent: true })}
-          {profitLossLine("Less Supplier Rebate Received", -supplierRebateReceived, { indent: true })}
+          {costOfGoods.costLines.map((line) => profitLossLine(line.label, line.value, { indent: true }))}
           {profitLossLine("TOTAL COGS", cogs, { total: true })}
+          {costOfGoods.includedLines.length > 0 && (
+            <div className="pl-included" data-report-note="">
+              <small className="pl-included-heading">{INCLUDED_IN_COST_HEADING}: this period's bills, already inside Purchase Cost for the goods sold, not added again.</small>
+              {costOfGoods.includedLines.map((line) => profitLossLine(line.label, line.value, { indent: true, info: true }))}
+            </div>
+          )}
         </section>
         <section className="pl-section pl-result-section">
           {profitLossLine("GROSS PROFIT", grossProfit, { highlight: true, positive: grossProfit >= 0 })}
@@ -18852,19 +18970,36 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     </div>
   ) : (
     <div className={selectedReport === "purchaseHistory" ? "ledger-toolbar purchase-history-toolbar" : "ledger-toolbar"}>
-      <Field label="Report Range">
-        <select value={range} onChange={(event) => setRange(event.target.value)}>
-          <option value="today">Today</option>
-          <option value="yesterday">Yesterday</option>
-          <option value="week">This Week</option>
-          <option value="month">This Month</option>
-          <option value="custom">Custom Date Range</option>
-        </select>
-      </Field>
-      {range === "custom" && (
+      {selectedReport === "balanceSheet" ? (
+        // The balance sheet is as at one day, so it asks for that day only, and the input always
+        // shows the day in force (a preset range's last day) rather than looking empty (UI-9).
+        <Field label="As at date">
+          <input
+            type="date"
+            value={balanceSheetAsAtInput({ range, customRange, resolve: resolveReportDateRange })}
+            onChange={(event) => {
+              setRange("custom");
+              setCustomRange({ ...customRange, date_from: event.target.value, date_to: event.target.value });
+            }}
+          />
+        </Field>
+      ) : (
         <>
-          <Field label="Date From"><input type="date" value={customRange.date_from} onChange={(event) => setCustomRange({ ...customRange, date_from: event.target.value })} /></Field>
-          <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
+          <Field label="Report Range">
+            <select value={range} onChange={(event) => setRange(event.target.value)}>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="week">This Week</option>
+              <option value="month">This Month</option>
+              <option value="custom">Custom Date Range</option>
+            </select>
+          </Field>
+          {range === "custom" && (
+            <>
+              <Field label="Date From"><input type="date" value={customRange.date_from} onChange={(event) => setCustomRange({ ...customRange, date_from: event.target.value })} /></Field>
+              <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
+            </>
+          )}
         </>
       )}
       <Field label="Search / Filter"><input placeholder="Search this report" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
@@ -19089,10 +19224,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
               <option value="CANCELLED">Cancelled</option>
             </select>
           </Field>
-          <label className="check-field report-check-field">
-            <input checked={search.trim().length > 0} readOnly type="checkbox" />
-            <span>{search.trim() ? "Showing matched items only where applicable" : "Item-level search ready"}</span>
-          </label>
+          {/* A note, not a checkbox: nothing here can be ticked; it says what the search box does. */}
+          <p className="form-note">{search.trim() ? "Showing only the items that match the search, where a bill has several" : "The search also matches item names inside each bill"}</p>
           <button className="secondary-button" onClick={() => setSalesFilters({ date: "", status: "ACTIVE", viewMode: "INVOICE", customerMode: "ALL", customer: "", selectedCustomers: [], product: "", lot: "", paymentMode: "", userMode: "ALL", user: "", selectedUsers: [] })}>Clear Sales Filters</button>
         </>
       )}
@@ -19446,7 +19579,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       const from = formatFileDate(appliedQuery.date_from || data.dateFrom);
       const to = formatFileDate(appliedQuery.date_to || data.dateTo);
       const title = safeFileName(currentReport.title);
-      if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
+      if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${data.balanceSheet?.asAtDate ? formatFileDate(data.balanceSheet.asAtDate) : to}.pdf`;
       if (selectedReport === "cashBook") {
         const mode = cashBookFilters.bookAccount || cashBookFilters.paymentMode || "All";
         return `${mode === "BANK" ? "Bank_Book" : "Cash_Book"}_${cashBookFilters.paymentMode || mode}_${from}_to_${to}.pdf`;
@@ -19455,7 +19588,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     })();
     const reportFilterSummary = (() => {
       const parts = [];
-      if (selectedReport !== "stockInventory" && (appliedQuery.date_from || appliedQuery.date_to)) {
+      if (selectedReport === "balanceSheet" && (data.balanceSheet?.asAtDate || appliedQuery.date_from || appliedQuery.date_to)) {
+        // The server reads the balance sheet as at one day, every line cumulative, and names it
+        // (`balanceSheet.asAtDate`); a "from" date changes nothing and is not shown.
+        parts.push(`As at ${formatIndianReportDate(data.balanceSheet?.asAtDate || appliedQuery.date_to || appliedQuery.date_from)}`);
+      } else if (selectedReport !== "stockInventory" && (appliedQuery.date_from || appliedQuery.date_to)) {
         parts.push(`Range: ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}`);
       }
       if (selectedReport !== "stockInventory" && appliedSearch) parts.push(`Search: ${appliedSearch}`);
@@ -19793,7 +19930,11 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
       lot.remarks,
     ]);
   }));
-  const pagedLots = filteredLots.slice(0, Number(pageSize || 50));
+  // One page on screen, said out loud when it is not all of them; every lot when printing or
+  // exporting, so the file carries the lots its totals count (local/stockInventory.js).
+  const exportingReport = React.useContext(ReportExportContext);
+  const lotPage = paginateLots(filteredLots, exportingReport ? 0 : pageSize);
+  const pagedLots = lotPage.shown;
   // Deliberately not narrowed to this machine's shop, and that is the ruling rather than an
   // omission. docs/stock-distribution-decision.md separates the two questions: *selling* binds to
   // the machine, because the fruit and the customer are standing there, but *looking* binds to the
@@ -19965,7 +20106,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         <SummaryMetric label="Stock" value={formatUnitGroups(filteredUnitGroups)} />
         <SummaryMetric label="Out-of-Stock Lots" value={filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
         <SummaryMetric label="Low Stock Items" value={lowStockItems} />
-        <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : adjustmentCount} />
+        <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : auditError ? MISSING_VALUE : adjustmentCount} />
       </div>
       {inventoryLoading && <div className="cart-empty">{inventoryPresentation.message}</div>}
       {inventoryUnavailable && <div className="error-banner" role="alert" data-report-note="">{inventoryPresentation.message}</div>}
@@ -20107,6 +20248,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
                 <option value="25">25</option>
                 <option value="50">50</option>
                 <option value="100">100</option>
+                <option value="0">All</option>
               </select>
             </Field>
           </div>
@@ -20160,6 +20302,12 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
           {renderCompactLotRows(pagedLots)}
           {!inventoryLoading && !inventoryUnavailable && filteredLots.length === 0 && <tr><td colSpan={compactLotHeaders.length} className="empty-cell">No matching stock lots found.</td></tr>}
         </DataTable>
+      )}
+      {viewMode === "LOT" && lotPage.truncated && (
+        <p className="form-note stock-lot-page-note no-print" role="status">
+          {`Showing ${lotPage.shown.length} of ${lotPage.total} lots. Print, PDF and Excel include all ${lotPage.total}.`}{" "}
+          <button className="secondary-button compact-button" type="button" onClick={() => setPageSize(0)}>Show all</button>
+        </p>
       )}
       {viewMode === "CATEGORY" && (
         <DataTable headers={["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count"]}>
@@ -20248,6 +20396,9 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
 function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
   const [invoiceSearch, setInvoiceSearch] = useState("");
   const [invoiceList, setInvoiceList] = useState({ status: "loading", sales: [], message: "" });
+  // The last 30 days of bills until "Load older bills" (local/saleReturnDraft.js); the whole bill
+  // history on every open grew without end.
+  const [allBills, setAllBills] = useState(false);
   const [invoiceId, setInvoiceId] = useState("");
   const [returnOptions, setReturnOptions] = useState({ status: "idle", sale: null, items: [], message: "" });
   const [returnDate, setReturnDate] = useState(() => toDateKey(new Date()));
@@ -20265,10 +20416,11 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
   const pendingWrite = useRef({ fingerprint: "", operationId: "", approvalId: "" });
   const today = toDateKey(new Date());
 
-  const loadInvoices = async () => {
+  // `older` is passed in rather than read from state, so the screen's own load stays one function.
+  const loadInvoices = async ({ older = false } = {}) => {
     setInvoiceList((current) => ({ ...current, status: "loading", message: "" }));
     try {
-      const response = await axios.get(`${API_URL}/sales`);
+      const response = await axios.get(`${API_URL}/sales`, { params: returnInvoiceListParams({ allBills: older }) });
       setInvoiceList({ status: "ready", sales: Array.isArray(response.data) ? response.data : [], message: "" });
     } catch (error) {
       setInvoiceList({ status: "error", sales: [], message: getErrorMessage(error, "The bill list could not be loaded. Returns need the internet.") });
@@ -20379,7 +20531,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
     // The return is saved whatever happens below; a failed refresh must not read as a failed save.
     let refreshNote;
     try {
-      const [note] = await Promise.all([onSaved(), loadInvoices()]);
+      const [note] = await Promise.all([onSaved(), loadInvoices({ older: allBills })]);
       refreshNote = typeof note === "string" ? note : "";
     } catch (error) {
       refreshNote = `The lists on this screen could not refresh (${getErrorMessage(error, "unknown error")}). Reopen Sale Returns to see it.`;
@@ -20402,7 +20554,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
           </Field>
           <Field label="Select Invoice">
             <select disabled={invoiceList.status !== "ready" || saving} value={invoiceId} onChange={(event) => loadReturnOptions(event.target.value)}>
-              <option value="">{invoiceList.status === "loading" ? "Loading bills..." : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : invoiceSearch.trim() ? "No bill matches" : "No bills yet"}</option>
+              <option value="">{invoiceList.status === "loading" ? "Loading bills..." : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : invoiceSearch.trim() ? "No bill matches" : allBills ? "No bills yet" : `No bills in the last ${RETURN_INVOICE_DEFAULT_DAYS} days`}</option>
               {!selectedInvoiceListed && selectedInvoice && (
                 <option value={invoiceId}>{returnInvoiceLabel(selectedInvoice)}</option>
               )}
@@ -20423,11 +20575,18 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
         </div>
         {invoiceList.status === "error" && (
           <p className="return-note return-note-error" role="alert">
-            {invoiceList.message} <button className="table-action" onClick={loadInvoices} type="button">Try again</button>
+            {invoiceList.message} <button className="table-action" onClick={() => loadInvoices({ older: allBills })} type="button">Try again</button>
           </p>
         )}
         {invoiceList.status === "ready" && invoiceMatches > invoices.length && (
           <p className="return-note">{`Showing the latest ${invoices.length} of ${invoiceMatches} bills. Type the invoice number or customer to find an older one.`}</p>
+        )}
+        {invoiceList.status === "ready" && !allBills && (
+          // The window is said, never silent: a bill older than it is not missing, only not loaded.
+          <p className="return-note">
+            {`Bills from the last ${RETURN_INVOICE_DEFAULT_DAYS} days are listed. `}
+            <button className="table-action" disabled={saving} onClick={() => { setAllBills(true); loadInvoices({ older: true }); }} type="button">Load older bills</button>
+          </p>
         )}
         {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items...</p>}
         {returnOptions.status === "error" && <p className="return-note return-note-error" role="alert">{returnOptions.message}</p>}
@@ -20518,7 +20677,8 @@ const returnInvoiceLabel = (sale) => {
   ].filter(Boolean).join(" - ");
 };
 
-function WasteManagementModule({ entries, inventory, onReload, products, user }) {
+function WasteManagementModule({ entries, inventory, loadState = { status: "idle", message: "" }, onReload, products, user }) {
+  const loadFailed = loadState.status === "failed";
   const [draft, setDraft] = useState({
     product_id: "",
     quantity: "",
@@ -20597,10 +20757,16 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
               <div><strong>{item.product_name}</strong><span>{item.quantity.toLocaleString("en-IN")} quantity wasted</span></div>
               <strong>{currency.format(item.cost)}</strong>
             </article>
-          )) : <div className="empty-inline">No waste entries yet.</div>}
+          )) : loadFailed ? <div className="empty-inline">{MISSING_VALUE}</div> : <div className="empty-inline">No waste entries yet.</div>}
         </div>
       </ModuleCard>
       <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Each entry's quantity and what that fruit cost to buy. The waste reports are built from these.">
+        {loadFailed && (
+          <div className="error-banner" role="alert">
+            {loadState.message || "The waste entries could not be loaded."}{" "}
+            <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Try again</button>
+          </div>
+        )}
         <DataTable headers={["Date", "Product", "Type", "Quantity", "Cost", "Remarks"]}>
           {entries.map((entry) => (
             <tr key={entry.id}>
@@ -20612,6 +20778,7 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
               <td>{entry.remarks || "-"}</td>
             </tr>
           ))}
+          {entries.length === 0 && !loadFailed && <tr><td className="empty-cell" colSpan={6}>No waste entries yet.</td></tr>}
         </DataTable>
       </ModuleCard>
     </section>
@@ -20807,6 +20974,10 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
           )}
         </div>
       </div>
+
+      {board.status === DISTRIBUTION_BOARD_STATUS.READY && destinations.length === 0 && (
+        <p className="form-note">Sending stock needs a second shop or a warehouse to send it to. Add one in Branches &amp; Counters; if there is one already, press Refresh.</p>
+      )}
 
       {board.message && (
         <div className="startup-status-panel startup-status-error" role="alert">
@@ -21035,24 +21206,11 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     // Validated here rather than only in the store, so the operator is told which field is missing
     // instead of being handed the storage layer's message about the first one it happened to reach.
     if (!draft.customer_name.trim()) return setDraftError("Enter the customer's name, even for a first-time caller.");
-    const lines = draft.items
-      .map((line) => {
-        const product = products.find((candidate) => canonicalInventoryId(candidate.id) === canonicalInventoryId(line.product_id));
-        return product ? {
-          product_id: String(product.id),
-          product_name: product.product_name,
-          unit: product.unit || "",
-          quantity: Number(line.quantity),
-          agreed_rate: Number(line.agreed_rate),
-        } : null;
-      })
-      .filter((line) => line && Number.isFinite(line.quantity) && line.quantity > 0);
-    if (lines.length === 0) return setDraftError("Add at least one item with a quantity.");
-    // A rate of zero is not "no rate given" — it is a real number on a real order, and it would
-    // show the customer as owing nothing. Refused rather than stored.
-    if (lines.some((line) => !(line.agreed_rate > 0))) {
-      return setDraftError("Every item needs the rate you quoted. It fills in from today's rate when you pick the item.");
-    }
+    // A half-filled line (an item with no quantity, a zero rate) is refused naming it, never
+    // dropped from the order without a word (local/ordersBoard.js).
+    const built = buildOrderDraftLines(draft.items, products);
+    if (!built.ok) return setDraftError(built.message);
+    const lines = built.lines;
     setDraftError("");
     // Only clear the form once the order is actually saved. It used to reset unconditionally while
     // `takeOrder` swallowed the failure into a toast, so a rejected order wiped the customer, the
@@ -21506,7 +21664,7 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
   );
 }
 
-function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
+function ExpensesModule({ canCancel = false, expenses, loadState = { status: "idle", message: "" }, onReload, user }) {
   const expenseCategories = ["Rent", "Staff Salary", "Electricity", "Transport", "Loading / Hamali", "Packing Material", "Repair & Maintenance", "Food / Tea / Misc", "Other"];
   const emptyExpense = {
     expense_date: toDateKey(new Date()),
@@ -21516,13 +21674,13 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
     reference_number: "",
     vendor_name: "",
     remarks: "",
-    active: true,
   };
   const [draft, setDraft] = useState(emptyExpense);
   const [editingId, setEditingId] = useState(null);
+  const loadFailed = loadState.status === "failed";
   const [filters, setFilters] = useState({ search: "", category: "", payment_mode: "", status: "", date_from: "", date_to: "" });
   const filteredExpenses = expenses.filter((expense) => {
-    const status = expense.status || (expense.active !== false ? "ACTIVE" : "CANCELLED");
+    const status = expenseRecordStatus(expense);
     const searchText = `${expense.category || ""} ${expense.vendor_name || ""} ${expense.paid_to || ""} ${expense.reference_number || ""} ${expense.remarks || ""}`.toLowerCase();
     if (filters.search && !searchText.includes(filters.search.toLowerCase())) return false;
     if (filters.category && expense.category !== filters.category) return false;
@@ -21532,9 +21690,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
     if (filters.date_to && toDateKey(expense.expense_date) > filters.date_to) return false;
     return true;
   });
-  const totalActiveExpenses = filteredExpenses
-    .filter((expense) => expense.active !== false && expense.status !== "CANCELLED")
-    .reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
+  const totalActiveExpenses = expenseTotalExcludingCancelled(filteredExpenses);
 
   const saveExpense = async () => {
     try {
@@ -21570,7 +21726,6 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
       reference_number: expense.reference_number || "",
       vendor_name: expense.vendor_name || expense.paid_to || "",
       remarks: expense.remarks || "",
-      active: expense.active !== false,
     });
   };
   const cancelExpense = async (expense) => {
@@ -21605,7 +21760,6 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
           </Field>
           <Field label="Reference Number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
           <Field label="Paid To / Vendor Name"><input value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
-          <label className="check-field pm-check"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
           <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
         <div className="button-row">
@@ -21639,17 +21793,23 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
           </Field>
           <Field label="From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
           <Field label="To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
-          <button className="secondary-button" onClick={onReload}>Refresh</button>
+          <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Refresh</button>
         </div>
+        {loadFailed && (
+          <div className="error-banner" role="alert">
+            {loadState.message || "The expenses could not be loaded."}{" "}
+            <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Try again</button>
+          </div>
+        )}
         {/* Both tiles count the rows the table below shows, so the summary and the list cannot
             disagree about which expenses are in view. */}
         <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Total (excluding cancelled)" value={currency.format(totalActiveExpenses)} featured />
-          <SummaryMetric label="Entries shown" value={filteredExpenses.length} />
+          <SummaryMetric label="Total (excluding cancelled)" value={loadFailed ? MISSING_VALUE : currency.format(totalActiveExpenses)} featured />
+          <SummaryMetric label="Entries shown" value={loadFailed ? MISSING_VALUE : filteredExpenses.length} />
         </div>
         <DataTable headers={["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""]}>
           {filteredExpenses.map((expense) => {
-            const status = expense.status || (expense.active !== false ? "ACTIVE" : "CANCELLED");
+            const status = expenseRecordStatus(expense);
             return (
             <tr className={status === "CANCELLED" ? "muted-row" : ""} key={expense.id}>
               <td>{expense.expense_date}</td>
@@ -21663,7 +21823,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
               <td>
                 <div className="button-row table-actions-row">
                   {expense.packing_purchase === true ? (
-                    <span className="tag" title="This expense belongs to a Frooz Pack purchase. Correct the count in Frooz Pack.">Frooz Pack</span>
+                    <span className="tag" title="This expense belongs to a PEP Pack purchase. Correct the count in PEP Pack.">PEP Pack</span>
                   ) : (
                     <>
                       <button className="table-action" disabled={status === "CANCELLED"} onClick={() => editExpense(expense)}>Edit</button>
@@ -21675,7 +21835,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
             </tr>
           );})}
         </DataTable>
-        {filteredExpenses.length === 0 && <div className="cart-empty">No records found for selected filters.</div>}
+        {filteredExpenses.length === 0 && !loadFailed && <div className="cart-empty">No records found for selected filters.</div>}
       </ModuleCard>
     </section>
   );
@@ -21704,7 +21864,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     active: true,
     notes: "",
   };
-  const [tab, setTab] = useState(() => (["Owner", "Admin", "Purchase Manager"].includes(user.role) ? "master" : "payments"));
+  // Tabs follow the account authorities, not role names (local/rolePermissions.js).
+  const accountTabPlan = accountTabsFor(accountPermissions);
+  const [tab, setTab] = useState(() => accountTabPlan.initial);
   const [search, setSearch] = useState("");
   const [draft, setDraft] = useState(emptyAccount);
   const [editingKey, setEditingKey] = useState("");
@@ -21727,17 +21889,11 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
   const [ledgerExporting, setLedgerExporting] = useState(false);
   const [ledgerWhatsappOpen, setLedgerWhatsappOpen] = useState(false);
   const ledgerPrintRef = useRef(null);
-  const canManageAllAccounts = ["Owner", "Admin"].includes(user.role);
   // From the role's permission map (Owner always), as the server decides them -- a Cashier whose
   // Customer Payments box is unticked no longer gets a form that can only be refused.
   const canUseSupplierPayments = accountPermissions.supplierPayments === true;
   const canUseCustomerPayments = accountPermissions.customerPayments === true;
-  const accountTabs = [
-    ...(canManageAllAccounts || user.role === "Purchase Manager" ? [["master", "Account Master"]] : []),
-    ["ledger", "Ledger"],
-    ["payments", "Payments"],
-    ...(canManageAllAccounts || user.role === "Purchase Manager" ? [["outstanding", "Outstanding"]] : []),
-  ];
+  const accountTabs = accountTabPlan.tabs;
   const paymentActionOptions = accountPaymentActions.filter(([value]) =>
     value === "RECEIVE_CUSTOMER" ? canUseCustomerPayments : canUseSupplierPayments
   );
@@ -22046,12 +22202,12 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               <Field label="Search"><input placeholder="Search account or mobile" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
               <button className="secondary-button" onClick={onReload}>Refresh</button>
             </div>
-            <DataTable headers={["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", ""]}>
+            <DataTable headers={["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", "Actions"]}>
               {filteredAccounts.map((account) => (
                 <tr key={account.account_key}>
                   <td className="primary-cell">
                     {account.account_name}
-                    <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address || "-"}</small>
+                    {(account.system_account || account.firm_name || account.city || account.address) && <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address}</small>}
                   </td>
                   <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
                   <td>{account.mobile_number || "-"}</td>
@@ -22653,10 +22809,10 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
             >
               {previewIdentity.logo
                 ? <img alt="" src={previewIdentity.logo} />
-                : <span>Frooz mark (no logo chosen)</span>}
+                : <span>PEP mark (no logo chosen)</span>}
             </div>
             <div className="product-photo-actions">
-              <p>Choose your logo picture (PNG with a clear background looks best), or copy it and press Ctrl+V on the box. With no logo chosen, the Frooz mark is shown.</p>
+              <p>Choose your logo picture (PNG with a clear background looks best), or copy it and press Ctrl+V on the box. With no logo chosen, the PEP mark is shown.</p>
               <div className="button-row">
                 <label className="secondary-button product-photo-file">
                   Choose logo
@@ -22668,7 +22824,7 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
                   />
                 </label>
                 {(previewIdentity.logo || unusableLogo) && (
-                  <button className="danger-text-button" disabled={!canManage} onClick={() => { updateDraft("logo_url", ""); setLogoMessage("The Frooz mark comes back when you press Save."); }} type="button">Use the Frooz mark</button>
+                  <button className="danger-text-button" disabled={!canManage} onClick={() => { updateDraft("logo_url", ""); setLogoMessage("The PEP mark comes back when you press Save."); }} type="button">Use the PEP mark</button>
                 )}
               </div>
               {unusableLogo && <small className="product-photo-message product-photo-message-error">The saved logo is a file path or web address, which cannot be shown. Choose a logo picture instead.</small>}
@@ -23715,7 +23871,8 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
   };
   return (
     <ModuleCard eyebrow="Role Management" title="Permission Matrix" subtitle="Owner/Admin can control access to billing, settings, tax, rebates, payments, reports and inventory functions.">
-      <DataTable headers={["Role", ...permissionLabels.map(([, label]) => label), ""]}>
+      <p className="form-note">{`${permissionLabels.length} permissions, one column each: scroll the table sideways to see them all. The role stays in view.`}</p>
+      <DataTable className="permission-matrix-table" headers={["Role", ...permissionLabels.map(([, label]) => label), ""]}>
         {(roles || []).map((role) => (
           <tr key={role.role_name}>
             <td className="primary-cell">{role.role_name}</td>
@@ -23817,6 +23974,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   const [draft, setDraft] = useState(emptyForm);
   const [editingId, setEditingId] = useState(null);
   const [passwordTarget, setPasswordTarget] = useState(null);
+  // Deleting a user is asked first, by name, in this screen: { item, saving }.
+  const [deleteTarget, setDeleteTarget] = useState(null);
   const [recoveryMessage, setRecoveryMessage] = useState("");
   const roleNames = (roles || []).map((role) => role.role_name).filter(Boolean);
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
@@ -23929,13 +24088,16 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   const userAction = async (item, action) => {
     try {
       if (action === "delete") {
+        setDeleteTarget({ item, saving: true });
         const response = await axios.delete(`${API_URL}/users/${item.id}`, { data: { updated_by: user.id } });
-        alert(response.data.message || "User removed");
+        setDeleteTarget(null);
+        setRecoveryMessage(response.data.message || `${item.full_name || item.username} removed.`);
       } else {
         await axios.post(`${API_URL}/users/${item.id}/${action}`, { updated_by: user.id });
       }
       await onReload();
     } catch (error) {
+      if (action === "delete") setDeleteTarget(null);
       alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to update user status"));
     }
   };
@@ -23999,7 +24161,7 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
                 <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REVOKE_SESSIONS")}>Revoke Sessions</button>
                 <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REQUIRE_PASSWORD_CHANGE")}>Require Change</button>
                 {item.active ? <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "deactivate")}>Deactivate</button> : <button className="secondary-button" disabled={!canManage} onClick={() => userAction(item, "reactivate")}>Reactivate</button>}
-                <button className="remove-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "delete")}><Icon name="trash" size={15} /></button>
+                <button className="remove-button" disabled={!canManage || item.id === user.id} aria-label={`Delete ${item.full_name || item.username}`} onClick={() => setDeleteTarget({ item, saving: false })}><Icon name="trash" size={15} /></button>
               </div>
             </td>
           </tr>
@@ -24025,6 +24187,26 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
                 <Field label="Confirm Password"><PasswordInput value={passwordTarget.confirm_password} onChange={(event) => setPasswordTarget({ ...passwordTarget, confirm_password: event.target.value })} /></Field>
               </div>
               <button className="primary-button" onClick={changePassword}>{passwordTarget.recoveryAction ? "Reset Staff Access" : "Save Password"}</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {deleteTarget && (
+        <div className="modal-backdrop">
+          <section aria-label={`Delete ${deleteTarget.item.full_name || deleteTarget.item.username}`} className="invoice-modal change-history-modal" role="alertdialog">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Delete user</span>
+                <strong>{`Delete ${deleteTarget.item.full_name || deleteTarget.item.username}?`}</strong>
+              </div>
+              <button aria-label="Close without deleting" className="remove-button" disabled={deleteTarget.saving} onClick={() => setDeleteTarget(null)}><Icon name="close" /></button>
+            </div>
+            <div className="sale-edit-body">
+              <p className="form-note">{`${deleteTarget.item.username ? `Username ${deleteTarget.item.username}. ` : ""}If they have bills or other entries, they are switched off instead, and their history stays.`}</p>
+              <div className="button-row">
+                <button className="remove-button" disabled={deleteTarget.saving} onClick={() => userAction(deleteTarget.item, "delete")}>{deleteTarget.saving ? "Deleting…" : "Delete"}</button>
+                <button autoFocus className="secondary-button" disabled={deleteTarget.saving} onClick={() => setDeleteTarget(null)}>Keep user</button>
+              </div>
             </div>
           </section>
         </div>
@@ -25659,6 +25841,7 @@ function OperationalScopeManagement({
         <div className="scope-anchor" id={scopeSectionDomId("branches/activation-licences")}>
           <SettingsSectionErrorBoundary eyebrow="Step 5" fallbackNote="The licence list could not be drawn. Approving machines above still works." sectionName="Activation licences">
             <DeviceActivationIssuingSection
+              assignments={data.device_assignments}
               canIssue={isOwnerAccount}
               devices={settingsData.authorizedDevices}
               devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
@@ -25733,7 +25916,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
           <tr key={device.device_id}>
             <td className="primary-cell">{device.device_name}<small className="cell-note device-id-note">{device.device_id}</small></td>
             <td>{labelFor("deviceType", device.device_type || "Browser")}</td>
-            <td>{device.branch_name || "Main Branch"}<small className="cell-note">{device.counter_name || "No counter assigned"}</small></td>
+            <td>{device.branch_name || "Branch not known"}<small className="cell-note">{device.counter_name || "Counter: see Branches & Counters"}</small></td>
             <td><span className={statusClass("deviceStatus", device.status)}>{labelFor("deviceStatus", device.status)}</span></td>
             <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
             <td>{device.last_sync_at ? new Date(device.last_sync_at).toLocaleString("en-IN") : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
@@ -25911,9 +26094,8 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
         <button className="primary-button" disabled={!canManage || busy} onClick={() => backupNow("Manual")}>Backup Now</button>
         <button className="secondary-button" disabled={!canManage || busy} onClick={save}>Save Backup Settings</button>
         <button className="secondary-button" disabled={!canManage || busy} onClick={safeShutdown}>Close Software Safely</button>
-        <button className="remove-button" disabled>Restore Prepared - Disabled</button>
       </div>
-      <p className="form-note">Restore requires Owner permission and remains disabled until backup verification testing is completed.</p>
+      <p className="form-note">A backup is restored by FroozERP support, not from this screen. If you need one back, contact support and name the file from the list below.</p>
       <DataTable headers={["File", "Type", "Size", "Started", "Completed", "Status", "Error"]}>
         {backupLogs.map((log) => (
           <tr key={log.id}>
@@ -25926,6 +26108,7 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
             <td>{log.error_message || "-"}</td>
           </tr>
         ))}
+        {backupLogs.length === 0 && <tr><td className="empty-cell" colSpan={7}>No backups recorded yet. Backup Now makes the first one.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -25962,8 +26145,10 @@ function SystemInfoSection({ systemInfo }) {
         <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>
         <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
         <tr><td>Current Device Type</td><td>{labelFor("deviceType", device.device_type || "Browser")}</td></tr>
-        <tr><td>Current Branch</td><td>{branch.branch_name || "Main Branch"}</td></tr>
-        <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "Not assigned"}</td></tr>
+        {/* This reads the older device record, which a computer approved in Branches & Counters
+            (Step 4) leaves empty: say where to look rather than "Not assigned" or a made-up branch. */}
+        <tr><td>Current Branch</td><td>{branch.branch_name || "Not known here"}</td></tr>
+        <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "See Branches & Counters, Step 4"}</td></tr>
         <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
         <tr><td>Backup Location</td><td>{systemInfo.backupLocation || "-"}</td></tr>
       </DataTable>
@@ -25973,7 +26158,7 @@ function SystemInfoSection({ systemInfo }) {
           <li>Connect the Android phone or tablet to the same Wi-Fi as the FroozERP server computer.</li>
           <li>Open Chrome and enter <strong>{androidUrl}</strong>.</li>
           <li>Login with your FroozERP user. If device approval appears, approve it from an already approved Owner device.</li>
-          <li>For counter tablets, assign the device as Retail Counter Tablet from Authorized Devices.</li>
+          <li>For counter tablets, approve the device in Branches &amp; Counters, Step 4 (Computers &amp; phones).</li>
           <li>Use Chrome menu → Add to Home screen to install the FroozERP shortcut.</li>
         </ol>
         <p>Phones and tablets opened this way use the same server and the same data as this computer. No separate phone or tablet database is created.</p>
@@ -26405,7 +26590,7 @@ const newCartLineId = () => {
   return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
-function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, comboProblems = null, packing = null, onPackingShortages, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, comboProblems = null, packing = null, onPackingShortages, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, shortcutsPaused = false, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -26419,7 +26604,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   // which shows no combo tabs at all (v1).
   const combosEnabled = combos !== null && combos !== undefined;
   // Which tab the counter is looking at. Remembered per machine, so the juice counter opens
-  // on Frooz Bar every morning. Reading storage can throw (site data blocked); Retail then.
+  // on Bar by PEP every morning. Reading storage can throw (site data blocked); Retail then.
   const [posSection, setPosSection] = useState(() => {
     try { return readPosTab(window.localStorage, { combosEnabled }); } catch { return readPosTab(null); }
   });
@@ -26427,7 +26612,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const [comboAsk, setComboAsk] = useState(null);
   // A CUSTOM combo being filled ({ key, combo }): while it is open, every product added joins it.
   const [customBuild, setCustomBuild] = useState(null);
-  // Frooz Pack, desktop only (`packing` is null in the browser): what the cashier picked for each
+  // PEP Pack, desktop only (`packing` is null in the browser): what the cashier picked for each
   // customer's-choice combo ({ [combo_line_key]: rows }), and which combo the picker is open for.
   const [customPacking, setCustomPacking] = useState({});
   const [packPickFor, setPackPickFor] = useState(null);
@@ -26445,22 +26630,47 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const [cart, setCart] = useState([]);
   const [paymentMode, setPaymentMode] = useState("CASH");
   const [quantityMode, setQuantityMode] = useState(posSettings.enable_weighing_scale ? "SCALE" : "MANUAL");
+  // Settings can arrive after POS opens (the app opened straight onto POS). Until the cashier picks
+  // a mode, the counter then starts in Weighing Scale mode as Settings say, not stuck in Manual.
+  const quantityModeChosenRef = useRef(false);
+  useEffect(() => {
+    if (posSettings.enable_weighing_scale && !quantityModeChosenRef.current) setQuantityMode("SCALE");
+  }, [posSettings.enable_weighing_scale]);
   const [scaleMessage, setScaleMessage] = useState("");
   const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
   const [customer, setCustomer] = useState({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
   const [creditInfo, setCreditInfo] = useState({ due_date: "", remarks: "" });
   const [billDateTime, setBillDateTime] = useState(currentDateTimeLocal);
+  // Whether the Owner re-dated this bill on purpose. A bill nobody re-dated is stamped with the
+  // time it is saved (local/posCheckout.js), and the field follows the clock so it never shows the
+  // time POS was opened or the last bill was saved.
+  const [billDateEdited, setBillDateEdited] = useState(false);
+  useEffect(() => {
+    if (billDateEdited) return undefined;
+    const timer = window.setInterval(() => setBillDateTime(currentDateTimeLocal()), 30000);
+    return () => window.clearInterval(timer);
+  }, [billDateEdited]);
+  const resetBillDate = () => {
+    setBillDateEdited(false);
+    setBillDateTime(currentDateTimeLocal());
+  };
   // Lot discounts are given by the bill's own date, so a back-dated bill gets the discount that
   // was running that day, the same rule the server checks against.
-  const billDateKey = billDateTime ? billDateTime.slice(0, 10) : toDateKey(new Date());
+  const billDateKey = resolvePosBillDateTime({ typed: billDateTime, edited: billDateEdited, now: currentDateTimeLocal() }).slice(0, 10) || toDateKey(new Date());
   // Said when discounts changed under an open cart (a sync, or checkout refused by the server).
   const [discountNotice, setDiscountNotice] = useState("");
   // The browser checkout's key across a retry: a lost reply followed by a second press of an
   // unchanged cart must reach the server under the same key, or it is billed twice
   // (local/checkoutRetry.js; SaleReturnModule.pendingWrite keeps the same rule).
   const pendingCheckoutRef = useRef(null);
+  // An Owner/Admin discount approval given for this bill, kept across "Not yet" while the bill is
+  // unchanged ({ fingerprint, approvalId, saleRef }; local/checkoutRetry.js). Never in state: it is
+  // read only by checkout, and dropped once the bill is saved or the server refuses it.
+  const heldApprovalRef = useRef(null);
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
+  // A bill that saved while the screen behind it could not refresh: said as saved, never as failed.
+  const [saveNotice, setSaveNotice] = useState("");
   /**
    * An Owner or Admin approving more than 5% off an item (local/discounts.js), or null. Holds the
    * bill's own reference (`saleRef`, sent as the sale's idempotency key / sync operation id), the
@@ -26524,24 +26734,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     if (seedCart?.customer?.name) {
       setCustomer((current) => ({ ...current, ...seedCart.customer, system_account: false }));
     }
-    setCart(seedLines.map((line) => {
-      const lineId = newCartLineId();
-      return {
-        ...line,
-        line_id: lineId,
-        cart_key: lineId,
-        cart_identity: `${line.product_id}-${line.inventory_batch_id}`,
-        available_qty: Number(line.quantity || 0),
-        default_selling_rate: Number(line.selling_rate || 0),
-        discount_amount: 0,
-        // The order's agreed price: a lot discount that starts later does not re-price it.
-        keep_price: true,
-        lot_discount_id: null,
-        lot_discount_type: null,
-        lot_discount_value: 0,
-        lot_discount_per_unit: 0,
-      };
-    }));
+    // Each line's "available" is its lot's balance, so the order can grow at the till
+    // (local/orderBilling.js).
+    setCart(seedLinesToCart(seedLines, { lots: inventory, newLineId: newCartLineId }));
     onSeedConsumed?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seedCart]);
@@ -26717,7 +26912,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       : ""),
     [counterScope, inventory, products, shelf],
   );
-  // Frooz Retail shows every sellable product; the other tabs show only combos of their kinds
+  // PEP Market shows every sellable product; the other tabs show only combos of their kinds
   // (local/posSections.js). While a customer's-choice combo is being filled, every sellable product
   // is offered, whatever the tab.
   const searchResults = useMemo(() => {
@@ -26852,10 +27047,15 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const hasInvalidMixedPayment = paymentMode === "MIXED" && mixedPaymentModes.some(([mode]) => Number(mixedPayments[mode] || 0) < 0);
   const registeredCustomerSelected = Boolean(customer.account_id) && customer.system_account !== true;
   const salesMandiCustomerScope = String(paymentSettings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
-  const mandiTaxConfigured = paymentSettings.enable_sales_mandi_tax === true && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
-  const mandiTaxRelevantForCustomer = salesMandiCustomerScope === "ALL_CUSTOMERS" || (salesMandiCustomerScope === "REGISTERED_CUSTOMERS" && registeredCustomerSelected);
-  const mandiTaxNeedsConfiguration = mandiTaxRelevantForCustomer && salesMandiCustomerScope !== "NONE" && paymentSettings.enable_sales_mandi_tax === true && Number(paymentSettings.sales_mandi_tax_percent || 0) <= 0;
-  const mandiTaxDisabled = mandiTaxRelevantForCustomer && (salesMandiCustomerScope === "NONE" || paymentSettings.enable_sales_mandi_tax !== true);
+  // The panel is driven by the same figures as the totals: "Applied" whenever the bill is charging
+  // Mandi Tax, a walk-in included when the scope is every customer (local/posCheckout.js).
+  const mandiTaxPanel = describeMandiTaxPanel({
+    scope: salesMandiCustomerScope,
+    enabled: paymentSettings.enable_sales_mandi_tax === true,
+    percent: Number(paymentSettings.sales_mandi_tax_percent || 0),
+    registered: registeredCustomerSelected,
+    appliedRate: totals.mandiTaxRate,
+  });
 
   const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Oldest lot first";
   const getCompactLotName = (lot) => {
@@ -26941,23 +27141,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const saleUnit = lot.unit || product.unit;
     const weighed = effectiveQuantityMode === "SCALE" ? scaleQuantityFor(saleUnit, scale, takenScaleReading) : null;
     const addQuantity = weighed ?? 1;
-    // Stock promised to orders is not the counter's to sell. Checked at product level and before
-    // the per-lot arithmetic below, which is left exactly as it was — it handles money, and this
-    // is not the change to disturb it with.
-    const counterStock = describeCounterStock({
-      onHand: productOnHand(product.id),
-      reserved: reservedForProduct(reservedIndex, product.id),
-      // What is already in the cart, not that plus a whole unit. Asking for +1 made any fractional
-      // remainder unsellable: with 0.4 kg free the first add was refused, and there was then no line
-      // to type 0.4 into. Produce is sold by weight, so the operator sets the quantity next anyway,
-      // and the quantity handler re-checks with the real number.
-      requested: getCartQuantityForProduct(product.id) + (weighed ?? 0),
-      unit: lot.unit || product.unit || "",
-    });
-    if (counterStock.status !== COUNTER_STOCK.FREE) {
-      alert(counterStock.message);
-      return;
-    }
     const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
     // While a customer's-choice combo is open, the product joins it (local/combos.js): priced by the
@@ -26968,9 +27151,29 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const comboKey = comboTag?.combo_line_key || "";
     const cartIdentity = `${buildCartIdentity({ product, lot, unit: lot.unit || product.unit, sellingRate: discounted.sellingRate })}${comboKey ? `|combo:${comboKey}` : ""}`;
     const currentItem = cart.find((item) => item.cart_identity === cartIdentity && String(item.combo_line_key || "") === comboKey);
-    // Quantities carry 3 decimals; a weight added to a line must not leave 1.8900000000000001.
-    const nextQuantity = Math.round((Number(currentItem?.quantity || 0) + addQuantity) * 1000) / 1000;
-    const nextLotQuantity = getCartQuantityForLot(lot.id) + addQuantity;
+    // A scale weight sets the line (the pan holds all of it); a plain tap adds one. 3 decimals.
+    const currentQuantity = Number(currentItem?.quantity || 0);
+    const nextQuantity = scaleLineQuantity({ existing: currentQuantity, added: addQuantity, fromScale: weighed !== null });
+    const quantityChange = nextQuantity - currentQuantity;
+    // Stock promised to orders is not the counter's to sell. Checked at product level and before
+    // the per-lot arithmetic below, which is left exactly as it was — it handles money, and this
+    // is not the change to disturb it with.
+    const counterStock = describeCounterStock({
+      onHand: productOnHand(product.id),
+      reserved: reservedForProduct(reservedIndex, product.id),
+      // What is already in the cart, not that plus a whole unit. Asking for +1 made any fractional
+      // remainder unsellable: with 0.4 kg free the first add was refused, and there was then no line
+      // to type 0.4 into. Produce is sold by weight, so the operator sets the quantity next anyway,
+      // and the quantity handler re-checks with the real number. A scale weight asks for what it
+      // changes the line by, since it replaces the line's quantity.
+      requested: getCartQuantityForProduct(product.id) + (weighed !== null ? quantityChange : 0),
+      unit: lot.unit || product.unit || "",
+    });
+    if (counterStock.status !== COUNTER_STOCK.FREE) {
+      alert(counterStock.message);
+      return;
+    }
+    const nextLotQuantity = getCartQuantityForLot(lot.id) + quantityChange;
     if (availableStock < nextLotQuantity) {
       const moreAvailable = Math.max(availableStock - getCartQuantityForLot(lot.id), 0);
       alert(`Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${lotStableName(lot) || lot.id}.`);
@@ -27006,7 +27209,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     ));
     if (weighed !== null) {
       setTakenScaleReading(scale.readingId);
-      setScaleMessage(`${product.product_name}: ${formatKg(weighed)} from the scale.`);
+      setScaleMessage(currentItem
+        ? `${product.product_name}: line set to ${formatKg(weighed)} from the scale.`
+        : `${product.product_name}: ${formatKg(weighed)} from the scale.`);
     } else if (effectiveQuantityMode === "SCALE" && isWeighedUnit(saleUnit)) {
       setScaleMessage(`${product.product_name}: no steady weight on the scale, so the quantity is 1. Press F6 once the weight holds, or type it.`);
     }
@@ -27020,17 +27225,21 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }, 0);
   };
 
+  // True only when the line took the value. Every refusal returns false, so a caller (F6) never
+  // reports a change that did not happen.
   const updateCartItem = (lineId, field, value) => {
     // A combo's lines are priced by the combo: nothing on a fixed combo's line is typed over, and on
     // a customer's-choice combo only the quantity is, after which the combo is priced again.
     const comboLine = cart.find((item) => item.line_id === lineId);
-    if (isFixedComboLine(comboLine)) return;
-    if (isComboLine(comboLine) && field !== "quantity") return;
+    if (isFixedComboLine(comboLine)) return false;
+    if (isComboLine(comboLine) && field !== "quantity") return false;
     const number = Number(value);
-    if (!Number.isFinite(number) || number < 0) return;
+    if (!Number.isFinite(number) || number < 0) return false;
+    // Quantities carry 3 decimals and money 2: a fourth decimal is not taken (local/posCheckout.js).
+    if (!cartEntryFits(field, value)) return false;
     if (field === "selling_rate" && !canManualRateOverride) {
       alert("You do not have permission to change sale rate.");
-      return;
+      return false;
     }
     const currentItem = cart.find((item) => item.line_id === lineId);
     // Typing a weight is the normal way produce is sold, and this path checked only the lot
@@ -27045,13 +27254,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       });
       if (counterStock.status !== COUNTER_STOCK.FREE) {
         alert(counterStock.message);
-        return;
+        return false;
       }
     }
     if (field === "quantity" && currentItem && number + getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id) > Number(currentItem.available_qty || 0)) {
       const moreAvailable = Math.max(Number(currentItem.available_qty || 0) - getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id), 0);
       alert(currentItem.inventory_batch_id ? `Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${currentItem.lot_name || currentItem.inventory_batch_id}.` : `Only ${currentItem.available_qty || 0} units are available.`);
-      return;
+      return false;
     }
     const repriceAfter = (items) => (isComboLine(comboLine) ? repriceCustomCombo(items, comboLine.combo_line_key) : items);
     setCart((items) => repriceAfter(items.map((item) => {
@@ -27070,6 +27279,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       }
       return updated;
     })));
+    return true;
   };
 
   const completeQuantityEntry = (event) => {
@@ -27182,10 +27392,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   };
 
   // F6 / Read Weight: the scale's steady weight into the item whose quantity is being edited, or
-  // else the last kg item. It reads whatever is steady now, even a weight already used.
+  // else the last kg item that can take one (local/weighingScale.js). It reads whatever is steady
+  // now, even a weight already used.
   const readScaleWeight = () => {
     const focusedLineId = Object.keys(quantityRefs.current).find((lineId) => quantityRefs.current[lineId] && quantityRefs.current[lineId] === document.activeElement);
-    const target = cart.find((item) => item.line_id === focusedLineId) || [...cart].reverse().find((item) => isWeighedUnit(item.unit));
+    const target = scaleTargetLine(cart, focusedLineId);
     if (!target) {
       setScaleMessage(scale.state === SCALE_STATES.LIVE ? `${scale.message}. Add a kg item to put it on.` : scale.message);
       return;
@@ -27204,9 +27415,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       input?.select();
       return;
     }
-    updateCartItem(target.line_id, "quantity", kg);
-    setTakenScaleReading(scale.readingId);
-    setScaleMessage(`${target.product_name}: ${formatKg(kg)} from the scale.`);
+    // Said as taken only when the line took it; a refused weight stays on the scale for the next item.
+    if (updateCartItem(target.line_id, "quantity", kg) === true) {
+      setTakenScaleReading(scale.readingId);
+      setScaleMessage(`${target.product_name}: ${formatKg(kg)} from the scale.`);
+    } else {
+      setScaleMessage(`${target.product_name} could not take the weight. Type its quantity.`);
+    }
     input?.focus();
     input?.select();
   };
@@ -27214,10 +27429,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const selectCustomer = (customerId) => {
     const selected = customers.find((item) => String(item.id) === String(customerId));
     if (!selected) {
+      // Only the customer changes. The bill's charges stay: switching back to Walk-in mid-bill used
+      // to delete them without a word. A saved bill clears them for the next customer.
       setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
-      // Charges belong to the bill that just left, not the next customer. A crate charge
-      // carried into the following sale is money taken from somebody who was not charged it.
-      setChargeSelections([]);
       return;
     }
     setCustomer({
@@ -27237,7 +27451,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   };
 
   /**
-   * Frooz Pack on this bill (desktop only): what packing its combos use -- a fixed combo's own, a
+   * PEP Pack on this bill (desktop only): what packing its combos use -- a fixed combo's own, a
    * customer's-choice combo's as the cashier picked it -- and what this branch is short of. Packing
    * never stops a bill: a row that cannot be read is left out, a shortage is only a warning.
    */
@@ -27281,7 +27495,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     .map((entry) => `${packingPathLabel(entry)} × ${entry.quantity}`)
     .join(", ");
 
-  const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason, operationId = "", discountApprovalId = "" }) => {
+  const buildLocalSalePayload = ({ payments, selectedBillDate, billDateTime: savedBillDateTime, dateOverrideReason, operationId = "", discountApprovalId = "" }) => {
     const invoiceGlobalId = newSyncId("invoice");
     const offlineInvoiceRef = `OFF-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
     const savedCustomer = customer.account_id
@@ -27296,12 +27510,17 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       ...(discountApprovalId ? { discount_approval_id: discountApprovalId } : {}),
       offline_invoice_ref: offlineInvoiceRef,
       branch_id: String(user.branch_id || 1),
-      device_id: deviceInfo.device_id || newSyncId("device"),
+      // This computer's own id, always: checkout refuses before this point when it has not loaded.
+      device_id: deviceInfo.device_id,
       user_id: String(user.id || ""),
       customer: savedCustomer,
       bill_date: selectedBillDate,
-      bill_datetime: billDateTime,
+      bill_datetime: savedBillDateTime,
       payment_mode: paymentMode,
+      // A credit bill's due date and remarks, as the browser path sends them; the cloud reads both
+      // off the synced sale. Without them every counter credit bill reached Dues with no due date.
+      credit_due_date: paymentMode === "CREDIT" ? creditInfo.due_date || null : null,
+      credit_remarks: paymentMode === "CREDIT" ? creditInfo.remarks || customer.notes || "" : "",
       gross_total: Number(totals.gross || 0),
       item_discount_total: Number(totals.itemDiscount || 0),
       bill_discount_total: roundUi(totals.invoiceDiscount),
@@ -27334,7 +27553,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
        */
       other_charges: (totals.chargeLines || []).map((line) => ({ ...line })),
       other_charges_amount: Number(totals.otherChargesAmount || 0),
-      // Frooz Pack: the packing this bill's combos use. Read fresh from the cart; a row that cannot
+      // PEP Pack: the packing this bill's combos use. Read fresh from the cart; a row that cannot
       // be read is left out (local/froozPack.js) and never stops the bill.
       packing_usage: packingEnabled
         ? buildSalePackingUsage({ lines: cart, combos: combos?.combos || [], customPacking }).usage
@@ -27367,7 +27586,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           available_qty: Number(item.available_qty || 0),
           selling_rate: Number(item.selling_rate),
           discount_amount: Number(item.discount_amount || 0),
-          inventory_batch_id: item.inventory_batch_id ? Number(item.inventory_batch_id) : null,
+          // As text, never through Number(): "inventory-lot-5" became null and "004" became 4. The
+          // cloud resolves a text id (`resolveInventoryLotId`); the device reads `lot_id`.
+          inventory_batch_id: item.inventory_batch_id ? String(item.inventory_batch_id) : null,
           lot_discount_id: item.lot_discount_id || null,
           lot_discount_type: item.lot_discount_type || null,
           lot_discount_value: Number(item.lot_discount_value || 0),
@@ -27467,7 +27688,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return;
     }
     const today = toDateKey(new Date());
-    const selectedBillDate = billDateTime ? billDateTime.slice(0, 10) : today;
+    // The bill's date and time as of this press: now, unless the Owner re-dated it on purpose.
+    const effectiveBillDateTime = resolvePosBillDateTime({ typed: billDateTime, edited: billDateEdited, now: currentDateTimeLocal() });
+    const selectedBillDate = effectiveBillDateTime ? effectiveBillDateTime.slice(0, 10) : today;
     if (!canPosDateOverride && selectedBillDate !== today) {
       alert("You do not have permission to change bill date.");
       return;
@@ -27510,6 +27733,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       setDiscountNotice(comboProblems[0]);
       return;
     }
+    // A loose line with no quantity, or a discount bigger than the line, is said here with the
+    // product's name, before the device refuses it in words that do not name it.
+    const lineProblem = cartLineProblem(cart);
+    if (lineProblem) {
+      alert(lineProblem);
+      return;
+    }
     let zeroRateConfirmed = confirmations.zero_rate_confirmed === true;
     let belowCostConfirmed = confirmations.below_cost_confirmed === true;
     for (const item of cart) {
@@ -27544,6 +27774,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       setDiscountNotice(totals.manualBillError);
       return;
     }
+    // A charge that could not price itself stops the bill: saved without it, the bill would look
+    // finished and be short by the charge (local/posCheckout.js).
+    const chargeProblem = chargeRefusalProblem(totals.chargeRefusals);
+    if (chargeProblem) {
+      setDiscountNotice(chargeProblem);
+      return;
+    }
     if (totals.invoiceDiscount > totals.gross - totals.itemDiscount) {
       alert("Invoice discount cannot exceed the cart subtotal.");
       return;
@@ -27570,7 +27807,20 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // More than 5% off an item needs an Owner or Admin (local/discounts.js; the server keeps the
     // same rule). Decided before anything is billed or sent. Offline, Local Only or no cloud:
     // refused here with no request. Online: the approval dialog, and checkout resumes from it.
-    const discountApprovalId = String(confirmations.discount_approval_id || "").trim();
+    // What is being billed. A bill nobody re-dated counts as the same bill all day, so a retry a
+    // minute later is still recognised.
+    const billFingerprint = checkoutFingerprint({
+      cart,
+      customer,
+      payments,
+      billDate: selectedBillDate,
+      billDateTime: billDateEdited ? effectiveBillDateTime : "",
+      charges: totals.chargeLines || [],
+      billDiscount: billDiscountInput,
+    });
+    // An approval already given for this very bill (before "Not yet") still stands.
+    const heldApproval = confirmations.discount_approval_id ? null : heldApprovalFor(heldApprovalRef.current, billFingerprint);
+    const discountApprovalId = String(confirmations.discount_approval_id || heldApproval?.approvalId || "").trim();
     if (!discountApprovalId && confirmations.discount_approval_not_needed !== true && discountApprovalCheck.needed) {
       const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
       if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
@@ -27582,21 +27832,15 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }
     // The bill's own reference: the approval (if any) was issued for it, and it is the sale's
     // idempotency key (browser) or sync operation id (desktop).
-    let saleRef = String(confirmations.sale_ref || "").trim();
+    let saleRef = String(confirmations.sale_ref || heldApproval?.saleRef || "").trim();
     if (!saleRef && !isTauriRuntime()) {
-      const resolvedRef = resolveCheckoutRef(pendingCheckoutRef.current, checkoutFingerprint({
-        cart,
-        customer,
-        payments,
-        billDate: selectedBillDate,
-        billDateTime,
-        charges: totals.chargeLines || [],
-        billDiscount: billDiscountInput,
-      }), newSyncId("op"));
+      const resolvedRef = resolveCheckoutRef(pendingCheckoutRef.current, billFingerprint, newSyncId("op"));
       pendingCheckoutRef.current = resolvedRef.pending;
       saleRef = resolvedRef.ref;
     }
     if (!saleRef) saleRef = newSyncId("op");
+    // Kept until this bill is saved, so "Not yet" and Checkout again does not ask the Owner twice.
+    if (discountApprovalId) heldApprovalRef.current = { fingerprint: billFingerprint, approvalId: discountApprovalId, saleRef };
 
     // Nothing is saved, printed or sent until the cashier says the customer has paid (3 Oct 2026,
     // the owner). The dialog shows a UPI QR for exactly the UPI part of the bill. "Paid" comes back
@@ -27613,14 +27857,19 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           alert("Desktop local-first POS requires a selected stock lot for every item.");
           return;
         }
-        const localSale = buildLocalSalePayload({ payments, selectedBillDate, dateOverrideReason, operationId: saleRef, discountApprovalId });
+        // One computer, one device id, forever: a bill is never stamped with a made-up one.
+        if (!String(deviceInfo.device_id || "").trim()) {
+          alert("This computer's device id has not loaded yet. Wait a moment and try again.");
+          return;
+        }
+        const localSale = buildLocalSalePayload({ payments, selectedBillDate, billDateTime: effectiveBillDateTime, dateOverrideReason, operationId: saleRef, discountApprovalId });
         const result = await completeLocalPosSale(localSale);
         const invoice = {
           id: localSale.invoice_global_id,
           invoice_no: localSale.offline_invoice_ref,
           offline_invoice_ref: localSale.offline_invoice_ref,
           sale_date: selectedBillDate,
-          bill_datetime: billDateTime,
+          bill_datetime: effectiveBillDateTime,
           customer_name: localSale.customer?.name || "Walk-in Customer",
           customer_mobile: localSale.customer?.mobile || "",
           payment_mode: paymentMode,
@@ -27647,8 +27896,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             unit: item.unit,
             quantity: item.quantity,
             selling_rate: item.rate,
-            // The lot as the device names it: `inventory_batch_id` above went through Number() for the
-            // outbox, which turns a "lot-…" id into nothing and left the shelf update matching no lot.
+            // The lot as the device names it (`lot_id`), the id the shelf update matches on.
             inventory_batch_id: item.lot_id || item.inventory_batch_id,
             lot_name: item.lot_name,
             lot_size: item.lot_size,
@@ -27663,8 +27911,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           })),
           payments: localSale.payments,
         };
-        // Out of packing is a warning for the bell, raised once the bill is safely saved.
-        if (packingShort.length > 0) onPackingShortages?.(packingShortageNotifications(packingShort));
+        // Saved. Nothing from here on may report this bill as failed: it exists, with its number.
+        heldApprovalRef.current = null;
         setCart([]);
         setCustomBuild(null);
         setCustomPacking({});
@@ -27676,18 +27924,26 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // carried into the following sale is money taken from somebody who was not charged it.
       setChargeSelections([]);
         setCreditInfo({ due_date: "", remarks: "" });
-        setBillDateTime(currentDateTimeLocal());
+        resetBillDate();
         setDiscountNotice("");
         clearBillDiscount();
-        await onSaved?.({ localSale: invoice, pendingOperations: result?.pending_operations });
+        setSaveNotice("");
+        // The invoice first, then the refresh. A refresh that fails (a status read, the orders
+        // list) used to land in the checkout's catch: "Unable to complete checkout", no invoice, and
+        // a cashier who rang the bill up again. Printing goes through the invoice's own print path.
         setLastInvoice(invoice);
-        onInvoice(invoice);
+        onInvoice(invoice, { print: printAfterSave || printSettings.auto_print_after_billing === true });
+        try {
+          // Out of packing is a warning for the bell, raised once the bill is safely saved.
+          if (packingShort.length > 0) onPackingShortages?.(packingShortageNotifications(packingShort));
+          await onSaved?.({ localSale: invoice, pendingOperations: result?.pending_operations });
+        } catch (refreshError) {
+          setSaveNotice(describeSavedBillRefreshFailure(invoice.invoice_no, refreshError));
+        }
         if (typeof syncInBackground === "function") {
           syncInBackground().catch(() => {});
         }
-        if (printAfterSave || printSettings.auto_print_after_billing === true) {
-          setTimeout(() => window.print(), 250);
-        }
+        searchRef.current?.focus();
         return;
       }
       const saleWrite = createOperationalWrite(user, {
@@ -27729,7 +27985,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         created_by: user.id,
         device_id: deviceInfo.device_id,
         bill_date: selectedBillDate,
-        bill_datetime: billDateTime,
+        bill_datetime: effectiveBillDateTime,
         credit_due_date: paymentMode === "CREDIT" ? creditInfo.due_date || null : null,
         credit_remarks: paymentMode === "CREDIT" ? creditInfo.remarks || customer.notes || "" : "",
         date_override_reason: dateOverrideReason,
@@ -27742,6 +27998,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       const response = await axios.post(`${API_URL}/api/v3/sales`, saleWrite.body, saleWrite.config);
       // Confirmed: the next checkout is a new bill with a new key.
       pendingCheckoutRef.current = null;
+      heldApprovalRef.current = null;
       setCart([]);
       setCustomBuild(null);
       setCustomPacking({});
@@ -27753,18 +28010,22 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // carried into the following sale is money taken from somebody who was not charged it.
       setChargeSelections([]);
       setCreditInfo({ due_date: "", remarks: "" });
-      setBillDateTime(currentDateTimeLocal());
+      resetBillDate();
       setDiscountNotice("");
       clearBillDiscount();
       // Hand the saved sale to `onSaved`. It was called bare, so a bill raised through this path
       // linked nothing back to the order it came from — and `sale_id` is exactly what the storage
       // layer uses to refuse a second billing, so the order stayed cancellable and re-billable.
-      await onSaved({ sale: response.data.sale });
+      // The invoice first, then the refresh; a failed refresh is said as such, never as a failed bill.
+      setSaveNotice("");
       setLastInvoice(response.data.sale);
-      onInvoice(response.data.sale);
-      if (printAfterSave || printSettings.auto_print_after_billing === true) {
-        setTimeout(() => window.print(), 250);
+      onInvoice(response.data.sale, { print: printAfterSave || printSettings.auto_print_after_billing === true });
+      try {
+        await onSaved({ sale: response.data.sale });
+      } catch (refreshError) {
+        setSaveNotice(describeSavedBillRefreshFailure(response.data.sale?.invoice_no, refreshError));
       }
+      searchRef.current?.focus();
     } catch (error) {
       const responseData = error.response?.data || {};
       // A discount changed on the server after this till loaded it. Nothing was saved; the cart
@@ -27788,6 +28049,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // was used, expired or for another bill). Nothing was saved; ask for one, cart untouched.
       const approvalRequired = readDiscountApprovalRequired(error.response?.status, responseData);
       if (approvalRequired) {
+        // The approval held for this bill was refused (used, expired or for another bill).
+        heldApprovalRef.current = null;
         const route = resolvePosDiscountApprovalRoute({ needsApproval: true, user, offlineMode, connectivityMode });
         if (route.mode !== DISCOUNT_APPROVAL_MODE.CLOUD) {
           setDiscountNotice(route.message);
@@ -27859,7 +28122,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       .filter((lot) => {
         const status = lotStatus(lot);
         if (!isSelectableLot(lot)) return false;
-        if (lotFilter === "ACTIVE" && status !== "Active") return false;
         if (lotFilter === "DISCOUNTED" && !lotDiscountFor(lot.id)) return false;
         if (lotFilter === "AVAILABLE" && lotBalance(lot) <= 0) return false;
         if (lotSizeFilter && String(lot.lot_size || lot.size_grade || "") !== lotSizeFilter) return false;
@@ -27910,7 +28172,15 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     checkout(draft.printAfterSave, { ...draft.confirmations, payment_confirmed: true });
   };
 
+  /*
+   * F2/F3/F4/F6 are heard on the window, not only inside the POS section. After a saved bill, a
+   * closed invoice or "Not yet", focus falls to the page body, and a handler on the section went
+   * deaf until somebody clicked: a keyboard-only till needed the mouse after every bill. They stay
+   * quiet while a POS dialog or anything over POS (the invoice, Ctrl K, the leave question) is open.
+   */
   const handleShortcuts = (event) => {
+    if (event.defaultPrevented || shortcutsPaused) return;
+    if (paymentConfirm || discountApproval || comboAsk || lotSelectorProduct) return;
     if (event.key === "F2") {
       event.preventDefault();
       searchRef.current?.focus();
@@ -27928,14 +28198,22 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       readScaleWeight();
     }
   };
+  // Reassigned every render so the listener, registered once, never runs a stale checkout.
+  const shortcutHandlerRef = useRef(handleShortcuts);
+  shortcutHandlerRef.current = handleShortcuts;
+  useEffect(() => {
+    const onKeyDown = (event) => shortcutHandlerRef.current?.(event);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const printLastInvoice = () => {
     if (!lastInvoice) {
       alert("Save a bill before printing.");
       return;
     }
-    onInvoice(lastInvoice);
-    setTimeout(() => window.print(), 250);
+    // Through the invoice's own print path: its PDF name, page profile and drawn UPI QR.
+    onInvoice(lastInvoice, { print: true });
   };
 
   /**
@@ -27980,13 +28258,24 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     );
   };
 
+  // What is left in the line's lot once the cart has taken its share, to 3 decimals.
+  const describeCartLotLeft = (item) => {
+    const left = lotLeftAfterCart({
+      available: item.available_qty ?? stockByProduct.get(item.product_id),
+      inOtherLines: item.inventory_batch_id ? getCartQuantityForLot(item.inventory_batch_id, item.line_id) : 0,
+      quantity: item.quantity,
+    });
+    if (left === null) return "";
+    return `${left.toLocaleString("en-IN", { maximumFractionDigits: 3 })} ${item.unit || ""} left in this lot`.replace(/\s+/g, " ");
+  };
+
   const renderCartRow = (item) => {
     if (isComboLine(item)) return renderComboItemRow(item);
     return (
       <tr key={item.line_id}>
         <td className="primary-cell">
           {item.product_name}
-          <small className="cell-note">{item.available_qty || stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
+          <small className="cell-note">{describeCartLotLeft(item)}</small>
           {/* Said before the operator tries, not only when they are refused. A
               refusal at the till happens with a customer standing there. */}
           {reservedNote(reservedIndex, item.product_id, item.unit) && (
@@ -28017,14 +28306,15 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             )}
           </td>
         )}
-        <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
+        {/* Line by line to the paisa, as Gross Total adds it up (`lineGross`). */}
+        <td className="primary-cell">{currency.format(lineGross(item) - Number(item.discount_amount || 0))}</td>
         <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
       </tr>
     );
   };
 
   return (
-    <section className="pos-layout" onKeyDown={handleShortcuts}>
+    <section className="pos-layout">
       <div className="mobile-pos-note">
         POS billing is optimized for tablet and desktop. Phone screens remain supported for quick invoice lookup and emergency billing.
       </div>
@@ -28036,11 +28326,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <h2>Add items</h2>
               <p>Search for a product or scan its barcode.</p>
             </div>
-            <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout{effectiveQuantityMode === "SCALE" ? " - F6 Weight" : ""}</span>
+            <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout & Print{effectiveQuantityMode === "SCALE" ? " - F6 Weight" : ""}</span>
           </div>
           <div className="pos-mode-panel">
             <Field label="Quantity Mode">
-              <select value={effectiveQuantityMode} onChange={(event) => setQuantityMode(event.target.value)}>
+              <select value={effectiveQuantityMode} onChange={(event) => { quantityModeChosenRef.current = true; setQuantityMode(event.target.value); }}>
                 <option value="MANUAL">Manual</option>
                 <option disabled={!posSettings.enable_weighing_scale} value="SCALE">Weighing Scale Mode</option>
               </select>
@@ -28141,11 +28431,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <Icon name="alert" size={14} />
               {` ${comboProblems.length === 1 ? "1 combo cannot" : `${comboProblems.length} combos cannot`} be sold right now: `}
               {comboProblems.map((problem) => `${problem.comboName} (${describeComboStockProblem(problem)})`).join("; ")}
-              . Edit {comboProblems.length === 1 ? "it" : "them"} in Frooz Menu, or add stock.
+              . Edit {comboProblems.length === 1 ? "it" : "them"} in PEP Menu, or add stock.
             </p>
           )}
           {combosEnabled && combos?.status !== "ready" && (
-            <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Frooz Bar, Frooz Moments and Combos &amp; Offers tabs are empty. Press Sync now, then open POS again.</p>
+            <p className="warning-note" role="alert">Combos have not reached this computer yet, so the Bar by PEP, PEP Presents and PEP Drops tabs are empty. Press Sync now, then open POS again.</p>
           )}
           <div className="product-results">
             {searchResults.map((option, index) => {
@@ -28222,7 +28512,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               // An empty shelf is not an empty shop: say how a product gets onto it.
               <div className="cart-empty">
                 {posSection === "retail"
-                  ? (posEmptyReason || "Nothing in Frooz Retail has stock right now.")
+                  ? (posEmptyReason || "Nothing in PEP Market has stock right now.")
                   : emptyComboTabMessage({
                     nothingHere: `No ${posSection === "bar" ? "juices or The Cutting" : posSection === "moments" ? "gift hampers" : "combo offers"} are set up yet.`,
                     elsewhere: posTabs
@@ -28259,6 +28549,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               {`⚠ Packing running short: ${packingShort.map((shortage) => `${shortage.label} (${shortage.needed} needed, ${shortage.onHand} on hand)`).join("; ")}. The bill can still be saved.`}
             </p>
           )}
+          {packingEnabled && packingUsage.message && (
+            // Packing that could not be counted (a combo this computer does not list, a quantity it
+            // cannot read) is said, not dropped: PEP Pack stock would drift with nobody told.
+            <p className="warning-note pos-packing-short" role="status">{`${packingUsage.message} The bill can still be saved.`}</p>
+          )}
           {cart.length === 0 ? (
             <div className="cart-empty">Search or scan a product to begin billing.</div>
           ) : (
@@ -28288,7 +28583,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                                   </span>
                                 ))}
                                 <button className="secondary-button compact-button" type="button" onClick={() => setPackPickFor((current) => (current === group.key ? null : group.key))}>
-                                  {(customPacking[group.key] || []).length > 0 ? "Change packing" : "Add packing"}
+                                  {(customPacking[group.key] || []).length > 0 ? "Add more packing" : "Add packing"}
                                 </button>
                               </span>
                             )}
@@ -28315,7 +28610,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               disabled={!canPosDateOverride}
               type="datetime-local"
               value={billDateTime}
-              onChange={(event) => setBillDateTime(event.target.value)}
+              onChange={(event) => { setBillDateTime(event.target.value); setBillDateEdited(true); }}
             />
           </Field>
           <p className="form-note">{canPosDateOverride ? "Owner/Admin can select a previous or custom bill date." : "Bill date is locked for your role."}</p>
@@ -28332,19 +28627,19 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         <div className="checkout-section mandi-tax-panel">
           <div className="section-title-row">
             <strong>Mandi Tax</strong>
-            <span className={registeredCustomerSelected && mandiTaxConfigured ? "stock-ok" : "origin-rate"}>
-              {registeredCustomerSelected ? (mandiTaxConfigured ? "Applied" : mandiTaxDisabled ? "Disabled" : "Configuration Required") : "Not Applicable"}
+            <span className={mandiTaxPanel.applied ? "stock-ok" : "origin-rate"}>
+              {mandiTaxPanel.badge}
             </span>
           </div>
-          {!registeredCustomerSelected && <p className="form-note">Mandi Tax is not applicable for the official Walk-in Customer by default.</p>}
-          {mandiTaxDisabled && <p className="form-note">Mandi Tax is disabled in Settings for registered-customer sales. Enable it only if this business rule applies.</p>}
-          {mandiTaxNeedsConfiguration && (
+          {mandiTaxPanel.walkInNote && <p className="form-note">Mandi Tax is not applicable for the official Walk-in Customer by default.</p>}
+          {mandiTaxPanel.disabled && <p className="form-note">Mandi Tax is disabled in Settings for {mandiTaxPanel.salesLabel}. Enable it only if this business rule applies.</p>}
+          {mandiTaxPanel.needsConfiguration && (
             <div className="warning-action-row">
-              <p className="form-note stock-low">Mandi Tax configuration required for registered-customer sales.</p>
+              <p className="form-note stock-low">Mandi Tax configuration required for {mandiTaxPanel.salesLabel}.</p>
               <button className="secondary-button compact-button" type="button" onClick={onConfigureMandiTax}>Configure Mandi Tax</button>
             </div>
           )}
-          {registeredCustomerSelected && mandiTaxConfigured && (
+          {mandiTaxPanel.showPreview && (
             <div className="tax-preview-grid">
               <div className="total-line"><span>Tax Rate</span><strong>{Number(totals.mandiTaxRate || 0)}%</strong></div>
               <TotalLine label="Taxable Amount" value={totals.taxableAmount} />
@@ -28371,7 +28666,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <option value="CASH">Cash</option>
               <option value="UPI">UPI</option>
               <option value="CARD">Card</option>
-              <option value="BANK_TRANSFER">Bank</option>
+              <option value="BANK_TRANSFER">Bank Transfer</option>
               <option value="CREDIT">Credit</option>
               <option value="MIXED">Mixed Payment</option>
             </select>
@@ -28457,20 +28752,39 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
         </div>
         <div className="button-row checkout-actions">
-          <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(false)}>
+          <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError) || totals.chargeRefusals.length > 0} onClick={() => checkout(false)}>
             <Icon name="receipt" /> {saving ? "Saving..." : "Checkout"}
           </button>
           <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
             <Icon name="print" /> Print Bill
           </button>
-          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError)} onClick={() => checkout(true)}>
+          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError) || totals.chargeRefusals.length > 0} onClick={() => checkout(true)}>
             <Icon name="print" /> Checkout & Print
           </button>
         </div>
+        {saveNotice && (
+          <div className="warning-note pos-discount-notice" role="alert">
+            {saveNotice}
+            <button className="secondary-button compact-button" type="button" onClick={() => setSaveNotice("")}>OK</button>
+          </div>
+        )}
       </aside>
       {lotSelectorProduct && (
         <div className="modal-backdrop lot-selector-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeLotSelector()}>
-          <section className="invoice-modal lot-selector-modal" role="dialog" aria-modal="true" aria-label={`Select lot for ${lotSelectorProduct.product_name}`}>
+          <section
+            className="invoice-modal lot-selector-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Select lot for ${lotSelectorProduct.product_name}`}
+            // Escape closes the picker from anywhere in it, not only from its search box.
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.stopPropagation();
+                closeLotSelector();
+                searchRef.current?.focus();
+              }
+            }}
+          >
             <div className="invoice-toolbar lot-selector-toolbar">
               <div>
                 <span className="eyebrow">Lot Selection</span>
@@ -28488,7 +28802,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                   value={lotSelectorSearch}
                   onChange={(event) => setLotSelectorSearch(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Escape") closeLotSelector();
                     if (event.key === "Enter" && lotSelectorLots.length > 0 && isSelectableLot(lotSelectorLots[0])) addProduct(lotSelectorProduct, lotSelectorLots[0]);
                   }}
                 />
@@ -28497,7 +28810,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <Field label="Filter">
                 <select value={lotFilter} onChange={(event) => setLotFilter(event.target.value)}>
                   <option value="AVAILABLE">All Available Lots</option>
-                  <option value="ACTIVE">Active Lots</option>
                   <option value="DISCOUNTED">Discounted Lots</option>
                 </select>
               </Field>
@@ -28527,7 +28839,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     <th>Rate</th>
                     <th>Discount</th>
                     <th>Date</th>
-                    <th>Status</th>
                     <th>Select</th>
                   </tr>
                 </thead>
@@ -28548,7 +28859,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                         <td>{currency.format(rate)}</td>
                         <td>{activeDiscount ? <span className="status-badge status-active">Discounted</span> : <span className="status-badge">None</span>}</td>
                         <td>{formatDisplayDate(lotDateKey(lot))}</td>
-                        <td><span className={`status-badge status-${lotStatus(lot).toLowerCase().replace(/\s+/g, "-")}`}>{lotStatus(lot)}</span></td>
                         <td>
                           <button className="primary-button select-lot-button" disabled={!selectable} onClick={() => addProduct(lotSelectorProduct, lot)}>
                             Select
@@ -28558,12 +28868,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     );
                   })}
                   {lotSelectorLots.length === 0 && (
-                    <tr><td className="empty-cell" colSpan={9}>No matching lots found.</td></tr>
+                    <tr><td className="empty-cell" colSpan={8}>No matching lots found.</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <p className="form-note">Default view shows active lots with available stock. Sold-out lots are reference-only and cannot be billed.</p>
+            <p className="form-note">Only lots with stock that can be sold are shown.</p>
           </section>
         </div>
       )}
@@ -28631,12 +28941,53 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       {paymentConfirm && (
         <PosPaymentConfirmModal
           draft={paymentConfirm}
-          onClose={() => setPaymentConfirm(null)}
+          onClose={() => {
+            // "Not yet": the cart stays, and the keyboard is back on the search box.
+            setPaymentConfirm(null);
+            searchRef.current?.focus();
+          }}
           onPaid={confirmPayment}
           paymentSettings={paymentSettings}
         />
       )}
     </section>
+  );
+}
+
+/**
+ * "Leave POS?" asked before a bill in progress is thrown away (local/posLeaveGuard.js). An in-app
+ * dialog, never a browser box. Stay is focused, so Enter or Esc keeps the bill.
+ */
+function PosLeaveDialog({ onLeave, onStay }) {
+  return (
+    <div className="modal-backdrop">
+      <section
+        aria-label={POS_LEAVE_PROMPT.title}
+        aria-modal="true"
+        className="invoice-modal pos-leave-modal"
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.stopPropagation();
+            onStay();
+          }
+        }}
+        role="alertdialog"
+      >
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">POS</span>
+            <strong>{POS_LEAVE_PROMPT.title}</strong>
+          </div>
+        </div>
+        <div className="sale-edit-body">
+          <p>{POS_LEAVE_PROMPT.message}</p>
+          <div className="button-row">
+            <button autoFocus className="primary-button" type="button" onClick={onStay}>{POS_LEAVE_PROMPT.stay}</button>
+            <button className="secondary-button" type="button" onClick={onLeave}>{POS_LEAVE_PROMPT.leave}</button>
+          </div>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -28733,9 +29084,9 @@ function DiscountApprovalModal({ draft, onChange, onClose, onConfirm }) {
             route={{ mode: SALE_CHANGE_APPROVAL_MODE.CLOUD }}
           />
           {draft.error && <div className="error-banner" role="alert">{draft.error}</div>}
-          <p className="form-note">The bill is saved only after approval. Close this to change the discount; the cart stays as it is.</p>
+          <p className="form-note">After approval the bill goes on to payment; it is saved only once the customer has paid. Close this to change the discount; the cart stays as it is.</p>
           <div className="button-row">
-            <button className="primary-button" disabled={draft.saving || missingCredentials} type="submit">{draft.saving ? "Checking..." : "Approve and save bill"}</button>
+            <button className="primary-button" disabled={draft.saving || missingCredentials} type="submit">{draft.saving ? "Checking..." : "Approve"}</button>
             <button className="secondary-button" disabled={draft.saving} type="button" onClick={onClose}>Change discount</button>
           </div>
         </form>
@@ -28827,7 +29178,8 @@ function PosPaymentConfirmModal({ draft, onClose, onPaid, paymentSettings = {} }
 }
 
 function TotalLine({ label, muted, total, value }) {
-  return <div className={`${total ? "total-line total-line-main" : "total-line"} ${muted ? "total-line-muted" : ""}`}><span>{label}</span><strong>{currency.format(value)}</strong></div>;
+  // `-0` (a discount line with no discount) is shown as ₹0.00, not "-₹0.00".
+  return <div className={`${total ? "total-line total-line-main" : "total-line"} ${muted ? "total-line-muted" : ""}`}><span>{label}</span><strong>{currency.format(value === 0 ? 0 : value)}</strong></div>;
 }
 
 /**
@@ -29038,8 +29390,9 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
     Number(lot.remaining_qty ?? lot.balance_qty ?? 0) > 0 &&
     !["CANCELLED", "INACTIVE"].includes(String(lot.batch_status || "ACTIVE").toUpperCase())
   );
-  const gross = items.reduce((sum, item) => sum + Number(item.quantity || 0) * Number(item.selling_rate || 0), 0);
-  const itemDiscount = items.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
+  // Added up line by line to the paisa, as POS adds up a new bill (local/posCheckout.js): opening an
+  // edit and saving it unchanged must not move Net Payable.
+  const { gross, itemDiscount } = saleEditTotals(items);
   const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
   const basis = String(paymentSettings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
   const editCustomerScope = String(paymentSettings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
@@ -29229,7 +29582,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
           selling_rate: Number(item.selling_rate),
           discount: Number(item.discount_amount || 0),
           discount_amount: Number(item.discount_amount || 0),
-          amount: Math.max(Number(item.quantity || 0) * Number(item.selling_rate || 0) - Number(item.discount_amount || 0), 0),
+          amount: editLineAmount(item),
           lot_discount_id: item.lot_discount_id || null,
           lot_discount_type: item.lot_discount_type || null,
           lot_discount_value: Number(item.lot_discount_value || 0),
@@ -29276,7 +29629,8 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
         edited_by: user.id,
         device_id: deviceInfo?.device_id || "",
         bill_date: billDate,
-        bill_datetime: `${billDate}T00:00`,
+        // The bill keeps the time it was made; only its date can be edited.
+        bill_datetime: editedBillDateTime(invoice, billDate),
         payment_mode: paymentMode,
         reason,
         ...(approvalId ? { approval_id: approvalId } : {}),
@@ -29289,15 +29643,24 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
       );
       if (localEligible) {
         const result = await editLocalPosSale(payload);
-        await onSaved({ localSale: localSnapshotToInvoice(result.invoice), pendingOperations: result.pending_operations });
+        // Saved. A refresh that fails afterwards is said as that, never as a failed edit.
+        try {
+          await onSaved({ localSale: localSnapshotToInvoice(result.invoice), pendingOperations: result.pending_operations });
+        } catch (refreshError) {
+          alert(describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }));
+          onClose?.();
+          return;
+        }
         alert("Invoice updated locally. Pending sync.");
       } else {
         const saleEditWrite = createOperationalWrite(user, {
           ...payload,
           items: editItems.map((item) => ({
             id: Number(item.id || 0) || undefined,
-            product_id: Number(item.product_id),
-            inventory_batch_id: Number(item.inventory_batch_id || 0) || null,
+            // Ids go as text, never through Number(): "product-12" became NaN and "004" became 4.
+            // The server reads both the same way it reads a number.
+            product_id: String(item.product_id),
+            inventory_batch_id: item.inventory_batch_id ? String(item.inventory_batch_id) : null,
             quantity: Number(item.quantity),
             selling_rate: Number(item.selling_rate),
             discount_amount: Number(item.discount_amount || 0),
@@ -29311,7 +29674,13 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
           saleEditWrite.body,
           saleEditWrite.config
         );
-        await onSaved();
+        try {
+          await onSaved();
+        } catch (refreshError) {
+          alert(describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }));
+          onClose?.();
+          return;
+        }
         alert("Invoice updated");
       }
     } catch (error) {
@@ -29835,11 +30204,18 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
+  // The payload the QR above was last drawn (or failed to draw) for. An automatic print waits for
+  // it, so a bill printed straight after checkout carries its UPI QR.
+  const [upiQrSettledFor, setUpiQrSettledFor] = useState("");
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
   const [pdfPreview, setPdfPreview] = useState(null);
   const invoiceRef = useRef(null);
+  const invoiceSectionRef = useRef(null);
   const autoPrintedRef = useRef(false);
+  useEffect(() => {
+    invoiceSectionRef.current?.focus();
+  }, []);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
   const qrSizeMap = { SMALL: 110, MEDIUM: 145, LARGE: 180 };
   const qrDisplaySize = String(paymentSettings.qr_display_size || "MEDIUM").toUpperCase();
@@ -29868,8 +30244,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       return undefined;
     }
     QRCode.toDataURL(upiPayload, { errorCorrectionLevel: "M", margin: 1, width: qrCodeWidth })
-      .then((url) => active && setUpiQrDataUrl(url))
-      .catch(() => active && setUpiQrDataUrl(""));
+      .then((url) => { if (active) { setUpiQrDataUrl(url); setUpiQrSettledFor(upiPayload); } })
+      .catch(() => { if (active) { setUpiQrDataUrl(""); setUpiQrSettledFor(upiPayload); } });
     return () => {
       active = false;
     };
@@ -29894,9 +30270,12 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   };
   useEffect(() => {
     if (!autoPrintMode || autoPrintedRef.current) return;
+    // A bill with a UPI QR is printed once the QR is drawn (or has failed to draw), not before.
+    if (upiPayload && upiQrSettledFor !== upiPayload) return;
     autoPrintedRef.current = true;
-    printWithMode(autoPrintMode === "A4" ? "A4" : "THERMAL");
-  }, [autoPrintMode]);
+    // "DEFAULT" (Checkout & Print in POS): the mode this invoice opened in, the counter's own choice.
+    printWithMode(autoPrintMode === "A4" ? "A4" : autoPrintMode === "THERMAL" ? "THERMAL" : activePrintMode);
+  }, [autoPrintMode, upiPayload, upiQrSettledFor]);
   const exportInvoicePdf = async (mode = activePrintMode, save = true) => {
     setPrintMode(mode);
     setExporting(true);
@@ -29944,7 +30323,19 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
           wider than the 820px modal, so the modal scrolled sideways and the close button sat past
           its right edge (2 Oct 2026). Now the title and the close button share the top row, the
           actions wrap below them, and the whole bar stays pinned while the bill scrolls. */}
-      <section className="invoice-modal invoice-modal-bill">
+      <section
+        className="invoice-modal invoice-modal-bill"
+        // Focused on open so Escape closes the bill and the keyboard-only till carries on; a dialog
+        // opened from here (PDF view, WhatsApp) handles its own Escape first.
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && !pdfPreview && !whatsappOpen) {
+            event.stopPropagation();
+            onClose();
+          }
+        }}
+        ref={invoiceSectionRef}
+        tabIndex={-1}
+      >
         <div className="invoice-toolbar invoice-toolbar-bill">
           <div className="invoice-toolbar-head">
             <div className="invoice-toolbar-title">
@@ -30031,7 +30422,7 @@ function PurchaseSummary({ summary }) {
         <SummaryMetric label="Labour Charges" value={currency.format(summary.labourCharges)} />
         <SummaryMetric label="Other Charges" value={currency.format(summary.otherCharges)} />
         <SummaryMetric label="Gross Amount" value={currency.format(summary.grossAmount)} />
-        <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={`-${currency.format(summary.rebateAmount)}`} positive />
+        <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={Number(summary.rebateAmount) > 0 ? `-${currency.format(summary.rebateAmount)}` : currency.format(0)} positive />
         <SummaryMetric label="Net Payable" value={currency.format(summary.netPayable)} featured />
         <SummaryMetric label="Pending Balance" value={currency.format(summary.balanceAmount)} />
         <SummaryMetric label="Payment Status" value={summary.paymentStatus} />
@@ -30042,15 +30433,11 @@ function PurchaseSummary({ summary }) {
 }
 
 const chartSize = { width: 640, height: 250, padding: 34 };
-const chartCurrency = new Intl.NumberFormat("en-IN", {
-  maximumFractionDigits: 0,
-  notation: "compact",
-});
-
 const formatChartDate = (date) =>
   new Date(`${date}T00:00:00`).toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
 
-const formatChartMoney = (value) => `INR ${chartCurrency.format(Number(value || 0))}`;
+// The axis is short (₹1.2K, ₹4.5 L); a point's tooltip carries the exact amount.
+const formatChartMoney = (value) => formatChartRupees(value);
 
 const getChartPoints = (data, valueKey, maxValue) => {
   const innerWidth = chartSize.width - chartSize.padding * 2;
@@ -30099,7 +30486,7 @@ function LineChart({ color = "#f59e0b", data, subtitle, title, valueKey }) {
         <polyline className="chart-line" points={pointString} style={{ stroke: color }} />
         {points.map((point) => (
           <circle className="chart-point" cx={point.x} cy={point.y} key={`${point.date}-${point.x}`} r="4" style={{ fill: color }}>
-            <title>{`${formatChartDate(point.date)}: ${formatChartMoney(point.value)}`}</title>
+            <title>{`${formatChartDate(point.date)}: ${currency.format(Number(point.value || 0))}`}</title>
           </circle>
         ))}
         <text className="chart-axis-label" x={chartSize.padding} y={chartSize.height - 8}>{rows[0] ? formatChartDate(rows[0].date) : ""}</text>
@@ -30136,7 +30523,7 @@ function BarChart({ color = "#f59e0b", data, subtitle, title, valueKey }) {
           const y = chartSize.height - chartSize.padding - height;
           return (
             <rect className="chart-bar" height={Math.max(height, value > 0 ? 3 : 0)} key={row.date} rx="5" style={{ fill: color }} width={barSlot * 0.64} x={x} y={y}>
-              <title>{`${formatChartDate(row.date)}: ${formatChartMoney(value)}`}</title>
+              <title>{`${formatChartDate(row.date)}: ${currency.format(Number(value || 0))}`}</title>
             </rect>
           );
         })}
@@ -30174,7 +30561,7 @@ function DualLineChart({ data, firstKey, firstLabel, secondKey, secondLabel, sub
         <polyline className="chart-line" points={secondPoints.map((point) => `${point.x},${point.y}`).join(" ")} style={{ stroke: "#38bdf8" }} />
         {[...firstPoints, ...secondPoints].map((point, index) => (
           <circle className="chart-point" cx={point.x} cy={point.y} key={`${point.date}-${index}`} r="3.5" style={{ fill: index < firstPoints.length ? "#f59e0b" : "#38bdf8" }}>
-            <title>{`${formatChartDate(point.date)}: ${formatChartMoney(point.value)}`}</title>
+            <title>{`${formatChartDate(point.date)}: ${currency.format(Number(point.value || 0))}`}</title>
           </circle>
         ))}
         <text className="chart-axis-label" x={chartSize.padding} y={chartSize.height - 8}>{rows[0] ? formatChartDate(rows[0].date) : ""}</text>
@@ -30733,10 +31120,12 @@ function DashboardHighlights({ insights, lowStockItems, onNavigate, topProducts 
 
 function SummaryMetric({ featured = false, label, positive = false, value }) {
   const displayValue = value ?? "-";
+  // A negative amount stays on one line, with a true minus, in the loss colour.
+  const signed = presentSignedFigure(displayValue);
   return (
     <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"} title={`${label}: ${displayValue}`}>
       <span>{label}</span>
-      <strong className={positive ? "metric-value profit-cell" : "metric-value"}>{displayValue}</strong>
+      <strong className={positive ? "metric-value profit-cell" : signed.negative ? "metric-value metric-negative" : "metric-value"}>{signed.text}</strong>
     </div>
   );
 }
@@ -30805,7 +31194,7 @@ function DataTable({ children, className = "", headers }) {
   return (
     <div className={`table-wrap ${className}`.trim()}>
       <table>
-        <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? header : index}>{header}</th>)}</tr></thead>
+        <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? `${index}:${header}` : index}>{header}</th>)}</tr></thead>
         <tbody>{children}</tbody>
       </table>
     </div>

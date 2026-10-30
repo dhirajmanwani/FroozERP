@@ -14,7 +14,9 @@ import {
   plainScaleError,
   readSavedScalePort,
   saveScalePort,
+  scaleLineQuantity,
   scaleQuantityFor,
+  scaleTargetLine,
 } from "./weighingScale.js";
 
 const reading = (text, { now = 10_000, lastData = now - 100, port = "COM5" } = {}) => ({
@@ -162,4 +164,25 @@ test("errors: Windows' words become what to do, and a reader that is retrying sa
   const stopped = describeScale({ status: "failed", retrying: false, port_name: "COM12", error: "COM12 could not be opened: Access is denied." });
   assert.equal(stopped.state, SCALE_STATES.FAILED);
   assert.match(stopped.message, /Then press Connect or Find scale/);
+});
+
+test("scaleTargetLine: the focused line first, else the last kg line that can take a weight", () => {
+  const cart = [
+    { line_id: "a", unit: "KG", product_name: "Apple" },
+    { line_id: "b", unit: "PIECE", product_name: "Pineapple" },
+    { line_id: "c", unit: "KG", product_name: "Orange", combo_line_key: "J1", combo_type: "FIXED" },
+  ];
+  assert.equal(scaleTargetLine(cart, "").line_id, "a", "a fixed combo's line is never the target");
+  assert.equal(scaleTargetLine(cart, "b").line_id, "b", "the focused line, even a piece line (it is told why not)");
+  assert.equal(scaleTargetLine([...cart, { line_id: "d", unit: "kg", combo_line_key: "C1", combo_type: "CUSTOM" }], "").line_id, "d", "a customer's-choice combo line takes a typed weight");
+  assert.equal(scaleTargetLine([{ line_id: "b", unit: "PIECE" }], ""), null);
+  assert.equal(scaleTargetLine(null), null);
+});
+
+test("POS-8: a scale weight sets the line to the pan's weight; a plain tap adds one", () => {
+  // 1.200 kg of apples billed, more apples join the pan, it now reads 1.500 kg: the line is 1.5.
+  assert.equal(scaleLineQuantity({ existing: 1.2, added: 1.5, fromScale: true }), 1.5);
+  assert.equal(scaleLineQuantity({ existing: 0, added: 1.25, fromScale: true }), 1.25, "a new line takes the weight");
+  assert.equal(scaleLineQuantity({ existing: 2, added: 1, fromScale: false }), 3, "no weight: one more unit, as before");
+  assert.equal(scaleLineQuantity({ existing: 0.89, added: 1, fromScale: false }), 1.89, "3 decimals, no float tail");
 });

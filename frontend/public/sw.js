@@ -1,5 +1,5 @@
-const CACHE_NAME = "froozerp-shell-v1";
-const SHELL_ASSETS = ["./", "./branding/frooz-symbol-64.png", "./branding/frooz-symbol-192.png", "./manifest.webmanifest"];
+const CACHE_NAME = "froozerp-shell-v2";
+const SHELL_ASSETS = ["./", "./branding/pep-icon-64.png", "./branding/pep-icon-192.png", "./manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();

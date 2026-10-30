@@ -276,7 +276,11 @@ test("balance sheet: cash is the cash book's closing cash, and receivables carry
     assert.equal(money(ravi.returns), 30, "credit-note returns, not the cancelled 400 bill");
     assert.equal(money(ravi.opening_balance), 0, "the opening balance the shop figure did not count");
     assert.equal(money(ravi.balance), 1020);
-    assert.equal(sheet.supplierPayable, 0, "another company's supplier is not this shop's payable");
+    // Mandi Traders' 300 bill came on the 1st and was paid on the 10th, so on the 8th it is still
+    // owed (it read as settled while the cash was still in the drawer). Elsewhere Ltd's 500 is
+    // another company's supplier and is not this shop's payable.
+    assert.equal(sheet.supplierPayable, 300, "owed until paid on the 10th; another company's supplier is not this shop's payable");
+    assert.equal((await get("/reports/balance-sheet?date_to=2026-09-10")).supplierPayable, 0, "paid on the 10th");
     assert.ok(!receivables.rows.some((row) => row.customer_name === "Other Co"));
   });
 });
@@ -360,4 +364,153 @@ test("sales history carries each bill's payments, so a MIXED bill can be split b
   assert.ok(history, "the sales history statement carries payments");
   assert.match(history, /JSON_BUILD_OBJECT\('mode', sp\.payment_mode, 'amount', sp\.amount\)/);
   assert.match(history, /sp\.sale_id = s\.id AND sp\.payment_mode IS DISTINCT FROM 'CREDIT'/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Supplier Ledger: balance brought forward (UI-10), as-at Balance Sheet (UI-9), low stock (UI-3)
+// ---------------------------------------------------------------------------------------------
+
+// Columns the wide ledger statement reads that the shared schema above does not carry.
+const LEDGER_COLUMNS = `
+  ALTER TABLE purchases ADD COLUMN payment_status TEXT;
+  ALTER TABLE purchase_items ADD COLUMN purchase_rate NUMERIC(14,2);
+  ALTER TABLE purchase_items ADD COLUMN basic_amount NUMERIC(14,2);
+  CREATE TABLE sale_return_items (id SERIAL PRIMARY KEY, sale_return_id INTEGER, product_id INTEGER, return_quantity NUMERIC(14,3), selling_rate NUMERIC(14,2), return_amount NUMERIC(14,2));
+`;
+
+// Mandi Traders: opening balance 1000. Bill 300 (300, came 1 Sep, paid 10 Sep, from the shared seed);
+// bill 301 (2 Sep, gross 1100 with a 100 bill rebate, so 1000 net, 200 paid at the mandi); bill 302
+// still pending, so not yet owed; a 150 payment with 50 rebate on 4 Sep; a cancelled 999 payment.
+const SUPPLIER_LEDGER_SEED = `
+  UPDATE suppliers SET opening_balance = 1000 WHERE id = 40;
+  INSERT INTO purchases (id, supplier_id, supplier_name, purchase_date, payment_date, payment_mode, paid_amount, purchase_status,
+    purchase_bill_status, branch_id, gross_amount, total_amount, net_payable, rebate_amount, bill_number, purchase_type) VALUES
+    (301, 40, 'Mandi Traders', '2026-09-02', '2026-09-02', 'CASH', 200, 'ACTIVE', 'BILL_COMPLETED', 1, 1100, 1000, 1000, 100, 'MT-301', 'CREDIT'),
+    (302, 40, 'Mandi Traders', '2026-09-03', NULL, NULL, 0, 'ACTIVE', 'BILL_PENDING', 1, 500, 500, 500, 0, 'MT-302', 'CREDIT');
+  INSERT INTO supplier_payments (supplier_id, payment_date, payment_amount, rebate_amount, payment_mode, cancelled, branch_id) VALUES
+    (40, '2026-09-04', 150, 50, 'CASH', FALSE, 1), (40, '2026-09-04', 999, 0, 'CASH', TRUE, 1);
+`;
+
+const supplierLedger = (report) => report.ledgerReport.filter((row) => row.account_key === "SUPPLIER-40");
+const payable = (row) => money(row.credit) - money(row.debit);
+
+test("supplier ledger: a period opens with the balance brought forward, and runs on to what Accounts says", async () => {
+  await withDatabase(async ({ db }) => {
+    await db.exec(LEDGER_COLUMNS + SUPPLIER_LEDGER_SEED);
+    const accounts = await get("/supplier-summary?supplier_id=40");
+    // 1000 + 300 + 1100 - 100 rebate - (300 + 200) paid - 150 - 50 rebate.
+    assert.equal(money(accounts.suppliers[0].outstanding_balance), 1600);
+
+    // "Today" (the 12th): nothing happened, and the ledger still says 1600 is owed.
+    const today = await get("/reports/summary?date_from=2026-09-12&date_to=2026-09-12");
+    assert.deepEqual(supplierLedger(today), []);
+    const [broughtForward] = today.ledgerOpeningBalances.filter((row) => row.account_key === "SUPPLIER-40");
+    assert.equal(broughtForward.opening_balance, 1600);
+    assert.equal(broughtForward.credit, 1600, "owed to the supplier: a credit balance");
+    assert.equal(broughtForward.date, "2026-09-12");
+    assert.equal(broughtForward.voucher_no, "B/F");
+    assert.ok(!today.ledgerOpeningBalances.some((row) => row.party_name === "Elsewhere Ltd"), "another company's supplier");
+
+    // From the 5th: 1900 brought forward, then the 300 paid on the 10th.
+    const late = await get("/reports/summary?date_from=2026-09-05&date_to=2026-09-12");
+    const lateOpening = late.ledgerOpeningBalances.find((row) => row.account_key === "SUPPLIER-40");
+    assert.equal(lateOpening.opening_balance, 1900);
+    const lateRows = supplierLedger(late);
+    assert.deepEqual(lateRows.map((row) => [row.transaction_type, String(row.date).slice(0, 10), money(row.debit)]), [["Supplier Payment", "2026-09-10", 300]]);
+    assert.equal(lateOpening.opening_balance + lateRows.reduce((sum, row) => sum + payable(row), 0), 1600);
+
+    // The whole month: the supplier's own opening balance is brought forward, and every row runs to 1600.
+    const month = await get("/reports/summary?date_from=2026-09-01&date_to=2026-09-30");
+    assert.equal(month.ledgerOpeningBalances.find((row) => row.account_key === "SUPPLIER-40").opening_balance, 1000);
+    const rows = supplierLedger(month);
+    assert.equal(1000 + rows.reduce((sum, row) => sum + payable(row), 0), 1600);
+    const bill = rows.find((row) => row.transaction_type === "Supplier Purchase" && row.voucher_no === "MT-301");
+    assert.equal(money(bill.credit), 1100, "the gross bill; its rebate is the separate debit, taken once");
+    assert.equal(rows.filter((row) => row.transaction_type === "Supplier Rebate").map((row) => money(row.debit)).join(), "100");
+    assert.ok(rows.some((row) => row.transaction_type === "Supplier Payment" && money(row.debit) === 200 && String(row.date).startsWith("2026-09-02")), "paid at the mandi");
+    assert.ok(!rows.some((row) => row.voucher_no === "MT-302"), "a pending bill is not owed yet");
+    assert.ok(!rows.some((row) => money(row.debit) === 999), "a cancelled payment");
+    assert.equal(month.ledgerOpeningBalances.filter((row) => row.account_key === "SUPPLIER-40").length, 1);
+    assert.ok(!month.ledgerReport.some((row) => row.transaction_type === "Opening Balance"), "the Day Book reads ledgerReport: no b/f rows in it");
+
+    const sheet = await get("/reports/balance-sheet?date_to=2026-09-12");
+    assert.equal(sheet.supplierPayable, 1600, "the balance sheet's payable is where the ledger ends");
+  });
+});
+
+test("supplier ledger: a failed opening-balance query is null, not an empty list", () => {
+  const route = require("node:fs").readFileSync(require("node:path").join(__dirname, "server.js"), "utf8");
+  const summary = route.slice(route.indexOf('app.get("/reports/summary"'), route.indexOf("ledgerOpeningBalances,\n"));
+  assert.match(summary, /getSupplierLedgerOpeningBalances\(\{ dateFrom, branchId: req\.auth\.branchId \}\)\.catch\(\(error\) => \{[\s\S]*?return null;/);
+});
+
+test("balance sheet: as at one date; a range or 'today' control does not move it", async (t) => {
+  await withDatabase(async () => {
+    const asAt = await get("/reports/balance-sheet?date_to=2026-09-08&range=today&date_from=2026-09-08");
+    assert.equal(asAt.asAtDate, "2026-09-08");
+    assert.equal(asAt.dateFrom, undefined, "an as-at sheet has no range start");
+    const named = await get("/reports/balance-sheet?as_at=2026-09-08&range=month");
+    assert.equal(named.cash, asAt.cash);
+    assert.equal(named.asAtDate, "2026-09-08");
+    const bad = await probe(app, "GET", "/reports/balance-sheet?as_at=08-09-2026", headers);
+    assert.equal(bad.status, 400);
+
+    const summary = await get("/reports/summary?date_from=2026-09-01&date_to=2026-09-08");
+    assert.equal(summary.balanceSheet.asAtDate, "2026-09-08");
+    assert.equal(summary.balanceSheet.unavailable, false);
+    assert.equal(summary.balanceSheet.cash, asAt.cash);
+
+    // With no date it is as at today in India: 23:00 UTC on the 24th is the 25th.
+    t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-24T23:00:00Z") });
+    const signed = issueDeviceSession({ userId: OWNER_ID, deviceId: DEVICE_ID, companyId: 1, branchId: 1, role: "Owner", secret: TEST_SIGNING_KEY });
+    const undated = await probe(app, "GET", "/reports/balance-sheet", { authorization: `Bearer ${signed}` });
+    assert.equal(undated.status, 200, JSON.stringify(undated.body));
+    assert.equal(undated.body.asAtDate, "2026-10-25");
+    const todayRange = await probe(app, "GET", "/reports/summary?range=today", { authorization: `Bearer ${signed}` });
+    assert.equal(todayRange.body.dateFrom, "2026-10-25");
+    assert.equal(todayRange.body.balanceSheet.asAtDate, "2026-10-25");
+  });
+});
+
+test("dashboard low stock is Products' 'Low': stock at or below the product's own minimum, none set is not low", async () => {
+  const { pathToFileURL } = require("node:url");
+  const { isLowStock } = await import(pathToFileURL(require("node:path").join(__dirname, "..", "frontend", "src", "local", "productMaster.js")).href);
+  const { DASHBOARD_LOW_STOCK_SQL } = require("./server");
+  await withDatabase(async ({ db }) => {
+    await db.exec(`
+      ALTER TABLE products ADD COLUMN minimum_stock NUMERIC(14,3);
+      ALTER TABLE products ADD COLUMN active BOOLEAN DEFAULT TRUE;
+      ALTER TABLE products ADD COLUMN company_id INTEGER;
+      ALTER TABLE products ADD COLUMN deleted_at TIMESTAMP;
+      UPDATE products SET minimum_stock = 0 WHERE id = 10;
+      INSERT INTO products (id, product_name, unit, minimum_stock, active) VALUES
+        (11, 'Mango', 'KG', 0, TRUE),    -- no stock at all, minimum 0: low (Products shows "0.000 Kg Low")
+        (12, 'Banana', 'KG', NULL, TRUE), -- 4 kg, no minimum set: not low (was low under a default of 5)
+        (13, 'Grapes', 'KG', 5, TRUE),    -- 3 kg against 5: low
+        (14, 'Kiwi', 'KG', 2, TRUE),      -- 10 kg against 2: not low
+        (15, 'Plum', 'KG', 5, FALSE);     -- inactive
+      INSERT INTO products (id, product_name, unit, minimum_stock, active, company_id, deleted_at) VALUES
+        (16, 'Lychee', 'KG', 5, TRUE, 2, NULL),             -- another company's: not this shop's tile
+        (17, 'Fig', 'KG', 5, TRUE, NULL, CURRENT_TIMESTAMP); -- deleted: gone from Products, gone here
+      INSERT INTO inventory_batches (id, product_id, branch_id, remaining_qty, batch_status) VALUES
+        (1, 10, 1, 8, 'ACTIVE'), (2, 12, 1, 4, 'ACTIVE'), (3, 13, 1, 3, 'ACTIVE'), (4, 14, 1, 10, 'ACTIVE'),
+        (5, 11, 2, 50, 'ACTIVE'), (6, 13, 1, 40, 'CANCELLED');
+    `);
+    const dashboard = (await db.query(DASHBOARD_LOW_STOCK_SQL, [1])).rows.map((row) => row.product_name).sort();
+    assert.deepEqual(dashboard, ["Grapes", "Mango"]);
+
+    // The same products through Products' own rule, given what GET /products sends for this branch.
+    const products = (await db.query(`
+      SELECT p.product_name, p.minimum_stock, p.active,
+        COALESCE((SELECT SUM(remaining_qty) FROM inventory_batches ib WHERE ib.product_id = p.id AND ib.branch_id = 1
+          AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'), 0) AS current_stock
+      FROM products p
+      WHERE p.deleted_at IS NULL AND (p.company_id IS NULL OR p.company_id = 1)
+    `)).rows;
+    const productsLow = products.filter((row) => row.active !== false && isLowStock(row)).map((row) => row.product_name).sort();
+    assert.deepEqual(dashboard, productsLow);
+  });
+  const source = require("node:fs").readFileSync(require("node:path").join(__dirname, "server.js"), "utf8");
+  assert.equal(source.match(/\$\{DASHBOARD_LOW_STOCK_SQL\}/g).length, 2, "the tile's count and the list read one statement");
+  assert.doesNotMatch(source, /COALESCE\(p\.minimum_stock, 5\)/);
 });

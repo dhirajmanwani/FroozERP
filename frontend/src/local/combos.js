@@ -26,6 +26,7 @@ import { filterLotsForScope } from "./locationScope.js";
 import { lotAvailableQuantity } from "./posInventory.js";
 import { parseTargetMargin, roundSuggestedRate, suggestSaleRate } from "./saleRateUpdate.js";
 import { packingCostOf } from "./froozPack.js";
+import { COMBO_STOCK_REMINDER_KEY_PREFIX, FROST_STOCK_REMINDER_LABEL } from "./frostBellNotifications.js";
 
 export const COMBO_KINDS = Object.freeze(["COMBO_OFFER", "THE_CUTTING", "JUICE", "GIFTING"]);
 export const COMBO_TYPES = Object.freeze(["FIXED", "CUSTOM"]);
@@ -151,7 +152,7 @@ const normaliseItem = (item, index) => ({
 });
 
 /**
- * One packing row of a combo (Frooz Pack). The API names the size `packing_size_id` (its global
+ * One packing row of a combo (PEP Pack). The API names the size `packing_size_id` (its global
  * id); the snapshot's `local_combo_packing` row may say `size_id`. Either is read.
  */
 const normalisePackingRow = (row, index) => ({
@@ -170,7 +171,7 @@ const normalisePackingRow = (row, index) => ({
  * One combo row as the snapshot or the API sent it, in one shape.
  *
  * `packing` is always an array; `packing_known` says whether the source actually carried one. A
- * row from before Frooz Pack has no `packing` key, and "not told" must not become "none": an edit
+ * row from before PEP Pack has no `packing` key, and "not told" must not become "none": an edit
  * built from it leaves the stored packing alone (`comboDraftFrom` / `buildComboPayload`).
  */
 export const normaliseCombo = (row) => {
@@ -206,7 +207,7 @@ export const normaliseCombo = (row) => {
 };
 
 /**
- * Delete is for a combo nothing was billed with (owner, 23 Oct 2026; the same rule as Frooz Pack).
+ * Delete is for a combo nothing was billed with (owner, 23 Oct 2026; the same rule as PEP Pack).
  * One on a bill is switched off instead, so old bills and reports can still name it.
  */
 export const comboDeletable = (combo) => combo?.in_use === false;
@@ -286,7 +287,7 @@ export const validateComboDraft = (draft = {}, { products = null } = {}) => {
       }
       seen.push(key);
     });
-    // Packing (Frooz Pack): optional, but each row must name a size and a quantity, once.
+    // Packing (PEP Pack): optional, but each row must name a size and a quantity, once.
     const seenSizes = [];
     (Array.isArray(draft.packing) ? draft.packing : []).forEach((entry, index) => {
       const row = index + 1;
@@ -484,7 +485,7 @@ const costForProduct = (rates, product, item) => {
  * the shop's rounding rule (`suggestSaleRate`). An item with
  * no known cost means no cost and no suggestion -- a part-sum would suggest a loss.
  *
- * Its packing (Frooz Pack) is part of the cost: fruit + Σ packing quantity × unit cost (the row's
+ * Its packing (PEP Pack) is part of the cost: fruit + Σ packing quantity × unit cost (the row's
  * own, else `catalogue`'s). A packing row with no known cost is treated like a fruit with none.
  */
 export const suggestComboPrice = ({ items = [], rates = [], products = [], marginPercent = null, targetMargin, roundingRule, packing = [], catalogue = null } = {}) => {
@@ -963,7 +964,7 @@ export const combosForTab = (combos, tabKey) => sortCombos(
 );
 
 /**
- * Why the Frooz Menu screen cannot load or save here, or null. Combos are kept on the server
+ * Why the PEP Menu screen cannot load or save here, or null. Combos are kept on the server
  * (like discounts and sale rates), so Local Only, no cloud and offline each say so instead of
  * trying; POS keeps selling the combos its snapshot already has.
  */
@@ -1056,17 +1057,36 @@ export const describeComboStockProblem = (problem) => (problem?.missing || [])
   .map((entry) => `${entry.productName} ${MISSING_REASON_WORDS[entry.reason] || "is not available"}`)
   .join(", ");
 
+const STOCK_ONLY_REASONS = Object.freeze(["OUT_OF_STOCK", "NOT_ENOUGH"]);
+
+/** True when only fruit running out holds the combo up (nothing switched off). */
+export const comboHeldUpByStockOnly = (problem) => {
+  const missing = Array.isArray(problem?.missing) ? problem.missing : [];
+  return missing.length > 0 && missing.every((entry) => STOCK_ONLY_REASONS.includes(entry?.reason));
+};
+
 /**
- * The bell's rows for `comboStockProblems`: a warning per combo, telling the owner what to do.
- * Keys are the problems' own, so a combo that is fixed (stock added or the combo edited) drops out.
+ * The bell's rows for `comboStockProblems`, one per combo, telling the owner what to do. Keys are
+ * the problems' own, so a combo that is fixed (stock added or the combo edited) drops out.
+ *
+ * A combo held up only by fruit that ran out is a season ending, not an alarm (owner, 23 Oct 2026,
+ * the same rule as the fruit's own zero-stock row): an Info "Reminder", under its own key so the
+ * dismissal can be remembered on this computer until the combo can be made again. A product switched
+ * off stays a warning. The caller raises these only for the Owner and Admins, who can edit combos.
  */
-export const comboStockNotifications = (problems) => (Array.isArray(problems) ? problems : []).map((problem) => ({
-  severity: "warning",
-  title: `Edit combo: ${problem.comboName}`,
-  message: `${describeComboStockProblem(problem)}. Edit ${problem.comboName} in Frooz Menu, or add stock, before selling it.`,
-  source: "Frooz Menu",
-  dedupeKey: problem.key,
-}));
+export const comboStockNotifications = (problems) => (Array.isArray(problems) ? problems : []).map((problem) => {
+  const reminder = comboHeldUpByStockOnly(problem);
+  return {
+    severity: reminder ? "info" : "warning",
+    title: `Edit combo: ${problem.comboName}`,
+    message: reminder
+      ? `${describeComboStockProblem(problem)}. Add stock, or if its season is over, edit ${problem.comboName} in PEP Menu or dismiss this.`
+      : `${describeComboStockProblem(problem)}. Edit ${problem.comboName} in PEP Menu, or add stock, before selling it.`,
+    source: "PEP Menu",
+    dedupeKey: reminder ? `${COMBO_STOCK_REMINDER_KEY_PREFIX}${problem.key}` : problem.key,
+    ...(reminder ? { label: FROST_STOCK_REMINDER_LABEL } : {}),
+  };
+});
 
 /**
  * What an empty combo tab says. With combos on other tabs it names them, so a combo saved under
@@ -1079,5 +1099,5 @@ export const emptyComboTabMessage = ({ nothingHere = "", elsewhere = [] } = {}) 
     const where = others.map((entry) => `${entry.label} (${entry.names.join(", ")})`).join("; ");
     return `${nothingHere} Combos on this computer are on other tabs: ${where}.`;
   }
-  return `${nothingHere} The Owner or an Admin adds them in Frooz Menu. One just saved reaches this computer with the next sync: press Sync now, then open POS again.`;
+  return `${nothingHere} The Owner or an Admin adds them in PEP Menu. One just saved reaches this computer with the next sync: press Sync now, then open POS again.`;
 };

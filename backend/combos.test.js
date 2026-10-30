@@ -1040,8 +1040,14 @@ test("batch cost recalculation shares the bill discount over loose lines only, a
       -- Bill 2: a combo only, no loose line. Its lines must still be costed.
       INSERT INTO sales VALUES (2, 0, 500, 0, 0, 'PROVISIONAL');
       INSERT INTO sale_items VALUES (4, 2, 500, 500, 0, 'PROVISIONAL', 0, 'k9', 'combo-3', 'FIXED');
+      -- Bill 3: combos only, with a 10 bill discount and nothing loose to carry it: shared over
+      -- every line on its net (300 -> 6, 200 -> 4), so the lines add up to the bill.
+      INSERT INTO sales VALUES (3, 10, 490, 0, 0, 'PROVISIONAL');
+      INSERT INTO sale_items VALUES
+        (5, 3, 300, 300, 0, 'PROVISIONAL', 0, 'k7', 'combo-3', 'FIXED'),
+        (6, 3, 200, 200, 0, 'PROVISIONAL', 0, 'k7', 'combo-3', 'FIXED');
       INSERT INTO sale_batch_allocations (sale_item_id, inventory_batch_id, cost_amount)
-        VALUES (1, 900, 100), (2, 900, 50), (3, 900, 600), (4, 900, 150);
+        VALUES (1, 900, 100), (2, 900, 50), (3, 900, 600), (4, 900, 150), (5, 900, 100), (6, 900, 50);
     `);
     await recalculateSalesForBatch({ query: (sql, values) => db.query(sql, values) }, 900);
     const profits = (await db.query("SELECT id, profit, cost_status FROM sale_items ORDER BY id")).rows
@@ -1051,12 +1057,30 @@ test("batch cost recalculation shares the bill discount over loose lines only, a
       [2, 150, "FINAL"],
       [3, 350, "FINAL"],
       [4, 350, "FINAL"],
-    ], "apples: 1000 - 50 - 600; combo lines: net - cost, no discount share");
+      [5, 194, "FINAL"],
+      [6, 146, "FINAL"],
+    ], "apples: 1000 - 50 - 600; combo lines: net - cost, no discount share while a loose line carries it");
     const sale = (await db.query("SELECT profit FROM sales WHERE id = 1")).rows[0];
     assert.equal(Number(sale.profit), 700, "the lines add up to the bill: 200 + 150 + 350");
+    const comboOnly = (await db.query("SELECT profit FROM sales WHERE id = 3")).rows[0];
+    assert.equal(Number(comboOnly.profit), 194 + 146, "a combo-only bill's lines add up to it too");
   } finally {
     await db.close();
   }
+});
+
+test("a combo-only bill's discount is shared over its lines when it is booked, and adds up to the bill", () => {
+  const { invoiceDiscountShareOf } = require("./server");
+  const combo = { comboLineKey: "k1", comboId: "combo-3" };
+  const payload = {
+    grossAmount: 500, itemDiscountAmount: 0, invoiceDiscountAmount: 10,
+    invoiceItems: [{ netAmount: 300, combo }, { netAmount: 200, combo }],
+  };
+  const shares = payload.invoiceItems.map((item) => invoiceDiscountShareOf(payload, item));
+  assert.deepEqual(shares, [6, 4]);
+  // With a loose line on the bill the combo lines take none of it, as before.
+  const mixed = { ...payload, grossAmount: 600, invoiceItems: [...payload.invoiceItems, { netAmount: 100, combo: null }] };
+  assert.deepEqual(mixed.invoiceItems.map((item) => invoiceDiscountShareOf(mixed, item)), [0, 0, 10]);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1105,4 +1129,20 @@ test("checkout: a browser bill with a combo is refused with COMBO_COUNTER_ONLY b
     clearQueryResponder();
     clearConnectionResponder();
   }
+});
+
+test("every combo route refuses a session with no company before it reads or writes", () => {
+  // A NULL company reads as "any company" in the combo SQL, so such a session reached every
+  // company's combos (BE-11). No session issued today lacks one -- `issueDeviceSession` refuses to
+  // sign it -- which is why this is pinned on the source rather than driven over HTTP.
+  for (const handler of ["const listCombosHandler", "const saveComboHandler", "const deleteComboHandler"]) {
+    const start = SERVER_SOURCE.indexOf(handler);
+    assert.ok(start > 0, handler);
+    const body = SERVER_SOURCE.slice(start, SERVER_SOURCE.indexOf("\n};\n", start));
+    const refusal = body.indexOf("if (!companyId) return comboRefusal(res, 400, comboRules.CODES.COMPANY_REQUIRED");
+    assert.ok(refusal > 0, `${handler} refuses a session with no company`);
+    const firstRead = body.search(/client\.query\("BEGIN"\)|loadCombosWithItems\(/);
+    assert.ok(firstRead > refusal, `${handler} refuses before touching the database`);
+  }
+  assert.equal(combos.CODES.COMPANY_REQUIRED, "COMBO_COMPANY_REQUIRED");
 });

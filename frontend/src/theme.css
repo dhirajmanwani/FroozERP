@@ -41,18 +41,24 @@
  * bases. `brandPalette.test.mjs` reads this file and fails on anything that is not, so a
  * new colour goes in the palette with a comment saying what job it does, not in here.
  *
+ * The palette is the PEP logo's ("THE PEP - Pulp Eat Up"): forest-green ground #102f20,
+ * mustard #eab43f, cream #f6f4e5, with the ramps between them. See brandPalette.js.
+ *
  * Contrast, measured (WCAG 2.1, worst case across --ground/--panel/--card/--raised/
- * --raised-high in each theme):
+ * --raised-high in each theme; re-measured for the PEP palette - the light column was
+ * previously stale, measured before --panel was deepened to INK.body):
  *
  *                     dark        light
- *   --ink             12.0:1      13.2:1
- *   --ink-strong      10.7:1      13.2:1
- *   --ink-body         9.0:1      11.8:1
- *   --ink-muted        5.4:1       6.8:1
- *   --ink-faint        4.8:1       4.4:1   <- disabled/placeholder only, never reading text
- *   --accent           6.3:1       4.7:1
- *   --ink-on-accent    8.1:1       4.8:1   (against --accent, which fills the surface)
- *   signals (worst)    4.8:1       5.3:1
+ *   --ink             12.1:1       9.7:1
+ *   --ink-strong      10.8:1       9.7:1
+ *   --ink-body         9.0:1       9.0:1
+ *   --ink-muted        5.4:1       5.1:1
+ *   --ink-faint        4.8:1       3.3:1   <- disabled/placeholder only, never reading text
+ *   --accent           7.1:1       5.2:1
+ *   --accent-bright    8.8:1       6.9:1   (hover/focus)
+ *   --line-control     5.4:1       3.3:1   (a perceivable boundary: 3:1 floor)
+ *   --ink-on-accent    9.0:1       7.0:1   (against --accent, which fills the surface)
+ *   signals (worst)    4.8:1       4.6:1
  */
 
 :root {
@@ -65,70 +71,71 @@
      Light inverts the dark theme's elevation rule rather than mirroring it: on dark,
      lifting a surface means going lighter; on light it means going *whiter*, so --card
      through --raised-high all land on white and are separated by --line and the shadow
-     tokens instead of by hue. --ground is therefore the darkest light surface (1.13:1
+     tokens instead of by hue. --ground is therefore the darkest light surface (1.28:1
      against a white card), not the lightest, or cards would have nothing to sit on. */
-  --ground: #e8e3d3;              /* the page itself */
-  --panel: #c8d8ce;               /* sidebar and deep panels sitting on the page */
+  --ground: #e7e4ce;              /* the page itself */
+  --panel: #c9d7cf;               /* sidebar and deep panels sitting on the page */
   --card: #ffffff;                /* a content card */
   --raised: #ffffff;              /* a surface lifted off the page (dropdown, popover) */
   --raised-high: #ffffff;         /* a surface lifted off a raised surface (modal) */
   --track: #dfe9e2;               /* scrollbar troughs, inset wells */
-  --track-thumb: #8fab9c;         /* the scrollbar itself - must be visible in its trough */
-  --scrim: rgba(10, 45, 28, 0.45);   /* the dim behind a modal */
+  --track-thumb: #91ab9d;         /* the scrollbar itself - must be visible in its trough */
+  --scrim: rgba(16, 47, 32, 0.45);   /* the dim behind a modal */
 
   /* --- elevation ----------------------------------------------------------------
      Colour only; the offsets and blur stay with the rule that uses them. Light shadows
      are far weaker than dark ones because a shadow on paper is contact, not depth. */
-  --shadow-soft: rgba(10, 45, 28, 0.08);
-  --shadow-strong: rgba(10, 45, 28, 0.18);
+  --shadow-soft: rgba(16, 47, 32, 0.08);
+  --shadow-strong: rgba(16, 47, 32, 0.18);
 
   /* --- text ---------------------------------------------------------------------
      The dark theme has five steps between brightest and faint; paper has four, because
      the top of a light ramp runs out of room long before the bottom does. --ink-strong
      therefore lands on the heading colour here rather than one step below it. */
-  --ink: #0a2d1c;                 /* headings, primary values */
-  --ink-strong: #0a2d1c;          /* emphasised text */
-  --ink-strong-warm: #0a2d1c;     /* the same weight where the surroundings are warmer */
-  --ink-body: #123623;            /* ordinary reading text */
-  --ink-body-warm: #123623;
-  --ink-muted: #2c5d43;           /* labels, secondary detail */
-  --ink-muted-warm: #2c5d43;
-  --ink-faint: #4a7a61;           /* disabled, placeholder - not a reading colour */
-  --ink-on-accent: #f6f3ea;       /* text sitting on an accent-filled surface */
+  --ink: #102f20;                 /* headings, primary values */
+  --ink-strong: #102f20;          /* emphasised text */
+  --ink-strong-warm: #102f20;     /* the same weight where the surroundings are warmer */
+  --ink-body: #153525;            /* ordinary reading text */
+  --ink-body-warm: #153525;
+  --ink-muted: #305c46;           /* labels, secondary detail */
+  --ink-muted-warm: #305c46;
+  --ink-faint: #4e7964;           /* disabled, placeholder - not a reading colour */
+  --ink-on-accent: #f6f4e5;       /* text sitting on an accent-filled surface */
 
   /* --- lines --------------------------------------------------------------------
      --line and --line-strong are hairlines: they separate, they do not have to be
      *seen*. A border that carries meaning on its own - a form control's outline, a
      selected row's edge - needs 3:1 against its surface, which neither of them reaches,
      so it uses --line-control. */
-  --line: #c8d8ce;                /* an ordinary divider */
-  --line-strong: #97ada1;         /* a divider that has to carry weight */
-  --line-soft: rgba(10, 45, 28, 0.1);   /* a hairline that works over any surface */
-  --line-control: #4a7a61;        /* a border that must be perceivable: 4.4:1 worst case */
+  --line: #c9d7cf;                /* an ordinary divider */
+  --line-strong: #98aca2;         /* a divider that has to carry weight */
+  --line-soft: rgba(16, 47, 32, 0.1);   /* a hairline that works over any surface */
+  --line-control: #4e7964;        /* a border that must be perceivable: 3.3:1 worst case */
 
   /* --- neutral layers -----------------------------------------------------------
      Translucent so that one value works on every surface underneath it - a solid hover
      colour would need five variants, one per surface, and the fifth would be wrong. */
-  --fill-subtle: rgba(10, 45, 28, 0.03);
-  --fill: rgba(10, 45, 28, 0.06);
-  --fill-strong: rgba(10, 45, 28, 0.1);
-  --hover: rgba(10, 45, 28, 0.06);
-  --pressed: rgba(10, 45, 28, 0.12);
+  --fill-subtle: rgba(16, 47, 32, 0.03);
+  --fill: rgba(16, 47, 32, 0.06);
+  --fill-strong: rgba(16, 47, 32, 0.1);
+  --hover: rgba(16, 47, 32, 0.06);
+  --pressed: rgba(16, 47, 32, 0.12);
 
   /* --- accent -------------------------------------------------------------------
-     The working accent is NOT the same gold in both themes. #d9ac52 is tuned for a dark
-     ground and measures 2.9:1 on white - it fails as text on paper, which is precisely
-     why ACCENT.deep exists. On light, "hover" also means *darker*: brightening a gold
+     The working accent is NOT the same gold in both themes. The dark theme's is the logo's
+     own mustard, #eab43f, which measures 1.9:1 on white - it fails as text on paper, which
+     is precisely why ACCENT.deep exists. The light one is a dark mustard on the logo's hue,
+     held at the luminance that survives the tinted sidebar (5.2:1 there, 7.8:1 on white). On light, "hover" also means *darker*: brightening a gold
      that is already on white removes the only contrast it had. */
-  --accent: #6b4d18;              /* the working accent */
-  --accent-bright: #573c11;       /* hover, focus - darker here, see above */
-  --accent-soft: rgba(138, 101, 32, 0.1);    /* a translucent accent wash */
-  --accent-wash: rgba(138, 101, 32, 0.06);   /* the faintest accent tint */
-  --accent-line: rgba(138, 101, 32, 0.28);
-  --accent-line-strong: rgba(138, 101, 32, 0.5);
-  --accent-muted: #eed08d;        /* an accent surface switched on but unavailable */
-  --accent-shadow: rgba(138, 101, 32, 0.18); /* the well under accent text */
-  --focus-ring: rgba(138, 101, 32, 0.45);
+  --accent: #6a4e0c;              /* the working accent */
+  --accent-bright: #553d07;       /* hover, focus - darker here, see above */
+  --accent-soft: rgba(137, 102, 19, 0.1);    /* a translucent accent wash */
+  --accent-wash: rgba(137, 102, 19, 0.06);   /* the faintest accent tint */
+  --accent-line: rgba(137, 102, 19, 0.28);
+  --accent-line-strong: rgba(137, 102, 19, 0.5);
+  --accent-muted: #f7cd7e;        /* an accent surface switched on but unavailable */
+  --accent-shadow: rgba(137, 102, 19, 0.18); /* the well under accent text */
+  --focus-ring: rgba(137, 102, 19, 0.45);
 
   /* --- signals ------------------------------------------------------------------
      Five roles each, because a signal is never just one colour: the base is text and
@@ -176,14 +183,20 @@
      Anything inside a print surface uses these, not the tokens above. */
   --paper: #ffffff;
   --paper-ink: #111111;
-  --paper-ink-muted: #2c5d43;
-  --paper-line: #c8d8ce;
-  /* The shared price-list picture: fixed brand colours, the same in light and dark mode. */
-  --price-list-band: #0a2d1c;
-  --price-list-band-2: #123623;
-  --price-list-gold: #c29030;
-  --price-list-cream: #f6f3ea;
-  --accent-deep: #8a6520;         /* accent text where it must survive a light surface */
+  --paper-ink-muted: #305c46;
+  --paper-line: #c9d7cf;
+  /* The shared price-list picture: fixed brand colours, the same in light and dark mode - the PEP
+     logo's own ground, mustard and cream, so the picture a customer receives looks like the sign.
+     Mustard on the band 7.7:1, cream on the band and band-green rates on cream 13.1:1. */
+  --price-list-band: #102f20;
+  --price-list-band-2: #153525;
+  --price-list-gold: #eab43f;
+  --price-list-cream: #f6f4e5;
+  /* The green tile the shipped mark sits in on a light page: the logo's own ground, so the light
+     theme shows the original mustard-and-cream logo instead of a recoloured cut. Owner's choice,
+     30 Oct 2026. Mustard on it 7.7:1, cream 13.1:1. */
+  --brand-mark-tile: #102f20;
+  --accent-deep: #896613;         /* accent text where it must survive a light surface */
   /* The customer bill's saving: success green that reads on white paper (7.1:1), with a wash and
      rule built from it. Paper colours like the rest of this group, so never re-themed. Printed and
      PDF output override all three with black on white. */
@@ -203,10 +216,10 @@
   --card-veil-soft: rgba(255, 255, 255, 0.62);
   --card-veil: rgba(255, 255, 255, 0.8);
   --card-veil-solid: rgba(255, 255, 255, 0.97);
-  --shadow-faint: rgba(10, 45, 28, 0.04);
-  --shadow-deep: rgba(10, 45, 28, 0.26);
-  --scrim-soft: rgba(10, 45, 28, 0.28);
-  --scrim-strong: rgba(10, 45, 28, 0.5);
+  --shadow-faint: rgba(16, 47, 32, 0.04);
+  --shadow-deep: rgba(16, 47, 32, 0.26);
+  --scrim-soft: rgba(16, 47, 32, 0.28);
+  --scrim-strong: rgba(16, 47, 32, 0.5);
 
   /* --- geometry -----------------------------------------------------------------
      Not colours, so they are defined here once and never redefined by the dark blocks: a
@@ -239,48 +252,48 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
 
-    --ground: #03110b;
-    --panel: #092318;
-    --card: #123623;
-    --raised: #0d2e1f;
-    --raised-high: #0f3222;
-    --track: #0c2b1d;
-    --track-thumb: #2c5d43;
-    --scrim: rgba(3, 17, 11, 0.72);
+    --ground: #04100b;
+    --panel: #0b2219;
+    --card: #153525;
+    --raised: #102e20;
+    --raised-high: #123124;
+    --track: #0f2b1e;
+    --track-thumb: #305c46;
+    --scrim: rgba(4, 16, 11, 0.72);
 
-    --shadow-soft: rgba(3, 17, 11, 0.42);
-    --shadow-strong: rgba(3, 17, 11, 0.55);
+    --shadow-soft: rgba(4, 16, 11, 0.42);
+    --shadow-strong: rgba(4, 16, 11, 0.55);
 
-    --ink: #f6f3ea;
+    --ink: #f6f4e5;
     --ink-strong: #dfe9e2;
-    --ink-strong-warm: #e2eae5;
-    --ink-body: #c8d8ce;
+    --ink-strong-warm: #e2e9e5;
+    --ink-body: #c9d7cf;
     --ink-body-warm: #cedbd3;
-    --ink-muted: #8fab9c;
-    --ink-muted-warm: #97ada1;
-    --ink-faint: #7aa48f;
-    --ink-on-accent: #082116;
+    --ink-muted: #91ab9d;
+    --ink-muted-warm: #98aca2;
+    --ink-faint: #7da391;
+    --ink-on-accent: #0a2017;
 
-    --line: #2c5d43;
-    --line-strong: #4a7a61;
-    --line-soft: rgba(143, 171, 156, 0.12);
-    --line-control: #8fab9c;
+    --line: #305c46;
+    --line-strong: #4e7964;
+    --line-soft: rgba(145, 171, 157, 0.12);
+    --line-control: #91ab9d;
 
-    --fill-subtle: rgba(143, 171, 156, 0.07);
-    --fill: rgba(143, 171, 156, 0.12);
-    --fill-strong: rgba(143, 171, 156, 0.2);
-    --hover: rgba(143, 171, 156, 0.16);
-    --pressed: rgba(143, 171, 156, 0.22);
+    --fill-subtle: rgba(145, 171, 157, 0.07);
+    --fill: rgba(145, 171, 157, 0.12);
+    --fill-strong: rgba(145, 171, 157, 0.2);
+    --hover: rgba(145, 171, 157, 0.16);
+    --pressed: rgba(145, 171, 157, 0.22);
 
-    --accent: #d9ac52;
-    --accent-bright: #e6c274;
-    --accent-soft: rgba(217, 172, 82, 0.12);
-    --accent-wash: rgba(217, 172, 82, 0.07);
-    --accent-line: rgba(217, 172, 82, 0.28);
-    --accent-line-strong: rgba(217, 172, 82, 0.45);
-    --accent-muted: #4a3a14;
-    --accent-shadow: #2b1f06;
-    --focus-ring: rgba(217, 172, 82, 0.45);
+    --accent: #eab43f;
+    --accent-bright: #facb6c;
+    --accent-soft: rgba(234, 180, 63, 0.12);
+    --accent-wash: rgba(234, 180, 63, 0.07);
+    --accent-line: rgba(234, 180, 63, 0.28);
+    --accent-line-strong: rgba(234, 180, 63, 0.45);
+    --accent-muted: #4e3806;
+    --accent-shadow: #2c1e02;
+    --focus-ring: rgba(234, 180, 63, 0.45);
 
     --danger: #f87171;
     --danger-strong: #fca5a5;
@@ -311,19 +324,19 @@
     --attention-soft: rgba(253, 224, 71, 0.14);
     --attention-line: rgba(250, 204, 21, 0.4);
     --attention-ink: #fde047;
-    --veil-faint: rgba(8, 33, 22, 0.2);
-    --veil-subtle: rgba(8, 33, 22, 0.35);
-    --veil: rgba(8, 33, 22, 0.45);
-    --veil-strong: rgba(8, 33, 22, 0.62);
-    --veil-heavy: rgba(8, 33, 22, 0.78);
-    --veil-solid: rgba(8, 33, 22, 0.96);
-    --card-veil-soft: rgba(18, 54, 35, 0.62);
-    --card-veil: rgba(18, 54, 35, 0.8);
-    --card-veil-solid: rgba(18, 54, 35, 0.97);
-    --shadow-faint: rgba(3, 17, 11, 0.16);
-    --shadow-deep: rgba(3, 17, 11, 0.78);
-    --scrim-soft: rgba(3, 17, 11, 0.42);
-    --scrim-strong: rgba(3, 17, 11, 0.78);
+    --veil-faint: rgba(10, 32, 23, 0.2);
+    --veil-subtle: rgba(10, 32, 23, 0.35);
+    --veil: rgba(10, 32, 23, 0.45);
+    --veil-strong: rgba(10, 32, 23, 0.62);
+    --veil-heavy: rgba(10, 32, 23, 0.78);
+    --veil-solid: rgba(10, 32, 23, 0.96);
+    --card-veil-soft: rgba(21, 53, 37, 0.62);
+    --card-veil: rgba(21, 53, 37, 0.8);
+    --card-veil-solid: rgba(21, 53, 37, 0.97);
+    --shadow-faint: rgba(4, 16, 11, 0.16);
+    --shadow-deep: rgba(4, 16, 11, 0.78);
+    --scrim-soft: rgba(4, 16, 11, 0.42);
+    --scrim-strong: rgba(4, 16, 11, 0.78);
   }
 }
 
@@ -335,48 +348,48 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --ground: #03110b;
-  --panel: #092318;
-  --card: #123623;
-  --raised: #0d2e1f;
-  --raised-high: #0f3222;
-  --track: #0c2b1d;
-  --track-thumb: #2c5d43;
-  --scrim: rgba(3, 17, 11, 0.72);
+  --ground: #04100b;
+  --panel: #0b2219;
+  --card: #153525;
+  --raised: #102e20;
+  --raised-high: #123124;
+  --track: #0f2b1e;
+  --track-thumb: #305c46;
+  --scrim: rgba(4, 16, 11, 0.72);
 
-  --shadow-soft: rgba(3, 17, 11, 0.42);
-  --shadow-strong: rgba(3, 17, 11, 0.55);
+  --shadow-soft: rgba(4, 16, 11, 0.42);
+  --shadow-strong: rgba(4, 16, 11, 0.55);
 
-  --ink: #f6f3ea;
+  --ink: #f6f4e5;
   --ink-strong: #dfe9e2;
-  --ink-strong-warm: #e2eae5;
-  --ink-body: #c8d8ce;
+  --ink-strong-warm: #e2e9e5;
+  --ink-body: #c9d7cf;
   --ink-body-warm: #cedbd3;
-  --ink-muted: #8fab9c;
-  --ink-muted-warm: #97ada1;
-  --ink-faint: #7aa48f;
-  --ink-on-accent: #082116;
+  --ink-muted: #91ab9d;
+  --ink-muted-warm: #98aca2;
+  --ink-faint: #7da391;
+  --ink-on-accent: #0a2017;
 
-  --line: #2c5d43;
-  --line-strong: #4a7a61;
-  --line-soft: rgba(143, 171, 156, 0.12);
-  --line-control: #8fab9c;
+  --line: #305c46;
+  --line-strong: #4e7964;
+  --line-soft: rgba(145, 171, 157, 0.12);
+  --line-control: #91ab9d;
 
-  --fill-subtle: rgba(143, 171, 156, 0.07);
-  --fill: rgba(143, 171, 156, 0.12);
-  --fill-strong: rgba(143, 171, 156, 0.2);
-  --hover: rgba(143, 171, 156, 0.16);
-  --pressed: rgba(143, 171, 156, 0.22);
+  --fill-subtle: rgba(145, 171, 157, 0.07);
+  --fill: rgba(145, 171, 157, 0.12);
+  --fill-strong: rgba(145, 171, 157, 0.2);
+  --hover: rgba(145, 171, 157, 0.16);
+  --pressed: rgba(145, 171, 157, 0.22);
 
-  --accent: #d9ac52;
-  --accent-bright: #e6c274;
-  --accent-soft: rgba(217, 172, 82, 0.12);
-  --accent-wash: rgba(217, 172, 82, 0.07);
-  --accent-line: rgba(217, 172, 82, 0.28);
-  --accent-line-strong: rgba(217, 172, 82, 0.45);
-  --accent-muted: #4a3a14;
-  --accent-shadow: #2b1f06;
-  --focus-ring: rgba(217, 172, 82, 0.45);
+  --accent: #eab43f;
+  --accent-bright: #facb6c;
+  --accent-soft: rgba(234, 180, 63, 0.12);
+  --accent-wash: rgba(234, 180, 63, 0.07);
+  --accent-line: rgba(234, 180, 63, 0.28);
+  --accent-line-strong: rgba(234, 180, 63, 0.45);
+  --accent-muted: #4e3806;
+  --accent-shadow: #2c1e02;
+  --focus-ring: rgba(234, 180, 63, 0.45);
 
   --danger: #f87171;
   --danger-strong: #fca5a5;
@@ -407,17 +420,17 @@
   --attention-soft: rgba(253, 224, 71, 0.14);
   --attention-line: rgba(250, 204, 21, 0.4);
   --attention-ink: #fde047;
-  --veil-faint: rgba(8, 33, 22, 0.2);
-  --veil-subtle: rgba(8, 33, 22, 0.35);
-  --veil: rgba(8, 33, 22, 0.45);
-  --veil-strong: rgba(8, 33, 22, 0.62);
-  --veil-heavy: rgba(8, 33, 22, 0.78);
-  --veil-solid: rgba(8, 33, 22, 0.96);
-  --card-veil-soft: rgba(18, 54, 35, 0.62);
-  --card-veil: rgba(18, 54, 35, 0.8);
-  --card-veil-solid: rgba(18, 54, 35, 0.97);
-  --shadow-faint: rgba(3, 17, 11, 0.16);
-  --shadow-deep: rgba(3, 17, 11, 0.78);
-  --scrim-soft: rgba(3, 17, 11, 0.42);
-  --scrim-strong: rgba(3, 17, 11, 0.78);
+  --veil-faint: rgba(10, 32, 23, 0.2);
+  --veil-subtle: rgba(10, 32, 23, 0.35);
+  --veil: rgba(10, 32, 23, 0.45);
+  --veil-strong: rgba(10, 32, 23, 0.62);
+  --veil-heavy: rgba(10, 32, 23, 0.78);
+  --veil-solid: rgba(10, 32, 23, 0.96);
+  --card-veil-soft: rgba(21, 53, 37, 0.62);
+  --card-veil: rgba(21, 53, 37, 0.8);
+  --card-veil-solid: rgba(21, 53, 37, 0.97);
+  --shadow-faint: rgba(4, 16, 11, 0.16);
+  --shadow-deep: rgba(4, 16, 11, 0.78);
+  --scrim-soft: rgba(4, 16, 11, 0.42);
+  --scrim-strong: rgba(4, 16, 11, 0.78);
 }

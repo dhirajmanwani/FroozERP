@@ -89,6 +89,22 @@ test("the refund is what the customer paid for the line: bill discount and Mandi
   assert.equal(Math.round(whole * 100) / 100, 959 - 50);
 });
 
+test("a combo-only bill's discount is shared over its lines, as the bill's profit took it", () => {
+  // No loose line to carry the bill discount: it is shared over every line on its net, so a full
+  // return refunds what the customer paid, not the discount on top (BE-9).
+  const sale = { invoice_discount_amount: "10.00", tax_amount: "0" };
+  const lines = [
+    { id: 1, quantity: "1", amount: "300", discount_amount: "0", net_amount: "300", combo_line_key: "k1", combo_id: "combo-3", combo_type: "FIXED" },
+    { id: 2, quantity: "1", amount: "200", discount_amount: "0", net_amount: "200", combo_line_key: "k1", combo_id: "combo-3", combo_type: "FIXED" },
+  ];
+  assert.equal(rules.linePaidAmount({ line: lines[0], saleLines: lines, sale }), 294);
+  assert.equal(rules.linePaidAmount({ line: lines[1], saleLines: lines, sale }), 196);
+  // With a loose line on the bill the combo still takes none of it.
+  const withLoose = [...lines, { id: 3, quantity: "1", amount: "100", discount_amount: "0", net_amount: "100" }];
+  assert.equal(rules.linePaidAmount({ line: withLoose[0], saleLines: withLoose, sale }), 300);
+  assert.equal(rules.linePaidAmount({ line: withLoose[2], saleLines: withLoose, sale }), 90);
+});
+
 test("a net_amount of 0 is a real 0, and a missing one falls back to amount less discount", () => {
   const free = { id: 1, quantity: "1", amount: "50", discount_amount: "50", net_amount: "0" };
   assert.equal(rules.refundPerUnit({ line: free, saleLines: [free], sale: {} }), 0);
@@ -363,14 +379,40 @@ test("a return request is refused cleanly: repeated line, malformed or future da
   await withDatabase(async ({ db }) => {
     let response = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 1 }, { sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400);
+    assert.equal(response.body.code, "SALE_RETURN_DUPLICATE_LINE");
     response = await postReturn({ return_date: "2026-13-01", items: [{ sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400, JSON.stringify(response.body));
     assert.match(response.body.message, /YYYY-MM-DD/);
+    assert.equal(response.body.code, "SALE_RETURN_DATE_INVALID");
     response = await postReturn({ return_date: "2999-01-01", items: [{ sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400);
+    assert.equal(response.body.code, "SALE_RETURN_DATE_INVALID");
     response = await postReturn({ return_date: "2026-01-09", items: [{ sale_item_id: 1000, return_quantity: 1 }] });
     assert.equal(response.status, 400, "before the bill");
+    // Every refusal carries a code the screen can map, not only words (BE-14).
+    response = await postReturn({ items: [] });
+    assert.equal(response.body.code, "SALE_RETURN_INVALID_REQUEST");
+    response = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: -1 }] });
+    assert.equal(response.body.code, "SALE_RETURN_QUANTITY_INVALID", JSON.stringify(response.body));
+    response = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 99 }] });
+    assert.equal(response.body.code, "SALE_RETURN_QUANTITY_EXCEEDS", JSON.stringify(response.body));
     assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_returns")).n), 0, "nothing written");
+  });
+});
+
+test("two returns in the same millisecond get different return numbers, not a 500", async (t) => {
+  // return_no is UNIQUE and was `RET-<ms>` alone (BE-13).
+  const frozen = Date.now();
+  t.mock.method(Date, "now", () => frozen);
+  await withDatabase(async ({ db }) => {
+    const first = await postReturn({ items: [{ sale_item_id: 1000, return_quantity: 1 }] });
+    const second = await postReturn({ items: [{ sale_item_id: 1001, return_quantity: 0.1 }] });
+    assert.equal(first.status, 201, JSON.stringify(first.body));
+    assert.equal(second.status, 201, JSON.stringify(second.body));
+    assert.notEqual(first.body.return_no, second.body.return_no);
+    assert.match(first.body.return_no, new RegExp(`^RET-${frozen}-[0-9a-f]{6}$`));
+    assert.ok(first.body.return_no.length <= 40, "fits sale_returns.return_no VARCHAR(40)");
+    assert.equal(Number((await one(db, "SELECT COUNT(*) AS n FROM sale_returns")).n), 2);
   });
 });
 
@@ -561,6 +603,69 @@ test("P&L: one branch, sales and cost net of returns", async () => {
   for (const subquery of subqueries) assert.match(subquery, /branch_id = \$3/, subquery);
   assert.match(pl, /- COALESCE\(\(SELECT SUM\(total_return_amount\) FROM sale_returns WHERE return_date BETWEEN \$1 AND \$2 AND branch_id = \$3\), 0\) AS sales_revenue/);
   assert.match(pl, /- COALESCE\(\(SELECT SUM\(total_cost_amount\) FROM sale_returns WHERE return_date BETWEEN \$1 AND \$2 AND branch_id = \$3\), 0\) AS purchase_cost/);
+});
+
+/**
+ * UI-1. The walkthrough's seed: one purchase at rate 120 with mandi tax 217, freight 200, labour
+ * 100 and a 341.01 bill rebate, so its lots cost 121.95 landed; sales of 2,380 costed 1,534.50 at
+ * that landed cost; rent 1,500. Net profit is 2,380 - 1,534.50 - 1,500 = -654.50. Adding the
+ * charges again (and for the whole purchase, not the part sold) gave -830.49.
+ */
+const UI1_TOTALS = {
+  sales_revenue: "2380.00", purchase_cost: "1534.50", mandi_tax: "217.00", freight_charges: "200.00",
+  labour_charges: "100.00", other_purchase_charges: "0", purchase_bill_rebate: "341.01",
+  supplier_rebate_received: "0", expenses: "1500.00",
+};
+
+test("profit: purchase charges are inside the landed sale cost and are never added a second time", () => {
+  const { profitAndLossFromTotals } = require("./server");
+  const figures = profitAndLossFromTotals(UI1_TOTALS);
+  assert.equal(figures.costOfGoodsSold, 1534.5);
+  assert.equal(figures.grossProfit, 845.5, "the Dashboard's profit for the same sales");
+  assert.equal(Math.round(figures.netProfit * 100) / 100, -654.5);
+  assert.deepEqual(figures.includedInPurchaseCost, {
+    mandiTax: 217, freightCharges: 200, labourCharges: 100, otherPurchaseCharges: 0, purchaseBillRebate: 341.01,
+  });
+  // A rebate taken when paying the supplier is in no lot's cost: it still reduces COGS.
+  assert.equal(profitAndLossFromTotals({ ...UI1_TOTALS, supplier_rebate_received: "50" }).costOfGoodsSold, 1484.5);
+});
+
+test("profit: the P&L statement and the balance sheet (which All Shops sums) report that net profit", async () => {
+  // The P&L statement and the balance-sheet snapshot (which All Shops sums) are answered with the
+  // same totals; both must come out at -654.50 and agree with each other.
+  const isTotals = (sql) => /AS purchase_bill_rebate/.test(sql) && /AS supplier_rebate_received/.test(sql);
+  setQueryResponder((sql) => {
+    if (PERMISSION_SQL.test(sql)) return { rows: [OWNER_ROW], rowCount: 1 };
+    if (isTotals(sql)) return { rows: [UI1_TOTALS], rowCount: 1 };
+    return { rows: [], rowCount: 0 };
+  });
+  try {
+    const report = await probe(app, "GET", "/reports/summary?date_from=2026-10-24&date_to=2026-10-24", headers);
+    assert.equal(report.status, 200, JSON.stringify(report.body).slice(0, 300));
+    assert.equal(report.body.profitLoss.costOfGoodsSold, 1534.5);
+    assert.equal(report.body.profitLoss.netProfit, -654.5);
+    assert.equal(report.body.profitLoss.purchaseChargesIncludedInCost, true);
+    assert.equal(report.body.profitLoss.mandiTax, 217, "still reported, for reading");
+    assert.equal(report.body.balanceSheet.netProfit, -654.5);
+    const sheet = await probe(app, "GET", "/reports/balance-sheet?date_to=2026-10-24", headers);
+    assert.equal(sheet.status, 200, JSON.stringify(sheet.body).slice(0, 300));
+    assert.equal(sheet.body.profitLoss?.netProfit ?? sheet.body.netProfit, -654.5);
+  } finally {
+    clearQueryResponder();
+  }
+  // Neither formula may add a purchase charge to the cost of goods sold again.
+  const source = require("node:fs").readFileSync(require("node:path").join(__dirname, "server.js"), "utf8");
+  assert.doesNotMatch(source, /purchaseCost\s*\+\s*mandiTax|purchaseCost\s*\n\s*\+ Number\(profitLoss\.mandi_tax/);
+  assert.equal(source.split("profitAndLossFromTotals(").length - 1, 2, "used by the P&L statement and the balance sheet");
+  assert.match(source, /netProfit: snapshot\.netProfit,/, "All Shops takes each shop's figure from the snapshot");
+});
+
+test("balance sheet: sales and their cost are net of returns, as the P&L takes them", async () => {
+  const statements = await reportStatements();
+  const sheet = statements.find((sql) => /AS purchase_bill_rebate/.test(sql) && /sale_date <= \$1/.test(sql));
+  assert.ok(sheet, "the balance-sheet totals ran");
+  assert.match(sheet, /- COALESCE\(\(SELECT SUM\(total_return_amount\) FROM sale_returns WHERE branch_id = \$2 AND return_date <= \$1\), 0\) AS sales_revenue/);
+  assert.match(sheet, /- COALESCE\(\(SELECT SUM\(total_cost_amount\) FROM sale_returns WHERE branch_id = \$2 AND return_date <= \$1\), 0\) AS purchase_cost/);
 });
 
 test("daily summary: cash and UPI net of refunds, net profit net of the return margin", async () => {

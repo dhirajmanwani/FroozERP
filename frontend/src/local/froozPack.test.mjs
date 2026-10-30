@@ -489,12 +489,12 @@ test("a shortage is matched to its size by the API's numeric id too", () => {
   ]);
 });
 
-test("the bell row is a warning from Frooz Pack, keyed by size", () => {
+test("the bell row is a warning from PEP Pack, keyed by size", () => {
   const rows = packingShortageNotifications([{ key: "packing-short:packing-size-4", label: "Gift Box › Window Box › Grand · 1 kg", needed: 4, onHand: 3 }]);
   assert.equal(rows.length, 1);
   const [row] = rows;
   assert.equal(row.severity, "warning");
-  assert.equal(row.source, "Frooz Pack");
+  assert.equal(row.source, "PEP Pack");
   assert.equal(row.dedupeKey, "packing-short:packing-size-4");
   assert.match(row.title, /Gift Box › Window Box › Grand · 1 kg/);
   assert.match(row.message, /4 needed, 3 on hand/);
@@ -615,7 +615,7 @@ test("a type, design or size form is checked as the server checks it", () => {
 // Availability
 // ---------------------------------------------------------------------------------------------
 
-test("Frooz Pack writes need the cloud: Local Only, no cloud and offline each say so", () => {
+test("PEP Pack writes need the cloud: Local Only, no cloud and offline each say so", () => {
   assert.match(resolvePackAvailability({ connectivityMode: "LOCAL_ONLY", online: true, isTauri: true }), /Local Only/);
   // Local Only wins even when the machine is online and has a cloud set up.
   assert.match(resolvePackAvailability({ connectivityMode: "LOCAL_ONLY", online: true, isTauri: true, cloudConfigured: true }), /Local Only/);
@@ -628,7 +628,7 @@ test("Frooz Pack writes need the cloud: Local Only, no cloud and offline each sa
   assert.equal(resolvePackAvailability(), null);
 });
 
-test("the Frooz Pack screen shows everything the picker hides, marked, and falls back up a level", () => {
+test("the PEP Pack screen shows everything the picker hides, marked, and falls back up a level", () => {
   const catalogue = readPackingCatalogue(snapshotPacking());
   const top = packingManageView(catalogue, createPackingDrill());
   assert.equal(top.level, "types");
@@ -667,18 +667,18 @@ test("the Frooz Pack screen shows everything the picker hides, marked, and falls
 });
 
 test("an empty picker names the packing types that still need a design and a size", () => {
-  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }), "No packing set up yet. The Owner or an Admin adds it in Frooz Pack.");
+  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }), "No packing set up yet. The Owner or an Admin adds it in PEP Pack.");
   assert.equal(
     packingEmptyPickerMessage({ status: "ready", types: [
       { id: "packing-type-1", name: "Bottle", active: true, designs: [] },
       { id: "packing-type-2", name: "Box", active: true, designs: [{ id: "packing-design-1", name: "Window", active: true, sizes: [] }] },
       { id: "packing-type-3", name: "Old", active: false, designs: [] },
     ] }),
-    "Bottle, Box have no size yet. In Frooz Pack, press New packing, choose each one, name a design and tick its sizes."
+    "Bottle, Box have no size yet. In PEP Pack, press New packing, choose each one, name a design and tick its sizes."
   );
   assert.equal(
     packingEmptyPickerMessage([{ id: "packing-type-1", name: "Bottle", designs: [] }]),
-    "Bottle has no size yet. In Frooz Pack, press New packing, choose it, name a design and tick its sizes."
+    "Bottle has no size yet. In PEP Pack, press New packing, choose it, name a design and tick its sizes."
   );
 });
 
@@ -870,4 +870,113 @@ test("delete: only what the owner's list says is unused; unknown (the counter's 
   assert.equal(snapshot.types[0].in_use, null);
   assert.equal(packingDeletable(snapshot.types[0]), false, "no answer about use is not 'unused'");
   for (const odd of [undefined, null, {}, { in_use: "false" }, { in_use: 0 }]) assert.equal(packingDeletable(odd), false);
+});
+
+// --- Fixes from the back-office audit ---------------------------------------------------------
+
+import {
+  checkPackingNodeForm,
+  newPackingPurchaseClientRef,
+  packingNodeRef,
+  packingSetupStart,
+  startPackingNodeForm,
+} from "./froozPack.js";
+import { readFileSync as readAppSource } from "node:fs";
+
+const packApp = readAppSource(new URL("../App.jsx", import.meta.url), "utf8");
+const packModule = packApp.slice(packApp.indexOf("function FroozPackModule("), packApp.indexOf("function FroozPackModule(") + 40000);
+
+const twoDesigns = () => ({
+  type: { id: "packing-type-1", global_id: "packing-type-1", name: "Gift Box" },
+  windowBox: { id: "packing-design-3", global_id: "packing-design-3", name: "Window Box" },
+  round: { id: "packing-design-4", global_id: "packing-design-4", name: "Round" },
+});
+
+test("a size form opened under one design saves under it, even after browsing to another (BO-2)", () => {
+  const { type, windowBox, round } = twoDesigns();
+  const opened = { level: "sizes", type, design: windowBox, crumbs: [{ label: "Packing" }, { label: "Gift Box" }, { label: "Window Box" }] };
+  const size = { id: "packing-size-9", global_id: "packing-size-9", size_name: "GRAND", capacity: "1 kg", unit_cost: 40, sort_order: 2, active: true, in_use: true };
+  const form = startPackingNodeForm("size", size, opened);
+  assert.deepEqual(form.parent, { design_id: "packing-design-3" });
+  assert.equal(form.where, "Gift Box › Window Box");
+  assert.equal(form.ref, "packing-size-9");
+  assert.equal(form.inUse, true);
+  assert.deepEqual(form.draft, { sort_order: "2", active: true, size_name: "GRAND", capacity: "1 kg", unit_cost: "40" });
+  // The owner now browses into Round; the form still holds Window Box.
+  void round;
+  const check = checkPackingNodeForm(form);
+  assert.equal(check.ok, true, check.message);
+  assert.equal(check.payload.design_id, "packing-design-3");
+
+  const design = startPackingNodeForm("design", { id: "packing-design-3", name: "Window Box", sort_order: 0 }, { level: "designs", type, crumbs: [{ label: "Packing" }, { label: "Gift Box" }] });
+  assert.deepEqual(design.parent, { type_id: "packing-type-1" });
+  assert.equal(checkPackingNodeForm(design).payload.type_id, "packing-type-1");
+  const top = startPackingNodeForm("type", null, { level: "types", crumbs: [{ label: "Packing" }] });
+  assert.deepEqual(top.parent, {});
+  assert.equal(top.where, "");
+  assert.equal(packingNodeRef({ id: 12, global_id: "packing-size-12" }), "packing-size-12");
+  assert.equal(packingNodeRef({ id: "004" }), "004");
+});
+
+test("PEP Pack saves a node against the parent it opened in, and holds the list still while a form is open", () => {
+  const saveNode = packModule.slice(packModule.indexOf("const saveNode = async"), packModule.indexOf("const startRemoval"));
+  assert.ok(saveNode.length > 0);
+  assert.doesNotMatch(saveNode, /view\.(design|type)/, "the parent used to be read from the drill-down at Save time");
+  assert.match(saveNode, /checkPackingNodeForm\(nodeForm\)/);
+  assert.match(packModule, /setNodeForm\(startPackingNodeForm\(kind, node, view\)\)/);
+  assert.match(packModule, /<PackDrillHeader\s+crumbs=\{view\.crumbs\}\s+disabled=\{busy\}/);
+  assert.match(packModule, /disabled=\{row\.leaf \|\| busy\}/);
+  assert.match(packModule, /const goBack = \(\) => \{\s+if \(busy\) return;/);
+  assert.match(packModule, /if \(!row \|\| row\.leaf \|\| busy\) return;/);
+  assert.match(packModule, /Correct the count: \$\{adjust\.path\}/);
+});
+
+test("purchase errors name the line by its place in the table, blank spare lines included (BO-15)", () => {
+  const draft = { payment_mode: "CASH", lines: [
+    { size_id: "packing-size-4", quantity: "1", rate: "1" },
+    { size_id: "", quantity: "", rate: "" },
+    { size_id: "packing-size-9", quantity: "", rate: "2" },
+  ] };
+  assert.match(buildPackingPurchasePayload(draft).message, /^Line 3: enter a quantity/);
+});
+
+test("a packing purchase sends its form's client_ref, the same on every retry (BE-4)", () => {
+  const ref = newPackingPurchaseClientRef({ randomUUID: () => "0f8e3c1a-1111-4222-8333-444455556666" });
+  assert.equal(ref, "pack-purchase:0f8e3c1a-1111-4222-8333-444455556666");
+  assert.match(ref, /^[A-Za-z0-9._:-]{1,80}$/, "the server's CLIENT_REF_PATTERN");
+  const fallback = newPackingPurchaseClientRef({ randomUUID: null, now: () => 1_700_000_000_000, random: () => 0.5 });
+  assert.match(fallback, /^pack-purchase:[a-z0-9]+-[a-z0-9]+$/);
+  assert.notEqual(newPackingPurchaseClientRef(), newPackingPurchaseClientRef(), "a new form gets a new key");
+
+  const draft = { payment_mode: "CASH", client_ref: ref, lines: [{ size_id: "packing-size-4", quantity: "2", rate: "5" }] };
+  assert.equal(buildPackingPurchasePayload(draft).payload.client_ref, ref);
+  assert.equal(buildPackingPurchasePayload(draft).payload.client_ref, buildPackingPurchasePayload(draft).payload.client_ref);
+  assert.equal(Object.hasOwn(buildPackingPurchasePayload({ ...draft, client_ref: "" }).payload, "client_ref"), false);
+  assert.equal(buildPackingPurchasePayload({ ...draft, client_ref: "bad ref!" }).ok, false);
+
+  const startPurchase = packModule.slice(packModule.indexOf("const startPurchase = () =>"), packModule.indexOf("const updatePurchase ="));
+  assert.match(startPurchase, /client_ref: newPackingPurchaseClientRef\(\)/, "made once, when the form opens");
+  const savePurchase = packModule.slice(packModule.indexOf("const savePurchase = async"), packModule.indexOf("const startAdjust"));
+  assert.doesNotMatch(savePurchase, /newPackingPurchaseClientRef/, "a retry must not make a new key");
+});
+
+test("New packing inside a switched-off type or design starts where the form can follow, and says why (BO-17)", () => {
+  const catalogue = readPackingCatalogue({ types: [
+    { id: 1, global_id: "packing-type-1", name: "Gift Box", active: true, designs: [
+      { id: 3, global_id: "packing-design-3", name: "Window Box", active: false, sizes: [] },
+      { id: 4, global_id: "packing-design-4", name: "Round", active: true, sizes: [] },
+    ] },
+    { id: 2, global_id: "packing-type-2", name: "Basket", active: false, designs: [] },
+  ] });
+  const offType = packingSetupStart(catalogue, { typeId: "packing-type-2" });
+  assert.equal(offType.draft.type_id, "");
+  assert.equal(offType.note, "Basket is switched off. Switch it on (Edit) to add packing under it.");
+  const offDesign = packingSetupStart(catalogue, { typeId: "packing-type-1", designId: "packing-design-3" });
+  assert.equal(offDesign.draft.type_id, "packing-type-1");
+  assert.equal(offDesign.draft.design_id, "");
+  assert.match(offDesign.note, /^Window Box is switched off/);
+  const on = packingSetupStart(catalogue, { typeId: "packing-type-1", designId: "packing-design-4" });
+  assert.equal(on.draft.design_id, "packing-design-4");
+  assert.equal(on.note, "");
+  assert.equal(packingSetupStart(catalogue).note, "");
 });

@@ -909,7 +909,11 @@ const linkSpokenReminder = async (pool, branchId, question, title) => {
   });
 };
 
-const getPendingPurchaseBills = async (pool, branchId) => {
+/**
+ * `limit: null` reads every pending bill. The facts keep their fifty rows; `runAlertRules` needs
+ * the whole set, because a bill left out of it is treated as completed and its alert resolved.
+ */
+const getPendingPurchaseBills = async (pool, branchId, { limit = 50 } = {}) => {
   const branch = requireBranchScope(branchId);
   const result = await pool.query(`
     SELECT p.id, p.supplier_id, COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS supplier_name,
@@ -921,13 +925,21 @@ const getPendingPurchaseBills = async (pool, branchId) => {
       AND p.purchase_bill_status = 'BILL_PENDING'
       AND p.branch_id = $1
     ORDER BY p.purchase_date, p.id
-    LIMIT 50
+    ${limit === null ? "" : `LIMIT ${Number(limit)}`}
   `, [branch]);
   const rows = result.rows.map((row) => ({ ...row, net_payable: roundCurrency(row.net_payable), balance_amount: roundCurrency(row.balance_amount) }));
   return buildFact("pending_purchase_bills", "Pending Bills", "Current pending purchase bills", rows, { count: rows.length });
 };
 
-const getLowStockProducts = async (pool, branchId) => {
+/**
+ * Products at or under their minimum at this branch.
+ *
+ * Only this branch's company's products that are not deleted, and only products this branch has
+ * ever held a lot of: a fruit the shop has never stocked is not "out of stock" here, and another
+ * company's catalogue must not appear at all. `limit: null` reads the whole set -- `runAlertRules`
+ * resolves the alert of every product missing from it, so it must not be cut at fifty.
+ */
+const getLowStockProducts = async (pool, branchId, { limit = 50 } = {}) => {
   const branch = requireBranchScope(branchId);
   const result = await pool.query(`
     SELECT p.id, p.product_name, p.category, p.unit, COALESCE(p.minimum_stock, 0) AS minimum_stock,
@@ -936,10 +948,13 @@ const getLowStockProducts = async (pool, branchId) => {
     FROM products p
     LEFT JOIN inventory_batches ib ON ib.product_id = p.id AND ib.branch_id = $1
     WHERE p.active IS DISTINCT FROM FALSE
+      AND p.deleted_at IS NULL
+      AND ${branchCompanyAccountFilter("p")}
     GROUP BY p.id
-    HAVING COALESCE(SUM(CASE WHEN COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' THEN ib.remaining_qty ELSE 0 END), 0) <= GREATEST(COALESCE(p.minimum_stock, 0), 0)
+    HAVING COUNT(ib.id) > 0
+      AND COALESCE(SUM(CASE WHEN COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' THEN ib.remaining_qty ELSE 0 END), 0) <= GREATEST(COALESCE(p.minimum_stock, 0), 0)
     ORDER BY available_stock ASC, p.product_name
-    LIMIT 50
+    ${limit === null ? "" : `LIMIT ${Number(limit)}`}
   `, [branch]);
   const rows = result.rows.map((row) => ({
     ...row,
@@ -957,6 +972,8 @@ const getStockRunoutForecast = async (pool, branchId) => {
     FROM products p
     LEFT JOIN inventory_batches ib ON ib.product_id = p.id AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' AND ib.branch_id = $1
     WHERE p.active IS DISTINCT FROM FALSE
+      AND p.deleted_at IS NULL
+      AND ${branchCompanyAccountFilter("p")}
     GROUP BY p.id
     ORDER BY p.product_name
     LIMIT 50
@@ -1931,7 +1948,7 @@ const getCollectionSummary = async (pool, branchId, range) => {
 
 /**
  * The key `facts` carries once the condition behind an alert has gone away -- written only by
- * `resolveClearedCustomerOverdueAlerts`.
+ * `resolveClearedCustomerOverdueAlerts` and `resolveClearedAlerts`.
  *
  * It is what separates "the owner resolved this" from "this stopped being true". A resolved alert
  * stays resolved while its condition holds, because the owner said so and a rule re-firing every
@@ -1947,7 +1964,9 @@ const upsertAlert = async (pool, branchId, alert) => {
     VALUES (NULL, $10, $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ON CONFLICT (dedup_key)
     DO UPDATE SET
+      alert_type = EXCLUDED.alert_type,
       severity = EXCLUDED.severity,
+      title = EXCLUDED.title,
       message = EXCLUDED.message,
       facts = EXCLUDED.facts,
       status = CASE WHEN ai_alerts.status = 'RESOLVED' THEN 'OPEN' ELSE ai_alerts.status END,
@@ -2001,14 +2020,44 @@ const resolveClearedCustomerOverdueAlerts = async (pool, branchId, stillOverdueK
   `, [branch, stillOverdueKeys]);
 };
 
+/**
+ * The same close-and-mark as `resolveClearedCustomerOverdueAlerts`, for the alert types whose rule
+ * reads its whole live set: stock under minimum and purchase bills pending too long.
+ *
+ * Without it a `ZERO_STOCK` alert stayed open after the fruit was restocked, so the bell kept
+ * saying "out of stock", and a dismissed reminder was never forgotten -- the frontend forgets a
+ * dismissal once the alert stops being live -- so the next run-out did not ring. `stillLiveKeys`
+ * must be the whole set, read without a limit, for the reason given above.
+ */
+const resolveClearedAlerts = async (pool, branchId, alertTypes, stillLiveKeys) => {
+  const branch = requireBranchScope(branchId);
+  await pool.query(`
+    UPDATE ai_alerts
+    SET status = 'RESOLVED',
+        resolved_at = CASE WHEN status = 'RESOLVED' THEN resolved_at ELSE CURRENT_TIMESTAMP END,
+        facts = facts || jsonb_build_object('${ALERT_CONDITION_CLEARED_KEY}', CURRENT_TIMESTAMP),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE branch_id = $1
+      AND alert_type = ANY($2::text[])
+      AND facts ->> '${ALERT_CONDITION_CLEARED_KEY}' IS NULL
+      AND NOT (dedup_key = ANY($3::text[]))
+  `, [branch, alertTypes, stillLiveKeys]);
+};
+
+const STOCK_ALERT_TYPES = ["LOW_STOCK", "ZERO_STOCK"];
+const PURCHASE_PENDING_ALERT_TYPES = ["PURCHASE_BILL_PENDING"];
+const lowStockAlertKey = (branchId, row) => `low-stock:${branchId}:${row.id}`;
+const purchasePendingAlertKey = (branchId, row) => `purchase-pending:${branchId}:${row.id}`;
+
 const customerOverdueAlertKey = (branchId, row) => `customer-overdue:${branchId}:${row.customer_id || row.customer_name}`;
 
 const runAlertRules = async (pool, branchId, settings) => {
   const [customerOutstanding, pendingPurchases, lowStock] = await Promise.all([
     // Every debtor, not the fact's top fifty: a customer missing from this list is resolved below.
     getCustomerOutstandingRows(pool, branchId, settings),
-    getPendingPurchaseBills(pool, branchId),
-    getLowStockProducts(pool, branchId),
+    // Whole sets, not the facts' fifty: anything missing from them is resolved below.
+    getPendingPurchaseBills(pool, branchId, { limit: null }),
+    getLowStockProducts(pool, branchId, { limit: null }),
   ]);
   const overdueCustomers = customerOutstanding.rows.filter((item) => OVERDUE_DUE_STATUSES.includes(item.due_status));
   for (const row of overdueCustomers) {
@@ -2025,9 +2074,10 @@ const runAlertRules = async (pool, branchId, settings) => {
     });
   }
   await resolveClearedCustomerOverdueAlerts(pool, branchId, overdueCustomers.map((row) => customerOverdueAlertKey(branchId, row)));
-  for (const row of pendingPurchases.rows.filter((item) => Number(item.pending_days || 0) >= settings.thresholds.purchaseBillPendingDays)) {
+  const overduePurchases = pendingPurchases.rows.filter((item) => Number(item.pending_days || 0) >= settings.thresholds.purchaseBillPendingDays);
+  for (const row of overduePurchases) {
     await upsertAlert(pool, branchId, {
-      dedupKey: `purchase-pending:${branchId}:${row.id}`,
+      dedupKey: purchasePendingAlertKey(branchId, row),
       type: "PURCHASE_BILL_PENDING",
       severity: "ATTENTION",
       sourceModule: "Pending Bills",
@@ -2038,9 +2088,10 @@ const runAlertRules = async (pool, branchId, settings) => {
       facts: row,
     });
   }
+  await resolveClearedAlerts(pool, branchId, PURCHASE_PENDING_ALERT_TYPES, overduePurchases.map((row) => purchasePendingAlertKey(branchId, row)));
   for (const row of lowStock.rows) {
     await upsertAlert(pool, branchId, {
-      dedupKey: `low-stock:${branchId}:${row.id}`,
+      dedupKey: lowStockAlertKey(branchId, row),
       type: Number(row.available_stock || 0) <= 0 ? "ZERO_STOCK" : "LOW_STOCK",
       severity: row.severity,
       sourceModule: "Inventory Lots",
@@ -2051,6 +2102,7 @@ const runAlertRules = async (pool, branchId, settings) => {
       facts: row,
     });
   }
+  await resolveClearedAlerts(pool, branchId, STOCK_ALERT_TYPES, lowStock.rows.map((row) => lowStockAlertKey(branchId, row)));
 };
 
 /**
@@ -3325,6 +3377,8 @@ module.exports = {
   getCustomerOutstanding,
   getSupplierOutstanding,
   getSupplierBalanceRows,
+  getLowStockProducts,
+  getPendingPurchaseBills,
   runAlertRules,
   safeBriefingFact,
   emptyBriefingFact,

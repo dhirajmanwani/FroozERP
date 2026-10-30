@@ -84,3 +84,37 @@ export const insightCardValue = (value, formatMoney = (number) => String(number)
   if (typeof value === "string" && value.trim()) return { text: value, unavailable: false };
   return { text: UNKNOWN_FIGURE, unavailable: true };
 };
+
+/**
+ * A tile's value with a negative amount kept in one piece. `currency.format(-1190)` is
+ * "-₹1,190.00", and the browser may break a line after the hyphen, so a narrow tile read
+ * "-" above "₹1,190.00": at a glance, a positive balance. The sign becomes a true minus (U+2212)
+ * held to the figure by a word joiner (U+2060), and `negative` lets the tile colour it.
+ * Anything that is not a negative figure is returned as it came.
+ */
+export const presentSignedFigure = (value) => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 0 ? { text: `−⁠${String(Math.abs(value))}`, negative: true } : { text: value, negative: false };
+  }
+  if (typeof value !== "string") return { text: value, negative: false };
+  const match = /^\s*[-−]\s*(?=[₹\d])/.exec(value);
+  if (!match) return { text: value, negative: false };
+  return { text: `−⁠${value.slice(match[0].length)}`, negative: true };
+};
+
+/**
+ * A chart axis or tooltip figure in rupees, short: ₹950, ₹1.2K, ₹4.5 L, ₹2.1 Cr. The axis used
+ * `Intl.NumberFormat("en-IN", { notation: "compact" })`, whose "T" (thousand) read as trillion
+ * ("INR 1T" for ₹1,190), and said INR where the rest of the app says ₹.
+ */
+export const formatChartRupees = (value) => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "₹0";
+  const sign = number < 0 ? "−" : "";
+  const size = Math.abs(number);
+  const short = (amount) => String(Math.round(amount * 10) / 10);
+  if (size >= 1e7) return `${sign}₹${short(size / 1e7)} Cr`;
+  if (size >= 1e5) return `${sign}₹${short(size / 1e5)} L`;
+  if (size >= 1e3) return `${sign}₹${short(size / 1e3)}K`;
+  return `${sign}₹${Math.round(size)}`;
+};

@@ -87,7 +87,7 @@ test("the keys the list names by hand are still handled in App.jsx", () => {
   assert.match(app, /\(event\.ctrlKey \|\| event\.metaKey\) && event\.key\.toLowerCase\(\) === "k"/, "Ctrl K");
   assert.match(app, /if \(isShortcutSheetChord\(event\)\)/, "Ctrl /");
   assert.match(app, /event\.key === "Escape"\) \{\s*setFrostDrawerOpen\(false\);\s*setCommandPaletteOpen\(false\);\s*setShortcutSheetOpen\(false\);/, "Esc closes all three");
-  for (const key of ["F2", "F3", "F4"]) {
+  for (const key of ["F2", "F3", "F4", "F6"]) {
     assert.match(app, new RegExp(`event\\.key === "${key}"`), `${key} inside POS Billing`);
   }
 });
@@ -111,4 +111,27 @@ test("the top bar stays on screen while the page scrolls, and sticky panels star
   assert.match(topbar[1], /top: 0;/);
   assert.match(css, /\.checkout-card \{[^}]*top: calc\(var\(--topbar-height, 0px\) \+ 18px\);/);
   assert.match(css, /\.sticky-report-filters \{[^}]*top: calc\(var\(--topbar-height, 0px\) \+ 10px\);/);
+});
+
+test("POS F-keys are heard on the window, so they work again after a bill or \"Not yet\"", () => {
+  const start = app.indexOf("function PosBilling(");
+  const pos = app.slice(start, app.indexOf("\nfunction PosLeaveDialog(", start));
+  assert.match(pos, /window\.addEventListener\("keydown", onKeyDown\)/);
+  assert.match(pos, /if \(event\.defaultPrevented \|\| shortcutsPaused\) return;/);
+  assert.match(pos, /if \(paymentConfirm \|\| discountApproval \|\| comboAsk \|\| lotSelectorProduct\) return;/);
+  assert.doesNotMatch(pos, /<section className="pos-layout" onKeyDown=/);
+});
+
+test("the invoice closes on Escape and takes focus when it opens", () => {
+  const start = app.indexOf("function InvoiceModal(");
+  const body = app.slice(start, app.indexOf("function PurchaseSummary(", start));
+  assert.match(body, /event\.key === "Escape" && !pdfPreview && !whatsappOpen/);
+  assert.match(body, /invoiceSectionRef\.current\?\.focus\(\)/);
+});
+
+test("the shortcut list names F6 and calls F4 what it does", () => {
+  const sheet = buildShortcutSheet({ visibleModuleIds: ["sales"] });
+  const rows = JSON.stringify(sheet);
+  assert.match(rows, /"keys":"F6"/);
+  assert.match(rows, /Checkout & Print/);
 });

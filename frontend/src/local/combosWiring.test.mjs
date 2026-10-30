@@ -110,3 +110,12 @@ test("combos whose fruit is missing ring the bell and are named on POS; the form
   assert.match(app, /const productChoices = comboPickableProducts\(products\);/);
   assert.match(app, /emptyComboTabMessage\(\{/);
 });
+
+test("combo reminders ring only for the Owner and Admins, and a dismissal is remembered on this computer (BO-9)", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const effect = app.slice(app.indexOf("const raisedComboRows"), app.indexOf("Read today's payments"));
+  assert.match(effect, /const comboBellAllowed = isRateManagerRole\(user\?\.role\);/);
+  assert.match(effect, /if \(!comboBellAllowed\) \{/);
+  assert.match(effect, /if \(dismissed\.has\(row\.dedupeKey\)\) continue;/);
+  assert.match(effect, /pruneDismissedStockReminders\(dismissed, \[\.\.\.live\], isComboStockReminderKey\)/);
+});

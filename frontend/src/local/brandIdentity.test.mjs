@@ -34,10 +34,10 @@ test("the big line is the business name and the small line brand - by company", 
 });
 
 test("blank fields fall back without printing empty separators", () => {
-  assert.deepEqual(resolveBrandIdentity({}), { title: "FroozERP", tagline: "", logo: null });
+  assert.deepEqual(resolveBrandIdentity({}), { title: "THE PEP", tagline: "", logo: null });
   assert.equal(resolveBrandIdentity({ business_name: "Frooz", company_name: "SRT" }).tagline, "SRT");
   assert.equal(resolveBrandIdentity({ business_name: "Frooz", brand_name: "Fresh" }).tagline, "Fresh");
-  assert.equal(resolveBrandIdentity(null).title, "FroozERP");
+  assert.equal(resolveBrandIdentity(null).title, "THE PEP");
 });
 
 test("a brand name that repeats the business name is not printed twice", () => {

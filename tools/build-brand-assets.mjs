@@ -1,48 +1,99 @@
 #!/usr/bin/env node
-// Derives every brand asset the app and the website use from one vector source.
+// Derives every vector brand asset the app and the website use from one source.
 //
-// The source is the official lockup exported from Illustrator. It carries three
-// colour classes and nothing else, so each variant here is a viewBox crop plus a
-// class recolour - no path editing, so a re-export of the source stays compatible.
+// The source is THE PEP lockup (branding/source/pep-logo-source.svg), traced once from
+// the supplied logo, one path set per colour. It carries two colour classes and five
+// named parts and nothing else, so each variant here is a part selection, a viewBox crop
+// and a class recolour - no path editing, so a re-trace of the source stays compatible.
 //
 // Run: node tools/build-brand-assets.mjs
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { ACCENT, BRAND, CREAM, CREAM_DIM } from "../frontend/src/local/brandPalette.js";
+import { ACCENT, BRAND, CREAM } from "../frontend/src/local/brandPalette.js";
 
-const brandingDir = join(dirname(fileURLToPath(import.meta.url)), "..", "frontend", "public", "branding");
-const SOURCE = join(brandingDir, "frooz-logo.svg");
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const brandingDir = join(repoRoot, "frontend", "public", "branding");
+const websiteBrandingDir = join(repoRoot, "website", "public", "branding");
+const SOURCE = join(repoRoot, "branding", "source", "pep-logo-source.svg");
 
-// Measured from the source artwork's element bounding boxes.
+const PARTS = ["pep-letters", "pep-counters", "pep-leaf", "pep-the", "pep-tagline"];
+
+// Measured from the traced parts' bounding boxes (source units, 4x the JPEG), plus a
+// margin of 40-48 units so no edge touches the crop.
 const CROPS = {
-  logo: { viewBox: "0 0 2172 724", note: "full lockup" },
-  mark: { viewBox: "88 47 565 577", note: "monogram and leaf only" },
-  wordmark: { viewBox: "802 106 1349 472", note: "tagline and FROOZ only" },
+  logo: {
+    viewBox: "22 11 2723 1447",
+    parts: PARTS,
+    note: "full lockup: THE, pep, leaf and tagline",
+  },
+  mark: {
+    viewBox: "233 19 2504 1313",
+    parts: ["pep-letters", "pep-counters", "pep-leaf"],
+    note: "the pep letters and leaf only",
+  },
+  // The name without the slogan, for strips too small for the tagline to be read.
+  wordmark: {
+    viewBox: "30 19 2707 1313",
+    parts: ["pep-letters", "pep-counters", "pep-leaf", "pep-the"],
+    note: "THE and pep, no tagline",
+  },
 };
 
-// The source classes, in the order Illustrator emitted them.
-const CLASS_ROLES = { st0: "gold", st1: "green-deep", st2: "green-mid" };
-
+// --- Colour ------------------------------------------------------------------
 // Values come from the palette module rather than being retyped here, so the
 // artwork and the app cannot drift apart.
+
+function luminance(hex) {
+  const value = hex.replace("#", "");
+  const full = value.length === 3 ? [...value].map((c) => c + c).join("") : value;
+  const [r, g, b] = [0, 2, 4].map((at) => parseInt(full.slice(at, at + 2), 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+export function contrast(a, b) {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+// The logo's own mustard is about 1.9:1 on white - it is a colour for a dark ground. On
+// a light ground the letters take the palette's deep gold, the brightest one that still
+// clears 3:1 (the large-text floor) on white and on cream alike.
+const LIGHT_GROUNDS = ["#ffffff", CREAM];
+const lightInk = [ACCENT.deep, ACCENT.deepStrong, ACCENT.deepHover].find((colour) =>
+  LIGHT_GROUNDS.every((ground) => contrast(colour, ground) >= 3),
+);
+if (!lightInk) throw new Error("no deep gold in brandPalette.js clears 3:1 on white and cream");
+
 const PALETTES = {
-  "": { gold: BRAND.gold, "green-deep": BRAND.greenDeep, "green-mid": BRAND.greenMid },
-  "-reversed": { gold: ACCENT.accent, "green-deep": CREAM, "green-mid": CREAM_DIM },
+  // On a light ground: deep gold letters, and the cream parts become deep green.
+  "": { "pep-ink": lightInk, "pep-cream": BRAND.greenDeep },
+  // On the dark green ground: the logo's own colours.
+  "-reversed": { "pep-ink": BRAND.gold, "pep-cream": CREAM },
 };
 
 const source = readFileSync(SOURCE, "utf8");
 
 function recolour(svg, palette) {
-  return svg.replace(/\.(st\d+)\s*\{\s*fill:\s*#[0-9a-fA-F]{3,8};\s*\}/g, (match, cls) => {
-    const role = CLASS_ROLES[cls];
-    if (!role) throw new Error(`unknown colour class ${cls} in ${SOURCE}`);
-    const colour = palette[role];
-    if (!colour) throw new Error(`palette has no colour for role ${role}`);
+  return svg.replace(/\.(pep-[a-z]+)\s*\{\s*fill:\s*#[0-9a-fA-F]{3,8};\s*\}/g, (match, cls) => {
+    const colour = palette[cls];
+    if (!colour) throw new Error(`palette has no colour for class ${cls} in ${SOURCE}`);
     return `.${cls} {\n        fill: ${colour};\n      }`;
   });
+}
+
+function selectParts(svg, keep) {
+  let out = svg;
+  for (const part of PARTS) {
+    if (keep.includes(part)) continue;
+    const next = out.replace(new RegExp(`\\n\\s*<g id="${part}">[\\s\\S]*?</g>`), "");
+    if (next === out) throw new Error(`source svg has no part ${part}`);
+    out = next;
+  }
+  return out;
 }
 
 function crop(svg, viewBox) {
@@ -53,41 +104,75 @@ function crop(svg, viewBox) {
   return replaced;
 }
 
+function withComment(svg, text) {
+  return svg.replace(/<!--[\s\S]*?-->/, `<!-- ${text} - generated by tools/build-brand-assets.mjs from branding/source/pep-logo-source.svg, do not edit -->`);
+}
+
+// The full lockup on its own green ground: the logo as supplied, for places that cannot
+// provide the ground themselves (full-logo PNGs, social cards). The ground runs a margin
+// past the artwork's crop so the lockup does not touch the edge of the picture.
+const GROUND_MARGIN = 160;
+function onGround(svg, viewBox) {
+  const [x, y, width, height] = viewBox.split(" ").map(Number)
+    .map((value, index) => (index < 2 ? value - GROUND_MARGIN : value + GROUND_MARGIN * 2));
+  return crop(svg, `${x} ${y} ${width} ${height}`).replace(
+    /(<\/defs>)/,
+    `$1\n  <rect x="${x}" y="${y}" width="${width}" height="${height}" fill="${BRAND.greenDeep}"/>`,
+  );
+}
+
 // A favicon needs its own ground. A browser tab bar is light in one theme and dark
-// in the other, and the reversed mark - cream on nothing - vanishes on the light one.
-function tileFavicon(source) {
-  const inner = source.replace(/^[\s\S]*?<svg[^>]*>/, "").replace(/<\/svg>\s*$/, "");
+// in the other, and the reversed mark - cream and mustard on nothing - is lost on the
+// light one. The mark is about 2:1, so it sits across the tile's width.
+function tileFavicon(markSvg) {
+  const inner = markSvg.replace(/^[\s\S]*?<svg[^>]*>/, "").replace(/<\/svg>\s*$/, "").replace(/<!--[\s\S]*?-->\s*/, "");
   const [x, y, width, height] = CROPS.mark.viewBox.split(" ").map(Number);
   const side = Math.max(width, height);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
   <!-- generated by tools/build-brand-assets.mjs, do not edit -->
-  <rect width="48" height="48" rx="11" fill="${PALETTES[""]["green-deep"]}"/>
+  <rect width="48" height="48" rx="11" fill="${BRAND.greenDeep}"/>
   <rect x=".6" y=".6" width="46.8" height="46.8" rx="10.4" fill="none"
-        stroke="${PALETTES[""].gold}" stroke-opacity=".42" stroke-width="1.2"/>
-  <svg x="6" y="6" width="36" height="36"
-       viewBox="${x - (side - width) / 2} ${y - (side - height) / 2} ${side} ${side}">
+        stroke="${BRAND.gold}" stroke-opacity=".42" stroke-width="1.2"/>
+  <svg x="3" y="3" width="42" height="42"
+       viewBox="${x} ${y - (side - height) / 2} ${side} ${side}">
 ${inner}
   </svg>
 </svg>
 `;
 }
 
-let written = 0;
-for (const [name, { viewBox, note }] of Object.entries(CROPS)) {
+const written = [];
+function write(path, body) {
+  writeFileSync(path, body);
+  written.push(path.slice(repoRoot.length + 1));
+}
+
+for (const [name, { viewBox, parts, note }] of Object.entries(CROPS)) {
   for (const [suffix, palette] of Object.entries(PALETTES)) {
-    if (name === "logo" && suffix === "") continue; // that is the source itself
-    const out = join(brandingDir, `frooz-${name}${suffix}.svg`);
-    const body = crop(recolour(source, palette), viewBox)
-      .replace(/<!-- Generator:[^>]*-->/, `<!-- ${note}${suffix ? ", for dark surfaces" : ""} - generated by tools/build-brand-assets.mjs, do not edit -->`);
-    writeFileSync(out, body);
-    written += 1;
+    const body = withComment(
+      crop(selectParts(recolour(source, palette), parts), viewBox),
+      `${note}${suffix ? ", for dark surfaces" : ", for light surfaces"}`,
+    );
+    write(join(brandingDir, `pep-${name}${suffix}.svg`), body);
   }
 }
-writeFileSync(
-  join(brandingDir, "..", "favicon.svg"),
-  tileFavicon(recolour(source, PALETTES["-reversed"])),
+write(
+  join(brandingDir, "pep-logo-on-green.svg"),
+  withComment(onGround(recolour(source, PALETTES["-reversed"]), CROPS.logo.viewBox), "full lockup on its own green ground"),
 );
-written += 1;
+write(
+  join(repoRoot, "frontend", "public", "favicon.svg"),
+  tileFavicon(selectParts(recolour(source, PALETTES["-reversed"]), CROPS.mark.parts)),
+);
 
-console.log(`wrote ${written} brand assets to ${brandingDir}`);
+// The website is dark throughout, so it takes only the reversed cuts.
+mkdirSync(websiteBrandingDir, { recursive: true });
+for (const file of ["pep-logo-reversed.svg", "pep-mark-reversed.svg", "pep-wordmark-reversed.svg"]) {
+  copyFileSync(join(brandingDir, file), join(websiteBrandingDir, file));
+}
+copyFileSync(join(repoRoot, "frontend", "public", "favicon.svg"), join(websiteBrandingDir, "favicon.svg"));
+written.push("website/public/branding/pep-*-reversed.svg, favicon.svg");
+
+console.log(`light-ground letters: ${lightInk} (${contrast(lightInk, "#ffffff").toFixed(2)}:1 on white, ${contrast(lightInk, CREAM).toFixed(2)}:1 on cream)`);
+for (const line of written) console.log(line);

@@ -403,7 +403,7 @@ function wireEvents() {
       .map((row) => `${row.name} - ${formatKg(row.quantityKg)} - ${formatRupees(row.total)}`)
       .join("\n");
     openWhatsApp(
-      `Frooz order\n\n${lines}\n\nTotal about ${formatRupees(totals.subtotal)}\n\nPlease confirm the weight and final bill.`,
+      `THE PEP order\n\n${lines}\n\nTotal about ${formatRupees(totals.subtotal)}\n\nPlease confirm the weight and final bill.`,
     );
   });
 }

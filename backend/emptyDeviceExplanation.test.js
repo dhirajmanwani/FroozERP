@@ -31,9 +31,31 @@ const SCRIPT = path.join(__dirname, "..", "scripts", "cloud", "explain-empty-dev
 const modulePath = pathToFileURL(SCRIPT).href;
 const BOOTSTRAP = fs.readFileSync(path.join(__dirname, "syncReferenceBootstrap.js"), "utf8");
 
+/**
+ * The WHERE clause without its `EXISTS (...)` subqueries. The scope the report groups by is the
+ * clause's own top-level filter; a subquery's predicates belong to the table it reads. Products
+ * gained one on 24 Oct 2026 (DT-1): a switched-off product still travels when a lot sent to this
+ * location points at it, and that lot's branch and location are the lots query's filter, not a new
+ * scope for products.
+ */
+const withoutExistsSubqueries = (sql) => {
+  let out = sql;
+  for (let at = out.search(/\bEXISTS\s*\(/i); at !== -1; at = out.search(/\bEXISTS\s*\(/i)) {
+    let index = out.indexOf("(", at) + 1;
+    for (let depth = 1; depth > 0 && index < out.length; index += 1) {
+      if (out[index] === "(") depth += 1;
+      else if (out[index] === ")") depth -= 1;
+    }
+    out = `${out.slice(0, at)}TRUE${out.slice(index)}`;
+  }
+  return out;
+};
+
 /** The chunk of `syncReferenceBootstrap.js` that selects from `table`, and its WHERE clause. */
 const queryFor = (table) => {
-  const chunks = BOOTSTRAP.split("client.query(").slice(1);
+  // Subqueries out first, so the products query's EXISTS over inventory_batches is not read as the
+  // lots query.
+  const chunks = BOOTSTRAP.split("client.query(").slice(1).map((text) => withoutExistsSubqueries(text));
   // `FROM products` appears only in the products query; the other queries reach it as
   // `JOIN products p`. Matching the FROM is what keeps one table's filter from being read off
   // another table's join.

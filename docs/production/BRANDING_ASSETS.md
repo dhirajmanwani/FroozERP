@@ -1,77 +1,77 @@
 # Branding Assets
 
-**Rewritten 2026-08-22.** The maintainer supplied the logo as vector art. Everything the app and the
-website show is now derived from that one file by a script, so the assets cannot drift apart from
-each other or from the brand.
+**Rewritten 2026-10-30** for the new name and logo: **THE PEP - Pulp Eat Up.** (the logo writes
+it "THE pép" with "PULP EAT UP." under it). Everything the app and the website show is derived
+from one vector file by script, so the assets cannot drift apart from each other or from the brand.
 
 ## The source
 
 ```text
-frontend/public/branding/frooz-logo.svg
+branding/source/pep-logo-source.svg     the vector source
+branding/source/pep-logo-original.jpeg  the logo as supplied (1206x636), kept for reference
 ```
 
-This is the official lockup, exported from Illustrator. It carries exactly three colours and nothing
-else — a deep green, a mid green and a gold — which is what makes everything below a recolour rather
-than a redraw.
+The source was traced once from the supplied JPEG, colour by colour (potrace, at 4x the JPEG's
+scale; the two counters are true circles fitted to the traced dots). It carries two colour classes
+and five named parts and nothing else, which is what makes everything below a selection, a crop and
+a recolour rather than a redraw:
 
-| Role | Value |
-| --- | --- |
-| Deep green | `#0a2d1c` |
-| Mid green | `#123623` |
-| Gold | `#c29030` |
+| Class / part | What it is | Supplied colour |
+| --- | --- | --- |
+| `pep-ink` / `pep-letters` | the "pép" letters, bite mark included | mustard `#eab43f` |
+| `pep-cream` / `pep-counters`, `pep-leaf`, `pep-the`, `pep-tagline` | the dots in the p's, the leaf, the vertical THE, the tagline | cream `#f6f4e5` |
 
-The reversed variants ink in a warm cream, `#f6f3ea`.
-
-If a fresh export ever arrives, replace this file and re-run both generators. Do not hand-edit it,
-and do not hand-edit anything either generator produces.
+The green ground (`#102f20`) is not in the artwork; the one variant that needs it adds it. Colour
+values in every output come from `frontend/src/local/brandPalette.js`, never retyped. Do not
+hand-edit the source or anything the generators write.
 
 ## Generated: vector variants
 
 `node tools/build-brand-assets.mjs`
 
-```text
-frontend/public/branding/frooz-logo-reversed.svg
-frontend/public/branding/frooz-mark.svg
-frontend/public/branding/frooz-mark-reversed.svg
-frontend/public/branding/frooz-wordmark.svg
-frontend/public/branding/frooz-wordmark-reversed.svg
-```
-
-Each is a viewBox crop of the source plus a colour swap. Three shapes, two palettes.
-
-| Variant | What it is | Use it for |
+| File (in `frontend/public/branding/`) | Parts | Use it for |
 | --- | --- | --- |
-| `frooz-logo` | The full lockup, about 3:1 | Wide strips: site header, invoice header, splash |
-| `frooz-mark` | The monogram and its leaf, square | Favicon, app icon, avatar, the sidebar badge, anything small |
-| `frooz-wordmark` | Tagline and `FROOZ`, no monogram | When the mark is already on screen nearby |
+| `pep-logo.svg` / `pep-logo-reversed.svg` | full lockup | wide strips: splash, invoice header, site |
+| `pep-mark.svg` / `pep-mark-reversed.svg` | "pép" and leaf, about 2:1 | favicon, app icon, sidebar badge, anything small |
+| `pep-wordmark.svg` / `pep-wordmark-reversed.svg` | THE and "pép", no tagline | strips too small for the tagline to be read |
+| `pep-logo-on-green.svg` | full lockup on its own green ground | where the ground cannot be supplied |
 
-**The `-reversed` twin is not optional on a dark surface.** The normal cut is deep green; on the app's
-deep-green ground it disappears completely. The app's screen chrome uses reversed everywhere; the
-invoice uses the normal cut, because it prints on white paper.
+Also `frontend/public/favicon.svg` (the reversed mark on a deep-green tile), and the reversed cuts
+plus favicon copied to `website/public/branding/`.
 
-## Generated: raster icons
+- **Reversed** (dark surfaces): letters `BRAND.gold`, cream parts `CREAM` - the logo's own colours.
+- **Light** (white or cream surfaces, the invoice): letters take the brightest of `ACCENT.deep`,
+  `deepStrong`, `deepHover` that clears 3:1 on white and on cream (the script fails if none does),
+  and the cream parts become `BRAND.greenDeep`. The supplied mustard is about 1.9:1 on white.
 
-`node tools/build-brand-rasters.mjs`
+**The `-reversed` twin is not optional on a dark surface**, and the light cut is not optional on
+paper: each disappears or goes muddy on the other's ground.
+
+Legacy names: `frooz-logo.svg`, `frooz-logo-reversed.svg`, `frooz-mark.svg`,
+`frooz-mark-reversed.svg` and `frooz-wordmark-reversed.svg` are byte copies of the matching
+`pep-*` files, kept only while `App.jsx`, `index.html` and `tools/build-brand-tokens.mjs` still
+load those names. Remove them from `LEGACY_COPIES` once nothing does.
+
+## Generated: rasters
+
+`node tools/build-brand-rasters.mjs` (after the vector step), then `node tools/build-android-icons.mjs`
 
 ```text
-frontend/public/branding/frooz-icon-64.png
-frontend/public/branding/frooz-icon-192.png
-frontend/public/branding/frooz-icon-512.png
-src-tauri/icons/32x32.png
-src-tauri/icons/128x128.png
-src-tauri/icons/128x128@2x.png
-src-tauri/icons/icon.png
-src-tauri/icons/icon.ico
+frontend/public/branding/pep-icon-{64,192,512}.png    web / PWA icons (+ frooz-icon-{64,192}.png copies for index.html)
+frontend/public/branding/pep-logo-full-{512,1024}.png lockup on its green ground
+frontend/public/branding/pep-logo-invoice-320.png     light lockup on transparency, for white paper
+branding/generated/pep-icon-1024.png, pep-logo-{full,light,reversed}-2048.png
+src-tauri/icons/32x32.png, 128x128.png, 128x128@2x.png, icon.png, icon.ico (16-256)
+src-tauri/icons/android/**                            launcher icons, adaptive layers, background colour
 ```
 
-These are the mark drawn on a deep-green rounded tile with a gold hairline, not the bare mark. A
-desktop icon has to hold its own against whatever wallpaper is behind it, and a single-colour cream
-shape on transparency does not.
+The icons are the mark across a deep-green rounded tile with a gold hairline, not the bare mark: a
+desktop icon has to hold its own against whatever wallpaper is behind it.
 
-The generator needs a Chromium, Chrome or Edge binary. It finds the usual paths; set `CHROME_PATH`
-if it cannot. It draws on a canvas and reads the pixels back rather than taking screenshots, because
-headless Chromium's `--window-size` sets the window rather than the viewport and clamps width to
-500px, which silently crops small tiles.
+The generators need a Chromium, Chrome or Edge binary. They find the usual paths; set `CHROME_PATH`
+if they cannot. They draw on a canvas and read the pixels back rather than taking screenshots,
+because headless Chromium's `--window-size` sets the window rather than the viewport and clamps
+width to 500px, which silently crops small tiles.
 
 ## Typefaces
 
@@ -125,6 +125,9 @@ same way.
 
 ## Superseded
 
+The Frooz lockup (an Illustrator export, formerly `frontend/public/branding/frooz-logo.svg`, now a
+legacy copy of the PEP art) is in git history. Older still:
+
 ```text
 frontend/public/branding/frooz-official-logo.png
 frontend/public/branding/frooz-logo-full-1024.png
@@ -133,11 +136,11 @@ frontend/public/branding/frooz-logo-invoice-320.png
 frontend/public/branding/frooz-symbol-512.png
 frontend/public/branding/frooz-symbol-192.png
 frontend/public/branding/frooz-symbol-64.png
-branding/source/**
-branding/generated/**
+branding/source/frooz-*
+branding/generated/frooz-*, future-android/, future-ios/
 ```
 
-All of these show an earlier mark — a multicoloured fruit circle with a white `F` in it — that the
+All of these show the oldest mark — a multicoloured fruit circle with a white `F` in it — that the
 current logo replaced. Nothing in the app points at them any more. They are left in place rather than
 deleted, because the maintainer may still be using them on printed material or elsewhere off this
 repo. **Do not reintroduce them into the app or the website.**

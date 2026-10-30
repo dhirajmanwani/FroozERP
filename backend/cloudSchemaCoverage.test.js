@@ -64,6 +64,58 @@ const declared = {
 };
 
 /**
+ * The columns each `CREATE TABLE` names, as `Map<table, Set<column>>` (several CREATEs of one
+ * table are merged).
+ *
+ * The body is read up to its balanced closing parenthesis and split on top-level commas, so
+ * `NUMERIC(14, 2)` and `CHECK (a > 0)` stay whole. Table constraints (PRIMARY KEY (...), UNIQUE,
+ * CONSTRAINT, FOREIGN KEY, CHECK, EXCLUDE) are not columns.
+ */
+const createTableColumns = (sql) => {
+  const out = new Map();
+  const pattern = /CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gi;
+  let match;
+  while ((match = pattern.exec(sql))) {
+    let index = pattern.lastIndex;
+    let depth = 1;
+    const start = index;
+    while (depth > 0 && index < sql.length) {
+      if (sql[index] === "(") depth += 1;
+      else if (sql[index] === ")") depth -= 1;
+      index += 1;
+    }
+    const parts = [];
+    let current = "";
+    let nested = 0;
+    for (const character of sql.slice(start, index - 1)) {
+      if (character === "(") nested += 1;
+      if (character === ")") nested -= 1;
+      if (character === "," && nested === 0) {
+        parts.push(current);
+        current = "";
+      } else {
+        current += character;
+      }
+    }
+    parts.push(current);
+    const table = match[1].toLowerCase();
+    const columns = out.get(table) || new Set();
+    for (const part of parts) {
+      const word = part.trim().split(/\s+/)[0];
+      if (!word || /^(PRIMARY|UNIQUE|CONSTRAINT|FOREIGN|CHECK|EXCLUDE)$/i.test(word)) continue;
+      columns.add(word.replace(/"/g, "").toLowerCase());
+    }
+    out.set(table, columns);
+  }
+  return out;
+};
+
+/** Index names created by `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table`, as `[name, table]`. */
+const createdIndexes = (sql) =>
+  [...sql.matchAll(/CREATE\s+(?:UNIQUE\s+)?INDEX(?:\s+IF NOT EXISTS)?\s+([A-Za-z_][A-Za-z0-9_]*)\s+ON\s+([A-Za-z_][A-Za-z0-9_]*)/gi)]
+    .map(([, name, table]) => [name.toLowerCase(), table.toLowerCase()]);
+
+/**
  * What the registered migrations create, read the same way the bootstrap is read.
  *
  * Comments are stripped first, for the reason `withoutComments` exists: a comment quoting
@@ -89,7 +141,8 @@ const migrated = (() => {
     [...sql.matchAll(/ALTER TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD COLUMN(?:\s+IF NOT EXISTS)?\s+([A-Za-z_][A-Za-z0-9_]*)/gi)]
       .map(([, table, column]) => `${table.toLowerCase()}.${column.toLowerCase()}`),
   );
-  return { tables, columns };
+  const indexes = new Set(createdIndexes(sql).map(([name]) => name));
+  return { tables, columns, tableColumns: createTableColumns(sql), indexes };
 })();
 
 const excused = (name) => Object.prototype.hasOwnProperty.call(baseline.excused, name);
@@ -110,15 +163,23 @@ test("a table added to the bootstrap reaches the cloud", () => {
   );
 });
 
+/**
+ * Declared `table.column` names no registered migration carries.
+ *
+ * A column a migration's CREATE TABLE names is carried by it; saying so again as an ALTER would be
+ * noise. But only *that* column: this used to excuse every ALTER on any table a migration creates,
+ * so `ALTER TABLE combos ADD COLUMN ...` put in the bootstrap alone passed here -- while
+ * `verifyDeclaredSchema` checks ALTER-declared columns and the hosted backend refused to boot,
+ * which is the third outage in the header, back through the test meant to stop it.
+ */
+const strandedColumns = (columns) => columns.filter((name) => {
+  const [table, column] = name.split(".");
+  if (migrated.tableColumns.get(table)?.has(column)) return false;
+  return !baselineColumns.has(name) && !migrated.columns.has(name) && !excused(name);
+});
+
 test("a column added to the bootstrap reaches the cloud", () => {
-  const stranded = declared.columns.filter((name) => {
-    const [table] = name.split(".");
-    // A column of a table the migration creates is carried by that CREATE TABLE. Saying so again
-    // as an ALTER would be noise, and demanding it would make this test unpassable for any new
-    // table -- the same shape of unsatisfiable check that `above` was.
-    if (migrated.tables.has(table)) return false;
-    return !baselineColumns.has(name) && !migrated.columns.has(name) && !excused(name);
-  });
+  const stranded = strandedColumns(declared.columns);
   assert.deepEqual(
     stranded,
     [],
@@ -127,6 +188,44 @@ test("a column added to the bootstrap reaches the cloud", () => {
     + "Write a migration under backend/migrations/cloud/ and register it in "
     + "scripts/run-cloud-migrations.js.",
   );
+});
+
+test("a bootstrap CREATE TABLE of a migrated table names no column its migration lacks", () => {
+  // The quieter twin of the rule above. A column added inside the bootstrap's CREATE TABLE body of
+  // a table a migration also creates exists on every bootstrapped database and never on the cloud,
+  // and `verifyDeclaredSchema` cannot see it (it reads only ALTER-declared columns), so the first
+  // sign is a 500 at runtime. Baseline tables are left out: the cloud held them whole on the day.
+  const bootstrapColumns = createTableColumns(BOOTSTRAP);
+  const missing = [];
+  for (const [table, columns] of bootstrapColumns) {
+    if (baselineTables.has(table) || !migrated.tables.has(table)) continue;
+    const carried = migrated.tableColumns.get(table) || new Set();
+    for (const column of columns) {
+      const name = `${table}.${column}`;
+      if (!carried.has(column) && !migrated.columns.has(name) && !excused(name)) missing.push(name);
+    }
+  }
+  assert.ok(bootstrapColumns.size > 50, `the CREATE TABLE reader found only ${bootstrapColumns.size} tables; it has stopped reading`);
+  assert.deepEqual(missing, [], `the bootstrap creates these columns and no registered migration does: ${missing.join(", ")}`);
+});
+
+test("an index the bootstrap creates on a post-baseline table reaches the cloud", () => {
+  // An `ON CONFLICT` target whose unique index is missing on the cloud is not a boot refusal; it is
+  // a 500 on the first write (42P10), and a packing bookkeeping failure inside a bill's savepoint is
+  // skipped silently. Baseline tables' indexes were on the cloud on the day it was measured.
+  const stranded = createdIndexes(BOOTSTRAP)
+    .filter(([name, table]) => !baselineTables.has(table) && !migrated.indexes.has(name))
+    .map(([name, table]) => `${name} ON ${table}`);
+  assert.ok(migrated.indexes.has("packing_purchases_client_ref_key"), "the reader sees migration indexes");
+  assert.deepEqual(stranded, [], `these indexes are created in initializeDatabase() and by no registered migration: ${stranded.join(", ")}`);
+});
+
+test("the rule catches an ALTER on a table a migration creates when the migration lacks the column", () => {
+  // The case the old excuse let through. `combos` is created by 024; this column is in neither its
+  // CREATE TABLE nor any ALTER, so it must be reported.
+  assert.deepEqual(strandedColumns(["combos.zz_added_only_in_the_bootstrap"]), ["combos.zz_added_only_in_the_bootstrap"]);
+  assert.deepEqual(strandedColumns(["combos.margin_percent"]), [], "a column 024's CREATE TABLE names is carried");
+  assert.deepEqual(strandedColumns(["packing_purchases.client_ref"]), [], "a column a migration ALTERs in is carried");
 });
 
 // -------------------------------------------------------------------------------------------

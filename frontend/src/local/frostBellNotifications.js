@@ -583,7 +583,21 @@ export const DISMISSED_STOCK_REMINDERS_KEY = "froozerp.frostBell.dismissedStockR
 
 const STOCK_REMINDER_KEY_PREFIX = `frost:${FROST_BELL_KIND.STOCK_REMINDER.toLowerCase()}:`;
 
-export const isStockReminderKey = (key) => typeof key === "string" && key.startsWith(STOCK_REMINDER_KEY_PREFIX);
+/**
+ * A fixed combo that cannot be made because a fruit in it ran out follows the same rule as the
+ * fruit (owner, 23 Oct 2026): an Info "Reminder", dismissible, the dismissal remembered here until
+ * the combo can be made again (local/combos.js `comboStockNotifications`). Its own prefix, so a
+ * combo blocked by a product switched off (still a warning) is never silenced for good.
+ */
+export const COMBO_STOCK_REMINDER_KEY_PREFIX = "combo-stock-reminder:";
+
+/** FROST's zero-stock reminders. */
+export const isFrostStockReminderKey = (key) => typeof key === "string" && key.startsWith(STOCK_REMINDER_KEY_PREFIX);
+/** Combo reminders: a combo held up only by fruit that ran out. */
+export const isComboStockReminderKey = (key) => typeof key === "string" && key.startsWith(COMBO_STOCK_REMINDER_KEY_PREFIX);
+
+/** Every reminder whose dismissal is remembered on this computer. */
+export const isStockReminderKey = (key) => isFrostStockReminderKey(key) || isComboStockReminderKey(key);
 
 /** The remembered keys. A storage that is missing, throws or holds rubbish reads as none. */
 export const readDismissedStockReminders = (storage) => {
@@ -616,8 +630,13 @@ export const withDismissedStockReminders = (dismissed, entries) => {
   return next;
 };
 
-/** Forget dismissals whose reminder is no longer live, so the next run-out rings again. */
-export const pruneDismissedStockReminders = (dismissed, liveKeys) => {
+/**
+ * Forget dismissals whose reminder is no longer live, so the next run-out rings again. `family`
+ * says which reminders `liveKeys` is the whole list of (FROST's by default); the other family's
+ * dismissals are kept, since FROST's list says nothing about combos and the combo check nothing
+ * about FROST.
+ */
+export const pruneDismissedStockReminders = (dismissed, liveKeys, family = isFrostStockReminderKey) => {
   const live = new Set(liveKeys || []);
-  return new Set([...(dismissed || [])].filter((key) => live.has(key)));
+  return new Set([...(dismissed || [])].filter((key) => !family(key) || live.has(key)));
 };

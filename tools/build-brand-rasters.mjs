@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Renders the app icon at every size Windows and the web manifest ask for, from
-// the same vector mark the app itself uses.
+// Renders the app icon at every size Windows and the web manifest ask for, and the
+// logo PNGs (full lockup, invoice), from the same vector art the app itself uses.
 //
 // The icon is the mark on a deep-green tile rather than the mark alone: a desktop
-// icon has to hold its own against whatever wallpaper is behind it, and the mark
-// is a single-colour cream shape with nothing to sit on.
+// icon has to hold its own against whatever wallpaper is behind it. THE PEP mark is
+// about twice as wide as it is tall, so it sits across the tile's width.
 //
 // Drawing happens on a canvas inside the browser and comes back out as data URIs,
 // rather than through --screenshot. Headless Chromium's --window-size sets the
@@ -12,7 +12,7 @@
 // tiles come back cropped. A canvas is exactly the size it is told to be.
 //
 // Needs a Chromium binary. Set CHROME_PATH, or let it find the usual names.
-// Run: node tools/build-brand-rasters.mjs
+// Run after tools/build-brand-assets.mjs: node tools/build-brand-rasters.mjs
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
@@ -31,12 +31,13 @@ const GREEN_DEEP = BRAND.greenDeep;
 const GREEN_MID = BRAND.greenMid;
 const GOLD = BRAND.gold;
 
-const SIZES = [16, 32, 48, 64, 128, 192, 256, 512];
+const SIZES = [16, 32, 48, 64, 128, 192, 256, 512, 1024];
 
 const OUTPUTS = [
-  ["frontend/public/branding/frooz-icon-64.png", 64],
-  ["frontend/public/branding/frooz-icon-192.png", 192],
-  ["frontend/public/branding/frooz-icon-512.png", 512],
+  ["frontend/public/branding/pep-icon-64.png", 64],
+  ["frontend/public/branding/pep-icon-192.png", 192],
+  ["frontend/public/branding/pep-icon-512.png", 512],
+  ["branding/generated/pep-icon-1024.png", 1024],
   ["src-tauri/icons/32x32.png", 32],
   ["src-tauri/icons/128x128.png", 128],
   ["src-tauri/icons/128x128@2x.png", 256],
@@ -44,6 +45,18 @@ const OUTPUTS = [
 ];
 
 const ICO_SIZES = [16, 32, 48, 64, 128, 256];
+
+// The wide logo PNGs: [output, svg in frontend/public/branding, width in px].
+// On-green is the logo exactly as supplied; the invoice cut is the light-ground art on
+// transparency, because an invoice is white paper in both themes.
+const LOGOS = [
+  ["frontend/public/branding/pep-logo-full-512.png", "pep-logo-on-green.svg", 512],
+  ["frontend/public/branding/pep-logo-full-1024.png", "pep-logo-on-green.svg", 1024],
+  ["frontend/public/branding/pep-logo-invoice-320.png", "pep-logo.svg", 320],
+  ["branding/generated/pep-logo-full-2048.png", "pep-logo-on-green.svg", 2048],
+  ["branding/generated/pep-logo-light-2048.png", "pep-logo.svg", 2048],
+  ["branding/generated/pep-logo-reversed-2048.png", "pep-logo-reversed.svg", 2048],
+];
 
 function findChrome() {
   if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
@@ -64,13 +77,28 @@ function findChrome() {
   return found;
 }
 
-const markSvg = readFileSync(join(brandingDir, "frooz-mark-reversed.svg"), "utf8");
-const markDataUri = `data:image/svg+xml;base64,${Buffer.from(markSvg).toString("base64")}`;
+// The generated SVGs carry only a viewBox. Give the copy that goes into the canvas an
+// explicit size from it, so the browser rasterises it at its true proportions.
+function svgDataUri(file) {
+  const svg = readFileSync(join(brandingDir, file), "utf8");
+  const viewBox = svg.match(/viewBox="([^"]+)"/);
+  if (!viewBox) throw new Error(`${file} has no viewBox`);
+  const [, , width, height] = viewBox[1].split(/\s+/).map(Number);
+  const sized = svg.replace(/<svg\b/, `<svg width="${width}" height="${height}"`);
+  return { uri: `data:image/svg+xml;base64,${Buffer.from(sized).toString("base64")}`, ratio: height / width };
+}
+
+const mark = svgDataUri("pep-mark-reversed.svg");
+const logoJobs = LOGOS.map(([out, file, width]) => {
+  const { uri, ratio } = svgDataUri(file);
+  return { out, uri, width, height: Math.round(width * ratio) };
+});
 
 // Proportions are fractions of the tile, so every size is the same design rather
 // than one design scaled badly.
 const drawPage = `<!doctype html><html><body><pre id="out"></pre><script>
 const SIZES = ${JSON.stringify(SIZES)};
+const LOGOS = ${JSON.stringify(logoJobs)};
 const mark = new Image();
 mark.onload = () => {
   const results = [];
@@ -101,9 +129,10 @@ mark.onload = () => {
     ctx.globalAlpha = 1;
 
     // The mark, centred, inside a margin that keeps it clear of the rounded corners.
-    // Small tiles get a tighter margin: at 32px a generous one leaves the glyph
-    // too small to recognise on a taskbar.
-    const inset = Math.round(size * (size <= 48 ? 0.11 : 0.19));
+    // Small tiles get a tighter margin: at 32px a generous one leaves the letters
+    // too small to recognise on a taskbar. The mark is wide, so the margin that
+    // matters is the side one; top and bottom have room to spare.
+    const inset = Math.round(size * (size <= 48 ? 0.06 : 0.12));
     const box = size - inset * 2;
     const scale = Math.min(box / mark.naturalWidth, box / mark.naturalHeight);
     const width = mark.naturalWidth * scale;
@@ -112,12 +141,25 @@ mark.onload = () => {
 
     results.push(size + " " + canvas.toDataURL("image/png"));
   }
-  document.getElementById("out").textContent = results.join("\\n");
+  let pending = LOGOS.length;
+  for (const job of LOGOS) {
+    const art = new Image();
+    art.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = job.width;
+      canvas.height = job.height;
+      canvas.getContext("2d").drawImage(art, 0, 0, job.width, job.height);
+      results.push(job.out + " " + canvas.toDataURL("image/png"));
+      pending -= 1;
+      if (pending === 0) document.getElementById("out").textContent = results.join("\\n");
+    };
+    art.src = job.uri;
+  }
 };
-mark.src = ${JSON.stringify(markDataUri)};
+mark.src = ${JSON.stringify(mark.uri)};
 </script></body></html>`;
 
-const work = join(tmpdir(), `frooz-rasters-${process.pid}`);
+const work = join(tmpdir(), `pep-rasters-${process.pid}`);
 mkdirSync(work, { recursive: true });
 const page = join(work, "draw.html");
 writeFileSync(page, drawPage);
@@ -139,11 +181,13 @@ const block = dom.match(/<pre id="out">([\s\S]*?)<\/pre>/);
 if (!block) throw new Error("the render page produced no output - is the Chromium binary usable?");
 
 const rendered = new Map();
+const renderedLogos = new Map();
 for (const line of block[1].trim().split("\n")) {
-  const [size, uri] = line.trim().split(" ");
+  const [key, uri] = line.trim().split(" ");
   const base64 = (uri || "").replace("data:image/png;base64,", "");
-  if (!base64) throw new Error(`no image came back for size ${size}`);
-  rendered.set(Number(size), Buffer.from(base64, "base64"));
+  if (!base64) throw new Error(`no image came back for ${key}`);
+  if (/^\d+$/.test(key)) rendered.set(Number(key), Buffer.from(base64, "base64"));
+  else renderedLogos.set(key, Buffer.from(base64, "base64"));
 }
 for (const size of SIZES) {
   const png = rendered.get(size);
@@ -188,6 +232,16 @@ function buildIco(entries) {
 for (const [relative, size] of OUTPUTS) {
   writeFileSync(join(repoRoot, relative), rendered.get(size));
   console.log(`${relative}  ${size}x${size}`);
+}
+
+for (const job of logoJobs) {
+  const png = renderedLogos.get(job.out);
+  if (!png || png.readUInt32BE(16) !== job.width || png.readUInt32BE(20) !== job.height) {
+    throw new Error(`${job.out} did not render at ${job.width}x${job.height}`);
+  }
+  mkdirSync(dirname(join(repoRoot, job.out)), { recursive: true });
+  writeFileSync(join(repoRoot, job.out), png);
+  console.log(`${job.out}  ${job.width}x${job.height}`);
 }
 
 writeFileSync(

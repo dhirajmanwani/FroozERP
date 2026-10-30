@@ -121,3 +121,12 @@ test("offline Sales History reads every bill in the period, not the newest 200",
   assert.match(local, /localRows = await listLocalPosSalesBetween\(normalizedParams\.date_from, normalizedParams\.date_to\);/);
   assert.doesNotMatch(local, /listLocalPosSales\(\)/);
 });
+
+test("a balance sheet the server could not work out is an error, never a sheet of zeroes (UI-9)", async () => {
+  const { BALANCE_SHEET_UNAVAILABLE_NOTE } = await import("./reportCenterOffline.js");
+  const failed = resolveReportAvailability("balanceSheet", { balanceSheet: { unavailable: true, cash: 0 } });
+  assert.deepEqual(failed, { available: false, tone: "error", message: BALANCE_SHEET_UNAVAILABLE_NOTE });
+  assert.deepEqual(resolveReportAvailability("balanceSheet", { balanceSheet: { unavailable: false, asAtDate: "2026-10-25" } }), { available: true });
+  // Only the balance sheet is held back; the other reports from the same load still show.
+  assert.deepEqual(resolveReportAvailability("profitLoss", { balanceSheet: { unavailable: true } }), { available: true });
+});

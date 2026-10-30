@@ -205,6 +205,16 @@ test("quantity and measurement are different numbers", async () => {
   assert.equal(resolved.lines[0].manual, false);
 });
 
+test("a charge named by its pull-feed id (charge-type-N) is the same charge", async () => {
+  // An older counter build stored pulled charge types under that id and sent it on the bill.
+  const resolved = await resolveSaleCharges(chargeClient(), {
+    requests: [{ charge_type_id: `charge-type-${CRATE_ID}`, measurement: 10, quantity: 1 }],
+    companyId: COMPANY_ID,
+  });
+  assert.equal(resolved.error, undefined, JSON.stringify(resolved.error));
+  assert.equal(resolved.lines[0].amount, 40);
+});
+
 test("the price comes from the stored charge type, not from the amount the client sent", async () => {
   // Rule 1 of the server's two obligations. A POS that can name its own price can hand out any
   // discount it likes, to anyone standing at the counter, with nothing in the bill saying so.

@@ -147,9 +147,12 @@ const linePaidAmount = ({ line, saleLines, sale, includeOtherCharges = false }) 
   // The bill discount was earned by the loose lines only: a combo is already priced, so the slab
   // base and each line's profit share (server.js, invoiceDiscountShareOf) leave combo lines out.
   // Sharing it over them too would refund a loose line more than the customer paid for it. Tax and
-  // charges were levied on every line, so they still share over all of them.
+  // charges were levied on every line, so they still share over all of them. A bill with no loose
+  // net to carry it (only combos) shares it over every line, as invoiceDiscountShareOf does.
   const discountSubtotal = lines.reduce((sum, row) => sum + (isComboLine(row) ? 0 : lineNetAmount(row)), 0);
-  const discountShare = !isComboLine(line) && discountSubtotal > 0 ? lineNet / discountSubtotal : 0;
+  const discountShare = discountSubtotal > 0
+    ? (isComboLine(line) ? 0 : lineNet / discountSubtotal)
+    : netShare;
 
   const invoiceDiscount = finiteOrNull(sale?.invoice_discount_amount) ?? 0;
   const taxAmount = finiteOrNull(sale?.tax_amount) ?? 0;

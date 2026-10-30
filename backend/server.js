@@ -1196,7 +1196,7 @@ const buildOtpEmailHtml = ({ code, purpose }) => `
       <p style="margin:0 0 18px;color:#cbd5e1">Use this code to ${purpose === "username" ? "recover your username" : purpose === "contact" ? "verify your recovery contact" : "reset your password"}.</p>
       <div style="font-size:32px;letter-spacing:8px;font-weight:800;color:#fbbf24">${code}</div>
       <p style="margin:18px 0 0;color:#94a3b8">This code expires in 10 minutes. If you did not request this, contact your Owner/Admin.</p>
-      <p style="margin:14px 0 0;color:#94a3b8">FroozERP - Feel the Freakin' Frooz<br/>SRT Company</p>
+      <p style="margin:14px 0 0;color:#94a3b8">THE PEP - Pulp Eat Up.<br/>SRT Company</p>
     </div>
   </div>
 `;
@@ -4178,6 +4178,51 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS credit_status VARCHAR(30) DEFAULT 'PAID';
     UPDATE sale_items SET default_selling_rate = selling_rate WHERE default_selling_rate IS NULL;
 
+    -- Frooz Pack purchase idempotency key, the combo/packing TIMESTAMPTZ conversion and the
+    -- "in use" indexes. Cloud migration 026 carries exactly these statements; keep the two
+    -- identical. Here, after sale_items has its combo columns and 025's tables exist.
+    ALTER TABLE packing_purchases ADD COLUMN IF NOT EXISTS client_ref VARCHAR(80);
+    CREATE UNIQUE INDEX IF NOT EXISTS packing_purchases_client_ref_key
+      ON packing_purchases (company_id, client_ref)
+      WHERE client_ref IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS sale_items_combo_id_idx
+      ON sale_items (combo_id)
+      WHERE combo_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS sale_packing_usage_size_idx
+      ON sale_packing_usage (size_id);
+    CREATE INDEX IF NOT EXISTS sale_packing_usage_size_global_idx
+      ON sale_packing_usage (size_global_id);
+    CREATE INDEX IF NOT EXISTS sale_packing_usage_combo_idx
+      ON sale_packing_usage (combo_id)
+      WHERE combo_id IS NOT NULL;
+    DO $$
+    DECLARE
+      target RECORD;
+    BEGIN
+      FOR target IN
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND data_type = 'timestamp without time zone'
+          AND (table_name, column_name) IN (
+            ('combos', 'created_at'), ('combos', 'updated_at'),
+            ('packing_types', 'created_at'), ('packing_types', 'updated_at'),
+            ('packing_designs', 'created_at'), ('packing_designs', 'updated_at'),
+            ('packing_sizes', 'created_at'), ('packing_sizes', 'updated_at'),
+            ('packing_stock', 'updated_at'),
+            ('packing_purchases', 'created_at'),
+            ('packing_movements', 'created_at')
+          )
+      LOOP
+        EXECUTE format(
+          'ALTER TABLE %I ALTER COLUMN %I TYPE TIMESTAMPTZ USING %I AT TIME ZONE ''UTC''',
+          target.table_name,
+          target.column_name,
+          target.column_name
+        );
+      END LOOP;
+    END $$;
+
     CREATE TABLE IF NOT EXISTS pos_rate_override_audit (
       id SERIAL PRIMARY KEY,
       sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
@@ -4487,6 +4532,13 @@ const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, bran
   const values = [scope.value];
   const purchaseDateFilter = isDateInput(dateTo) ? `AND purchase_date <= $${values.push(dateTo)}` : "";
   const paymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
+  // Money paid against a purchase leaves on the day it was paid, as the cash book takes it: a bill
+  // received on the 1st and paid on the 10th is owed as at the 8th. Read by purchase date, the
+  // payable as at the 8th was already settled while the cash was still in the drawer, and the
+  // Supplier Ledger (which dates the payment) disagreed with this as-at figure.
+  const purchasePaidSql = isDateInput(dateTo)
+    ? `SUM(CASE WHEN COALESCE(payment_date, purchase_date) <= $${values.length} THEN COALESCE(paid_amount, 0) ELSE 0 END)`
+    : "SUM(COALESCE(paid_amount, 0))";
   if (supplierId) {
     values.push(supplierId);
     filters.push(`s.id = $${values.length}`);
@@ -4514,7 +4566,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, bran
         SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS total_purchases,
         SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS net_purchase_cost,
         SUM(COALESCE(rebate_amount, 0)) AS purchase_rebate,
-        SUM(COALESCE(paid_amount, 0)) AS purchase_paid
+        ${purchasePaidSql} AS purchase_paid
       FROM purchases
       WHERE supplier_id IS NOT NULL
         AND ${scope.predicate()}
@@ -4903,11 +4955,52 @@ const buildCustomerSummaryPayload = (rows) => {
  *
  * Cash and bank come from `getCashBookReport`, which is scoped to the same branch arm by arm.
  */
+/**
+ * Profit from the period's totals, one rule for the P&L statement and the balance sheet (and so
+ * All Shops, which sums balance-sheet snapshots).
+ *
+ * `purchase_cost` is `sales.total_cost` net of returned cost, and that is already the **landed**
+ * cost: every lot's `effective_cost_per_unit` is the purchase's net payable over its quantity
+ * (`buildPurchaseFinancials`: rate x qty + mandi tax + freight + labour + other - the bill's rebate),
+ * and a sale is costed at it. The P&L used to add the period's mandi tax, freight, labour and other
+ * charges and take off the bill rebates a second time -- for the whole purchase, not just the part
+ * sold -- so Net Profit fell short of the Dashboard's by exactly those charges (UI-1). They are
+ * reported as `includedInPurchaseCost`, for reading, and never added.
+ *
+ * A rebate taken when paying the supplier (`supplier_payments.rebate_amount`) is in no lot's cost,
+ * so it still reduces the cost of goods sold.
+ */
+const profitAndLossFromTotals = (row = {}) => {
+  const figure = (key) => Number(row[key] || 0);
+  const salesRevenue = figure("sales_revenue");
+  const purchaseCost = figure("purchase_cost");
+  const supplierRebateReceived = figure("supplier_rebate_received");
+  const costOfGoodsSold = purchaseCost - supplierRebateReceived;
+  const grossProfit = salesRevenue - costOfGoodsSold;
+  const expenses = figure("expenses");
+  return {
+    salesRevenue,
+    purchaseCost,
+    supplierRebateReceived,
+    costOfGoodsSold,
+    grossProfit,
+    expenses,
+    netProfit: grossProfit - expenses,
+    includedInPurchaseCost: {
+      mandiTax: figure("mandi_tax"),
+      freightCharges: figure("freight_charges"),
+      labourCharges: figure("labour_charges"),
+      otherPurchaseCharges: figure("other_purchase_charges"),
+      purchaseBillRebate: figure("purchase_bill_rebate"),
+    },
+  };
+};
+
 const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchId } = {}) => {
   if (!parsePositiveInteger(branchId)) {
     throw new Error("getBalanceSheetSnapshot requires a branchId");
   }
-  const asAtDate = isDateInput(dateTo) ? dateTo : toDateKey(new Date());
+  const asAtDate = isDateInput(dateTo) ? dateTo : saleReturnRules.indiaBusinessDateKey();
   // Cash and bank are the cash book's closing balances, so the headline and its drill-down
   // (`/reports/balance-sheet/details/cash_in_hand`, which reads the cash book) are one figure. A
   // separate SQL here once left out sale-return refunds and contra entries and dated a pending
@@ -4927,15 +5020,18 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchI
     pool.query(
       `
       SELECT
-        COALESCE((SELECT SUM(total_amount) FROM sales WHERE branch_id = $2 AND sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS sales_revenue,
-        COALESCE((SELECT SUM(total_cost) FROM sales WHERE branch_id = $2 AND sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS purchase_cost,
+        -- Net of returns, each on its return date, as the P&L statement takes them.
+        COALESCE((SELECT SUM(total_amount) FROM sales WHERE branch_id = $2 AND sale_status <> 'CANCELLED' AND sale_date <= $1), 0)
+          - COALESCE((SELECT SUM(total_return_amount) FROM sale_returns WHERE branch_id = $2 AND return_date <= $1), 0) AS sales_revenue,
+        COALESCE((SELECT SUM(total_cost) FROM sales WHERE branch_id = $2 AND sale_status <> 'CANCELLED' AND sale_date <= $1), 0)
+          - COALESCE((SELECT SUM(total_cost_amount) FROM sale_returns WHERE branch_id = $2 AND return_date <= $1), 0) AS purchase_cost,
         COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS mandi_tax,
         COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS freight_charges,
         COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS labour_charges,
         COALESCE((SELECT SUM(other_charges) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS other_purchase_charges,
         COALESCE((SELECT SUM(amount) FROM expenses WHERE branch_id = $2 AND active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date <= $1), 0) AS expenses,
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE branch_id = $2 AND cancelled = FALSE AND payment_date <= $1), 0) AS supplier_rebate_received
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS purchase_bill_rebate,
+        COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE branch_id = $2 AND cancelled = FALSE AND payment_date <= $1), 0) AS supplier_rebate_received
       `,
       [asAtDate, branchId]
     ),
@@ -4943,19 +5039,11 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchI
     getCustomerSummaryRows({ dateTo: asAtDate, branchId }),
   ]);
 
-  const profitLoss = profitLossResult.rows[0] || {};
+  const figures = profitAndLossFromTotals(profitLossResult.rows[0] || {});
   const inventoryValue = Number(inventoryResult.rows[0]?.inventory_value || 0);
   const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
   const supplierPayable = supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
-  const purchaseCost = Number(profitLoss.purchase_cost || 0);
-  const costOfGoodsSold = purchaseCost
-    + Number(profitLoss.mandi_tax || 0)
-    + Number(profitLoss.freight_charges || 0)
-    + Number(profitLoss.labour_charges || 0)
-    + Number(profitLoss.other_purchase_charges || 0)
-    - Number(profitLoss.supplier_rebate_received || 0);
-  const grossProfit = Number(profitLoss.sales_revenue || 0) - costOfGoodsSold;
-  const netProfit = grossProfit - Number(profitLoss.expenses || 0);
+  const { purchaseCost, costOfGoodsSold, grossProfit, netProfit } = figures;
   const cashInHand = Number(cashBook.closing_cash || 0);
   const cashAtBank = Number(cashBook.closing_bank || 0);
   const totalAssets = cashInHand + cashAtBank + inventoryValue + customerReceivable;
@@ -4974,11 +5062,11 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchI
     totalAssets: roundCurrency(totalAssets),
     totalLiabilities: roundCurrency(supplierPayable + netProfit + ownerCapital),
     profitLoss: {
-      salesRevenue: roundCurrency(Number(profitLoss.sales_revenue || 0)),
+      salesRevenue: roundCurrency(figures.salesRevenue),
       purchaseCost: roundCurrency(purchaseCost),
       costOfGoodsSold: roundCurrency(costOfGoodsSold),
       grossProfit: roundCurrency(grossProfit),
-      expenses: roundCurrency(Number(profitLoss.expenses || 0)),
+      expenses: roundCurrency(figures.expenses),
       netProfit: roundCurrency(netProfit),
     },
     supplierRows,
@@ -5391,6 +5479,39 @@ const parseDashboardRange = (query = {}) => {
   };
 };
 
+/**
+ * The products the dashboard calls low on stock: one statement for the tile's count and the list
+ * under it, so they cannot disagree (UI-3).
+ *
+ * "Low" is Products' rule (`isLowStock` in frontend/src/local/productMaster.js): stock at or below
+ * the product's own stored minimum. A product with no minimum set is not low. This used to treat
+ * a missing minimum as 5, so a product with no minimum and 4 kg in hand was low on the
+ * Dashboard and not on Products. A product this branch holds none of is still counted (the branch
+ * is in the JOIN, not the WHERE): stock 0 against a minimum of 0 is low, as Products shows it.
+ * Only this branch's company's products count, and never a deleted one, as on the offline tile.
+ */
+const DASHBOARD_LOW_STOCK_SQL = `
+  SELECT *
+  FROM (
+    SELECT
+      p.id AS product_id,
+      p.product_name,
+      p.unit,
+      p.minimum_stock,
+      COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
+    FROM products p
+    LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+      AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+      AND ib.branch_id = $1
+    WHERE p.active IS DISTINCT FROM FALSE
+      AND p.deleted_at IS NULL
+      AND (p.company_id IS NULL OR p.company_id = (SELECT company_id FROM branches WHERE id = $1))
+    GROUP BY p.id, p.product_name, p.unit, p.minimum_stock
+  ) stock_position
+  WHERE stock_position.minimum_stock IS NOT NULL
+    AND stock_position.current_stock <= stock_position.minimum_stock
+`;
+
 const DEFAULT_DASHBOARD_SUMMARY = Object.freeze({
   todaySales: 0,
   todayProfit: 0,
@@ -5489,20 +5610,7 @@ const getDashboardSummary = async (branchId) => {
     readDashboardMetric("todaySales", "SELECT COALESCE(SUM(total_amount), 0) AS value FROM sales WHERE branch_id = $1 AND sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'", [branchId]),
     readDashboardMetric("todayProfit", "SELECT COALESCE(SUM(profit), 0) AS value FROM sales WHERE branch_id = $1 AND sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'", [branchId]),
     readDashboardMetric("stockValue", "SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate, 0)), 0) AS value FROM inventory_batches WHERE branch_id = $1 AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'", [branchId]),
-    readDashboardMetric("lowStockItems", `
-      SELECT COALESCE(COUNT(*), 0) AS value
-      FROM (
-        SELECT p.id, COALESCE(SUM(ib.remaining_qty), 0) AS current_stock, COALESCE(p.minimum_stock, 5) AS minimum_stock
-        FROM products p
-        -- Branch goes in the JOIN, not the WHERE: in a WHERE it would drop every product this branch
-        -- holds no stock of, which is precisely the set that is low on stock.
-        LEFT JOIN inventory_batches ib ON ib.product_id = p.id AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-          AND ib.branch_id = $1
-        WHERE p.active IS DISTINCT FROM FALSE
-        GROUP BY p.id, p.minimum_stock
-      ) stock
-      WHERE stock.current_stock <= stock.minimum_stock
-    `, [branchId]),
+    readDashboardMetric("lowStockItems", `SELECT COALESCE(COUNT(*), 0) AS value FROM (${DASHBOARD_LOW_STOCK_SQL}) low_stock`, [branchId]),
     readDashboardMetric("transactions", "SELECT COALESCE(COUNT(*), 0) AS value FROM sales WHERE branch_id = $1 AND sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'", [branchId]),
     readDashboardMetric("todayExpenses", "SELECT COALESCE(SUM(amount), 0) AS value FROM expenses WHERE branch_id = $1 AND expense_date = CURRENT_DATE AND active IS DISTINCT FROM FALSE", [branchId]),
     readDashboardMetric("todayReturns", "SELECT COALESCE(SUM(total_return_amount), 0) AS value FROM sale_returns WHERE branch_id = $1 AND return_date = CURRENT_DATE", [branchId]),
@@ -5729,23 +5837,7 @@ const getDashboardLowStockItems = async (branchId) => {
   const result = await pool.query(
     `
     SELECT *
-    FROM (
-      SELECT
-        p.id AS product_id,
-        p.product_name,
-        p.unit,
-        COALESCE(p.minimum_stock, 5) AS minimum_stock,
-        COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
-      FROM products p
-      -- Branch belongs in the JOIN: a WHERE would hide every product this branch has no batch of,
-      -- and a product with no stock at all is the most low-stock thing there is.
-      LEFT JOIN inventory_batches ib ON ib.product_id = p.id
-        AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-        AND ib.branch_id = $1
-      WHERE p.active IS DISTINCT FROM FALSE
-      GROUP BY p.id, p.product_name, p.unit, p.minimum_stock
-    ) stock
-    WHERE stock.current_stock <= stock.minimum_stock
+    FROM (${DASHBOARD_LOW_STOCK_SQL}) stock
     ORDER BY (stock.current_stock - stock.minimum_stock), stock.product_name
     LIMIT 10
     `,
@@ -6571,20 +6663,27 @@ const recordComboFindings = async (client, { saleId, invoiceItems, companyId, ac
  * A line's share of the bill discount, for its stored profit. Unchanged for a bill without a
  * combo. With one, the offer's lines take none of it -- the bill-total slab does not apply to a
  * combo that is already priced -- and the rest share it on their net, as before.
+ *
+ * A bill with no loose line to carry it (only combos, and a manual bill discount) shares it over
+ * every line, the pre-combo rule. It used to share it over nothing: `sales.profit` was net of the
+ * discount and the lines' profit was not, so product-wise profit overstated the bill's.
+ * `recalculateSalesForBatch` and `saleReturns.linePaidAmount` follow the same rule.
  */
 const invoiceDiscountShareOf = (salePayload, item) => {
   const invoiceItems = salePayload.invoiceItems || [];
-  if (!invoiceItems.some((entry) => comboRules.isComboPricedLine(entry))) {
+  const shareOverEveryLine = () => {
     const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
     return subtotalAfterItemDiscounts === 0
       ? 0
       : roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / subtotalAfterItemDiscounts));
-  }
-  if (comboRules.isComboPricedLine(item)) return 0;
+  };
+  if (!invoiceItems.some((entry) => comboRules.isComboPricedLine(entry))) return shareOverEveryLine();
   const base = roundCurrency(invoiceItems
     .filter((entry) => !comboRules.isComboPricedLine(entry))
     .reduce((sum, entry) => sum + Number(entry.netAmount || 0), 0));
-  return base > 0 ? roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / base)) : 0;
+  if (base <= 0) return shareOverEveryLine();
+  if (comboRules.isComboPricedLine(item)) return 0;
+  return roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / base));
 };
 
 /** The refusal for an edit of a bill that has combo lines: cancel and re-bill instead. */
@@ -6904,7 +7003,8 @@ const chargeRequestsIncludeManualAmount = (requests) =>
  */
 const resolveSaleCharges = async (client, { requests, companyId = null, allowManualAmount = false } = {}) => {
   const parsed = chargeRequestsFrom(requests).map((request) => ({
-    chargeTypeId: parsePositiveInteger(request?.charge_type_id ?? request?.chargeTypeId ?? request?.id),
+    // A counter on an older build names a charge it pulled as `charge-type-7` (its change id).
+    chargeTypeId: parsePositiveInteger(String(request?.charge_type_id ?? request?.chargeTypeId ?? request?.id ?? "").replace(/^charge-type-/, "")),
     measurement: request?.measurement ?? request?.measure ?? null,
     quantity: request?.quantity ?? request?.qty ?? 1,
     manualAmount: parseManualChargeAmount(request),
@@ -7151,6 +7251,12 @@ const buildSalePayload = async (
     // (a desktop bill already handed over; an Owner/Admin edit), or the edited line was already 0.
     // It used to be parsed as "no rate" and silently re-priced at the default rate.
     allowZeroRate = false,
+    // A desktop bill already handed to the customer (the sync path only) names products and a
+    // customer that were live when it was billed. Switching either off afterwards -- the season's
+    // last mango, a closed credit account -- used to reject the bill for good ("One or more products
+    // could not be found"), so the cloud's sales and cash never held it. The browser checkout
+    // stays strict.
+    allowInactiveProducts = false,
   }
 ) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
@@ -7191,7 +7297,11 @@ const buildSalePayload = async (
 
   let customerAccount;
   if (selectedCustomerId) {
-    const customerResult = await client.query("SELECT * FROM customers WHERE id = $1 AND active = TRUE FOR SHARE", [selectedCustomerId]);
+    const customerResult = await client.query(
+      `SELECT * FROM customers WHERE id = $1 AND (active = TRUE OR $2::BOOLEAN)
+         AND (company_id IS NULL OR $3::INTEGER IS NULL OR company_id = $3) FOR SHARE`,
+      [selectedCustomerId, allowInactiveProducts, companyId]
+    );
     if (customerResult.rows.length === 0) {
       return { error: { status: 400, message: "Selected customer account is not active" } };
     }
@@ -7207,8 +7317,8 @@ const buildSalePayload = async (
 
   const productIds = [...new Set(parsedItems.map((item) => item.productId))];
   const productResult = await client.query(
-    "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND active = TRUE ORDER BY id FOR SHARE",
-    [productIds]
+    "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND (active = TRUE OR $2::BOOLEAN) ORDER BY id FOR SHARE",
+    [productIds, allowInactiveProducts]
   );
   if (productResult.rows.length !== productIds.length) {
     return { error: { status: 404, message: "One or more products could not be found" } };
@@ -10973,8 +11083,9 @@ app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res)
 // Combos & Offers: the master (backend/combos.js holds the rules).
 //
 // Reading needs only a session: the counter sells from it. Writing is Owner/Admin through
-// `requireRateManager`, like charge types and products -- a combo's price is a price. There is no
-// DELETE: `active: false` takes a combo off the POS and keeps every bill that sold it readable.
+// `requireRateManager`, like charge types and products -- a combo's price is a price. DELETE removes
+// only a combo no bill names (409 COMBO_IN_USE otherwise); `active: false` takes one off the POS and
+// keeps every bill that sold it readable.
 //
 // Every create and update republishes the whole combo, items nested, with
 // `logMasterDataSyncChange` (one change row per branch, so every branch's counters hear it) as
@@ -10985,6 +11096,13 @@ app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res)
 // ---------------------------------------------------------------------------------------------
 
 const comboRefusal = (res, status, code, message) => res.status(status).json({ code, message });
+
+/**
+ * A session with no company is refused, as Frooz Pack refuses it. The queries read a NULL company
+ * as "any company", so such a session listed, edited and deleted every company's combos and made
+ * new ones every company saw. Every session issued today carries a company; this is the backstop.
+ */
+const COMBO_COMPANY_REQUIRED_MESSAGE = "This session has no shop to keep combos for. Sign in at a counter of the shop.";
 
 /** A combo row as the API, the sync change and the bootstrap hand it out. */
 const presentCombo = (row) => ({ ...row, unavailable_products: comboRules.unavailableProductsOf(row) });
@@ -11013,7 +11131,9 @@ const markCombosInUse = async (client, combos) => {
 
 const listCombosHandler = async (req, res) => {
   try {
-    const combos = await loadCombosWithItems(pool, { companyId: parsePositiveInteger(req.auth.companyId) });
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return comboRefusal(res, 400, comboRules.CODES.COMPANY_REQUIRED, COMBO_COMPANY_REQUIRED_MESSAGE);
+    const combos = await loadCombosWithItems(pool, { companyId });
     return res.json(await markCombosInUse(pool, combos));
   } catch (error) {
     console.error("Loading combos failed", { code: error?.code, message: error?.message });
@@ -11058,6 +11178,7 @@ const saveComboHandler = async (req, res) => {
     if (!parsed.ok) return comboRefusal(res, 400, parsed.code, parsed.message);
     const combo = parsed.value;
     const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return comboRefusal(res, 400, comboRules.CODES.COMPANY_REQUIRED, COMBO_COMPANY_REQUIRED_MESSAGE);
     const rawComboRef = updating ? cleanText(String(req.params.id || "")) : "";
     if (updating && !rawComboRef) return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
 
@@ -11203,6 +11324,7 @@ const deleteComboHandler = async (req, res) => {
     const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return comboRefusal(res, 403, comboRules.CODES.PERMISSION_REQUIRED, "Only the Owner or an Admin can manage combos and offers.");
     const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return comboRefusal(res, 400, comboRules.CODES.COMPANY_REQUIRED, COMBO_COMPANY_REQUIRED_MESSAGE);
     const rawComboRef = cleanText(String(req.params.id || ""));
     if (!rawComboRef) return comboRefusal(res, 404, comboRules.CODES.NOT_FOUND, "This combo was not found.");
 
@@ -11273,8 +11395,9 @@ app.delete("/api/v3/combos/:id", deleteComboHandler);
 // Reading needs only a session: the counter picks packing from the tree, with its own branch's
 // counts. Writing is Owner/Admin through `requireRateManager(req.auth.userId)` -- one call site,
 // in `packingWriteRoute` -- and needs the session's company and branch (stock and the purchase
-// expense are per branch), refused before any write otherwise. No DELETE: `active: false` retires
-// a type, design or size and keeps every bill and purchase that used it readable.
+// expense are per branch), refused before any write otherwise. DELETE removes only packing nothing
+// has used (409 PACKING_IN_USE otherwise); `active: false` retires a type, design or size and keeps
+// every bill and purchase that used it readable.
 //
 // The company is always `req.auth.companyId`, the branch `req.auth.branchId`, the actor
 // `req.auth.userId`; nothing here reads an identity from the request body or headers.
@@ -11285,7 +11408,9 @@ const froozPackDeps = () => ({
   logSyncChange,
   logMasterDataSyncChange,
   anchorBranchId: companyAnchorBranchId,
-  today: () => toDateKey(new Date()),
+  // The shop's day, not the server's: the process runs in UTC, so before 05:30 IST `toDateKey`
+  // named yesterday and an early-morning purchase was booked to the day before.
+  today: () => saleReturnRules.indiaBusinessDateKey(),
 });
 
 const packingWriteRoute = (work) => async (req, res) => {
@@ -11769,6 +11894,9 @@ const processedAckFromRow = (row) => ({
   server_updated_at: row.result_payload?.server_updated_at || row.processed_at,
   error_code: row.result_payload?.error_code || null,
   message: row.result_payload?.message || "Already processed",
+  // The first answer's own result (a bill's server id and invoice number), so a resend answered
+  // from here does not leave the counter without them. Absent when the first answer had none.
+  ...(row.result_payload?.result_payload ? { result_payload: row.result_payload.result_payload } : {}),
 });
 
 /** A new desktop bill (not an edit or a cancel): the only stored conflict that is judged again. */
@@ -12229,9 +12357,13 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     // already been given to the customer. A hand-entered amount that reaches here was authorised on
     // the device that wrote it; refusing it now would strand the invoice in the sync queue forever.
     allowManualChargeAmount: true,
+    // Switched off since it was billed is not a reason to refuse it: see buildSalePayload.
+    allowInactiveProducts: true,
   });
   if (salePayload.error) {
-    if (salePayload.error.status === 409) {
+    // 404: a product the bill names is not on the server at all. Held as a conflict, judged again
+    // on the next push, rather than rejected and stored as processed for good.
+    if (salePayload.error.status === 409 || salePayload.error.status === 404) {
       return conflict(salePayload.error.message || "POS sale conflict; invoice retained locally for review", salePayload.error);
     }
     return rejectOperation(operation, "VALIDATION_ERROR", salePayload.error.message || "POS sale validation failed");
@@ -18812,23 +18944,28 @@ const getUnifiedPaymentRows = async ({ accountKey, companyId } = {}) => {
 };
 
 const getReportDateRange = (query = {}) => {
-  const today = new Date();
+  // "Today" is the shop's day. The server runs in UTC, so `new Date()` read locally was yesterday
+  // until 05:30 IST: a report opened at 01:00 showed the day before, and an as-at Balance Sheet
+  // was as at yesterday. The arithmetic is done on that India date at UTC midnight, so the process
+  // timezone never enters it.
+  const today = new Date(`${saleReturnRules.indiaBusinessDateKey()}T00:00:00Z`);
   const end = new Date(today);
   const start = new Date(today);
+  const dayKey = (date) => date.toISOString().slice(0, 10);
   const range = String(query.range || "today").toLowerCase();
   if (isDateInput(query.date_from) && isDateInput(query.date_to) && query.date_from <= query.date_to) {
     return { dateFrom: query.date_from, dateTo: query.date_to, range: "custom" };
   }
   if (range === "yesterday") {
-    start.setDate(today.getDate() - 1);
-    end.setDate(today.getDate() - 1);
+    start.setUTCDate(today.getUTCDate() - 1);
+    end.setUTCDate(today.getUTCDate() - 1);
   } else if (range === "week") {
-    const day = today.getDay() || 7;
-    start.setDate(today.getDate() - day + 1);
+    const day = today.getUTCDay() || 7;
+    start.setUTCDate(today.getUTCDate() - day + 1);
   } else if (range === "month") {
-    start.setDate(1);
+    start.setUTCDate(1);
   }
-  return { dateFrom: toDateKey(start), dateTo: toDateKey(end), range };
+  return { dateFrom: dayKey(start), dateTo: dayKey(end), range };
 };
 
 app.get("/accounts", async (req, res) => {
@@ -20405,14 +20542,17 @@ app.get("/dashboard-expense-trend", async (req, res) => {
 app.get("/reports/balance-sheet", async (req, res) => {
   try {
     if (await denyWithoutReportsPermission(req, res)) return;
-    const reportRange = getReportDateRange(req.query);
-    const dateFrom = req.query.date_from || reportRange.dateFrom;
-    const dateTo = req.query.date_to || reportRange.dateTo;
-    const snapshot = await getBalanceSheetSnapshot({ dateTo, branchId: req.auth.branchId });
+    // A balance sheet is as at one date, not over a range (UI-9). `as_at` or `date_to` names it;
+    // `range` and `date_from` are not read, so a "today" range control can never move it, and with
+    // no date it is as at today in India.
+    const asAt = [req.query.as_at, req.query.date_to].find((value) => isDateInput(value));
+    if (!asAt && (req.query.as_at || req.query.date_to)) {
+      return res.status(400).json({ message: "Select a valid as-at date" });
+    }
+    const snapshot = await getBalanceSheetSnapshot({ dateTo: asAt || saleReturnRules.indiaBusinessDateKey(), branchId: req.auth.branchId });
     return res.json({
-      dateFrom,
-      dateTo,
       asAtDate: snapshot.asAtDate,
+      dateTo: snapshot.asAtDate,
       cash: snapshot.cash,
       bank: snapshot.bank,
       inventory: snapshot.inventory,
@@ -20982,6 +21122,162 @@ const resolveReportTask = async (task, index) => {
   }
 };
 
+/**
+ * A supplier's ledger entries for the Report Center: one statement, read twice by
+ * `/reports/summary` -- once for the rows in the range (`ledgerReport`) and once, summed, for the
+ * balance brought forward before it (`ledgerOpeningBalances`, UI-10). Because both come from
+ * here, opening + the rows in the range is the balance at the end of the range.
+ *
+ * The entries are the ones Accounts (`getSupplierSummaryRows`) and `/supplier-ledger` count:
+ *   - a completed purchase bill credits the supplier its gross amount (goods + mandi tax + freight
+ *     + labour + other), and its bill rebate is a separate debit. This used to credit `net_payable`,
+ *     which is already net of that rebate, and then debit the rebate again;
+ *   - money paid at the time of purchase is a debit on the day it was paid, never before the
+ *     bill's own date. It was missing, so a bill paid in cash at the mandi read as owed in the
+ *     ledger while Accounts said settled;
+ *   - a pending purchase bill (`purchase_bill_status` not BILL_COMPLETED) is not yet owed, as in
+ *     Accounts;
+ *   - a supplier payment debits the amount paid plus the rebate taken with it.
+ * Cancelled purchases and payments are left out together.
+ *
+ * `onDate(column)` is the date condition; `branchParam` the placeholder of the branch.
+ */
+const supplierLedgerEntriesSql = ({ onDate, branchParam }) => `
+          SELECT p.purchase_date AS date, 'Supplier Purchase' AS transaction_type,
+            p.supplier_name AS party_name,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
+            'Purchase' AS voucher_type,
+            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
+            COALESCE(p.payment_mode, '') AS payment_mode,
+            0::NUMERIC AS debit,
+            COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) AS credit,
+            COALESCE(p.payment_status, '') AS status,
+            COALESCE(p.remarks, 'Purchase #' || p.id) AS remarks,
+            COALESCE(
+              STRING_AGG(pr.product_name || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM pi.quantity::TEXT)) || COALESCE(pr.unit, '') || ' @ ' || pi.purchase_rate || ' = ' || pi.basic_amount, E'\n' ORDER BY pi.id),
+              COALESCE(p.remarks, 'Purchase #' || p.id)
+            ) AS narration
+          FROM purchases p
+          LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+          LEFT JOIN products pr ON pr.id = pi.product_id
+          WHERE ${onDate("p.purchase_date")} AND p.branch_id = ${branchParam}
+            AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+            AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+          GROUP BY p.id
+          UNION ALL
+          SELECT p.purchase_date AS date, 'Supplier Rebate' AS transaction_type,
+            p.supplier_name AS party_name,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
+            'Rebate' AS voucher_type,
+            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
+            COALESCE(p.payment_mode, '') AS payment_mode,
+            COALESCE(p.rebate_amount, 0) AS debit,
+            0::NUMERIC AS credit,
+            COALESCE(p.payment_status, '') AS status,
+            COALESCE(p.remarks, 'Supplier rebate') AS remarks,
+            'Rebate received against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS narration
+          FROM purchases p
+          WHERE ${onDate("p.purchase_date")} AND p.branch_id = ${branchParam}
+            AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+            AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+            AND COALESCE(p.rebate_amount, 0) > 0
+          UNION ALL
+          -- Money paid with the bill is entered no earlier than the bill: a payment dated before
+          -- its purchase (an advance) would otherwise sit in a period whose bill is not there yet,
+          -- so the ledger's b/f and Accounts' as-at payable disagreed.
+          SELECT GREATEST(COALESCE(p.payment_date, p.purchase_date), p.purchase_date) AS date, 'Supplier Payment' AS transaction_type,
+            p.supplier_name AS party_name,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
+            'Payment' AS voucher_type,
+            COALESCE(p.payment_reference_number, p.bill_number, 'PUR-' || p.id) AS voucher_no,
+            COALESCE(p.payment_mode, '') AS payment_mode,
+            p.paid_amount AS debit,
+            0::NUMERIC AS credit,
+            COALESCE(p.payment_status, '') AS status,
+            'Paid against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS remarks,
+            'Paid against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS narration
+          FROM purchases p
+          WHERE ${onDate("GREATEST(COALESCE(p.payment_date, p.purchase_date), p.purchase_date)")} AND p.branch_id = ${branchParam}
+            AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+            AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+            AND COALESCE(p.paid_amount, 0) > 0
+          -- A cancelled purchase or sale is left out together with its reversal. Listing only the
+          -- reversal (the original being filtered out above) credited the party with the full amount
+          -- of a document that was never counted; the same goes for cancelled payments and expenses.
+          UNION ALL
+          SELECT sp.payment_date AS date, 'Supplier Payment' AS transaction_type,
+            s.supplier_name AS party_name,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || s.id AS account_key,
+            'Payment' AS voucher_type,
+            COALESCE(sp.reference_number, 'SP-' || sp.id) AS voucher_no,
+            sp.payment_mode,
+            sp.payment_amount + COALESCE(sp.rebate_amount, 0) AS debit,
+            0::NUMERIC AS credit,
+            CASE WHEN sp.cancelled THEN 'CANCELLED' ELSE 'ACTIVE' END AS status,
+            COALESCE(sp.remarks, sp.reference_number, 'Supplier payment') AS remarks,
+            COALESCE(sp.remarks, 'Supplier payment') || CASE WHEN COALESCE(sp.rebate_amount, 0) > 0 THEN ' | Rebate ' || sp.rebate_amount ELSE '' END AS narration
+          FROM supplier_payments sp
+          JOIN suppliers s ON s.id = sp.supplier_id
+          WHERE ${onDate("sp.payment_date")} AND sp.branch_id = ${branchParam}
+            AND sp.cancelled = FALSE`;
+
+/**
+ * Each supplier's balance brought forward to `dateFrom` at this branch (UI-10): the supplier's own
+ * opening balance plus every ledger entry before `dateFrom`, from `supplierLedgerEntriesSql`. A
+ * ledger for "today" otherwise opened at nothing, and a supplier owed thousands read as owed
+ * nothing. Positive is owed to the supplier (Cr), the sign the Supplier Ledger's running balance
+ * uses. Suppliers with a zero balance brought forward are left out.
+ *
+ * The rows are shaped like `ledgerReport` rows, dated `dateFrom`, so the Supplier Ledger can put
+ * one first and run its balance on from it. They are not in `ledgerReport` itself, which the Day
+ * Book also reads, and a balance brought forward is not a transaction of the day.
+ */
+const getSupplierLedgerOpeningBalances = async ({ dateFrom, branchId }) => {
+  const result = await pool.query(
+    `
+    SELECT * FROM (
+      SELECT
+        s.id AS supplier_id,
+        s.supplier_name AS party_name,
+        'SUPPLIER-' || s.id AS account_key,
+        ROUND((COALESCE(s.opening_balance, 0) + COALESCE(SUM(entry.credit), 0) - COALESCE(SUM(entry.debit), 0))::NUMERIC, 2) AS opening_balance
+      FROM suppliers s
+      LEFT JOIN (${supplierLedgerEntriesSql({ onDate: (column) => `${column} < $1`, branchParam: "$2" })}
+      ) entry ON entry.account_key = 'SUPPLIER-' || s.id
+      WHERE (s.company_id IS NULL OR s.company_id = (SELECT company_id FROM branches WHERE id = $2))
+      GROUP BY s.id, s.supplier_name, s.opening_balance
+    ) brought_forward
+    WHERE opening_balance <> 0
+    ORDER BY party_name
+    `,
+    [dateFrom, branchId]
+  );
+  return result.rows.map((row) => {
+    const balance = roundCurrency(Number(row.opening_balance || 0));
+    return {
+      date: dateFrom,
+      transaction_type: "Opening Balance",
+      voucher_type: "Opening Balance",
+      voucher_no: "B/F",
+      party_name: row.party_name,
+      account_type: "SUPPLIER",
+      account_key: row.account_key,
+      supplier_id: row.supplier_id,
+      payment_mode: "",
+      debit: balance < 0 ? roundCurrency(-balance) : 0,
+      credit: balance > 0 ? balance : 0,
+      opening_balance: balance,
+      status: "ACTIVE",
+      remarks: "Opening balance b/f",
+      narration: "Opening balance b/f",
+    };
+  });
+};
+
 const EMPTY_BALANCE_SHEET = Object.freeze({
   cash: 0,
   bank: 0,
@@ -21425,64 +21721,7 @@ app.get("/reports/summary", async (req, res) => {
         `
         SELECT *
         FROM (
-          SELECT p.purchase_date AS date, 'Supplier Purchase' AS transaction_type,
-            p.supplier_name AS party_name,
-            'SUPPLIER' AS account_type,
-            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
-            'Purchase' AS voucher_type,
-            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
-            COALESCE(p.payment_mode, '') AS payment_mode,
-            0::NUMERIC AS debit,
-            COALESCE(NULLIF(p.net_payable, 0), NULLIF(p.gross_amount, 0), p.total_amount, 0) AS credit,
-            COALESCE(p.payment_status, '') AS status,
-            COALESCE(p.remarks, 'Purchase #' || p.id) AS remarks,
-            COALESCE(
-              STRING_AGG(pr.product_name || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM pi.quantity::TEXT)) || COALESCE(pr.unit, '') || ' @ ' || pi.purchase_rate || ' = ' || pi.basic_amount, E'\n' ORDER BY pi.id),
-              COALESCE(p.remarks, 'Purchase #' || p.id)
-            ) AS narration
-          FROM purchases p
-          LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
-          LEFT JOIN products pr ON pr.id = pi.product_id
-          WHERE p.purchase_date BETWEEN $1 AND $2 AND p.branch_id = $3
-            AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
-          GROUP BY p.id
-          UNION ALL
-          SELECT p.purchase_date AS date, 'Supplier Rebate' AS transaction_type,
-            p.supplier_name AS party_name,
-            'SUPPLIER' AS account_type,
-            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
-            'Rebate' AS voucher_type,
-            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
-            COALESCE(p.payment_mode, '') AS payment_mode,
-            COALESCE(p.rebate_amount, 0) AS debit,
-            0::NUMERIC AS credit,
-            COALESCE(p.payment_status, '') AS status,
-            COALESCE(p.remarks, 'Supplier rebate') AS remarks,
-            'Rebate received against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS narration
-          FROM purchases p
-          WHERE p.purchase_date BETWEEN $1 AND $2 AND p.branch_id = $3
-            AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
-            AND COALESCE(p.rebate_amount, 0) > 0
-          -- A cancelled purchase or sale is left out together with its reversal. Listing only the
-          -- reversal (the original being filtered out above) credited the party with the full amount
-          -- of a document that was never counted; the same goes for cancelled payments and expenses.
-          UNION ALL
-          SELECT sp.payment_date AS date, 'Supplier Payment' AS transaction_type,
-            s.supplier_name AS party_name,
-            'SUPPLIER' AS account_type,
-            'SUPPLIER-' || s.id AS account_key,
-            'Payment' AS voucher_type,
-            COALESCE(sp.reference_number, 'SP-' || sp.id) AS voucher_no,
-            sp.payment_mode,
-            sp.payment_amount + sp.rebate_amount AS debit,
-            0::NUMERIC AS credit,
-            CASE WHEN sp.cancelled THEN 'CANCELLED' ELSE 'ACTIVE' END AS status,
-            COALESCE(sp.remarks, sp.reference_number, 'Supplier payment') AS remarks,
-            COALESCE(sp.remarks, 'Supplier payment') || CASE WHEN COALESCE(sp.rebate_amount, 0) > 0 THEN ' | Rebate ' || sp.rebate_amount ELSE '' END AS narration
-          FROM supplier_payments sp
-          JOIN suppliers s ON s.id = sp.supplier_id
-          WHERE sp.payment_date BETWEEN $1 AND $2 AND sp.branch_id = $3
-            AND sp.cancelled = FALSE
+          ${supplierLedgerEntriesSql({ onDate: (column) => `${column} BETWEEN $1 AND $2`, branchParam: "$3" })}
           UNION ALL
           SELECT s.sale_date AS date, 'Customer Sale' AS transaction_type,
             COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS party_name,
@@ -21971,8 +22210,10 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0) AS labour_charges,
           COALESCE((SELECT SUM(other_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0) AS other_purchase_charges,
           COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS expenses,
-          COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0)
-            + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS supplier_rebate_received,
+          -- The bill rebate is inside the landed purchase_cost (see profitAndLossFromTotals); only a
+          -- rebate taken when paying the supplier reduces the cost of goods sold.
+          COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3), 0) AS purchase_bill_rebate,
+          COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2 AND branch_id = $3), 0) AS supplier_rebate_received,
           COALESCE((
             SELECT JSON_AGG(JSON_BUILD_OBJECT('category', category, 'amount', total_amount) ORDER BY category)
             FROM (
@@ -22024,18 +22265,17 @@ app.get("/reports/summary", async (req, res) => {
       console.warn(`Report balance sheet returned zero defaults: ${error.code || error.message}`);
       return EMPTY_BALANCE_SHEET;
     });
+    // Balance brought forward for the Supplier Ledger (UI-10). A failure is null, never an empty
+    // list: "no balance brought forward" is a statement about the supplier, not about the query.
+    const ledgerOpeningBalances = await getSupplierLedgerOpeningBalances({ dateFrom, branchId: req.auth.branchId }).catch((error) => {
+      console.warn(`Report ledger opening balances unavailable: ${error.code || error.message}`);
+      return null;
+    });
     const profitLoss = profitLossResult.rows[0] || {};
     const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
     const supplierPayable = supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
-    const purchaseCost = Number(profitLoss.purchase_cost || 0);
-    const mandiTax = Number(profitLoss.mandi_tax || 0);
-    const freightCharges = Number(profitLoss.freight_charges || 0);
-    const labourCharges = Number(profitLoss.labour_charges || 0);
-    const otherPurchaseCharges = Number(profitLoss.other_purchase_charges || 0);
-    const supplierRebateReceived = Number(profitLoss.supplier_rebate_received || 0);
-    const costOfGoodsSold = purchaseCost + mandiTax + freightCharges + labourCharges + otherPurchaseCharges - supplierRebateReceived;
-    const grossProfit = Number(profitLoss.sales_revenue || 0) - costOfGoodsSold;
-    const netProfit = grossProfit - Number(profitLoss.expenses || 0);
+    const figures = profitAndLossFromTotals(profitLoss);
+    const { purchaseCost, supplierRebateReceived, costOfGoodsSold, grossProfit, netProfit, includedInPurchaseCost } = figures;
     return res.json({
       dateFrom,
       dateTo,
@@ -22054,6 +22294,7 @@ app.get("/reports/summary", async (req, res) => {
       mostWastedProducts: wasteProductResult.rows.slice(0, 5),
       stockReport: stockResult.rows,
       ledgerReport: ledgerResult.rows,
+      ledgerOpeningBalances,
       dayToDayReport: ledgerResult.rows,
       salesProductReport: salesProductResult.rows,
       salesCustomerReport: salesCustomerResult.rows,
@@ -22069,6 +22310,10 @@ app.get("/reports/summary", async (req, res) => {
       returnHistoryReport: returnHistoryResult.rows,
       stockMovementReport: stockMovementResult.rows,
       balanceSheet: {
+        // The sheet is as at the range's last day; the frontend labels it "As at" this date (UI-9).
+        asAtDate: balanceSheetSnapshot.asAtDate,
+        // A failed snapshot is not a sheet of zeroes: say so, so it is never shown as one.
+        unavailable: balanceSheetSnapshot === EMPTY_BALANCE_SHEET,
         cash: balanceSheetSnapshot.cash,
         bank: balanceSheetSnapshot.bank,
         inventory: balanceSheetSnapshot.inventory,
@@ -22082,11 +22327,19 @@ app.get("/reports/summary", async (req, res) => {
       },
       profitLoss: {
         salesRevenue: roundCurrency(Number(profitLoss.sales_revenue || 0)),
+        // Landed: already holds the sold goods' share of mandi tax, freight, labour, other charges
+        // and the bill rebate. COGS = purchaseCost - supplierRebateReceived, nothing else.
         purchaseCost: roundCurrency(purchaseCost),
-        mandiTax: roundCurrency(mandiTax),
-        freightCharges: roundCurrency(freightCharges),
-        labourCharges: roundCurrency(labourCharges),
-        otherPurchaseCharges: roundCurrency(otherPurchaseCharges),
+        // The period's purchase charges, for reading only: they are inside purchaseCost for the
+        // part sold and are NOT part of COGS a second time. Kept under the old names so a screen
+        // can label them "included in purchase cost"; `purchaseChargesIncludedInCost` says so.
+        mandiTax: roundCurrency(includedInPurchaseCost.mandiTax),
+        freightCharges: roundCurrency(includedInPurchaseCost.freightCharges),
+        labourCharges: roundCurrency(includedInPurchaseCost.labourCharges),
+        otherPurchaseCharges: roundCurrency(includedInPurchaseCost.otherPurchaseCharges),
+        purchaseBillRebate: roundCurrency(includedInPurchaseCost.purchaseBillRebate),
+        purchaseChargesIncludedInCost: true,
+        // Rebates taken when paying suppliers: in no lot's cost, so they reduce COGS.
         supplierRebateReceived: roundCurrency(supplierRebateReceived),
         costOfGoodsSold: roundCurrency(costOfGoodsSold),
         expenses: roundCurrency(Number(profitLoss.expenses || 0)),
@@ -22193,15 +22446,18 @@ app.post("/expenses", async (req, res) => {
         expense_date, category, amount, payment_mode, reference_number,
         vendor_name, paid_to, remarks, branch_id, created_by, active, status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ACTIVE')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, 'ACTIVE')
       RETURNING *
       `,
+      // Always active: a client `active: false` used to store a row that said ACTIVE, was paid, and
+      // was left out of every report (they all filter `active IS DISTINCT FROM FALSE`), with no way
+      // to edit it back. Cancelling, with a reason, is the only way an expense stops counting.
       [
         req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
         nullableText(req.body.reference_number), nullableText(req.body.vendor_name || req.body.paid_to),
         nullableText(req.body.paid_to || req.body.vendor_name),
         nullableText(req.body.remarks), req.auth.branchId,
-        req.auth.userId, req.body.active !== false,
+        req.auth.userId,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -23094,11 +23350,13 @@ const recalculateSalesForBatch = async (client, batchId) => {
       -- The bill discount is shared over the loose lines only, as the bill booked it
       -- (invoiceDiscountShareOf): a combo's lines are already priced and take none of it. A bill
       -- with no combo is unchanged. Summed with CASE rather than filtered, so a combo-only bill
-      -- still has its row here and its lines' cost and profit are still updated.
+      -- still has its row here and its lines' cost and profit are still updated. A bill with no
+      -- loose net to carry the discount shares it over every line (all_subtotal), as the bill did.
       sale_subtotal AS (
         SELECT sale_id,
                SUM(CASE WHEN COALESCE(combo_line_key, combo_id, combo_type) IS NULL
-                        THEN COALESCE(net_amount, amount) ELSE 0 END) AS subtotal
+                        THEN COALESCE(net_amount, amount) ELSE 0 END) AS subtotal,
+               SUM(COALESCE(net_amount, amount)) AS all_subtotal
         FROM sale_items
         WHERE sale_id = $1
         GROUP BY sale_id
@@ -23112,6 +23370,8 @@ const recalculateSalesForBatch = async (client, batchId) => {
           - CASE
               WHEN sale_subtotal.subtotal > 0 AND COALESCE(si.combo_line_key, si.combo_id, si.combo_type) IS NULL
               THEN COALESCE(s.invoice_discount_amount, 0) * (COALESCE(si.net_amount, si.amount) / sale_subtotal.subtotal)
+              WHEN COALESCE(sale_subtotal.subtotal, 0) <= 0 AND sale_subtotal.all_subtotal > 0
+              THEN COALESCE(s.invoice_discount_amount, 0) * (COALESCE(si.net_amount, si.amount) / sale_subtotal.all_subtotal)
               ELSE 0
             END
           - item_costs.cost_amount
@@ -24857,12 +25117,16 @@ const createSaleHandler = async (req, res) => {
     const manualBillDiscount = discountRules.readManualBillDiscount(req.body.manual_bill_discount);
     const rawBillDateTime = cleanText(bill_datetime || "");
     const rawBillDate = cleanText(bill_date || rawBillDateTime || "");
-    const transactionDate = toBusinessDateKey(rawBillDate);
+    // The shop's day, not the process's: the server runs in UTC, so from 00:00 to 05:30 IST
+    // `toDateKey(new Date())` was yesterday, and a Cashier billing at today's date was refused as
+    // "changing the bill date" (an Owner was asked to confirm a future bill). A bill sent with no
+    // date takes the same India day.
+    const todayDate = saleReturnRules.indiaBusinessDateKey();
+    const transactionDate = rawBillDate ? toBusinessDateKey(rawBillDate) : todayDate;
     const requestedBillDateTime = rawBillDateTime || `${transactionDate}T00:00`;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(transactionDate)) {
       return res.status(400).json({ message: "Select a valid bill date" });
     }
-    const todayDate = toDateKey(new Date());
     const isBackdatedBill = transactionDate < todayDate;
     const isFutureBill = transactionDate > todayDate;
     if (transactionDate !== todayDate) {
@@ -25525,8 +25789,44 @@ const createSaleHandler = async (req, res) => {
 app.post("/sales", createSaleHandler);
 app.post("/api/v3/sales", rateLimitSyncRequest, v3WriteAdapter(createSaleHandler));
 
+/**
+ * The optional window of `GET /sales`, from its query string.
+ *
+ * - `days=N` (whole number, 1..3650): bills dated within the last N India business days, today
+ *   included -- `days=30` is today and the 29 days before it. The Sale Returns screen sends this.
+ * - `date_from=YYYY-MM-DD`: bills dated on or after that day. Wins over `days` when both are sent.
+ *
+ * Neither: `{ dateFrom: null }`, and the route answers exactly as it always has, every bill of the
+ * branch. Anything else is `{ error }`, answered 400, never read as "no window".
+ */
+const salesListWindow = (query = {}, today = saleReturnRules.indiaBusinessDateKey()) => {
+  const rawFrom = query.date_from;
+  const rawDays = query.days;
+  if (rawFrom !== undefined && rawFrom !== "") {
+    if (!isDateInput(rawFrom) || Number.isNaN(Date.parse(`${rawFrom}T00:00:00Z`))) {
+      return { error: "date_from must be a date written YYYY-MM-DD." };
+    }
+    return { dateFrom: String(rawFrom) };
+  }
+  if (rawDays !== undefined && rawDays !== "") {
+    const days = /^\d+$/.test(String(rawDays)) ? Number(rawDays) : NaN;
+    if (!Number.isInteger(days) || days < 1 || days > 3650) return { error: "days must be a whole number from 1 to 3650." };
+    const from = new Date(`${today}T00:00:00Z`);
+    from.setUTCDate(from.getUTCDate() - (days - 1));
+    return { dateFrom: from.toISOString().slice(0, 10) };
+  }
+  return { dateFrom: null };
+};
+
+// Optional window: `?days=N` or `?date_from=YYYY-MM-DD` (see `salesListWindow`). Without either it
+// lists every bill of the branch, as it always has; callers that only need recent bills should send
+// one, since the list is joined line by line and grows with every bill.
 app.get("/sales", async (req, res) => {
   try {
+    const window = salesListWindow(req.query || {});
+    if (window.error) return res.status(400).json({ code: "SALES_WINDOW_INVALID", message: window.error });
+    const values = [req.auth.branchId];
+    if (window.dateFrom) values.push(window.dateFrom);
     const result = await pool.query(`
       SELECT
         s.id,
@@ -25575,9 +25875,10 @@ app.get("/sales", async (req, res) => {
       LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
       LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
       WHERE s.branch_id = $1
+        ${window.dateFrom ? "AND s.sale_date >= $2::DATE" : ""}
       GROUP BY s.id, c.customer_name
       ORDER BY s.created_at DESC, s.id DESC
-    `, [req.auth.branchId]);
+    `, values);
 
     return res.json(result.rows);
   } catch (error) {
@@ -26014,12 +26315,12 @@ const createSaleReturnHandler = async (req, res) => {
     const createdBy = req.auth.userId;
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     if (!saleId || !REFUND_TYPES.has(refundType) || !returnReason || items.length === 0) {
-      return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
+      return res.status(400).json({ code: "SALE_RETURN_INVALID_REQUEST", message: "Select invoice, products, refund type and return reason" });
     }
     // One line per sale line. A repeated sale_item_id would be checked against the returnable
     // quantity and mapped to batches as if the other line did not exist.
     if (saleReturnRules.findDuplicateSaleItemId(items)) {
-      return res.status(400).json({ message: "Each product can appear only once in a return. Combine the quantities into one line." });
+      return res.status(400).json({ code: "SALE_RETURN_DUPLICATE_LINE", message: "Each product can appear only once in a return. Combine the quantities into one line." });
     }
     // `billing`, not `invoice_cancellation`, and the choice is deliberate. A return refunds money and
     // is a partial void of a sale, so the stricter key is arguable — but returns are counter work a
@@ -26092,7 +26393,7 @@ const createSaleReturnHandler = async (req, res) => {
     });
     if (returnDate.error) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: returnDate.error });
+      return res.status(400).json({ code: "SALE_RETURN_DATE_INVALID", message: returnDate.error });
     }
     // Every line of the bill, for its share of the bill discount and Mandi Tax.
     const saleLinesResult = await client.query(
@@ -26103,7 +26404,9 @@ const createSaleReturnHandler = async (req, res) => {
       [saleId]
     );
     const saleLines = saleLinesResult.rows;
-    const returnNo = `RET-${Date.now()}`;
+    // A random suffix: two returns in the same millisecond (two counters, or a double press that
+    // passes the line locks on different lines) collided on the UNIQUE return_no and answered 500.
+    const returnNo = `RET-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
     const returnResult = await client.query(
       `
       INSERT INTO sale_returns (
@@ -26132,7 +26435,7 @@ const createSaleReturnHandler = async (req, res) => {
       const requestedQuantity = saleReturnRules.normalizeReturnQuantity(requested.return_quantity);
       if (!saleItemId || !requestedQuantity) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: "Enter valid return quantities" });
+        return res.status(400).json({ code: "SALE_RETURN_QUANTITY_INVALID", message: "Enter valid return quantities" });
       }
       const returnQuantity = requestedQuantity.quantity;
       // Lock the line first, then read what earlier returns took from it: a concurrent return of
@@ -26167,12 +26470,12 @@ const createSaleReturnHandler = async (req, res) => {
         : 0;
       if (!saleItem || requestedQuantity.thousandths > returnable) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: `${saleItem?.product_name || "Item"} return quantity exceeds returnable quantity` });
+        return res.status(400).json({ code: "SALE_RETURN_QUANTITY_EXCEEDS", message: `${saleItem?.product_name || "Item"} return quantity exceeds returnable quantity` });
       }
       const perUnit = saleReturnRules.refundPerUnit({ line: saleItem, saleLines, sale });
       if (perUnit === null) {
         await client.query("ROLLBACK");
-        return res.status(409).json({ message: `${saleItem.product_name || "Item"} has no sold quantity to price the return against` });
+        return res.status(409).json({ code: "SALE_RETURN_UNPRICEABLE", message: `${saleItem.product_name || "Item"} has no sold quantity to price the return against` });
       }
       const returnAmount = saleReturnRules.refundAmountFor(perUnit, returnQuantity);
       const allocations = await client.query(
@@ -26192,7 +26495,7 @@ const createSaleReturnHandler = async (req, res) => {
       });
       if (restoration.unmappedThousandths > 0) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: "Unable to map return quantity to original inventory batch" });
+        return res.status(400).json({ code: "SALE_RETURN_UNMAPPED_BATCH", message: "Unable to map return quantity to original inventory batch" });
       }
       for (const line of restoration.lines) {
         await client.query(
@@ -26268,7 +26571,7 @@ const createSaleReturnHandler = async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
-    return res.status(500).json({ message: "Error Saving Sale Return" });
+    return res.status(500).json({ code: "SALE_RETURN_SAVE_FAILED", message: "Error Saving Sale Return" });
   } finally {
     client.release();
   }
@@ -27532,4 +27835,11 @@ module.exports = {
   // that an absent or malformed fingerprint never erases a stored one.
   readDevicePayload,
   upsertDeviceRequest,
+  // Exported so `salesSyncIntegrity.test.js` can pin the optional `GET /sales` window by date.
+  salesListWindow,
+  // Exported so `combos.test.js` can check that a line's discount share adds up to the bill's.
+  invoiceDiscountShareOf,
+  // Exported so `saleReturns.test.js` can pin the one profit rule the P&L and balance sheet share.
+  profitAndLossFromTotals,
+  DASHBOARD_LOW_STOCK_SQL,
 };

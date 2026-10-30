@@ -1,22 +1,22 @@
 {
-  "name": "FroozERP",
-  "short_name": "FroozERP",
-  "description": "FroozERP - Feel the Freakin' Frooz by SRT Company.",
+  "name": "THE PEP",
+  "short_name": "THE PEP",
+  "description": "THE PEP - Pulp Eat Up. by SRT Company.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#0a2d1c",
-  "theme_color": "#0a2d1c",
+  "background_color": "#102f20",
+  "theme_color": "#102f20",
   "orientation": "any",
   "icons": [
     {
-      "src": "./branding/frooz-icon-192.png",
+      "src": "./branding/pep-icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "./branding/frooz-icon-512.png",
+      "src": "./branding/pep-icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
@@ -27,13 +27,13 @@
       "name": "POS Billing",
       "short_name": "POS",
       "url": "./?view=sales",
-      "icons": [{ "src": "./branding/frooz-icon-192.png", "sizes": "192x192", "type": "image/png" }]
+      "icons": [{ "src": "./branding/pep-icon-192.png", "sizes": "192x192", "type": "image/png" }]
     },
     {
       "name": "Owner Dashboard",
       "short_name": "Dashboard",
       "url": "./?view=dashboard",
-      "icons": [{ "src": "./branding/frooz-icon-192.png", "sizes": "192x192", "type": "image/png" }]
+      "icons": [{ "src": "./branding/pep-icon-192.png", "sizes": "192x192", "type": "image/png" }]
     }
   ]
 }

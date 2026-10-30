@@ -39,19 +39,19 @@ const OUT = join(repoRoot, "website", "src", "tokens.css");
 // name -> [value, what it is for]. The comment is the point: a hex tells the next
 // person nothing about whether they are allowed to use it.
 const TOKENS = [
-  ["-- brand", null, "The three colours in the logo, plus its ink"],
-  ["green-deep", BRAND.greenDeep, "the logo's deep green"],
-  ["green-mid", BRAND.greenMid, "the logo's mid green"],
-  ["gold", BRAND.gold, "the logo's gold - correct on paper, muddy on a dark screen"],
-  ["cream", CREAM, "the reversed logo's ink"],
-  ["cream-dim", CREAM_DIM, "the reversed logo's second ink"],
+  ["-- brand", null, "The PEP logo's colours: its green ground, a mid green, its mustard, its cream"],
+  ["green-deep", BRAND.greenDeep, "the logo's ground green"],
+  ["green-mid", BRAND.greenMid, "a step up from the logo's green - cards"],
+  ["gold", BRAND.gold, "the logo's mustard - bright on the dark ground, too light for text on paper"],
+  ["cream", CREAM, "the logo's cream - leaf, counters, tagline"],
+  ["cream-dim", CREAM_DIM, "a dimmer cream at the same hue"],
 
   ["-- ground", null, "Surfaces, darkest first"],
   ["ground", GROUND.canvas, "the page"],
   ["ground-deep", GROUND.abyss, "behind a sheet, and the deepest shadow"],
   ["panel", GROUND.raised, "a surface lifted off the page"],
   ["panel-high", GROUND.raisedHigh, "a surface lifted off a panel"],
-  ["card", GROUND.card, "a product card - the logo's own mid green"],
+  ["card", GROUND.card, "a product card - BRAND.greenMid"],
   ["line", GROUND.border, "a divider"],
   ["line-strong", GROUND.borderStrong, "a divider that has to carry weight"],
 
@@ -63,7 +63,7 @@ const TOKENS = [
   ["ink", INK.brightest, "headings and prices"],
 
   ["-- accent", null, "Gold means \"this is the action\", and nothing else"],
-  ["accent", ACCENT.accent, "the action, on the dark ground"],
+  ["accent", ACCENT.accent, "the action, on the dark ground - the logo mustard itself"],
   ["accent-bright", ACCENT.bright, "hover and focus"],
   ["accent-deep", ACCENT.deep, "gold on a light surface"],
 
@@ -123,9 +123,9 @@ console.log(`wrote ${TOKENS.filter(([, v]) => v !== null).length + ALPHAS.length
 // The shared files. Only the reversed logo cuts: this site is dark throughout, and
 // the normal cut is deep green, which disappears on it.
 const SHARED = [
-  ["frontend/public/branding/frooz-logo-reversed.svg", "website/public/branding/frooz-logo-reversed.svg"],
-  ["frontend/public/branding/frooz-mark-reversed.svg", "website/public/branding/frooz-mark-reversed.svg"],
-  ["frontend/public/branding/frooz-wordmark-reversed.svg", "website/public/branding/frooz-wordmark-reversed.svg"],
+  ["frontend/public/branding/pep-logo-reversed.svg", "website/public/branding/pep-logo-reversed.svg"],
+  ["frontend/public/branding/pep-mark-reversed.svg", "website/public/branding/pep-mark-reversed.svg"],
+  ["frontend/public/branding/pep-wordmark-reversed.svg", "website/public/branding/pep-wordmark-reversed.svg"],
   ["frontend/public/favicon.svg", "website/public/branding/favicon.svg"],
   ["frontend/src/assets/fonts/inter-latin.woff2", "website/public/fonts/inter-latin.woff2"],
   ["frontend/src/assets/fonts/inter-latin-ext.woff2", "website/public/fonts/inter-latin-ext.woff2"],

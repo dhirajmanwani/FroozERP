@@ -335,3 +335,58 @@ test("the auth layer never covered created_by, which is why the routes had to ch
     "an agreeing header must not buy a disagreeing body past the check",
   );
 });
+
+// -------------------------------------------------------------------------------------------
+// POST /expenses stores an active row whatever `active` the client sends (BO-1)
+// -------------------------------------------------------------------------------------------
+
+test("an expense saved with active:false is stored active and is counted where reports count", async () => {
+  // The form's "Active" box, unticked, stored `active = false, status = 'ACTIVE'`: the register said
+  // Active, the money was paid, and every report (`active IS DISTINCT FROM FALSE`) left it out, with
+  // no way to edit it back. Only a cancellation, with its reason, takes an expense out now.
+  const { loadServerApp, probe, setQueryResponder, clearQueryResponder } = require("./routeAuthCoverage");
+  const { issueDeviceSession } = require("./deviceSession");
+  const { PGlite } = require("@electric-sql/pglite");
+  const app = loadServerApp();
+  const db = new PGlite();
+  await db.exec(`
+    CREATE TABLE expenses (
+      id SERIAL PRIMARY KEY, expense_date DATE NOT NULL DEFAULT CURRENT_DATE, category VARCHAR(120) NOT NULL,
+      amount NUMERIC(14, 2) NOT NULL, payment_mode VARCHAR(30) NOT NULL DEFAULT 'CASH', reference_number VARCHAR(120),
+      vendor_name VARCHAR(160), paid_to VARCHAR(160), remarks TEXT, branch_id INTEGER, created_by INTEGER,
+      active BOOLEAN DEFAULT TRUE, status VARCHAR(20) DEFAULT 'ACTIVE'
+    );
+  `);
+  setQueryResponder(async (text, values) => {
+    const sql = String(typeof text === "object" && text ? text.text : text).replace(/\s+/g, " ").trim();
+    if (/FROM authorized_devices d/i.test(sql)) {
+      return { rows: [{
+        device_id: "FZDEV-EXP", device_status: "APPROVED", company_id: 1, branch_id: 1, operational_location_id: 10,
+        assignment_generation: 1, fixed_operational: true, intended_usage: "POS", device_permissions: {},
+        device_assignment_active: true, location_active: true, branch_active: true, role_id: 1, is_default: true,
+        staff_permissions: {}, staff_assignment_active: true, role_name: "Owner",
+      }] };
+    }
+    if (/SELECT session_revocation_version FROM users/i.test(sql)) return { rows: [{ session_revocation_version: 0 }] };
+    if (/FROM users u JOIN roles r/.test(sql)) return { rows: [{ id: 7, full_name: "Rig", username: "rig", branch_id: 1, role_name: "Owner", permissions: {} }] };
+    if (/INSERT INTO expenses/.test(sql)) return db.query(sql, values || []);
+    return { rows: [] };
+  });
+  try {
+    const token = issueDeviceSession({
+      userId: 7, deviceId: "FZDEV-EXP", companyId: 1, branchId: 1, role: "Owner",
+      secret: "route-auth-coverage-isolated-signing-key-000000",
+    });
+    const response = await probe(app, "POST", "/expenses", { authorization: `Bearer ${token}`, "content-type": "application/json" }, {
+      expense_date: "2026-10-20", category: "Rent", amount: 2000, payment_mode: "CASH", active: false,
+    });
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    assert.equal(response.body.active, true);
+    assert.equal(response.body.status, "ACTIVE");
+    const counted = await db.query("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE active IS DISTINCT FROM FALSE");
+    assert.equal(Number(counted.rows[0].total), 2000, "the P&L filter counts it");
+  } finally {
+    clearQueryResponder();
+    await db.close();
+  }
+});

@@ -195,3 +195,52 @@ test("bootstrap boundary locks assignment and change-log writers", async () => {
   assert.match(statement, /staff_location_assignments/);
   assert.match(statement, /SHARE MODE/);
 });
+
+test("bootstrap sends a switched-off product that a lot it sends still points at, and no other", async () => {
+  // A deactivated product has `deleted_at` set, but its lots still travel; a lot whose product was
+  // not in `records` failed the device's foreign key and rolled back the whole fill (DT-1). Run on
+  // a real Postgres so the products and lots predicates are judged together.
+  const { PGlite } = require("@electric-sql/pglite");
+  const db = new PGlite();
+  await db.exec(`
+    CREATE TABLE product_categories (id INTEGER PRIMARY KEY, global_id TEXT, company_id INTEGER, category_name TEXT, entity_version INTEGER, updated_at TIMESTAMPTZ, created_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ);
+    CREATE TABLE products (
+      id INTEGER PRIMARY KEY, global_id TEXT, company_id INTEGER, product_name TEXT, category TEXT, category_id INTEGER,
+      active BOOLEAN, entity_version INTEGER, selling_rate_updated_at TIMESTAMPTZ, created_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ
+    );
+    CREATE TABLE inventory_batches (
+      id INTEGER PRIMARY KEY, global_id TEXT, product_id INTEGER, company_id INTEGER, branch_id INTEGER,
+      operational_location_id INTEGER, entity_version INTEGER, updated_at TIMESTAMPTZ, created_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ
+    );
+    INSERT INTO products (id, company_id, product_name, active, entity_version, deleted_at) VALUES
+      (1, 1, 'Apple', TRUE, 1, NULL),
+      (2, 1, 'Mango (season over)', FALSE, 2, CURRENT_TIMESTAMP),
+      (3, 1, 'Retired, no lot here', FALSE, 2, CURRENT_TIMESTAMP),
+      (4, 1, 'Retired, lot elsewhere', FALSE, 2, CURRENT_TIMESTAMP);
+    INSERT INTO inventory_batches (id, product_id, company_id, branch_id, operational_location_id, entity_version) VALUES
+      (10, 1, 1, 1, 1001, 1), (11, 2, 1, 1, 1001, 1), (12, 4, 1, 1, 2002, 1);
+  `);
+  try {
+    const client = {
+      query: async (sql, params) => {
+        if (/FROM products p\s+LEFT JOIN product_categories/.test(sql) || /FROM inventory_batches ib\s+JOIN products p/.test(sql)) {
+          return db.query(sql, params);
+        }
+        if (/high_watermark/.test(sql)) return { rows: [{ high_watermark: "1" }] };
+        if (/FROM operational_locations/.test(sql)) return { rows: [{ id: 1001, company_id: 1, branch_id: 1 }] };
+        if (/FROM device_assignments/.test(sql)) return { rows: [{ device_id: "device-a", company_id: 1, branch_id: 1, operational_location_id: 1001, assignment_generation: 2, active: true }] };
+        return { rows: [] };
+      },
+    };
+    const snapshot = await captureReferenceBootstrap(client, context);
+    const products = snapshot.records.filter((row) => row.entity_type === "product").map((row) => row.entity_id);
+    const lots = snapshot.records.filter((row) => row.entity_type === "inventory_lot");
+    assert.deepEqual(products, ["product-1", "product-2"]);
+    assert.deepEqual(lots.map((row) => row.payload.product_global_id), ["product-1", "product-2"]);
+    for (const lot of lots) assert.ok(products.includes(lot.payload.product_global_id), "every lot's product is in records");
+    const mango = snapshot.records.find((row) => row.entity_id === "product-2");
+    assert.equal(mango.payload.active, false, "it travels switched off");
+  } finally {
+    await db.close();
+  }
+});

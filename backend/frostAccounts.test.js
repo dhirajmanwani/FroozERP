@@ -1157,3 +1157,141 @@ test("an unavailable briefing fact carries null figures, never 0", async () => {
   assert.match(fact.summary.error, /connection terminated/);
   assert.deepEqual(fact.rows, []);
 });
+
+/* ------------------------- stock and pending-bill alerts follow the shelf (PGlite, BE-2 / BE-3) */
+
+/**
+ * The alert rules against a real Postgres: a `ZERO_STOCK` alert must stop being live when the fruit
+ * is restocked (the bell forgets a dismissal only then, so the next run-out rings again), must turn
+ * into `LOW_STOCK` -- type and title -- when restocked under its minimum, and only this branch's
+ * company's live products that this branch has ever stocked may raise one at all.
+ */
+const ALERT_SCHEMA = `
+  CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, active BOOLEAN DEFAULT TRUE);
+  CREATE TABLE products (
+    id INTEGER PRIMARY KEY, product_name TEXT, category TEXT, unit TEXT, minimum_stock NUMERIC,
+    active BOOLEAN DEFAULT TRUE, deleted_at TIMESTAMP, company_id INTEGER
+  );
+  CREATE TABLE inventory_batches (
+    id SERIAL PRIMARY KEY, product_id INTEGER, branch_id INTEGER, remaining_qty NUMERIC, batch_status TEXT DEFAULT 'ACTIVE'
+  );
+  CREATE TABLE suppliers (id INTEGER PRIMARY KEY, supplier_name TEXT);
+  CREATE TABLE purchases (
+    id INTEGER PRIMARY KEY, supplier_id INTEGER, supplier_name TEXT, purchase_date DATE, bill_number TEXT,
+    net_payable NUMERIC, balance_amount NUMERIC, purchase_bill_status TEXT, purchase_status TEXT, branch_id INTEGER
+  );
+  CREATE TABLE ai_alerts (
+    id SERIAL PRIMARY KEY, company_id INTEGER, branch_id INTEGER, dedup_key VARCHAR(240) UNIQUE NOT NULL,
+    alert_type VARCHAR(80) NOT NULL, severity VARCHAR(20) NOT NULL DEFAULT 'INFO', status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+    source_module VARCHAR(80) NOT NULL, linked_entity_type VARCHAR(80), linked_entity_id VARCHAR(120), title VARCHAR(220) NOT NULL,
+    message TEXT NOT NULL, facts JSONB NOT NULL DEFAULT '{}'::jsonb, detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    acknowledged_at TIMESTAMP, acknowledged_by INTEGER, snoozed_until TIMESTAMP, resolved_at TIMESTAMP,
+    resolved_by INTEGER, owner_notes TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  INSERT INTO branches VALUES (1, 1, TRUE), (2, 2, TRUE);
+`;
+
+const ALERT_RULE_SETTINGS = { thresholds: { ...FACT_SETTINGS.thresholds, purchaseBillPendingDays: 3 } };
+
+const withAlertDatabase = async (run) => {
+  const { PGlite } = require("@electric-sql/pglite");
+  const db = new PGlite();
+  await db.exec(ALERT_SCHEMA);
+  // The receivable reads are covered above with a scripted pool; here they find no debtors.
+  const pool = {
+    query: async (text, values = []) => (RECEIVABLE_BILLS.test(text) || RECEIVABLE_CREDITS.test(text)
+      ? { rows: [], rowCount: 0 }
+      : db.query(text, values)),
+  };
+  try {
+    return await run({ db, pool });
+  } finally {
+    await db.close();
+  }
+};
+
+const count = async (db, sql) => Number((await db.query(sql)).rows[0].n);
+
+const alertRow = async (db, key) => (await db.query(
+  "SELECT alert_type, status, title, facts ->> 'condition_cleared_at' AS cleared FROM ai_alerts WHERE dedup_key = $1",
+  [key],
+)).rows[0];
+
+test("a restocked fruit's alert resolves, a partial restock turns it LOW_STOCK, and a later run-out reopens it", async () => {
+  await withAlertDatabase(async ({ db, pool }) => {
+    await db.exec(`
+      INSERT INTO products (id, product_name, unit, minimum_stock, company_id) VALUES (1, 'Mango', 'kg', 5, 1);
+      INSERT INTO inventory_batches (product_id, branch_id, remaining_qty) VALUES (1, 1, 0);
+    `);
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    let alert = await alertRow(db, "low-stock:1:1");
+    assert.deepEqual([alert.alert_type, alert.status], ["ZERO_STOCK", "OPEN"]);
+
+    // Partial restock, still under the minimum: same row, new type.
+    await db.exec("UPDATE inventory_batches SET remaining_qty = 2");
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    alert = await alertRow(db, "low-stock:1:1");
+    assert.deepEqual([alert.alert_type, alert.status], ["LOW_STOCK", "OPEN"], "no longer out of stock");
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM ai_alerts"), 1);
+
+    // Restocked above the minimum: the alert stops being live, and says why.
+    await db.exec("UPDATE inventory_batches SET remaining_qty = 20");
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    alert = await alertRow(db, "low-stock:1:1");
+    assert.equal(alert.status, "RESOLVED");
+    assert.ok(alert.cleared, "resolved because the condition cleared, so it may reopen");
+
+    // Runs out again later: it rings again.
+    await db.exec("UPDATE inventory_batches SET remaining_qty = 0");
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    alert = await alertRow(db, "low-stock:1:1");
+    assert.deepEqual([alert.alert_type, alert.status, alert.cleared], ["ZERO_STOCK", "OPEN", null]);
+  });
+});
+
+test("stock alerts: other companies' products, deleted products and fruit never stocked here raise none", async () => {
+  await withAlertDatabase(async ({ db, pool }) => {
+    await db.exec(`
+      INSERT INTO products (id, product_name, unit, minimum_stock, company_id, deleted_at) VALUES
+        (1, 'Mango', 'kg', 0, 1, NULL),
+        (2, 'Theirs', 'kg', 0, 2, NULL),
+        (3, 'Archived', 'kg', 0, 1, CURRENT_TIMESTAMP),
+        (4, 'Never Here', 'kg', 0, 1, NULL);
+      INSERT INTO inventory_batches (product_id, branch_id, remaining_qty) VALUES (1, 1, 0), (2, 1, 0), (3, 1, 0), (4, 2, 0);
+    `);
+    const fact = await service.getLowStockProducts(pool, 1);
+    assert.deepEqual(fact.rows.map((row) => row.product_name), ["Mango"]);
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    const keys = (await db.query("SELECT dedup_key FROM ai_alerts ORDER BY dedup_key")).rows.map((row) => row.dedup_key);
+    assert.deepEqual(keys, ["low-stock:1:1"]);
+  });
+});
+
+test("the alert rules read every low-stock product, not the briefing's fifty, so none is resolved by the cut", async () => {
+  await withAlertDatabase(async ({ db, pool }) => {
+    await db.exec(`
+      INSERT INTO products (id, product_name, unit, minimum_stock, company_id)
+        SELECT n, 'Fruit ' || LPAD(n::text, 3, '0'), 'kg', 0, 1 FROM generate_series(1, 55) AS n;
+      INSERT INTO inventory_batches (product_id, branch_id, remaining_qty) SELECT n, 1, 0 FROM generate_series(1, 55) AS n;
+    `);
+    assert.equal((await service.getLowStockProducts(pool, 1)).rows.length, 50, "the fact keeps its fifty");
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM ai_alerts WHERE status = 'OPEN'"), 55);
+  });
+});
+
+test("a pending purchase bill's alert resolves once the bill is completed", async () => {
+  await withAlertDatabase(async ({ db, pool }) => {
+    await db.exec(`
+      INSERT INTO suppliers VALUES (1, 'Verma');
+      INSERT INTO purchases (id, supplier_id, purchase_date, net_payable, balance_amount, purchase_bill_status, branch_id)
+        VALUES (9, 1, CURRENT_DATE - 10, 100, 100, 'BILL_PENDING', 1);
+    `);
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    assert.equal((await alertRow(db, "purchase-pending:1:9")).status, "OPEN");
+    await db.exec("UPDATE purchases SET purchase_bill_status = 'BILL_COMPLETED'");
+    await service.runAlertRules(pool, 1, ALERT_RULE_SETTINGS);
+    assert.equal((await alertRow(db, "purchase-pending:1:9")).status, "RESOLVED");
+  });
+});

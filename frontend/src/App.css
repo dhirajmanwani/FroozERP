@@ -227,15 +227,16 @@ input[type="number"] {
 }
 
 .brand-monogram {
-  width: 42px;
+  /* Sized by height alone; the width follows the aspect ratio. The shipped PEP mark is about twice
+     as wide as it is tall, so a box drawing it (`.brand-monogram-wide`) widens; an owner's own logo
+     keeps the square. */
   height: 42px;
+  aspect-ratio: 1 / 1;
   display: grid;
   flex: 0 0 auto;
   place-items: center;
-  /* No tile. The mark sits directly on whatever it is placed on and carries its own colour: the
-     green cut on a light ground, the cream cut on a dark one. It had a gold-washed badge, then a
-     solid one; both were a box the logo never asked for. A mark drawn this well does not need
-     something behind it to be legible, and the box was competing with it. */
+  /* The wrapper paints nothing: an owner's own logo sits directly on the app. The shipped mark's
+     light-theme tile belongs to its own image (`.brand-art-on-light`, further down), not here. */
 }
 
 .brand-monogram img {
@@ -276,7 +277,6 @@ input[type="number"] {
 }
 
 .brand-lockup-compact .brand-monogram {
-  width: 36px;
   height: 36px;
   border-radius: 9px;
 }
@@ -523,8 +523,9 @@ input[type="number"] {
   color: var(--ink-strong-warm);
 }
 
-/* `--ink-muted-warm`, not `--ink-muted`: on the gold fill the plainer muted ink measures 4.44:1 in
-   dark, just under the 4.5:1 this 12px line needs. The warm one clears it at 4.62:1. */
+/* `--ink-muted-warm`, not `--ink-muted`: on the gold fill the plainer muted ink measured 4.44:1 in
+   dark, just under the 4.5:1 this 12px line needs (4.50:1 on the PEP palette - on the line, not
+   past it). The warm one clears it at 4.63:1. */
 .local-only-banner span {
   color: var(--ink-muted-warm);
   font-size: 12px;
@@ -558,8 +559,8 @@ input[type="number"] {
    identical to a working one, so the only feedback is the cursor — which is why AUTO read as
    "restricted" rather than "unavailable" when App Mode pins the device to Local Only. */
 .connectivity-segmented button:disabled {
-  background: #03110b;
-  color: #4a7a61;
+  background: #04100b;
+  color: #4e7964;
   cursor: not-allowed;
   opacity: 0.6;
 }
@@ -594,6 +595,12 @@ input[type="number"] {
 
 .maintenance-cleanup-panel {
   margin-top: 16px;
+}
+
+/* The heading on its own line: inline, it ran into the sentence ("Automatic UpdatesThis device"). */
+.maintenance-cleanup-panel > strong {
+  display: block;
+  margin-bottom: 4px;
 }
 
 .cleanup-result-grid {
@@ -764,7 +771,7 @@ input[type="number"] {
 }
 
 .startup-details-toggle:hover {
-  color: #f2dfae;
+  color: #fbdda4;
   transform: none;
   box-shadow: none;
 }
@@ -832,7 +839,6 @@ input[type="number"] {
 }
 
 .welcome-banner .brand-monogram {
-  width: 72px;
   height: 72px;
 }
 
@@ -1058,7 +1064,7 @@ input[type="number"] {
   display: grid;
   gap: 10px;
   padding: 14px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid rgba(234, 180, 63, 0.16);
   border-radius: 12px;
   background: var(--veil);
 }
@@ -1071,7 +1077,7 @@ input[type="number"] {
 
 .purchase-print-narration article {
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid rgba(145, 171, 157, 0.1);
   border-radius: 9px;
   background: var(--card-veil-soft);
 }
@@ -1560,12 +1566,16 @@ td:last-child {
   border-right: 0;
 }
 
+/* Wraps between words only. `overflow-wrap: anywhere` (and `word-break: break-word`) also let the
+   table count a cell's narrowest width as one letter, so a squeezed table gave these columns that
+   width and printed "25/ 10/ 202 6" and "Walk-in Custome r". `break-word` still breaks a word too
+   long for the column, but only after the column has its longest word's width. */
 td.primary-cell,
 td.purchase-items-cell {
   max-width: 340px;
   white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 td .button-row {
@@ -1737,9 +1747,9 @@ tbody tr:last-child td {
   align-items: center;
   gap: 10px;
   padding: 26px 34px;
-  border: 1px solid rgba(217, 172, 82, 0.28);
+  border: 1px solid rgba(234, 180, 63, 0.28);
   border-radius: 14px;
-  background: #092318;
+  background: #0b2219;
   color: #f7f9f7;
   text-align: center;
 }
@@ -1751,14 +1761,14 @@ tbody tr:last-child td {
 
 .pdf-export-overlay-card span {
   font-size: 12px;
-  color: #97ada1;
+  color: #98aca2;
 }
 
 .pdf-export-overlay-spinner {
   width: 26px;
   height: 26px;
-  border: 3px solid rgba(217, 172, 82, 0.25);
-  border-top-color: #e6c274;
+  border: 3px solid rgba(234, 180, 63, 0.25);
+  border-top-color: #facb6c;
   border-radius: 50%;
   animation: pdf-export-spin 0.8s linear infinite;
 }
@@ -1848,7 +1858,7 @@ tbody tr:last-child td {
 
 .pdf-export-mode th {
   color: #000000 !important;
-  background: #e2eae5 !important;
+  background: #e2e9e5 !important;
   font-weight: 900 !important;
   font-size: clamp(9.5pt, calc(10.5pt * var(--font-scale)), 12.5pt) !important;
 }
@@ -2156,6 +2166,14 @@ td.origin-rate {
   color: var(--accent);
 }
 
+/* The minus makes the figure a character wider than its neighbours, and a tile sized for them
+   broke it ("−₹1,880.0" / "0"). A step smaller keeps it on one line at laptop widths; the
+   break-anywhere safety net below still applies to a figure too big for any tile. */
+.summary-metric strong.metric-negative {
+  color: var(--danger-ink);
+  font-size: clamp(13px, 1.3vw, 18px);
+}
+
 .sync-owner-summary {
   display: grid;
   grid-template-columns: 1fr;
@@ -2302,7 +2320,6 @@ td.origin-rate {
 }
 
 .about-frooz-panel .brand-monogram {
-  width: 76px;
   height: 76px;
   background: #fff;
 }
@@ -2704,7 +2721,7 @@ td.origin-rate {
   color: var(--ink-faint);
   font-size: 10px;
   line-height: 1.25;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .product-result em {
@@ -3487,9 +3504,15 @@ tbody tr:has(> .empty-cell):hover {
   padding: 5px 9px;
 }
 
+/* No inner height: a short box cut the last product in half with no sign that it scrolled. The page
+   scrolls instead, and the header row stays sticky inside the wrap. */
 .stock-inventory-report .table-wrap {
   margin-top: 8px;
-  max-height: min(52vh, 470px);
+  max-height: none;
+}
+
+.stock-inventory-report {
+  min-width: 0;
 }
 
 .quick-filter-row,
@@ -3810,8 +3833,11 @@ tbody tr:has(> .empty-cell):hover {
   font-size: 14px;
 }
 
+/* minmax(0, 1fr): a grid item's own minimum is its content's, so a wide tile row or table pushed
+   the whole report past the card's right edge. */
 .report-paper {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -3821,7 +3847,7 @@ tbody tr:has(> .empty-cell):hover {
   justify-content: space-between;
   gap: 20px;
   padding-bottom: 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.16);
+  border-bottom: 1px solid rgba(145, 171, 157, 0.16);
 }
 
 .report-print-header strong,
@@ -3959,6 +3985,29 @@ tbody tr:has(> .empty-cell):hover {
   border-color: rgba(251, 113, 133, 0.3);
 }
 
+/* UI-1: charges already inside the landed purchase cost, listed for information only. */
+.pl-included {
+  border-top: 1px dashed var(--line);
+}
+
+.pl-included-heading {
+  display: block;
+  padding: 8px 14px 2px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pl-line-info span,
+.pl-line-info strong {
+  color: var(--ink-muted);
+  font-weight: 600;
+}
+
+.pl-line-info strong.pl-negative {
+  color: var(--ink-muted) !important;
+}
+
 .pl-empty-note {
   padding: 12px 14px;
   border: 1px dashed var(--line);
@@ -3986,6 +4035,14 @@ tbody tr:has(> .empty-cell):hover {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+/* Each side's table needs about 570px. Side by side in a narrower card, the Bank column was cut
+   off with nothing to say it was there, so the sides stack until there is room for both. */
+@media (max-width: 1500px) {
+  .cash-book-sides {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .cash-book-panel {
@@ -4059,7 +4116,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .cash-book-panel .cell-note {
   white-space: normal;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .cash-book-closing {
@@ -4491,7 +4548,7 @@ tbody tr:has(> .empty-cell):hover {
 .invoice-paper {
   margin: 0 16px 16px;
   padding: 28px;
-  color: #123623;
+  color: #153525;
   background: #fff;
 }
 
@@ -4503,22 +4560,21 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .brand-lockup-invoice .brand-monogram {
-  width: 68px;
   height: 68px;
-  border-color: #c29030;
+  border-color: #eab43f;
   border-radius: 8px;
   background: #fff;
   box-shadow: none;
 }
 
 .brand-lockup-invoice .brand-copy strong {
-  color: #082116;
+  color: #0a2017;
   font-size: 16px;
   letter-spacing: 1.2px;
 }
 
 .brand-lockup-invoice .brand-copy small {
-  color: #4a7a61;
+  color: #4e7964;
   font-size: 10px;
   letter-spacing: 1.4px;
 }
@@ -4530,7 +4586,7 @@ tbody tr:has(> .empty-cell):hover {
 .invoice-footer small {
   display: block;
   margin-top: 3px;
-  color: #4a7a61;
+  color: #4e7964;
   font-size: 11px;
 }
 
@@ -4558,7 +4614,7 @@ tbody tr:has(> .empty-cell):hover {
   padding: 10px;
   border: 1px solid #dfe9e2;
   border-radius: 12px;
-  color: #082116;
+  color: #0a2017;
   background: #fff;
 }
 
@@ -4572,7 +4628,7 @@ tbody tr:has(> .empty-cell):hover {
 .upi-qr-box span,
 .upi-qr-box small {
   display: block;
-  color: #082116;
+  color: #0a2017;
 }
 
 /* A long bill number wraps inside the box instead of pushing it past the bill's edge. */
@@ -4607,12 +4663,12 @@ tbody tr:has(> .empty-cell):hover {
 .invoice-footer {
   margin-top: 28px;
   padding-top: 14px;
-  border-top: 1px dashed #c8d8ce;
+  border-top: 1px dashed #c9d7cf;
   text-align: center;
 }
 
 .invoice-footer strong {
-  color: #082116;
+  color: #0a2017;
   font-size: 12px;
 }
 
@@ -4688,13 +4744,11 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .bill-head .brand-lockup-invoice .brand-monogram {
-  width: 44px;
   height: 44px;
   border-radius: 10px;
 }
 
 .bill-paper.invoice-thermal .bill-head .brand-lockup-invoice .brand-monogram {
-  width: 30px;
   height: 30px;
   border-radius: 6px;
 }
@@ -5131,7 +5185,6 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .login-brand .brand-monogram {
-  width: 64px;
   height: 64px;
 }
 
@@ -5204,7 +5257,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .recovery-link-button:hover {
-  color: #f2dfae;
+  color: #fbdda4;
   transform: none;
   box-shadow: none;
 }
@@ -5232,6 +5285,18 @@ tbody tr:has(> .empty-cell):hover {
 
   .startup-api-panel {
     padding: 7px 10px;
+  }
+
+  /* On a 768-high laptop screen the menu scrolled, and All Shops, Branches & Counters and Settings
+     sat below a scrollbar that is easy to miss. Tighter rows fit the whole menu. */
+  .sidebar-nav {
+    gap: 1px;
+  }
+
+  .nav-item {
+    min-height: 30px;
+    padding-top: 5px;
+    padding-bottom: 5px;
   }
 }
 
@@ -5361,10 +5426,6 @@ tbody tr:has(> .empty-cell):hover {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .cash-book-sides {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .cash-book-closing {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -5479,7 +5540,6 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   .brand-lockup-compact .brand-monogram {
-    width: 33px;
     height: 33px;
     border-radius: 8px;
   }
@@ -6791,7 +6851,7 @@ tbody tr:has(> .empty-cell):hover {
     margin: 0;
     padding: 18px;
     box-sizing: border-box;
-    color: #092318;
+    color: #0b2219;
     background: #ffffff;
     border: 0 !important;
     box-shadow: none !important;
@@ -6830,7 +6890,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.print-target th,
   .print-section.print-target td {
     padding: 4px 5px !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     border: 1px solid #cedbd3 !important;
     font-size: 10pt !important;
@@ -6870,7 +6930,7 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-section.print-target .purchase-items-cell span {
     max-width: none !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     text-decoration: none !important;
     white-space: pre-wrap !important;
     word-break: break-word !important;
@@ -6968,13 +7028,13 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   .print-section.print-target .date-total-row td {
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #eef2ef !important;
     font-weight: 800 !important;
   }
 
   .print-section.print-target .report-filter-summary span {
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     border: 1px solid #111111 !important;
     font-size: clamp(8.5pt, calc(9pt * var(--font-scale)), 11pt) !important;
@@ -7000,14 +7060,14 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.cash-book-print-report.print-target .cash-book-closing span {
     border-color: #cedbd3 !important;
     border-radius: 0 !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     box-shadow: none !important;
   }
 
   .print-section.cash-book-print-report.print-target .cash-book-panel h3 {
     padding: 5px 6px !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #eef2ef !important;
     border-bottom: 1px solid #cedbd3 !important;
     font-size: 10pt !important;
@@ -7023,7 +7083,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.cash-book-print-report.print-target .cash-book-title span,
   .print-section.cash-book-print-report.print-target .cash-book-title h2,
   .print-section.cash-book-print-report.print-target .cash-book-title p {
-    color: #092318 !important;
+    color: #0b2219 !important;
   }
 
   .print-section.cash-book-print-report.print-target .cash-book-closing span {
@@ -7044,7 +7104,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.profit-loss-print-report.print-target .profit-loss-statement {
     gap: 8px !important;
     padding: 0 !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
   }
 
@@ -7055,7 +7115,7 @@ tbody tr:has(> .empty-cell):hover {
     page-break-inside: avoid !important;
     border-color: #cedbd3 !important;
     border-radius: 0 !important;
-    color: #092318 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
     box-shadow: none !important;
   }
@@ -7072,7 +7132,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-section.profit-loss-print-report.print-target .pl-line span,
   .print-section.profit-loss-print-report.print-target .pl-line strong,
   .print-section.profit-loss-print-report.print-target .pl-empty-note {
-    color: #092318 !important;
+    color: #0b2219 !important;
   }
 
   .print-section.profit-loss-print-report.print-target .pl-title-block h2 {
@@ -7089,8 +7149,8 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-section.profit-loss-print-report.print-target .pl-line {
     padding: 5px 8px !important;
-    border-bottom: 1px solid #e2eae5 !important;
-    color: #092318 !important;
+    border-bottom: 1px solid #e2e9e5 !important;
+    color: #0b2219 !important;
     background: #ffffff !important;
   }
 
@@ -7101,7 +7161,7 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-section.profit-loss-print-report.print-target .pl-line-total,
   .print-section.profit-loss-print-report.print-target .pl-line-highlight {
-    background: #f6f3ea !important;
+    background: #f6f4e5 !important;
   }
 
   body:has(.invoice-paper) .erp-shell {
@@ -7235,14 +7295,13 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   .invoice-paper.invoice-thermal .brand-monogram {
-    width: 28px;
     height: 28px;
     border-radius: 5px;
   }
 
   .invoice-paper.invoice-thermal .brand-copy strong,
   .invoice-paper.invoice-thermal .invoice-meta strong {
-    color: #092318;
+    color: #0b2219;
     font-size: 14px;
     font-weight: 900;
     letter-spacing: 0.2px;
@@ -7253,7 +7312,7 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .invoice-meta span,
   .invoice-paper.invoice-thermal .invoice-customer small,
   .invoice-paper.invoice-thermal .invoice-customer span {
-    color: #092318 !important;
+    color: #0b2219 !important;
     font-size: 11.5px !important;
     font-weight: 700 !important;
     letter-spacing: 0;
@@ -7281,7 +7340,7 @@ tbody tr:has(> .empty-cell):hover {
     margin: 5px 0 0;
     padding: 3px 0;
     border: 0;
-    color: #092318 !important;
+    color: #0b2219 !important;
     page-break-inside: avoid;
     break-inside: avoid;
   }
@@ -7299,7 +7358,7 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .upi-qr-box strong,
   .invoice-paper.invoice-thermal .upi-qr-box span,
   .invoice-paper.invoice-thermal .upi-qr-box small {
-    color: #092318 !important;
+    color: #0b2219 !important;
     font-size: 10px;
     font-weight: 800;
     line-height: 1.12;
@@ -7308,9 +7367,9 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .invoice-footer {
     margin: 5px 0 0;
     padding: 4px 0 0;
-    color: #092318 !important;
+    color: #0b2219 !important;
     text-align: center;
-    border-top: 1px dashed #092318;
+    border-top: 1px dashed #0b2219;
     page-break-after: avoid;
     break-after: avoid;
   }
@@ -7318,7 +7377,7 @@ tbody tr:has(> .empty-cell):hover {
   .invoice-paper.invoice-thermal .invoice-footer strong,
   .invoice-paper.invoice-thermal .invoice-footer span,
   .invoice-paper.invoice-thermal .invoice-footer small {
-    color: #092318 !important;
+    color: #0b2219 !important;
     font-size: 11px;
     font-weight: 800;
     line-height: 1.15;
@@ -7331,7 +7390,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-area table,
   .print-area th,
   .print-area td {
-    color: #092318;
+    color: #0b2219;
     border-color: #cedbd3;
   }
 
@@ -7343,7 +7402,7 @@ tbody tr:has(> .empty-cell):hover {
   .print-area .table-wrap,
   .print-area .invoice-customer,
   .print-area .total-line {
-    color: #092318;
+    color: #0b2219;
     border-color: #cedbd3;
     background: #ffffff;
   }
@@ -7353,13 +7412,13 @@ tbody tr:has(> .empty-cell):hover {
   .print-area h3,
   .print-area .primary-cell,
   .print-area .balance-cell {
-    color: #092318;
+    color: #0b2219;
   }
 
   .print-area span,
   .print-area small,
   .print-area p {
-    color: #1e4a34;
+    color: #224a36;
   }
 
   .brand-lockup-invoice .brand-monogram {
@@ -7420,7 +7479,7 @@ tbody tr:has(> .empty-cell):hover {
 
   .print-area th,
   .invoice-paper th {
-    background: #e2eae5 !important;
+    background: #e2e9e5 !important;
     font-weight: 900 !important;
   }
 
@@ -7571,13 +7630,13 @@ tbody tr:has(> .empty-cell):hover {
   height: 62px;
   display: grid;
   place-items: center;
-  border: 1px solid rgba(230, 194, 116, 0.58);
+  border: 1px solid rgba(250, 203, 108, 0.58);
   border-radius: 50%;
-  color: #faf6ea;
+  color: #fdf6e8;
   background:
     radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.24), transparent 21%),
-    conic-gradient(from 140deg, #d9ac52, #082116, #2c5d43, #d9ac52);
-  box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.09);
+    conic-gradient(from 140deg, #eab43f, #0a2017, #305c46, #eab43f);
+  box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(234, 180, 63, 0.09);
   cursor: pointer;
 }
 
@@ -7632,8 +7691,8 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 @keyframes frostPulse {
-  0%, 100% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.1); }
-  50% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 15px rgba(217, 172, 82, 0.18); }
+  0%, 100% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(234, 180, 63, 0.1); }
+  50% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 15px rgba(234, 180, 63, 0.18); }
 }
 
 .frost-drawer-backdrop,
@@ -7656,11 +7715,16 @@ tbody tr:has(> .empty-cell):hover {
   border-left: 1px solid var(--accent-line);
   background: var(--ground);
   box-shadow: -24px 0 60px var(--shadow-strong);
-  transition: transform 180ms ease;
+  /* Closed, it is off the screen and also out of reach: no Tab stop, nothing for a screen reader,
+     and no panel showing over the page in a full-page capture. Hidden only once it has slid out. */
+  visibility: hidden;
+  transition: transform 180ms ease, visibility 0s linear 180ms;
 }
 
 .frost-drawer-open {
   transform: translateX(0);
+  visibility: visible;
+  transition: transform 180ms ease, visibility 0s;
 }
 
 .frost-drawer-header {
@@ -8339,13 +8403,31 @@ button.shortcut-sheet-row:focus-visible {
    the System state, and only `prefers-color-scheme` separates it there.
    --------------------------------------------------------------------------------------------- */
 
+.brand-monogram.brand-monogram-wide {
+  aspect-ratio: 1.6 / 1;
+}
+
+/* The collapsed rail is 48px inside its padding: the wide mark fits it at a smaller height. */
+.sidebar-rail .brand-monogram.brand-monogram-wide {
+  height: 28px;
+}
+
 /* Every rule here is scoped under `.brand-monogram`, and that is load-bearing rather than tidy.
    `.brand-monogram img` sets `display: block` and scores 0,1,1; a bare `.brand-art-on-dark` scores
    0,1,0 and loses to it whatever the order, so both cuts rendered and the login screen showed the
    mark twice, overlapping. Dark mode hid its spare only by accident -- the themed rules below
    carry an extra selector and were already winning. Keep these at 0,2,0 or higher. */
 .brand-monogram .brand-art-on-dark { display: none; }
-.brand-monogram .brand-art-on-light { display: block; }
+.brand-monogram .brand-art-on-light {
+  display: block;
+  /* In a light theme the shipped mark is the original logo -- the reversed, mustard-and-cream cut --
+     in a small tile of its own green. The owner chose this over a recoloured cut on 30 Oct 2026.
+     Only the shipped mark gets it: an owner's own logo and the bill keep no tile. */
+  background: var(--brand-mark-tile);
+  border-radius: 8px;
+  box-sizing: border-box;
+  padding: 10% 9%;
+}
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .brand-monogram .brand-art-on-dark { display: block; }
@@ -10317,6 +10399,11 @@ button.shortcut-sheet-row:focus-visible {
   width: min(420px, calc(100vw - 32px));
 }
 
+/* "Leave POS?" -- asked before a bill in progress is cleared. */
+.pos-leave-modal {
+  width: min(420px, calc(100vw - 32px));
+}
+
 .pos-combo-ask-body {
   display: grid;
   gap: 12px;
@@ -10685,3 +10772,26 @@ button.shortcut-sheet-row:focus-visible {
   }
 }
 .packing-add-here { margin: 10px 0 4px; }
+/* The keys hint on its own line under the button, not run into it. */
+.packing-browser > small.form-note { display: block; margin-top: 6px; }
+
+/* The bill dialog takes focus on open (so Escape closes it); the focus itself draws nothing. */
+.invoice-modal-bill:focus {
+  outline: none;
+}
+
+/* Permission Matrix: dozens of columns in one card. The role column stays put while the rest
+   scrolls sideways, so a tick is never far from the role it belongs to. */
+.permission-matrix-table th:first-child,
+.permission-matrix-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--card);
+  box-shadow: 1px 0 0 var(--line);
+}
+
+.permission-matrix-table th:first-child {
+  z-index: 3;
+  background: linear-gradient(180deg, var(--card-veil-solid), var(--veil-solid));
+}

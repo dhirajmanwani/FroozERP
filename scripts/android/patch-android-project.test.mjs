@@ -201,7 +201,8 @@ test("launcher icon: FroozERP's icon replaces the placeholder, stray ic_launcher
   assert.ok(fs.readFileSync(path.join(resDir, "mipmap-hdpi", "ic_launcher.png"))
     .equals(fs.readFileSync(path.join(launcherIconSourceDir, "mipmap-hdpi", "ic_launcher.png"))));
   assert.equal(fs.readFileSync(path.join(resDir, "values", "strings.xml"), "utf8"), "<resources/>", "other resources are left alone");
-  assert.match(fs.readFileSync(path.join(resDir, "values", "ic_launcher_background.xml"), "utf8"), /#0a2d1c/);
+  const { BRAND } = await import("../../frontend/src/local/brandPalette.js");
+  assert.ok(fs.readFileSync(path.join(resDir, "values", "ic_launcher_background.xml"), "utf8").includes(BRAND.greenDeep));
   assert.deepEqual(syncLauncherIcons({ resDir }), []);
   fs.rmSync(resDir, { recursive: true, force: true });
 });

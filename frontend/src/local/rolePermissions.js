@@ -70,6 +70,18 @@ export const branchesScreenPlan = (role) => {
   };
 };
 
+// Screens only an Owner or Admin opens, whatever a role's module permissions say: prices are theirs
+// (the server's `requireRateManager`). Decided here so the sidebar, Ctrl K, the Alt shortcuts and
+// `navigate` refuse alike: a role holding Discounts used to reach a blank Sale Rate Update on Alt+4.
+export const RATE_MANAGER_VIEWS = Object.freeze(["sale-rates", "combos", "frooz-pack"]);
+
+export const isRateManagerRole = (role) => ["OWNER", "ADMIN"].includes(roleKey(role));
+
+// A screen whose key was split from an older one. Expenses opened on `reports` until the server began
+// checking `expenses`; the startup migration copies `reports` into `expenses`, but a stored map it
+// has not reached has no `expenses` key, and keeps the screen it had rather than losing it.
+const LEGACY_VIEW_KEYS = Object.freeze({ expenses: "reports" });
+
 /**
  * May this role open `view`. `defaultPermissions` is the role's built-in default
  * (`defaultRolePermissions[role]`), consulted only for keys the stored map leaves undefined.
@@ -84,6 +96,7 @@ export const resolveModuleAccess = ({
   if (OWNER_ONLY_VIEWS.includes(view)) return isOwnerRole(role);
   if (view === "branches") return branchesScreenPlan(role).open;
   if (isOwnerRole(role)) return true;
+  if (RATE_MANAGER_VIEWS.includes(view) && !isRateManagerRole(role)) return false;
   if (view === "dashboard") {
     if (defines(permissions, "dashboard")) return permissions.dashboard === true;
     return roleKey(role) === "ADMIN";
@@ -91,6 +104,8 @@ export const resolveModuleAccess = ({
   const keys = MULTI_KEY_VIEWS[view] || (modulePermissionMap[view] ? [modulePermissionMap[view]] : []);
   const storedKeys = keys.filter((key) => defines(permissions, key));
   if (storedKeys.length > 0) return storedKeys.some((key) => permissions[key] === true);
+  const legacyKey = LEGACY_VIEW_KEYS[view];
+  if (legacyKey && defines(permissions, legacyKey)) return permissions[legacyKey] === true;
   const defaults = defaultPermissions || {};
   return Boolean(defaults.all || defaults[view]);
 };
@@ -107,7 +122,7 @@ export const resolveAccountPermissions = ({ role, permissions } = {}) => ({
  * Completing, editing or cancelling a pending purchase bill. The server allows Owner and Admin
  * only (`requireRateManager` on complete-bill, update and cancel), whatever the role map says.
  */
-export const canManagePendingPurchaseBills = (role) => ["OWNER", "ADMIN"].includes(roleKey(role));
+export const canManagePendingPurchaseBills = (role) => isRateManagerRole(role);
 
 export const PENDING_BILL_MANAGER_NOTE = "Only the Owner or an Admin can complete, edit or cancel a pending bill.";
 
@@ -126,6 +141,25 @@ export const defaultAccountMasterType = (accountTypes = [], permissions = {}) =>
   if (options.some(([value]) => value === "CUSTOMER")) return "CUSTOMER";
   if (options.some(([value]) => value === "SUPPLIER")) return "SUPPLIER";
   return options[0]?.[0] || "SUPPLIER";
+};
+
+/**
+ * The Accounts screen's tabs and the one it opens on, from the account authorities
+ * (`resolveAccountPermissions`), not from role names: a custom role given Supplier Accounts gets
+ * Account Master, and a Purchase Manager whose Supplier Accounts box is unticked no longer gets a
+ * Master tab with an empty Account Type list. Outstanding goes with Master, as it always did.
+ */
+export const accountTabsFor = (permissions = {}) => {
+  const master = permissions?.customerAccounts === true || permissions?.supplierAccounts === true;
+  return {
+    tabs: [
+      ...(master ? [["master", "Account Master"]] : []),
+      ["ledger", "Ledger"],
+      ["payments", "Payments"],
+      ...(master ? [["outstanding", "Outstanding"]] : []),
+    ],
+    initial: master ? "master" : "payments",
+  };
 };
 
 export const canEditAccountRow = (account, permissions = {}) => {

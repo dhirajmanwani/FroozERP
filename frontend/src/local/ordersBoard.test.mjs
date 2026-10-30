@@ -295,3 +295,19 @@ test("handing an order over goes through the same check the server applies", () 
   // The shop list has to be there, or an Owner sees a waiting order and has nowhere to send it.
   assert.match(app, /branches=\{settingsData\.branches \|\| \[\]\}/);
 });
+
+test("a new order refuses a half-filled line by name instead of dropping it (BO-14)", async () => {
+  const { buildOrderDraftLines } = await import("./ordersBoard.js");
+  const products = [{ id: 4, product_name: "Apple", unit: "KG" }, { id: "004", product_name: "Kiwi", unit: "PCS" }];
+  const apple = { product_id: "4", quantity: "2", agreed_rate: "120" };
+  assert.equal(buildOrderDraftLines([apple, { product_id: "004", quantity: "", agreed_rate: "30" }], products).message, "Kiwi: enter a quantity, or remove the line.");
+  assert.match(buildOrderDraftLines([apple, { product_id: "004", quantity: "3", agreed_rate: "0" }], products).message, /^Kiwi: enter the rate you quoted/);
+  assert.equal(buildOrderDraftLines([apple, { product_id: "", quantity: "1", agreed_rate: "" }], products).message, "Line 2: choose an item, or remove the line.");
+  assert.equal(buildOrderDraftLines([{ product_id: "", quantity: "", agreed_rate: "" }], products).message, "Add at least one item with a quantity.");
+  const built = buildOrderDraftLines([apple, { product_id: "", quantity: "", agreed_rate: "" }, { product_id: "004", quantity: "1.5", agreed_rate: "40" }], products);
+  assert.equal(built.ok, true);
+  assert.deepEqual(built.lines, [
+    { product_id: "4", product_name: "Apple", unit: "KG", quantity: 2, agreed_rate: 120 },
+    { product_id: "004", product_name: "Kiwi", unit: "PCS", quantity: 1.5, agreed_rate: 40 },
+  ], "\"004\" and 4 stay different items");
+});

@@ -20,7 +20,8 @@
  * complete, which is worse than refusing.
  */
 
-import { canonicalInventoryId } from "./stockInventory.js";
+import { canonicalInventoryId, inventoryIdsEqual } from "./stockInventory.js";
+import { lotAvailableQuantity } from "./posInventory.js";
 
 export const ORDER_BILLING_PROBLEM = Object.freeze({
   PRODUCT_GONE: "PRODUCT_GONE",
@@ -123,3 +124,34 @@ export const describeOrderBillingProblems = ({ problems = [] } = {}) => {
   if (problems.length === 1) return problems[0].message;
   return `${problems.length} problems with this order: ${problems.map((problem) => problem.message).join(" ")}`;
 };
+
+/**
+ * A sent order's seed lines as POS cart lines.
+ *
+ * `available_qty` is the lot's own balance (what the quantity check and the row's "left in this lot"
+ * read), not the order's quantity: with the order's 2 kg as "available", the customer who wanted
+ * 2.5 kg from a 30 kg lot was told "Only 0 more units are available". A lot this computer no longer
+ * lists keeps the order's quantity, so the line can still be billed as ordered; the device re-checks
+ * the real balance when the bill is saved.
+ */
+export const seedLinesToCart = (lines, { lots = [], newLineId } = {}) => (Array.isArray(lines) ? lines : []).map((line) => {
+  const lineId = typeof newLineId === "function" ? newLineId() : `seed-${Math.random().toString(16).slice(2)}`;
+  const lot = (Array.isArray(lots) ? lots : []).find((entry) => inventoryIdsEqual(entry?.id, line?.inventory_batch_id));
+  return {
+    ...line,
+    line_id: lineId,
+    cart_key: lineId,
+    cart_identity: `${line.product_id}-${line.inventory_batch_id}`,
+    // Never below the order's own quantity: the line was seeded from that lot, so it can at least
+    // be billed as ordered.
+    available_qty: Math.max(lot ? lotAvailableQuantity(lot) : 0, Number(line.quantity || 0)),
+    default_selling_rate: Number(line.selling_rate || 0),
+    discount_amount: 0,
+    // The order's agreed price: a lot discount that starts later does not re-price it.
+    keep_price: true,
+    lot_discount_id: null,
+    lot_discount_type: null,
+    lot_discount_value: 0,
+    lot_discount_per_unit: 0,
+  };
+});

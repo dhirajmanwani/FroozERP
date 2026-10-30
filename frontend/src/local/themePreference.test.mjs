@@ -650,7 +650,7 @@ for (const [themeName, theme] of [["light", lightTokens], ["dark", mediaDarkToke
 
   test(`${themeName}: --ink-faint is dimmer than --ink-muted and is not a reading colour`, () => {
     // Deliberately not held to 4.5:1 - it is the disabled/placeholder step, and on light it
-    // measures 4.37:1 against --ground. What must hold is that the ramp is still a ramp: a
+    // measures 3.3:1 at worst (against --panel). What must hold is that the ramp is still a ramp: a
     // faint step that is not fainter than muted means one of them is doing the other's job.
     const faint = worstAgainstSurfaces(theme, "--ink-faint");
     const muted = worstAgainstSurfaces(theme, "--ink-muted");
@@ -692,16 +692,20 @@ test("the dark theme's surfaces are the palette's own ground ramp", () => {
   // Not "near enough". If these drift, the themed app and the parts of App.css that have
   // not been converted yet stop matching, and the seam is visible.
   //
-  // `--ground` was `#082116` until the contrast pass moved it one step deeper to `GROUND.abyss`.
+  // `--ground` was GROUND.canvas (`#082116` then, `#0a2017` on the PEP palette) until the contrast
+  // pass moved it one step deeper to `GROUND.abyss`.
   // The seam this test guards against needs a literal painting the *same role*: a background of
-  // the old value sitting beside a background of the new one. Every remaining `#082116` in
+  // the old value sitting beside a background of the new one. Every remaining canvas literal in
   // App.css is a `color:` -- text, and mostly invoice text that is deliberately never themed --
   // so there is nothing left to disagree with. Checked before the value was changed, not assumed.
-  assert.equal(mediaDarkTokens.get("--ground"), "#03110b");
-  assert.equal(mediaDarkTokens.get("--panel"), "#092318");
-  assert.equal(mediaDarkTokens.get("--card"), "#123623");
-  assert.equal(mediaDarkTokens.get("--ink"), "#f6f3ea");
-  assert.equal(mediaDarkTokens.get("--accent"), "#d9ac52");
+  //
+  // Re-pinned for the PEP rebrand: the same roles (GROUND.abyss, GROUND.panel, GROUND.card, CREAM,
+  // ACCENT.accent), retuned to the PEP logo. The dark accent is now the logo's mustard itself.
+  assert.equal(mediaDarkTokens.get("--ground"), "#04100b");
+  assert.equal(mediaDarkTokens.get("--panel"), "#0b2219");
+  assert.equal(mediaDarkTokens.get("--card"), "#153525");
+  assert.equal(mediaDarkTokens.get("--ink"), "#f6f4e5");
+  assert.equal(mediaDarkTokens.get("--accent"), "#eab43f");
 });
 
 test("no remaining literal paints a surface that a moved token also paints", () => {
@@ -715,7 +719,9 @@ test("no remaining literal paints a surface that a moved token also paints", () 
   // because nothing else is that colour anywhere near it.
   const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8");
   const surfacePainted = (appCss.match(
-    /(background|border|box-shadow|outline)[^;{}]*#(082116|1e4a34|2c5d43|4a7a61)\b/gi,
+    // GROUND.canvas, GROUND.border, GROUND.borderStrong, INK.faint - on the PEP palette. Was
+    // 082116|1e4a34|2c5d43|4a7a61 on the Frooz one; the rule is the roles, not those hexes.
+    /(background|border|box-shadow|outline)[^;{}]*#(0a2017|224a36|305c46|4e7964)\b/gi,
   ) || []).filter((declaration) => !/gradient\(/i.test(declaration));
   assert.deepEqual(
     surfacePainted,
@@ -726,16 +732,18 @@ test("no remaining literal paints a surface that a moved token also paints", () 
 });
 
 test("the light theme does not reuse the dark theme's gold", () => {
-  // #d9ac52 measures 2.87:1 on white. ACCENT.deep exists precisely so that the light theme
+  // The dark accent is the PEP logo's mustard, #eab43f, and it measures 1.89:1 on white (the Frooz
+  // gold it replaced, #d9ac52, measured 2.1:1). ACCENT.deep exists precisely so that the light theme
   // has a gold that survives paper, and reaching for the dark one here is the single
   // easiest way to ship an unreadable light theme.
   assert.notEqual(lightTokens.get("--accent"), mediaDarkTokens.get("--accent"));
-  // `ACCENT.deepStrong`, not `deep`. #8a6520 clears 4.5:1 on a white card and only 3.6:1 on the
+  // `ACCENT.deepStrong`, not `deep`. #896613 clears 4.5:1 on a white card and only 3.5:1 on the
   // light theme's sidebar -- and gold labels sit on the sidebar. The working accent has to survive
   // every light surface, not just the lightest one, so `deep` stays available as `--accent-deep`
   // for the places that are always on white.
-  assert.equal(lightTokens.get("--accent"), "#6b4d18");
-  assert.ok(contrast("#d9ac52", "#ffffff") < 4.5, "the premise of this test still holds");
+  // Re-pinned for PEP: #6b4d18 retuned onto the mustard's hue at the same luminance.
+  assert.equal(lightTokens.get("--accent"), "#6a4e0c");
+  assert.ok(contrast("#eab43f", "#ffffff") < 4.5, "the premise of this test still holds");
 });
 
 
@@ -806,34 +814,48 @@ test("every token App.css uses has a value in the light theme", () => {
 });
 
 
-test("the mark has no tile of its own", () => {
-  // Ruled by the maintainer, after two attempts at a badge: no box behind the symbol. It sits
-  // directly on whatever it is placed on and carries its own colour. Both earlier versions -- a
-  // gold wash, then a solid tile -- were a container the logo never asked for, and the second was
-  // competing with it. Asserted on the rule rather than on a token, because the failure mode is
-  // somebody adding a background back to make it "stand out".
-  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8");
+test("the wrapper has no tile; only the shipped mark's light cut does", () => {
+  // The maintainer first ruled out any box behind the mark (a gold wash, then a solid tile). On
+  // 30 Oct 2026 he chose the opposite for the light theme only: the original PEP logo, mustard and
+  // cream, in a small tile of its own green. So the wrapper -- which also holds an owner's uploaded
+  // logo -- still paints nothing, and the tile lives on the shipped mark's light-theme image alone.
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
   const start = appCss.indexOf(".brand-monogram {");
   assert.ok(start > 0, "the mark's wrapper must still exist");
-  const rule = appCss.slice(start, appCss.indexOf("}", start)).replace(/\/\*[\s\S]*?\*\//g, "");
+  const rule = appCss.slice(start, appCss.indexOf("}", start));
   for (const property of ["background", "border", "box-shadow"]) {
     assert.doesNotMatch(
       rule,
       new RegExp(`\\b${property}\\s*:`),
-      `the mark must not paint a ${property}; it sits on the app, not in a box`,
+      `the wrapper must not paint a ${property}; an owner's own logo sits on the app, not in a box`,
     );
   }
+  const tile = appCss.match(/\.brand-monogram \.brand-art-on-light\s*\{([^}]*)\}/);
+  assert.ok(tile, "the light cut's rule must exist");
+  assert.match(tile[1], /background:\s*var\(--brand-mark-tile\)/, "the light cut sits in the green tile");
+  const jsx = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(
+    jsx,
+    /className="brand-art-on-light" src=\{assetPath\("branding\/pep-mark-reversed\.svg"\)\}/,
+    "the light theme shows the original mustard-and-cream logo, not a recoloured cut",
+  );
 });
 
 test("each cut of the mark reads on the ground it is shown against", () => {
-  // With no tile, the surface behind the mark is the app itself -- so the cut has to suit the
-  // theme, and the theme switch is the only thing making it legible. The cream cut on a light page
-  // would be a mark nobody can see, which is what shipped before the switch existed.
+  // Dark theme: the reversed cut sits on the app itself. Light theme: the same cut sits in its own
+  // green tile, so what has to read is the logo on the tile, and the tile on the light page.
+  // CREAM and BRAND.gold on the PEP palette are the reversed cut's colours
+  // (tools/build-brand-assets.mjs).
   const darkGround = mediaDarkTokens.get("--ground");
+  assert.ok(contrast("#f6f4e5", darkGround) >= 7, "the cream cut must read on the dark page");
+  const tile = lightTokens.get("--brand-mark-tile");
+  assert.ok(tile, "the light theme must define the tile colour");
+  assert.ok(contrast("#f6f4e5", tile) >= 7, "cream must read on the tile");
+  assert.ok(contrast("#eab43f", tile) >= 4.5, "mustard must read on the tile");
   const lightSurfaces = [lightTokens.get("--ground"), lightTokens.get("--panel"), lightTokens.get("--card")];
-  assert.ok(contrast("#f6f3ea", darkGround) >= 7, "the cream cut must read on the dark page");
   for (const surface of lightSurfaces) {
-    assert.ok(contrast("#0a2d1c", surface) >= 7, `the green cut must read on ${surface}`);
+    assert.ok(contrast(tile, surface) >= 7, `the tile must stand out on ${surface}`);
   }
 });
 

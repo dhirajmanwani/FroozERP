@@ -234,7 +234,7 @@ test("the header names the shop and the shop's own day", () => {
     address: "Ratanada, Jodhpur",
     dateLabel: "Sat, 3 Oct 2026",
   });
-  assert.equal(buildPriceListHeader({ now: NOW }).title, "FroozERP");
+  assert.equal(buildPriceListHeader({ now: NOW }).title, "THE PEP");
   assert.equal(buildPriceListHeader({ businessSettings: null, now: NOW }).subtitle, "Today's prices");
 });
 
@@ -303,7 +303,7 @@ test("the list is due from the set minute onwards, once a day, and catches up af
 
 test("local dates and the file name use the device's own day", () => {
   assert.equal(localDateString(new Date(2026, 0, 5, 23, 59)), "2026-01-05");
-  assert.equal(priceListFileName(new Date(2026, 9, 3, 8, 0)), "Frooz_PriceList_2026-10-03.png");
+  assert.equal(priceListFileName(new Date(2026, 9, 3, 8, 0)), "PEP_PriceList_2026-10-03.png");
 });
 
 test("the WhatsApp caption lists each item and stops at the row limit", () => {
@@ -376,10 +376,10 @@ test("the app (counter or phone) always copies and saves; only a real browser op
 });
 
 test("the outcome says only what actually happened, and a total failure is an error", () => {
-  const both = priceListCopySaveOutcome({ copied: true, saved: true, fileName: "Frooz_PriceList_2026-10-03.png" });
+  const both = priceListCopySaveOutcome({ copied: true, saved: true, fileName: "PEP_PriceList_2026-10-03.png" });
   assert.equal(both.tone, "ok");
   assert.match(both.text, /Ctrl\+V/);
-  assert.match(both.text, /Frooz_PriceList_2026-10-03\.png/);
+  assert.match(both.text, /PEP_PriceList_2026-10-03\.png/);
   const copiedOnly = priceListCopySaveOutcome({ copied: true, saved: false, fileName: "x.png" });
   assert.doesNotMatch(copiedOnly.text, /Downloads/);
   const savedOnly = priceListCopySaveOutcome({ copied: false, saved: true, fileName: "x.png" });

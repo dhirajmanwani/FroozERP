@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import {
   OWNER_ONLY_VIEWS,
   accountMasterTypeOptions,
+  accountTabsFor,
   allowedPaymentAction,
   branchesScreenPlan,
   mayReadReports,
@@ -138,4 +139,39 @@ test("a held payment action the role may not use moves to the first one it may",
   const effect = app.slice(app.lastIndexOf("useEffect(() => {", at), app.indexOf("]);", at) + 3);
   assert.match(effect, /if \(next && next !== payment\.payment_action\)/);
   assert.match(effect, /\[canUseCustomerPayments, canUseSupplierPayments, payment\.payment_action\]/);
+});
+
+test("Sale Rate Update, PEP Menu and PEP Pack open for Owner and Admin only, whatever the map says", () => {
+  const map = { ...modulePermissionMap, "sale-rates": "discounts", discounts: "discounts" };
+  const open = (role, view, permissions) => resolveModuleAccess({ view, role, permissions, defaultPermissions: defaults[role] || {}, modulePermissionMap: map });
+  for (const view of ["sale-rates", "combos", "frooz-pack"]) {
+    assert.equal(open("Cashier", view, { discounts: true }), false, `${view}: Discounts used to open a blank screen on Alt+4`);
+    assert.equal(open("Purchase Manager", view, { discounts: true, all: true }), false);
+    assert.equal(open("Admin", view, {}), true);
+    assert.equal(open("Owner", view, { discounts: false }), true);
+  }
+  assert.equal(open("Cashier", "discounts", { discounts: true }), true, "the Discounts list itself still follows the key");
+});
+
+test("Expenses follows the server's `expenses` key, falling back to `reports` only when the map has no `expenses`", () => {
+  const map = { ...modulePermissionMap, expenses: "expenses" };
+  const open = (role, permissions) => resolveModuleAccess({ view: "expenses", role, permissions, defaultPermissions: defaults[role] || {}, modulePermissionMap: map });
+  assert.equal(open("Purchase Manager", { reports: true, expenses: false }), false, "unticking Expenses hides it even with Reports");
+  assert.equal(open("Purchase Manager", { reports: false, expenses: true }), true, "ticking Expenses opens it without Reports");
+  assert.equal(open("Inventory Manager", { reports: true }), true, "a map the expenses migration has not reached keeps today's screen");
+  assert.equal(open("Inventory Manager", { reports: false }), false);
+  assert.equal(open("Admin", {}), true);
+  assert.equal(open("Cashier", {}), false);
+});
+
+test("Accounts tabs follow the account authorities, not role names (BO-13)", () => {
+  const ids = (plan) => plan.tabs.map(([id]) => id);
+  const custom = accountTabsFor(resolveAccountPermissions({ role: "Delivery Lead", permissions: { supplier_accounts: true } }));
+  assert.deepEqual(ids(custom), ["master", "ledger", "payments", "outstanding"], "a custom role given Supplier Accounts gets Account Master");
+  assert.equal(custom.initial, "master");
+  const pm = accountTabsFor(resolveAccountPermissions({ role: "Purchase Manager", permissions: { supplier_accounts: false, customer_accounts: false } }));
+  assert.deepEqual(ids(pm), ["ledger", "payments"], "no Master tab with an empty Account Type list");
+  assert.equal(pm.initial, "payments");
+  assert.deepEqual(ids(accountTabsFor(resolveAccountPermissions({ role: "Owner" }))), ["master", "ledger", "payments", "outstanding"]);
+  assert.deepEqual(ids(accountTabsFor()), ["ledger", "payments"]);
 });

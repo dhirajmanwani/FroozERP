@@ -74,3 +74,27 @@ test("a FROST insight tile with no figure prints a dash and says it is unavailab
   assert.match(app, /<p>\{insightCardValue\(card\.value, money\)\.text\}<\/p>/);
   assert.match(app, /insightCardValue\(card\.value, money\)\.unavailable && <small className="cell-note">Unavailable just now<\/small>/);
 });
+
+test("a negative tile figure stays in one piece with a true minus (UI-6)", async () => {
+  const { presentSignedFigure } = await import("./figurePresentation.js");
+  assert.deepEqual(presentSignedFigure("-₹1,190.00"), { text: "−⁠₹1,190.00", negative: true });
+  assert.deepEqual(presentSignedFigure("₹380.00"), { text: "₹380.00", negative: false });
+  assert.deepEqual(presentSignedFigure("-"), { text: "-", negative: false }, "the missing-value dash is not a minus");
+  assert.deepEqual(presentSignedFigure("6.500 KG • 6 PIECE"), { text: "6.500 KG • 6 PIECE", negative: false });
+  assert.deepEqual(presentSignedFigure(-3), { text: "−⁠3", negative: true });
+  assert.deepEqual(presentSignedFigure(0), { text: 0, negative: false });
+  assert.deepEqual(presentSignedFigure(null), { text: null, negative: false });
+  const app = (await import("node:fs")).readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /const signed = presentSignedFigure\(displayValue\);/);
+  assert.match(app, /title=\{`\$\{label\}: \$\{displayValue\}`\}/, "exports read the title, which keeps the plain figure");
+});
+
+test("chart axis figures are short rupees, never INR 1T (UI-14)", async () => {
+  const { formatChartRupees } = await import("./figurePresentation.js");
+  assert.equal(formatChartRupees(1190), "₹1.2K");
+  assert.equal(formatChartRupees(950), "₹950");
+  assert.equal(formatChartRupees(450000), "₹4.5 L");
+  assert.equal(formatChartRupees(21000000), "₹2.1 Cr");
+  assert.equal(formatChartRupees(-1500), "−₹1.5K");
+  assert.equal(formatChartRupees("x"), "₹0");
+});

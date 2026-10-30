@@ -60,8 +60,8 @@ export const NAVIGATION_LOOKUP = Object.freeze({
  *
  *   Alt+W  Waste Management       Alt+A  All Shops
  *   Alt+C  Discounts (chhoot)     Alt+B  Branches & Counters
- *   Alt+O  Frooz Menu (juices, cutting, gifts, offers; O for offers)
- *   Alt+P  Frooz Pack (baskets, gift boxes, bottles, bowls; P for packing)
+ *   Alt+O  PEP Menu (juices, cutting, gifts, offers; O for offers)
+ *   Alt+P  PEP Pack (baskets, gift boxes, bottles, bowls; P for packing)
  *   Alt+X  Expenses               Alt+S  Settings
  *   Alt+T  Stock Distribution (transfer)
  *
@@ -148,8 +148,8 @@ const modules = [
   {
     id: "combos",
     // Named by the owner's ask (22 Oct 2026): one name for the screen that makes juices, The
-    // Cutting, gift hampers and offers. "Combos & Offers" stays the name of the POS tab for offers.
-    label: "Frooz Menu",
+    // Cutting, gift hampers and offers. "PEP Drops" is the name of the POS tab for offers.
+    label: "PEP Menu",
     icon: "gift",
     // O for offers. The owner sets combos up now and then; the counter sells them from POS tabs.
     shortcut: "O",
@@ -158,9 +158,9 @@ const modules = [
   },
   {
     id: "frooz-pack",
-    // The packing a combo goes out in, kept as stock (owner, 22 Oct 2026). Beside Frooz Menu
-    // because combos are where packing is used. Owner/Admin only, like Frooz Menu.
-    label: "Frooz Pack",
+    // The packing a combo goes out in, kept as stock (owner, 22 Oct 2026). Beside PEP Menu
+    // because combos are where packing is used. Owner/Admin only, like PEP Menu.
+    label: "PEP Pack",
     icon: "package",
     // P for packing. Opened when packing is bought or a count is corrected, not all day.
     shortcut: "P",

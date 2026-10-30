@@ -107,6 +107,13 @@ const migrationFiles = [
   // the combo's packing) and the reference bootstrap would answer 500 on the missing tables.
   // Must run after 024: combo_packing references combos.
   "backend/migrations/cloud/025_frooz_pack.sql",
+  // 026 (24 Oct 2026) adds `packing_purchases.client_ref` and its partial unique index, so a
+  // retried packing purchase is answered with the first save instead of booking a second expense
+  // and raising the count twice; converts 024/025's plain TIMESTAMP created_at/updated_at to
+  // TIMESTAMPTZ once (008 did it silently on the next replay, and only on the cloud); and indexes
+  // sale_items.combo_id and sale_packing_usage's size/combo columns for the "in use" checks. All
+  // of it is mirrored in `initializeDatabase()`. Must run after 025.
+  "backend/migrations/cloud/026_packing_purchase_client_ref.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

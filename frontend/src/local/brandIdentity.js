@@ -1,8 +1,8 @@
 // The name and logo at the top of every screen, on the sign-in page and on bills.
 //
 // They come from Settings > Business Identity, so the owner can change them without a new build:
-// - the logo is the picture chosen there ("Choose logo"); with none chosen, the Frooz mark that
-//   ships with the app (the "फ" monogram) is shown, exactly as before;
+// - the logo is the picture chosen there ("Choose logo"); with none chosen, the PEP mark that
+//   ships with the app (the "pép" letters) is shown;
 // - the big line is the Business Name, the same name a bill prints as the shop's name;
 // - the small line under it is the Brand Name and the Company Name ("<brand> - by <company>").
 //
@@ -12,12 +12,12 @@
 //
 // The sign-in page and the start-up screen are drawn before any settings have loaded, so the last
 // identity seen is remembered on this computer and shown there. Losing that copy (cleared storage, a
-// private window) only means those screens show the Frooz mark until the next sign-in.
+// private window) only means those screens show the PEP mark until the next sign-in.
 
 import { PRODUCT_PHOTO_MAX_BYTES, fitWithin, photoDataUrlBytes } from "./productPhotos.js";
 
-export const DEFAULT_BRAND_TITLE = "FroozERP";
-export const DEFAULT_BRAND_TAGLINE = "Feel the Freakin' Frooz - by SRT Company";
+export const DEFAULT_BRAND_TITLE = "THE PEP";
+export const DEFAULT_BRAND_TAGLINE = "Pulp Eat Up. - by SRT Company";
 export const DEFAULT_BRAND_IDENTITY = Object.freeze({
   title: DEFAULT_BRAND_TITLE,
   tagline: DEFAULT_BRAND_TAGLINE,
