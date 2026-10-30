@@ -173,6 +173,7 @@ import {
   orderDevicesForIssuing,
   validateValidDays,
 } from "./local/activationIssuing";
+import { deviceKind, deviceSeenParts, formatDeviceDate, shortDeviceId } from "./local/deviceDisplay";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
@@ -2183,6 +2184,10 @@ function Icon({ name, size = 18 }) {
     package: <><path d="M3 7l9-4 9 4v10l-9 4-9-4Z" /><path d="m3 7 9 4 9-4" /><path d="M12 11v10" /><path d="m7.5 5 9 4" /></>,
     gift: <><rect x="3" y="8" width="18" height="4" rx="1" /><path d="M12 8v13M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7" /><path d="M7.5 8a2.5 2.5 0 0 1 0-5C10 3 12 8 12 8s2-5 4.5-5a2.5 2.5 0 0 1 0 5" /></>,
     refresh: <><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" /></>,
+    laptop: <><rect x="4" y="5" width="16" height="11" rx="1.5" /><path d="M2 19h20" /></>,
+    monitor: <><rect x="3" y="4" width="18" height="12" rx="1.5" /><path d="M8 20h8M12 16v4" /></>,
+    tablet: <><rect x="5" y="3" width="14" height="18" rx="2" /><path d="M11 18h2" /></>,
+    phone: <><rect x="7" y="2.5" width="10" height="19" rx="2" /><path d="M11 18.5h2" /></>,
   };
 
   return (
@@ -13921,7 +13926,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
             <SummaryMetric label="Expired" value={view.summary.expired} />
             {view.summary.unreadable > 0 && <SummaryMetric label="Cannot Be Read" value={view.summary.unreadable} />}
           </div>
-          <DataTable className="licence-table" headers={["", "Device", "Branch / Counter", "Activation", "Expires", "Last Seen"]}>
+          <DataTable className="device-table licence-table" headers={["", "Device", "Placed at", "Activation", "Last seen"]}>
             {orderedRows.map((row) => (
               <tr key={row.deviceId || row.deviceName}>
                 <td>
@@ -13934,8 +13939,8 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
                     type="radio"
                   />
                 </td>
-                <td className="primary-cell">
-                  {row.deviceName}
+                <td className="device-cell">
+                  <DeviceIdentity deviceId={row.deviceId} kind={deviceKind({ assignedType: (assignments || []).find((assignment) => assignment && assignment.active !== false && inventoryIdsEqual(assignment.device_id, row.deviceId))?.device_type, platform: row.platform, reportedType: row.reportedType })} name={row.deviceName}>
                   {/* Two devices can carry the same name after a counter is rebuilt and registers
                       again. When they do, the id below is the only thing separating them, and the
                       release process requires that nobody has to read one. This says which is
@@ -13946,26 +13951,30 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
                         ? row.nameDistinction.value
                         : row.nameDistinction?.kind === "lastSeen"
                           ? `Last seen ${new Date(row.nameDistinction.value).toLocaleString("en-IN")}`
-                          : "Same name as another device — check the ID below before issuing"}
+                          : "Same name as another device — check the ID before issuing"}
                     </small>
                   )}
-                  <small className="cell-note device-id-note">{row.deviceId || "No device ID"}</small>
+                  </DeviceIdentity>
                 </td>
                 {/* The live assignment (Step 4) first, so both steps name the same counter. */}
                 {(() => {
                   const where = deviceBranchAndCounter(row, assignments);
-                  return <td>{where.branch}<small className="cell-note">{where.counter}</small></td>;
+                  return <td className="device-place-cell"><DevicePlace branch={where.branch} counter={where.counter} /></td>;
                 })()}
-                <td>
+                <td className="device-status-cell">
                   <span className={stateClass(row.state)}>{row.label}</span>
-                  <small className="cell-note">{row.detail}</small>
+                  <small className="cell-note device-status-detail">{row.detail}</small>
                 </td>
-                <td>{row.latest?.expiresOn || "-"}</td>
-                <td>{row.lastActiveAt ? new Date(row.lastActiveAt).toLocaleString("en-IN") : "Not seen yet"}</td>
+                <td className="device-when-cell">
+                  {(() => {
+                    const seen = deviceSeenParts(row.lastActiveAt);
+                    return seen ? <><span className="device-place">{seen.date}</span><small className="cell-note">{seen.time}</small></> : <small className="cell-note">Not seen yet</small>;
+                  })()}
+                </td>
               </tr>
             ))}
             {orderedRows.length === 0 && (
-              <tr><td className="empty-cell" colSpan="6">No device has registered with this shop yet. A device appears here after it has connected once.</td></tr>
+              <tr><td className="empty-cell" colSpan="5">No device has registered with this shop yet. A device appears here after it has connected once.</td></tr>
             )}
           </DataTable>
 
@@ -14048,33 +14057,38 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
           )}
 
           <h3>Issued Licences</h3>
-          <DataTable headers={["Device", "Serial", "Issued", "Valid For", "Expires", "Status", "Issued By", "File"]}>
-            {view.history.map((entry, index) => (
+          <DataTable className="device-table issued-licence-table" headers={["Device", "Licence", "Status", ""]}>
+            {view.history.map((entry, index) => {
+              const device = view.rows.find((row) => inventoryIdsEqual(row.deviceId, entry.deviceId));
+              const assigned = (assignments || []).find((assignment) => assignment && assignment.active !== false && inventoryIdsEqual(assignment.device_id, entry.deviceId));
+              const issuedOn = entry.classification.issuedOn || entry.issuedAt;
+              return (
               <tr key={entry.id || `${entry.deviceId}-${entry.serial}-${index}`}>
-                <td className="primary-cell">
-                  {entry.deviceName}
-                  <small className="cell-note">{entry.deviceId || "No device ID"}</small>
-                  {entry.renamedSince && <small className="cell-note">Now called {entry.currentDeviceName}</small>}
-                  {entry.deviceRetired && <small className="cell-note">This device has since been retired</small>}
+                <td className="device-cell">
+                  <DeviceIdentity deviceId={entry.deviceId} kind={deviceKind({ assignedType: assigned?.device_type, platform: device?.platform, reportedType: device?.reportedType })} name={entry.deviceName}>
+                    {entry.renamedSince && <small className="cell-note">Now called {entry.currentDeviceName}</small>}
+                    {entry.deviceRetired && <small className="cell-note">This device has since been retired</small>}
+                  </DeviceIdentity>
                 </td>
-                <td>{entry.serial || "-"}</td>
-                <td>{entry.classification.issuedOn || entry.issuedAt || "Not recorded"}</td>
-                <td>{describeValidity(entry.validDays)}</td>
-                <td>{entry.classification.expiresOn || "-"}</td>
-                <td>
+                <td className="device-when-cell">
+                  <span className="device-place">{entry.classification.expiresOn ? `Till ${formatDeviceDate(entry.classification.expiresOn)}` : "No end date"}</span>
+                  <small className="cell-note" title={describeValidity(entry.validDays)}>From {issuedOn ? formatDeviceDate(issuedOn) : "a day not recorded"}</small>
+                  <small className="cell-note">{entry.serial ? `No. ${entry.serial}` : "No number"} · by {entry.issuedBy}</small>
+                </td>
+                <td className="device-status-cell">
                   <span className={licenceClass(entry.classification.status)}>{entry.classification.label}</span>
-                  <small className="cell-note">{entry.classification.detail}</small>
+                  <small className="cell-note device-status-detail">{entry.classification.detail}</small>
                 </td>
-                <td>{entry.issuedBy}</td>
-                <td>
+                <td className="device-action-cell">
                   <button className="table-action" disabled={issuing || !entry.downloadable} onClick={() => downloadAgain(entry)} type="button">
                     Get File Again
                   </button>
                 </td>
               </tr>
-            ))}
+              );
+            })}
             {view.history.length === 0 && (
-              <tr><td className="empty-cell" colSpan="8">No activation licence has been issued yet.</td></tr>
+              <tr><td className="empty-cell" colSpan="5">No activation licence has been issued yet.</td></tr>
             )}
           </DataTable>
           <p className="form-note">Signed in as {user?.username || user?.name || "Owner"}. Every licence issued here is recorded above with who issued it.</p>
@@ -25842,10 +25856,10 @@ function OperationalScopeManagement({
         {data.pending_devices.map((device) => {
           const draft = approvalDraft(device);
           return <section className="settings-inline-panel" key={device.device_id}>
-            <div>
-              <strong>{device.device_name}</strong>
-              <small className="cell-note device-id-note">{device.device_id} - {device.device_type || device.platform || "Other"}</small>
-              {previousIdsNote(device) && <small className="cell-note device-id-note">{previousIdsNote(device)}</small>}
+            <div className="device-pending-head">
+              <DeviceIdentity deviceId={device.device_id} kind={deviceKind({ platform: device.platform, reportedType: device.device_type })} name={device.device_name}>
+                {previousIdsNote(device) && <small className="cell-note device-id-note">{previousIdsNote(device)}</small>}
+              </DeviceIdentity>
               {canRetireDeviceId({ deviceId: device.device_id, currentDeviceId, isOwner: isOwnerAccount }) && (
                 <button className="table-action" disabled={!canManage} onClick={() => retireDevice(device)} type="button">Retire this id</button>
               )}
@@ -25865,20 +25879,20 @@ function OperationalScopeManagement({
         {data.pending_devices.length === 0 && <p className="scope-empty">Nothing is waiting. A new machine appears here after it presses Send to Shop.</p>}
         {stepMessage("computers")}
         <h3 className="scope-subheading">Approved</h3>
-        <DataTable headers={["Computer", "Branch", "Counter", "Used for", "Status", "Actions"]}>
+        <DataTable className="device-table" headers={["Computer", "Placed at", "Used for", "Status", ""]}>
           {data.device_assignments.map((assignment) => (
             <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}>
-              <td className="primary-cell">
-                {assignment.device_name}
-                <small className="cell-note device-id-note">{assignment.device_id}</small>
-                {previousIdsNote(assignment) && <small className="cell-note device-id-note">{previousIdsNote(assignment)}</small>}
-                {waitingIdsNote(assignment) && <small className="cell-note warning-note device-id-note">{waitingIdsNote(assignment)}</small>}
+              <td className="device-cell">
+                <DeviceIdentity deviceId={assignment.device_id} kind={deviceKind({ assignedType: assignment.device_type, platform: assignment.platform })} name={assignment.device_name || assignment.physical_label || assignment.device_id}>
+                  {assignment.physical_label && assignment.physical_label !== assignment.device_name && <small className="cell-note">{assignment.physical_label}</small>}
+                  {previousIdsNote(assignment) && <small className="cell-note device-id-note">{previousIdsNote(assignment)}</small>}
+                  {waitingIdsNote(assignment) && <small className="cell-note warning-note device-id-note">{waitingIdsNote(assignment)}</small>}
+                </DeviceIdentity>
               </td>
-              <td>{assignment.branch_name}</td>
-              <td>{assignment.location_name}</td>
-              <td>{labelFor("deviceUsage", assignment.intended_usage)}</td>
-              <td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td>
-              <td>
+              <td className="device-place-cell"><DevicePlace branch={assignment.branch_name} counter={assignment.location_name} /></td>
+              <td className="device-when-cell">{labelFor("deviceUsage", assignment.intended_usage)}</td>
+              <td className="device-when-cell"><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td>
+              <td className="device-action-cell">
                 {canRetireDeviceId({ deviceId: assignment.device_id, currentDeviceId, isOwner: isOwnerAccount })
                   ? <button className="table-action" disabled={!canManage} onClick={() => retireDevice(assignment)} type="button">Retire this id</button>
                   : (canonicalInventoryId(assignment.device_id) === canonicalInventoryId(currentDeviceId) ? <small className="cell-note">This computer</small> : null)}
@@ -31243,6 +31257,30 @@ function ModuleCard({ actions = null, children, eyebrow, id, subtitle, title }) 
       {children}
     </section>
   );
+}
+
+// One computer or phone in a table cell: what kind it is, its name, and the start and end of its
+// device id (the whole id is on the tooltip). Extra notes go underneath as children.
+function DeviceIdentity({ children, deviceId, kind, name }) {
+  const id = String(deviceId || "");
+  return (
+    <div className="device-identity">
+      <span className="device-identity-icon"><Icon name={kind?.icon || "monitor"} size={17} /></span>
+      <span className="device-identity-text">
+        <strong className="device-identity-name" title={name}>{name}</strong>
+        <span className="device-identity-meta">
+          <span>{kind?.label || "Computer"}</span>
+          {id ? <code className="device-id-chip" title={id}>{shortDeviceId(id)}</code> : <span>No device ID</span>}
+        </span>
+        {children}
+      </span>
+    </div>
+  );
+}
+
+// Branch on top, counter under it, for every device table.
+function DevicePlace({ branch, counter }) {
+  return <><span className="device-place">{branch || "-"}</span><small className="cell-note">{counter || "-"}</small></>;
 }
 
 function DataTable({ children, className = "", headers }) {

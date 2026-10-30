@@ -407,6 +407,8 @@ export const describeDeviceActivation = (device, licences, { today } = {}) => {
     branchName: text(row.branch_name),
     counterName: text(row.counter_name),
     lastActiveAt: text(row.last_active_at),
+    platform: text(row.platform),
+    reportedType: text(row.device_type),
     licenceCount: 0,
     latest: null,
     serial: "",
