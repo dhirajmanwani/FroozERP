@@ -129,7 +129,7 @@
   width: 252px;
   display: flex;
   flex-direction: column;
-  padding: 20px 14px;
+  padding: 20px 12px;
   box-sizing: border-box;
   background: var(--panel);
   border-right: 1px solid var(--line);
@@ -295,9 +295,15 @@ input[type="number"] {
   color: var(--ink-faint);
 }
 
+/* The module list (30 Oct 2026, the owner: "professional and premium border lines with proper
+   spacing between the modules"). Every row is the same height (36px, 31px on a 768-high laptop so all
+   nineteen fit without a scrollbar), on one line, with a hairline between
+   neighbours. The line steps aside around the highlighted row, so the highlight reads as one
+   clean block instead of being cut by the rules above and below it. */
 .sidebar-nav {
   display: grid;
-  gap: 3px;
+  gap: 0;
+  align-content: start;
 }
 
 .nav-item,
@@ -309,15 +315,36 @@ input[type="number"] {
 }
 
 .nav-item {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 11px;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 8px;
   border-radius: 8px;
   font-size: 13px;
   font-weight: 650;
   text-align: left;
+  white-space: nowrap;
   transition: 160ms ease;
+}
+
+.nav-item + .nav-item::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  height: 1px;
+  background: var(--nav-rule);
+  transition: opacity 160ms ease;
+}
+
+.nav-item:hover::before,
+.nav-item:hover + .nav-item::before,
+.nav-item-active::before,
+.nav-item-active + .nav-item::before {
+  opacity: 0;
 }
 
 .nav-item:hover,
@@ -328,6 +355,18 @@ input[type="number"] {
 
 .nav-item-active {
   color: var(--accent);
+}
+
+/* The open module also carries a short bar on its leading edge, so it is found at a glance. */
+.nav-item-active::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
 }
 
 .sidebar-profile {
@@ -5304,15 +5343,14 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   /* On a 768-high laptop screen the menu scrolled, and All Shops, Branches & Counters and Settings
-     sat below a scrollbar that is easy to miss. Tighter rows fit the whole menu. */
-  .sidebar-nav {
-    gap: 1px;
+     sat below a scrollbar that is easy to miss. Tighter rows fit the whole menu; the "Main Menu"
+     label gives up its line so each row keeps enough height to sit between its hairlines. */
+  .sidebar > .sidebar-section {
+    display: none;
   }
 
   .nav-item {
-    min-height: 30px;
-    padding-top: 5px;
-    padding-bottom: 5px;
+    min-height: 31px;
   }
 }
 
@@ -8219,11 +8257,11 @@ tbody tr:has(> .empty-cell):hover {
 /* The keyboard chip beside a module name. Deliberately quiet: it is a thing to notice once and
    then stop seeing, not a second label competing with the first. */
 .nav-shortcut {
-  /* Every screen has a key now, long labels included: the label may wrap, the chip never does. */
+  /* Every screen has a key now, long labels included. Neither the label nor the chip wraps. */
   flex: 0 0 auto;
   white-space: nowrap;
   margin-left: auto;
-  padding: 1px 6px;
+  padding: 1px 5px;
   border-radius: 5px;
   border: 1px solid var(--line-strong);
   font-family: inherit;

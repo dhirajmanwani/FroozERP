@@ -902,4 +902,9 @@ test("every module on a screen shares one frame and one gap", () => {
   for (const selector of [".settings-layout", ".scope-page", ".dashboard-blocks", ".chart-grid", ".pos-layout", ".pos-main"]) {
     assert.match(ruleFor(selector), /gap: var\(--module-gap\)/, `${selector} spaces its modules by --module-gap`);
   }
+  // The sidebar's module list: a hairline between neighbours, in a colour that shows on the panel.
+  // --line is the panel's own colour in light, which is why the first version drew nothing.
+  assert.match(ruleFor(".nav-item + .nav-item::before"), /background: var\(--nav-rule\)/);
+  assert.notEqual(lightTokens.get("--nav-rule"), lightTokens.get("--panel"), "the rule must differ from the panel it sits on");
+  assert.match(ruleFor(".nav-item"), /white-space: nowrap/, "a module name stays on one line");
 });

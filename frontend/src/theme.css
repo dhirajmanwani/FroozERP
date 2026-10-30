@@ -75,6 +75,7 @@
      against a white card), not the lightest, or cards would have nothing to sit on. */
   --ground: #e7e4ce;              /* the page itself */
   --panel: #c9d7cf;               /* sidebar and deep panels sitting on the page */
+  --nav-rule: #98aca2;            /* the hairline between sidebar modules; --line is the panel's own colour */
   --card: #ffffff;                /* a content card */
   --raised: #ffffff;              /* a surface lifted off the page (dropdown, popover) */
   --raised-high: #ffffff;         /* a surface lifted off a raised surface (modal) */
@@ -260,6 +261,7 @@
 
     --ground: #04100b;
     --panel: #0b2219;
+    --nav-rule: #305c46;
     --card: #153525;
     --raised: #102e20;
     --raised-high: #123124;
@@ -356,6 +358,7 @@
 
   --ground: #04100b;
   --panel: #0b2219;
+  --nav-rule: #305c46;
   --card: #153525;
   --raised: #102e20;
   --raised-high: #123124;
