@@ -1,0 +1,21 @@
+-- The human bill number a POS bill is printed and spoken with: "311026-001" — the bill date as
+-- DDMMYY, then that day's running number on this computer.
+--
+-- The POS assigns it and sends it as top-level `bill_no` in the sale payload. Nothing here
+-- computes or renumbers it. It is not an identity: `offline_invoice_ref` stays the unique key the
+-- cloud replays on, exactly as before, and `bill_no` carries no UNIQUE constraint because two
+-- computers can each print their own "311026-001" on the same day.
+--
+-- NULL means "no human number was assigned" — every bill that predates this migration, and any
+-- bill whose payload did not carry one. A bill keeps its number once it has one: an edit does not
+-- touch it, and a cloud pull or a cached copy that does not mention `bill_no` leaves the stored
+-- value alone (COALESCE, the same rule `server_invoice_no` follows).
+--
+-- Idempotent across restarts by version-gating in apply_migration(), which skips any version
+-- already recorded APPLIED in local_schema_migrations. SQLite has no ADD COLUMN IF NOT EXISTS, so
+-- this file is not safe to execute twice on its own — the gate is what makes it idempotent, exactly
+-- as for every other ALTER-bearing migration in this directory. Forward-only: never edit this file
+-- once it has been applied anywhere. In SQLite an ADD COLUMN with no default is an O(1) catalogue
+-- change, not a table rebuild.
+
+ALTER TABLE local_pos_invoices ADD COLUMN bill_no TEXT;

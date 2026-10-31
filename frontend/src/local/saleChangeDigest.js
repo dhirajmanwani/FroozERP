@@ -168,7 +168,7 @@ export const normalizeLocalChangeRows = (invoices, { userNamesById } = {}) => {
     const cancelled = status === "CANCELLED";
     if (!cancelled && !editReason) return;
     const saleId = canonicalInventoryId(invoice.id || invoice.invoice_global_id || invoice.sale_id);
-    const invoiceNo = canonicalInventoryId(invoice.server_invoice_no || invoice.offline_invoice_ref || invoice.invoice_no);
+    const invoiceNo = canonicalInventoryId(invoice.server_invoice_no || invoice.bill_no || invoice.offline_invoice_ref || invoice.invoice_no);
     // net_total is the stored column; total_amount is what localSnapshotToInvoice renames it to.
     const total = readLocalBillTotal(row, invoice);
     // A cancel is dated by `cancelled_at` alone. `updated_at` on a bill copied down from the cloud is
