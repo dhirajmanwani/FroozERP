@@ -126,7 +126,7 @@
   position: fixed;
   inset: 0 auto 0 0;
   z-index: 30;
-  width: 252px;
+  width: var(--sidebar-width, 252px);
   display: flex;
   flex-direction: column;
   padding: 20px 12px;
@@ -314,13 +314,16 @@ input[type="number"] {
   background: transparent;
 }
 
+/* Height, gap and padding grow with Display Typography (--font-scale), so Large and Extra Large text
+   keeps the same breathing room Medium has instead of filling a fixed 36px row (31 Oct 2026, the
+   owner: "bht chipak chipak lag rhe he"). */
 .nav-item {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 36px;
-  padding: 0 8px;
+  gap: calc(8px * var(--font-scale, 1));
+  min-height: max(36px, calc(33px * var(--font-scale, 1)));
+  padding: 0 calc(8px * var(--font-scale, 1));
   border-radius: 8px;
   font-size: 13px;
   font-weight: 650;
@@ -421,9 +424,9 @@ input[type="number"] {
 }
 
 .content-shell {
-  width: calc(100% - 252px);
+  width: calc(100% - var(--sidebar-width, 252px));
   min-height: 100vh;
-  margin-left: 252px;
+  margin-left: var(--sidebar-width, 252px);
 }
 
 /* Pinned to the top of the window (2 Oct 2026, asked for by the owner): search, back and forward
@@ -5350,7 +5353,7 @@ tbody tr:has(> .empty-cell):hover {
   }
 
   .nav-item {
-    min-height: 31px;
+    min-height: max(31px, calc(29px * var(--font-scale, 1)));
   }
 }
 
@@ -8422,7 +8425,7 @@ button.shortcut-sheet-row:focus-visible {
   /* The rail is a desktop affordance. On a narrow screen the sidebar is already an overlay, and a
      64px strip permanently taking width would be worse than either state. */
   .sidebar.sidebar-rail {
-    width: 252px;
+    width: var(--sidebar-width, 252px);
     padding-left: 14px;
     padding-right: 14px;
   }
