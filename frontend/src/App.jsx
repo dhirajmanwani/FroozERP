@@ -174,6 +174,7 @@ import {
   validateValidDays,
 } from "./local/activationIssuing";
 import { deviceKind, deviceSeenParts, formatDeviceDate, shortDeviceId } from "./local/deviceDisplay";
+import { billNoFloorKey, billNumbersOf, displayBillNo, nextBillNo, parseBillNo } from "./local/billNumber";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
@@ -1360,7 +1361,7 @@ const localSnapshotToInvoice = (snapshot) => {
     ...invoice,
     id: invoice.id || invoice.invoice_global_id,
     sale_id: invoice.id || invoice.invoice_global_id,
-    invoice_no: invoice.server_invoice_no || invoice.offline_invoice_ref || invoice.invoice_no,
+    invoice_no: displayBillNo(invoice),
     sale_status: invoice.status || invoice.sale_status || "COMPLETED",
     sale_date: invoice.bill_date || invoice.sale_date,
     transaction_date: invoice.bill_date || invoice.transaction_date,
@@ -27564,7 +27565,36 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     .map((entry) => `${packingPathLabel(entry)} × ${entry.quantity}`)
     .join(", ");
 
-  const buildLocalSalePayload = ({ payments, selectedBillDate, billDateTime: savedBillDateTime, dateOverrideReason, operationId = "", discountApprovalId = "" }) => {
+  // This computer's next date-wise bill number (local/billNumber.js) for a bill dated `billDate`.
+  // A failed read of today's bills is logged and does not stop the sale: the cloud keeps a
+  // repeated number apart as "-2" instead of refusing the bill.
+  const nextLocalBillNo = async (billDate) => {
+    let rows = [];
+    try {
+      rows = await listLocalPosSalesBetween(billDate, billDate);
+    } catch (error) {
+      writeDiagnosticLog("WARN", "bill-no-local-read-failed", { message: getErrorMessage(error, error?.message || "today's bills could not be read") });
+    }
+    let floor;
+    try {
+      floor = Number(localStorage.getItem(billNoFloorKey(billDate))) || 0;
+    } catch {
+      floor = 0;
+    }
+    return nextBillNo({ billDate, existing: billNumbersOf(rows), floor });
+  };
+
+  const rememberLocalBillNo = (billDate, billNo) => {
+    const parsed = parseBillNo(billNo);
+    if (!parsed) return;
+    try {
+      localStorage.setItem(billNoFloorKey(billDate), String(parsed.seq));
+    } catch {
+      // A floor only; the saved bills themselves are what the next number is read from.
+    }
+  };
+
+  const buildLocalSalePayload = ({ payments, selectedBillDate, billDateTime: savedBillDateTime, dateOverrideReason, operationId = "", discountApprovalId = "", billNo = "" }) => {
     const invoiceGlobalId = newSyncId("invoice");
     const offlineInvoiceRef = `OFF-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
     const savedCustomer = customer.account_id
@@ -27578,6 +27608,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // Passed through untouched to the outbox payload (local_db.rs keeps the sale as sent).
       ...(discountApprovalId ? { discount_approval_id: discountApprovalId } : {}),
       offline_invoice_ref: offlineInvoiceRef,
+      // The number printed on the bill, "311026-001". A label: offline_invoice_ref stays the key.
+      ...(billNo ? { bill_no: billNo } : {}),
       branch_id: String(user.branch_id || 1),
       // This computer's own id, always: checkout refuses before this point when it has not loaded.
       device_id: deviceInfo.device_id,
@@ -27931,11 +27963,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           alert("This computer's device id has not loaded yet. Wait a moment and try again.");
           return;
         }
-        const localSale = buildLocalSalePayload({ payments, selectedBillDate, billDateTime: effectiveBillDateTime, dateOverrideReason, operationId: saleRef, discountApprovalId });
+        const billNo = await nextLocalBillNo(selectedBillDate);
+        const localSale = buildLocalSalePayload({ payments, selectedBillDate, billDateTime: effectiveBillDateTime, dateOverrideReason, operationId: saleRef, discountApprovalId, billNo });
         const result = await completeLocalPosSale(localSale);
+        rememberLocalBillNo(selectedBillDate, billNo);
         const invoice = {
           id: localSale.invoice_global_id,
-          invoice_no: localSale.offline_invoice_ref,
+          invoice_no: localSale.bill_no || localSale.offline_invoice_ref,
+          bill_no: localSale.bill_no || "",
           offline_invoice_ref: localSale.offline_invoice_ref,
           sale_date: selectedBillDate,
           bill_datetime: effectiveBillDateTime,

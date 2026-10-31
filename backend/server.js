@@ -83,6 +83,7 @@ const { parsePosSection } = require("./productPosSection");
 const comboRules = require("./combos");
 const froozPack = require("./froozPack");
 const { parseBusinessLogo } = require("./businessLogo");
+const { assignBillNo } = require("./dailyBillNumber");
 const saleChangeApproval = require("./saleChangeApproval");
 const {
   effectiveLotRate,
@@ -12479,8 +12480,14 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     ]
   );
   const sale = saleResult.rows[0];
-  const invoiceNo = `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`;
-  await client.query("UPDATE sales SET invoice_no = $1 WHERE id = $2", [invoiceNo, sale.id]);
+  // The counter's own date-wise number ("311026-001", dailyBillNumber.js), kept apart as "-2" when
+  // another computer already used it that day.
+  const invoiceNo = await assignBillNo(client, {
+    saleId: sale.id,
+    dateKey: toDateKey(sale.sale_date),
+    requested: payload.bill_no,
+    fallback: `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`,
+  });
   await insertSaleCharges(client, sale.id, salePayload.chargeLines);
   await recordManualDiscountDecision(client, {
     saleId: sale.id,
@@ -25609,11 +25616,12 @@ const createSaleHandler = async (req, res) => {
       ]
     );
     const sale = saleResult.rows[0];
-    const invoiceNo = `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`;
-    await client.query(
-      "UPDATE sales SET invoice_no = $1 WHERE id = $2",
-      [invoiceNo, sale.id]
-    );
+    // Date-wise, "311026-001" (dailyBillNumber.js): the next number for the bill's date.
+    const invoiceNo = await assignBillNo(client, {
+      saleId: sale.id,
+      dateKey: toDateKey(sale.sale_date),
+      fallback: `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`,
+    });
     await insertSaleCharges(client, sale.id, resolvedCharges.lines);
     await recordManualDiscountDecision(client, {
       saleId: sale.id,

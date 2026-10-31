@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager};
 use crate::entitlement::{self, EntitlementState};
 use crate::machine_identity::{self, AnchorOutcome, AnchorWritePolicy, MachineContext};
 
-const CURRENT_SCHEMA_VERSION: &str = "030_dedupe_cached_sale_copies";
+const CURRENT_SCHEMA_VERSION: &str = "031_local_bill_no";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -40,6 +40,7 @@ const MIGRATION_027: &str = include_str!("../migrations/sqlite/027_product_pos_s
 const MIGRATION_028: &str = include_str!("../migrations/sqlite/028_combos.sql");
 const MIGRATION_029: &str = include_str!("../migrations/sqlite/029_frooz_pack.sql");
 const MIGRATION_030: &str = include_str!("../migrations/sqlite/030_dedupe_cached_sale_copies.sql");
+const MIGRATION_031: &str = include_str!("../migrations/sqlite/031_local_bill_no.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -2006,6 +2007,9 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
     let customer_id = optional_text(&customer, "account_id").or_else(|| optional_text(&customer, "customer_id"));
     let customer_name = optional_text(&customer, "name");
     let customer_mobile = optional_text(&customer, "mobile");
+    // The human bill number the POS printed ("311026-001"). Not an identity — `offline_invoice_ref`
+    // stays the replay key — and absent or blank is stored as NULL, never as a made-up number.
+    let bill_no = optional_text(&sale, "bill_no");
     // Validated before anything is written. A charge that could not price itself must stop the sale
     // here and be shown to the cashier, not land on the bill as a zero — see `normalise_sale_charges`.
     let (charge_lines, other_charges_amount) = normalise_sale_charges(&sale)?;
@@ -2035,9 +2039,9 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
             customer_name, customer_mobile, bill_date, bill_datetime, payment_mode,
             gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
             taxable_amount, mandi_tax_rate, mandi_tax_basis, tax_config_snapshot,
-            status, sync_status, entity_version, created_at, updated_at
+            status, sync_status, entity_version, created_at, updated_at, bill_no
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?18, ?19, ?20, 'COMPLETED', 'pending', ?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                   ?17, ?18, ?19, ?20, 'COMPLETED', 'pending', ?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?22)",
         params![
             invoice_id,
             offline_ref,
@@ -2060,6 +2064,7 @@ fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Resul
             mandi_tax_basis,
             tax_config_snapshot,
             entity_version,
+            bill_no,
         ],
     )
     .map_err(to_error)?;
@@ -4757,7 +4762,7 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
                     sync_status, server_invoice_no, server_sale_id, entity_version, created_at,
                     updated_at, edit_reason, cancellation_reason, cancelled_by, cancelled_at, base_version,
                     taxable_amount, mandi_tax_rate, mandi_tax_basis, tax_config_snapshot,
-                    other_charges_amount
+                    other_charges_amount, bill_no
              FROM local_pos_invoices WHERE id = ?1",
             [invoice_id],
             |row| {
@@ -4799,6 +4804,8 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
                     // the invoice row, while the lines below are read from `local_sale_charges` —
                     // the two are written together by `write_sale_charges` and never apart.
                     "other_charges_amount": row.get::<_, f64>(32)?,
+                    // The human bill number ("311026-001"); null on a bill that never had one.
+                    "bill_no": row.get::<_, Option<String>>(33)?,
                 }))
             },
         )
@@ -5526,6 +5533,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "028_combos", MIGRATION_028)?;
     apply_migration(&mut conn, "029_frooz_pack", MIGRATION_029)?;
     apply_migration(&mut conn, "030_dedupe_cached_sale_copies", MIGRATION_030)?;
+    apply_migration(&mut conn, "031_local_bill_no", MIGRATION_031)?;
     if first_open_in_this_process(path) {
         release_interrupted_syncing_at(&conn)?;
     }
@@ -6590,12 +6598,12 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
                     status, sync_status, server_invoice_no, server_sale_id, entity_version,
                     created_at, updated_at, synced_at,
-                    cancelled_at, cancelled_by, cancellation_reason
+                    cancelled_at, cancelled_by, cancellation_reason, bill_no
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14, ?15, ?16, ?17, 'synced', ?18, ?19, ?20,
                     COALESCE(?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                    ?23, ?24, ?25
+                    ?23, ?24, ?25, ?26
                  )
                  ON CONFLICT(id) DO UPDATE SET
                     customer_id = excluded.customer_id,
@@ -6619,7 +6627,10 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     cancelled_at = COALESCE(local_pos_invoices.cancelled_at, excluded.cancelled_at),
                     cancelled_by = COALESCE(local_pos_invoices.cancelled_by, excluded.cancelled_by),
-                    cancellation_reason = COALESCE(local_pos_invoices.cancellation_reason, excluded.cancellation_reason)
+                    cancellation_reason = COALESCE(local_pos_invoices.cancellation_reason, excluded.cancellation_reason),
+                    -- A list row that does not carry the bill number says nothing about it; the
+                    -- number this counter printed stays.
+                    bill_no = COALESCE(excluded.bill_no, local_pos_invoices.bill_no)
                  -- A bill with an operation still on its way to the cloud is newer here than in the
                  -- cloud's list: an offline edit or cancel not yet pushed. Overwriting it with the
                  -- cloud's totals and calling it synced reverted the edit on screen and hid that it
@@ -6660,6 +6671,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     optional_text(sale, "cancelled_at"),
                     optional_text(sale, "cancelled_by"),
                     optional_text(sale, "cancellation_reason"),
+                    optional_text(sale, "bill_no"),
                 ],
             )
             .map_err(to_error)?;
@@ -7324,7 +7336,7 @@ fn load_reference_snapshot_at(
             .prepare(
                 "SELECT id, offline_invoice_ref, bill_date, bill_datetime, customer_name, customer_mobile,
                         payment_mode, gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
-                        status, sync_status, server_invoice_no, created_at, other_charges_amount
+                        status, sync_status, server_invoice_no, created_at, other_charges_amount, bill_no
                  FROM local_pos_invoices
                  ORDER BY datetime(created_at) DESC, id DESC",
             )
@@ -7356,6 +7368,9 @@ fn load_reference_snapshot_at(
                     // of its total was charges rather than fruit, and so that a bill list and a
                     // reopened bill agree about it.
                     "other_charges_amount": row.get::<_, f64>(16)?,
+                    // Beside `offline_invoice_ref`, not in place of `invoice_no`: which number a
+                    // screen shows is the frontend's choice. Null on a bill that never had one.
+                    "bill_no": row.get::<_, Option<String>>(17)?,
                 }))
             })
             .map_err(to_error)?;
@@ -8905,6 +8920,9 @@ fn apply_pulled_pos_sale_with_tx(
     };
     let server_sale_id = optional_text(payload, "id");
     let server_invoice_no = optional_text(payload, "invoice_no");
+    // Absent or blank keeps the number this device already holds (COALESCE below): a pulled change
+    // that does not mention the bill number must not erase the one the counter printed.
+    let bill_no = optional_text(payload, "bill_no");
 
     if let Some(local_version) = existing_version {
         if incoming_version >= local_version {
@@ -8916,7 +8934,8 @@ fn apply_pulled_pos_sale_with_tx(
                      server_sale_id = COALESCE(?4, server_sale_id),
                      entity_version = ?5,
                      updated_at = COALESCE(?6, updated_at),
-                     synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     bill_no = COALESCE(?7, bill_no)
                  WHERE id = ?1",
                 params![
                     change.entity_id,
@@ -8925,6 +8944,7 @@ fn apply_pulled_pos_sale_with_tx(
                     server_sale_id,
                     incoming_version,
                     change.updated_at,
+                    bill_no,
                 ],
             )
             .map_err(to_error)?;
@@ -8980,11 +9000,12 @@ fn apply_pulled_pos_sale_with_tx(
             customer_name, customer_mobile, bill_date, bill_datetime, payment_mode,
             gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
             status, sync_status, server_invoice_no, server_sale_id, entity_version,
-            created_at, updated_at, synced_at
+            created_at, updated_at, synced_at, bill_no
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16, ?17, 'synced', ?18, ?19, ?20,
-            COALESCE(?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            COALESCE(?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            ?23
          )",
         params![
             change.entity_id,
@@ -9009,6 +9030,7 @@ fn apply_pulled_pos_sale_with_tx(
             incoming_version,
             optional_text(payload, "created_at"),
             change.updated_at,
+            bill_no,
         ],
     )
     .map_err(to_error)?;
@@ -10193,7 +10215,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 29;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 30;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -19224,6 +19246,218 @@ mod tests {
             .query_row("SELECT COUNT(*), COALESCE(SUM(seen_count), 0) FROM local_unapplied_changes", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((rows, seen), (1, 1), "nothing new is recorded and the old row is not retried");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    fn sale_with_bill_no(invoice: &str, bill_no: Option<&str>) -> serde_json::Value {
+        let mut sale = sale_on_lot(invoice, &format!("lot-{invoice}"), "product-test", 1.0, "2026-10-31");
+        if let Some(bill_no) = bill_no {
+            sale["bill_no"] = serde_json::json!(bill_no);
+        }
+        sale
+    }
+
+    fn sales_history_bill_no(path: &Path, invoice: &str) -> serde_json::Value {
+        let snapshot = load_reference_snapshot_at(path, None, Some("device-test")).expect("snapshot");
+        snapshot["sales_history"]
+            .as_array()
+            .expect("sales history")
+            .iter()
+            .find(|row| row["id"] == invoice)
+            .expect("the bill is in the sales history")["bill_no"]
+            .clone()
+    }
+
+    fn stored_bill_no(path: &Path, invoice: &str) -> serde_json::Value {
+        let conn = Connection::open(path).unwrap();
+        load_invoice_snapshot(&conn, invoice).expect("load the bill")["invoice"]["bill_no"].clone()
+    }
+
+    /// The human bill number the POS sends is stored and read back from every place a bill is
+    /// read: the bill itself, the date-range list, and the reference snapshot's sales history.
+    #[test]
+    fn a_sale_saved_with_a_bill_no_returns_it_from_load_and_every_list() {
+        let path = polish_path("bill-no-saved");
+        initialize_at(&path).unwrap();
+        let result = complete_local_pos_sale_at(&path, sale_with_bill_no("inv-bill-1", Some("311026-001"))).unwrap();
+        assert_eq!(result.invoice["bill_no"], "311026-001", "the outbox payload carries it to the cloud");
+        assert_eq!(result.invoice["offline_invoice_ref"], "OFF-inv-bill-1", "the replay key is untouched");
+
+        assert_eq!(stored_bill_no(&path, "inv-bill-1"), "311026-001");
+        let listed = list_local_pos_sales_between_at(&path, "2026-10-31", "2026-10-31").unwrap();
+        let row = listed.iter().find(|sale| sale["invoice"]["id"] == "inv-bill-1").expect("listed");
+        assert_eq!(row["invoice"]["bill_no"], "311026-001");
+        assert_eq!(row["invoice"]["offline_invoice_ref"], "OFF-inv-bill-1");
+        assert_eq!(sales_history_bill_no(&path, "inv-bill-1"), "311026-001");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// No number, or a blank one, is NULL — never an empty string and never a made-up number.
+    #[test]
+    fn a_sale_saved_without_a_bill_no_returns_null() {
+        let path = polish_path("bill-no-absent");
+        initialize_at(&path).unwrap();
+        complete_local_pos_sale_at(&path, sale_with_bill_no("inv-bill-none", None)).unwrap();
+        complete_local_pos_sale_at(&path, sale_with_bill_no("inv-bill-blank", Some("   "))).unwrap();
+        for invoice in ["inv-bill-none", "inv-bill-blank"] {
+            assert!(stored_bill_no(&path, invoice).is_null(), "{invoice} has no bill number");
+            assert!(sales_history_bill_no(&path, invoice).is_null(), "{invoice} has no bill number in the history");
+            let listed = list_local_pos_sales_between_at(&path, "2026-10-31", "2026-10-31").unwrap();
+            let row = listed.iter().find(|sale| sale["invoice"]["id"] == invoice).expect("listed");
+            assert!(row["invoice"]["bill_no"].is_null());
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pulled change or a cached cloud list row that does not mention the bill number must not
+    /// erase the one the counter printed. Each update is checked to have actually run (it carries
+    /// the cloud invoice number), so the number surviving is the COALESCE, not a skipped write.
+    #[test]
+    fn a_later_pull_or_cached_copy_without_a_bill_no_keeps_the_stored_one() {
+        let path = polish_path("bill-no-kept");
+        initialize_at(&path).unwrap();
+        complete_local_pos_sale_at(&path, sale_with_bill_no("inv-bill-kept", Some("311026-002"))).unwrap();
+        accept(&path, "op-inv-bill-kept");
+
+        // The pulled-change path, for a bill this counter already holds.
+        let pulled = |entity_id: &str, version: i64, payload: serde_json::Value| PulledChange {
+            change_id: serde_json::json!(version),
+            branch_id: Some(1),
+            entity_type: "pos_sale".to_string(),
+            entity_id: entity_id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(version),
+            payload,
+            updated_at: Some("2026-10-31T12:00:00.000Z".to_string()),
+        };
+        let apply = |change: &PulledChange| {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            apply_change_with_tx(&tx, change).expect("apply pulled sale");
+            tx.commit().unwrap();
+        };
+        apply(&pulled("inv-bill-kept", 2, serde_json::json!({ "id": 900, "invoice_no": "FZ-900", "status": "COMPLETED" })));
+        let conn = Connection::open(&path).unwrap();
+        let (bill_no, invoice_no): (Option<String>, Option<String>) = conn
+            .query_row("SELECT bill_no, server_invoice_no FROM local_pos_invoices WHERE id = 'inv-bill-kept'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        drop(conn);
+        assert_eq!(invoice_no.as_deref(), Some("FZ-900"), "the pulled update ran");
+        assert_eq!(bill_no.as_deref(), Some("311026-002"), "and kept the bill number");
+
+        // The cached cloud sales list (GET /sales rows in the reference snapshot).
+        let snapshot = serde_json::json!({
+            "branch_context": { "branch_id": "1", "branch_name": "Main" },
+            "device_identity": { "device_id": "device-test", "device_name": "Device Test" },
+            "products": [],
+            "categories": [],
+            "inventory_lots": [],
+            "customers": [],
+            "sales_history": [{
+                "id": 900,
+                "global_id": "inv-bill-kept",
+                "invoice_no": "FZ-900-B",
+                "sale_date": "2026-10-31",
+                "payment_mode": "CASH",
+                "gross_amount": 10,
+                "total_amount": 10,
+                "created_at": "2026-10-31T10:00:00.000Z"
+            }],
+            "settings_bundle": {}
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache the cloud list");
+        let conn = Connection::open(&path).unwrap();
+        let (bill_no, invoice_no): (Option<String>, Option<String>) = conn
+            .query_row("SELECT bill_no, server_invoice_no FROM local_pos_invoices WHERE id = 'inv-bill-kept'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        drop(conn);
+        assert_eq!(invoice_no.as_deref(), Some("FZ-900-B"), "the cached copy's update ran");
+        assert_eq!(bill_no.as_deref(), Some("311026-002"), "and kept the bill number");
+
+        // A bill first seen through a pull keeps the number it arrived with, through a later
+        // version that sends it blank.
+        apply(&pulled("remote-bill-1", 1, serde_json::json!({
+            "id": 901,
+            "offline_invoice_ref": "REMOTE-OFF-901",
+            "branch_id": 1,
+            "bill_no": "311026-004",
+            "sale_date": "2026-10-31",
+            "payment_mode": "CASH",
+            "total_amount": 30
+        })));
+        assert_eq!(stored_bill_no(&path, "remote-bill-1"), "311026-004");
+        apply(&pulled("remote-bill-1", 2, serde_json::json!({ "id": 901, "bill_no": "", "invoice_no": "FZ-901" })));
+        assert_eq!(stored_bill_no(&path, "remote-bill-1"), "311026-004");
+        assert_eq!(sales_history_bill_no(&path, "remote-bill-1"), "311026-004");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Migration 031 upgrades a real 030 profile once: existing bills read a NULL bill number and
+    /// are otherwise untouched, and restarts (which run the whole migration set again) do not fail
+    /// on the column already being there.
+    #[test]
+    fn migration_031_adds_bill_no_once_and_survives_restarts() {
+        let path = polish_path("migration-031");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            apply_migrations_through_023(&mut conn);
+            for (version, sql) in [
+                ("024_other_charges", MIGRATION_024),
+                ("025_device_machine_fingerprint", MIGRATION_025),
+                ("026_sync_outbox_entity_and_deferred_lots", MIGRATION_026),
+                ("027_product_pos_section", MIGRATION_027),
+                ("028_combos", MIGRATION_028),
+                ("029_frooz_pack", MIGRATION_029),
+                ("030_dedupe_cached_sale_copies", MIGRATION_030),
+            ] {
+                apply_migration(&mut conn, version, sql).expect("apply pre-031 migration");
+            }
+            conn.execute(
+                "INSERT INTO local_pos_invoices (id, offline_invoice_ref, branch_id, device_id, bill_date, bill_datetime, payment_mode, net_total)
+                 VALUES ('inv-pre-031', 'REF-pre-031', '1', 'device-test', '2026-10-30', '2026-10-30T10:00', 'CASH', 20)",
+                [],
+            )
+            .unwrap();
+        }
+        initialize_at(&path).expect("upgrade to 031");
+        simulate_restart(&path);
+        initialize_at(&path).expect("restart with the upgraded profile");
+        initialize_at(&path).expect("and again");
+        {
+            // The gate itself: a second apply of the same version is a no-op, not a duplicate column.
+            let mut conn = Connection::open(&path).unwrap();
+            apply_migration(&mut conn, "031_local_bill_no", MIGRATION_031).expect("031 applies once");
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let (applied, total): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE version = '031_local_bill_no'),
+                    (SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((applied, total), (1, EXPECTED_APPLIED_MIGRATIONS));
+        assert_eq!(status_at(&path).expect("status").schema_version, CURRENT_SCHEMA_VERSION);
+        let columns: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('local_pos_invoices') WHERE name = 'bill_no'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(columns, 1);
+        let (bill_no, reference, total_amount): (Option<String>, String, f64) = conn
+            .query_row(
+                "SELECT bill_no, offline_invoice_ref, net_total FROM local_pos_invoices WHERE id = 'inv-pre-031'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((bill_no, reference.as_str(), total_amount), (None, "REF-pre-031", 20.0));
         drop(conn);
         let _ = fs::remove_file(&path);
     }

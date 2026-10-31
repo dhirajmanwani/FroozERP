@@ -735,7 +735,7 @@ test("POS checkout asks for approval before billing, sends the approval with the
   comesBefore(checkoutBody, "resolvePosDiscountApprovalRoute(", "completeLocalPosSale(localSale)");
   comesBefore(checkoutBody, "openDiscountApproval(", "axios.post(`${API_URL}/api/v3/sales`");
   // The approval id and the reference it was issued for travel with both kinds of bill.
-  assert.match(checkoutBody, /buildLocalSalePayload\(\{ payments, selectedBillDate, billDateTime: effectiveBillDateTime, dateOverrideReason, operationId: saleRef, discountApprovalId \}\)/);
+  assert.match(checkoutBody, /buildLocalSalePayload\(\{ payments, selectedBillDate, billDateTime: effectiveBillDateTime, dateOverrideReason, operationId: saleRef, discountApprovalId, billNo \}\)/);
   assert.match(checkoutBody, /discount_approval_id: discountApprovalId \} : \{\}\),\n\s*\}, saleRef\);/);
   // A 403 DISCOUNT_APPROVAL_REQUIRED opens the dialog instead of an alert.
   assert.match(checkoutBody, /readDiscountApprovalRequired\(error\.response\?\.status, responseData\)/);
