@@ -243,6 +243,8 @@
      two edges, 16px gaps) messy. The edge itself is --line: visible, but a hairline. */
   --radius-card: 14px;
   --module-gap: 24px;
+  /* The side menu's width at Medium text; index.css widens it for Large and Extra Large. */
+  --sidebar-width: 252px;
   --radius-pill: 999px;
   --shadow-card: 0 1px 2px var(--shadow-faint), 0 8px 24px var(--shadow-faint);
   /* One height scale for every control: inputs and ordinary buttons share the tall step, row

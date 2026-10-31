@@ -30,11 +30,13 @@
 }
 
 :root[data-app-font-size="large"] {
-  --font-scale: 1.15;
+  --font-scale: 1.15;  /* The side menu grows with its text, so a module name keeps one line (Sidebar, App.css). */
+  --sidebar-width: 276px;
 }
 
 :root[data-app-font-size="extra-large"] {
-  --font-scale: 1.3;
+  --font-scale: 1.3;  /* The side menu grows with its text, so a module name keeps one line (Sidebar, App.css). */
+  --sidebar-width: 304px;
 }
 
 * {

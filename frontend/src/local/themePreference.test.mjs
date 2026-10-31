@@ -908,3 +908,21 @@ test("every module on a screen shares one frame and one gap", () => {
   assert.notEqual(lightTokens.get("--nav-rule"), lightTokens.get("--panel"), "the rule must differ from the panel it sits on");
   assert.match(ruleFor(".nav-item"), /white-space: nowrap/, "a module name stays on one line");
 });
+
+test("the side menu keeps its breathing room at every text size", () => {
+  // 31 Oct 2026, the owner: at Extra Large the module names sat in fixed 36px (31px on a short
+  // screen) rows and the longer ones were cut to "Waste Manag...". Rows, gaps and padding now
+  // grow with --font-scale and the menu widens, while Medium stays exactly as it was.
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const indexCss = readFileSync(new URL("../index.css", import.meta.url), "utf8");
+  const navItem = appCss.slice(appCss.indexOf(".nav-item {\n  position: relative;"));
+  const rule = navItem.slice(0, navItem.indexOf("}"));
+  assert.match(rule, /min-height: max\(36px, calc\(33px \* var\(--font-scale, 1\)\)\);/);
+  assert.match(rule, /gap: calc\(8px \* var\(--font-scale, 1\)\);/);
+  assert.match(appCss, /min-height: max\(31px, calc\(29px \* var\(--font-scale, 1\)\)\);/, "the short-screen row grows too");
+  assert.match(appCss, /\.sidebar \{[^}]*width: var\(--sidebar-width, 252px\);/s);
+  assert.match(appCss, /\.content-shell \{[^}]*margin-left: var\(--sidebar-width, 252px\);/s, "the page moves over with the menu");
+  assert.match(indexCss, /\[data-app-font-size="large"\] \{[^}]*--sidebar-width: 276px;/s);
+  assert.match(indexCss, /\[data-app-font-size="extra-large"\] \{[^}]*--sidebar-width: 304px;/s);
+  assert.ok(lightTokens.has("--sidebar-width"), "Medium's width is a light-theme token");
+});
