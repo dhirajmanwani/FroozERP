@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./syncRefreshPolicy.js";
+import { shouldRefreshAfterSync, shouldSyncAfterLocalSale, shouldSyncAfterPurchaseSave } from "./syncRefreshPolicy.js";
 
 test("a completed pull refreshes the screens even when the push failed", () => {
   assert.equal(shouldRefreshAfterSync({ lastError: "push refused", pullCompleted: true }), true);
@@ -26,4 +26,21 @@ test("App wires both, after the queued-offline branch has returned", () => {
   assert.ok(queuedReturn > 0 && sync > queuedReturn, "the sync belongs to the online path only");
   assert.ok(sync < save.indexOf('"Stock Arrival Saved - Bill Pending"'), "started before the success message, not awaited");
   assert.doesNotMatch(save.slice(sync - 20, sync), /await /);
+});
+
+test("a desktop bill saved to SQLite starts an immediate sync; nothing else does", () => {
+  assert.equal(shouldSyncAfterLocalSale({ tauriRuntime: true, localSale: { id: "s1" } }), true);
+  assert.equal(shouldSyncAfterLocalSale({ tauriRuntime: true, localSale: null }), false);
+  assert.equal(shouldSyncAfterLocalSale({ tauriRuntime: false, localSale: { id: "s1" } }), false);
+});
+
+test("App starts that sync after the shelf is updated, without waiting for it", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf("if (result?.localSale) {");
+  const block = app.slice(start, app.indexOf("return;", start));
+  const shelf = block.indexOf("setPosShelf(");
+  const sync = block.indexOf("runSyncNow({ force: true })");
+  assert.ok(shelf > 0 && sync > shelf, "the sync follows the shelf update");
+  assert.match(block, /shouldSyncAfterLocalSale\(\{ tauriRuntime: isTauriRuntime\(\), localSale: result\.localSale \}\)/);
+  assert.doesNotMatch(block.slice(sync - 20, sync), /await /);
 });

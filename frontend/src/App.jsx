@@ -92,6 +92,7 @@ import { describeLocalServiceFailure } from "./local/localServiceFailure";
 import { autoConnectivityBlockedReason as resolveAutoConnectivityBlockedReason } from "./local/autoConnectivityAvailability";
 import { clearOfflineFailures, offlineLockCountdownMessage, readOfflineLockState, registerOfflineFailure } from "./local/offlineLoginLockout";
 import { mayOpenOfflineSession } from "./local/offlineSessionEligibility";
+import { decideOfflineSessionUpgrade, resolveOfflineSessionUpgrade } from "./local/offlineSessionUpgrade";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -331,7 +332,7 @@ import { buildLocalOnlyReportsData, reportFlagsAfterServerLoad, resolveReportAva
 import { UNKNOWN_FIGURE, briefingCardFigure, customerDueCard, formatKnownFigure, insightCardValue, formatChartRupees, pickDashboardMetric, presentSignedFigure, unavailableBriefingNote } from "./local/figurePresentation";
 import { UPI_BANK_PAYMENT_MODES, dayBookVoucherLabel, paymentReportTotals, saleGrossAmount, salesHistoryMoneyTotals } from "./local/salesReportTotals";
 import { checkoutFingerprint, heldApprovalFor, resolveCheckoutRef } from "./local/checkoutRetry";
-import { shouldRefreshAfterSync, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
+import { shouldRefreshAfterSync, shouldSyncAfterLocalSale, shouldSyncAfterPurchaseSave } from "./local/syncRefreshPolicy";
 import { SCALE_STATES, createSteadiness, describeScale, findScalePort, formatKg, isWeighedUnit, nextSteadiness, readSavedScalePort, saveScalePort, scaleLineQuantity, scaleQuantityFor, scaleTargetLine } from "./local/weighingScale";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
@@ -7804,6 +7805,113 @@ function App() {
     }
   };
 
+  // A sign-in made while the cloud was down is an offline session with no cloud token, and nothing
+  // used to turn it back into a cloud session: that computer stopped syncing (every cycle 401) and
+  // kept stock another computer had already sold, until somebody signed out and back in (owner,
+  // 8 Nov 2026). Retried here with the password typed at sign-in, once the cloud answers and no bill
+  // is open. The rules are in local/offlineSessionUpgrade.js; Local Only makes no call at all.
+  const posWorkRef = useRef(posWork);
+  posWorkRef.current = posWork;
+  const offlineUpgradeRef = useRef({ inFlight: false, refused: false, lastAttemptAt: 0 });
+  const upgradeOfflineSession = async () => {
+    const state = offlineUpgradeRef.current;
+    const offlineUser = userRef.current;
+    const decision = decideOfflineSessionUpgrade({
+      user: offlineUser,
+      localOnly: isLocalOnlyConnectivitySelected(),
+      cloudConfigured: Boolean(AUTH_API_URL),
+      hasPassword: Boolean(password),
+      billInProgress: posWorkRef.current.cartLines > 0 || posWorkRef.current.saving === true,
+      inFlight: state.inFlight,
+      refused: state.refused,
+      lastAttemptAt: state.lastAttemptAt,
+    });
+    if (!decision.attempt) return decision.reason;
+    const cloudLoginGate = guardCloudCall("canonical-cloud-login", AUTH_API_URL);
+    if (!cloudLoginGate.allowed) return cloudLoginGate.code;
+    state.inFlight = true;
+    state.lastAttemptAt = Date.now();
+    try {
+      const health = await checkBackendHealth(AUTH_API_URL, {
+        details: true,
+        timeoutMs: 5000,
+        force: true,
+        reason: "offline-session-upgrade",
+        requireCloudIdentity: usesCloudBackend(),
+      });
+      if (!health.online) return "STILL_OFFLINE";
+      const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
+      let result;
+      try {
+        const response = await axios.post(`${AUTH_API_URL}/login`, {
+          username: username.trim() || String(offlineUser?.username || ""),
+          password,
+          ...latestDevice,
+        }, { timeout: 8000 });
+        result = resolveOfflineSessionUpgrade({ offlineUser, response });
+      } catch (error) {
+        result = resolveOfflineSessionUpgrade({ offlineUser, error });
+      }
+      writeDiagnosticLog(result.outcome === "UPGRADED" ? "INFO" : "WARN", "offline-session-upgrade", {
+        outcome: result.outcome,
+        deviceId: latestDevice.device_id,
+      });
+      if (result.outcome === "STILL_OFFLINE") return result.outcome;
+      // Someone signed out or in while the request was out: that answer is for a session gone.
+      if (userRef.current !== offlineUser) return "SESSION_CHANGED";
+      if (result.outcome !== "UPGRADED") {
+        state.refused = true;
+        notify({
+          severity: NOTIFICATION_SEVERITY.WARNING,
+          title: "This computer is not syncing",
+          message: result.message,
+          source: "Sync",
+          dedupeKey: "offline-session-upgrade-refused",
+          sticky: true,
+        });
+        return result.outcome;
+      }
+      mergeCloudIdentityIntoSavedConfig({
+        ...result.user,
+        device_id: latestDevice.device_id,
+        device_name: latestDevice.device_name,
+        cloud_api_url: CLOUD_API_URL,
+      });
+      // The ref first, as in login(): the request interceptor reads it, and the sync that follows
+      // must go out under the new token.
+      userRef.current = result.user;
+      setUser(result.user);
+      setOfflineMode(false);
+      await registerCloudDevice(result.user, latestDevice).catch((error) => {
+        writeDiagnosticLog("WARN", "offline-session-upgrade-register-failed", describeRequestFailure(error));
+      });
+      notify({
+        severity: NOTIFICATION_SEVERITY.INFO,
+        title: "Cloud is back",
+        message: result.message,
+        source: "Sync",
+        dedupeKey: "offline-session-upgraded",
+      });
+      return result.outcome;
+    } finally {
+      state.inFlight = false;
+    }
+  };
+  const upgradeOfflineSessionRef = useRef(upgradeOfflineSession);
+  upgradeOfflineSessionRef.current = upgradeOfflineSession;
+  useEffect(() => {
+    if (user?.offline_session !== true) return undefined;
+    // A new offline session starts with a clean slate; the first try waits a minute, because the
+    // sign-in that opened it has just found the cloud unreachable.
+    offlineUpgradeRef.current = { inFlight: false, refused: false, lastAttemptAt: Date.now() };
+    const timer = window.setInterval(() => {
+      upgradeOfflineSessionRef.current().catch((error) => {
+        writeDiagnosticLog("WARN", "offline-session-upgrade-failed", describeRequestFailure(error));
+      });
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [user?.offline_session, user?.id]);
+
   const activateDevice = async () => {
     if (!activationCode.trim()) {
       alert("Enter activation code.");
@@ -11204,6 +11312,12 @@ function App() {
                   });
                   setInventory(takeSold);
                   setPosShelf((shelf) => ({ ...shelf, inventoryLots: takeSold(shelf.inventoryLots) }));
+                  // Send the bill now, so another computer's stock follows within its next pull
+                  // instead of waiting for this one's minute too. Not awaited; Local Only refuses
+                  // inside runSyncNow (local/syncRefreshPolicy.js).
+                  if (shouldSyncAfterLocalSale({ tauriRuntime: isTauriRuntime(), localSale: result.localSale })) {
+                    runSyncNow({ force: true }).catch(() => null);
+                  }
                   await refreshSyncStatus();
                   return;
                 }

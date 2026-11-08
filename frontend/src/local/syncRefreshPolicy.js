@@ -10,7 +10,12 @@
  *    learns of it at the next background cycle — up to a minute later. A desktop save now starts a
  *    sync straight away.
  *
- * LOCAL_ONLY is untouched by both: `runSyncNow` refuses there before any request, and `syncNow`
+ * 3. A bill made on a counter waited for that counter's next background cycle (up to a minute) before
+ *    the cloud heard of it, and another computer pulls on its own minute after that, so the other
+ *    computer's stock lagged by up to two minutes (owner, 8 Nov 2026: "proper clouding"). A desktop
+ *    bill saved to this computer's SQLite now starts a sync straight away, not awaited.
+ *
+ * LOCAL_ONLY is untouched by all three: `runSyncNow` refuses there before any request, and `syncNow`
  * returns `pullCompleted: false` for it.
  */
 
@@ -21,3 +26,10 @@ export const shouldRefreshAfterSync = (status) => Boolean(status) && (status.pul
  * went to the server (a queued offline save is already in SQLite, and syncs on its own cycle).
  */
 export const shouldSyncAfterPurchaseSave = ({ tauriRuntime = false, queuedOffline = false } = {}) => Boolean(tauriRuntime) && !queuedOffline;
+
+/**
+ * Whether a POS bill should start an immediate sync: on the desktop, and only for a bill saved to
+ * this computer's SQLite (`localSale`). A bill the browser POS wrote straight to the cloud is
+ * already there.
+ */
+export const shouldSyncAfterLocalSale = ({ tauriRuntime = false, localSale = null } = {}) => Boolean(tauriRuntime) && Boolean(localSale);
