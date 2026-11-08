@@ -2195,3 +2195,27 @@ days, another shop, or the wrong action refused from the outbox), `discounts.tes
 lookup), `otherCharges.test.js` and `moneyScope.test.js` (fixtures), `masterDataAuthorization.test.js`
 (guard list gains `getStaffPermissionUser` and `getOwnerUser`).
 
+
+## An offline sign-in turns into a cloud session once the cloud answers (2026-11-08)
+
+**Symptom (owner, 8 Nov 2026).** The cloud was down for a while; a laptop signed in during that time
+and got an offline session, which carries no cloud token. Nothing ever upgraded it, so after the
+cloud came back every sync from that laptop was refused (`401 AUTH_SESSION_REQUIRED POST
+/api/sync/register-device`) and it kept stock another computer had already sold, until somebody
+signed out and in.
+
+**What changed.** While an offline session is open, the app retries the ordinary `POST /login` once
+a minute with the username and password typed at sign-in, and adopts the answer only if it carries a
+device session token for the same user id. Rules in `frontend/src/local/offlineSessionUpgrade.js`.
+
+**Security decisions.**
+- No new credential storage. The typed password was already held in the login form's in-memory state
+  for the life of the window; the retry reads that and nothing else. Nothing is written to disk or to
+  `sessionStorage`.
+- The identity is still the verified token: the retry is a real `/login`, so lockout, device approval
+  and `PASSWORD_RESET_REQUIRED` all apply. A different user id in the answer is refused.
+- A refusal (any 4xx) stops the retries for that session and says so in the bell, so a changed
+  password is never walked into the escalating lockout by a background loop.
+- Local Only makes no call: the decision refuses first and `guardCloudCall("canonical-cloud-login")`
+  refuses again.
+- It waits while a POS bill is open or being saved.
