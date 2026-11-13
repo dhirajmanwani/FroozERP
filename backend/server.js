@@ -98,6 +98,7 @@ const discountRules = require("./discounts");
 const saleReturnRules = require("./saleReturns");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
+  captureChangeFeedWatermark,
   captureReferenceBootstrap,
   lockReferenceBootstrapBoundary,
   readVisibleIncrementalChanges,
@@ -14551,13 +14552,47 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
   const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
   const bootstrapRequested =
     cursor === 0 && cleanText(req.query.bootstrap_protocol) === REFERENCE_BOOTSTRAP_PROTOCOL;
-  if (bootstrapRequested) {
-    if (operationalScopeMode !== SCOPE_MODES.ENFORCE) {
-      return res.status(409).json({
-        code: "OPERATIONAL_SCOPE_REQUIRED",
-        message: "Reference bootstrap requires enforced operational-location scope",
+  if (bootstrapRequested && operationalScopeMode !== SCOPE_MODES.ENFORCE) {
+    /*
+     * No reference bootstrap outside enforce, but no refusal either: start the device's feed.
+     *
+     * This answered 409 OPERATIONAL_SCOPE_REQUIRED until 13 Nov 2026. A device asks for the
+     * bootstrap whenever its cursor is 0, and only a successful pull moves the cursor, so a fresh
+     * or rebuilt desktop was refused on every cycle for ever: no incremental change ever reached
+     * it, the failed cycle skipped the post-sync refresh too, and a Purchase Entry saved on it
+     * reached its POS only after signing out and back in. See `captureChangeFeedWatermark`.
+     *
+     * Same authentication as the incremental pull below, and nothing is sent but a cursor.
+     */
+    const context = await resolveSyncRequestContext(req);
+    if (context.error) return sendOperationalScopeError(res, context.error);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const watermark = await captureChangeFeedWatermark(client);
+      await client.query("COMMIT");
+      await pool.query(
+        "UPDATE authorized_devices SET last_sync_at = CURRENT_TIMESTAMP, sync_status = 'PULLED', updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
+        [context.deviceId]
+      );
+      return res.json({
+        company_id: context.companyId,
+        branch_id: context.branchId,
+        operational_location_id: context.operationalLocationId,
+        changes: [],
+        next_cursor: watermark,
+        ...serverTimePayload(),
+        has_more: false,
       });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("Sync feed start failed", error.message);
+      return res.status(500).json({ message: "Sync pull failed" });
+    } finally {
+      client.release();
     }
+  }
+  if (bootstrapRequested) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");

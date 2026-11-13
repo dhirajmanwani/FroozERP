@@ -49,6 +49,36 @@ const lockReferenceBootstrapBoundary = async (client) => {
   );
 };
 
+const readChangeFeedHighWatermark = async (client) => {
+  const result = await client.query(
+    "SELECT COALESCE(MAX(change_id), 0)::BIGINT AS high_watermark FROM sync_change_log"
+  );
+  return String(result.rows[0]?.high_watermark || 0);
+};
+
+/**
+ * Where a device's incremental feed starts when the cloud has no reference bootstrap to give it.
+ *
+ * The bootstrap is served only under `FROOZERP_OPERATIONAL_SCOPE_MODE=enforce`. Outside it (the
+ * shipped default) the server used to answer a device's bootstrap request with 409 and nothing
+ * else. A device asks for one whenever its cursor is still 0, and only a successful pull or
+ * bootstrap ever moves that cursor, so a fresh or rebuilt desktop asked again on every cycle, was
+ * refused on every cycle, and never pulled a single incremental change. Its stock arrived only
+ * with the snapshot fetched at sign-in (`/inventory` and friends), so a Purchase Entry saved on
+ * that machine reached its POS only after signing out and back in (13 Nov 2026).
+ *
+ * Outside enforce the device's fill *is* that ordinary snapshot -- `freshDeviceOnboarding.js`
+ * says so, and the desktop refreshes it after every successful sync. What it lacks is a place to
+ * start the feed from. This is that place: the newest change id, read under a SHARE lock so that
+ * no writer still holding a lower id can commit after the read and be stepped over. Anything at or
+ * below it is already in the snapshot the device fetches after this pull; everything above it
+ * arrives as an ordinary change. Must be called inside a transaction.
+ */
+const captureChangeFeedWatermark = async (client) => {
+  await client.query("LOCK TABLE sync_change_log IN SHARE MODE");
+  return readChangeFeedHighWatermark(client);
+};
+
 const readVisibleIncrementalChanges = async (client, context, cursor, limit) => {
   const result = await client.query(
     `
@@ -114,10 +144,7 @@ const captureReferenceBootstrap = async (client, context) => {
     throw error;
   }
 
-  const highWatermarkResult = await client.query(
-    "SELECT COALESCE(MAX(change_id), 0)::BIGINT AS high_watermark FROM sync_change_log"
-  );
-  const highWatermark = String(highWatermarkResult.rows[0]?.high_watermark || 0);
+  const highWatermark = await readChangeFeedHighWatermark(client);
 
   const categoriesResult = await client.query(
     `
@@ -303,6 +330,7 @@ const captureReferenceBootstrap = async (client, context) => {
 module.exports = {
   COMPANY_REFERENCE_ENTITY_TYPES,
   REFERENCE_BOOTSTRAP_PROTOCOL,
+  captureChangeFeedWatermark,
   captureReferenceBootstrap,
   lockReferenceBootstrapBoundary,
   readVisibleIncrementalChanges,

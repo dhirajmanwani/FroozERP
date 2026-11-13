@@ -30,9 +30,11 @@ export function approvedDeviceCredentialMessage(errorPayload = {}) {
  *
  * On a device whose SQLite has no profile yet, sign-in first runs `initialPullForApprovedDevice`
  * (the reference bootstrap), then fetches the ordinary reference snapshot (`/products`,
- * `/inventory`, ...) and caches it into SQLite. The bootstrap is refused with 409
+ * `/inventory`, ...) and caches it into SQLite. The bootstrap was refused with 409
  * OPERATIONAL_SCOPE_REQUIRED whenever the cloud is not in `enforce` scope mode -- which is the
- * shipped default, and the only mode the app can run under today. The refusal was thrown straight
+ * shipped default, and the only mode the app can run under today. (Since 13 Nov 2026 the cloud
+ * answers that request with the cursor the device's feed starts from instead; see
+ * `captureChangeFeedWatermark` in backend/syncReferenceBootstrap.js.) The refusal was thrown straight
  * out of sign-in, the snapshot step never ran, and the device was left with no products and no
  * stock. Found 26 Sep 2026 on the first Android phone, whose POS was empty; a new Windows counter
  * would be the same.
