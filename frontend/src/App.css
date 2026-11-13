@@ -10691,7 +10691,7 @@ button.shortcut-sheet-row:focus-visible {
   margin: 0;
   padding: 10px;
   border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
 }
 
 .combo-item-row {
@@ -10773,7 +10773,7 @@ button.shortcut-sheet-row:focus-visible {
   min-width: 0;
   padding: 10px;
   border: 1px solid var(--accent-line-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: var(--accent-wash);
 }
 
@@ -10830,7 +10830,7 @@ button.shortcut-sheet-row:focus-visible {
 }
 
 .packing-rows:focus-visible {
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow: 0 0 0 2px var(--accent-line-strong);
 }
 
@@ -10840,7 +10840,7 @@ button.shortcut-sheet-row:focus-visible {
   gap: 8px;
   min-width: 0;
   border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: var(--card);
 }
 
@@ -10908,8 +10908,8 @@ button.shortcut-sheet-row:focus-visible {
 }
 
 .packing-purchase-table th:nth-child(1) { width: auto; }
-.packing-purchase-table th:nth-child(2) { width: 100px; }
-.packing-purchase-table th:nth-child(3) { width: 110px; }
+.packing-purchase-table th:nth-child(2) { width: 90px; }
+.packing-purchase-table th:nth-child(3) { width: 90px; }
 .packing-purchase-table th:nth-child(4) { width: 110px; }
 .packing-purchase-table th:nth-child(5) { width: 52px; }
 
@@ -10917,13 +10917,14 @@ button.shortcut-sheet-row:focus-visible {
   width: 100%;
 }
 
+/* The chosen packing reads whole ("Gift Box › Window Box › Grand · 1 kg"), wrapping if it must. */
 .packing-line-pick {
   display: block;
   width: 100%;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  height: auto;
+  overflow-wrap: anywhere;
+  white-space: normal;
   text-align: left;
 }
 
@@ -10937,12 +10938,32 @@ button.shortcut-sheet-row:focus-visible {
   padding-top: 0;
 }
 
+/* Send to another shop: Packing (with the From shop's count under it) → Qty → After sending. */
+.packing-transfer-form .packing-purchase-table th:nth-child(3) { width: 160px; }
+.packing-transfer-form .packing-purchase-table th:nth-child(4) { width: 52px; }
+.packing-transfer-form .packing-line-amount { white-space: normal; }
+
+.discount-form > label.packing-transfer-note { max-width: 640px; }
+.packing-purchase-total.packing-transfer-summary strong { margin-left: 0; }
+
+.packing-line-onhand {
+  display: block;
+  margin-top: 4px;
+}
+
 /* New packing: one row per size -- tick, actual size, cost. */
 .packing-setup-size {
   display: grid;
-  grid-template-columns: 120px minmax(0, 1fr) 140px;
+  grid-template-columns: 120px minmax(0, 1fr) 160px;
   gap: 8px;
   align-items: center;
+}
+
+/* The column names over the size rows: what each box is for. */
+.packing-setup-size-head {
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .packing-path {
@@ -11017,6 +11038,218 @@ button.shortcut-sheet-row:focus-visible {
   }
 }
 .packing-add-here { margin: 10px 0 4px; }
+
+/* ---------------------------------------------------------------------------------------------
+   PEP Pack and PEP Menu polish: wider purchase form, readable tables, steady row buttons.
+   --------------------------------------------------------------------------------------------- */
+
+/* The purchase is a table and a header, not a column of fields: let it use the card. */
+.discount-form.packing-purchase-form {
+  max-width: 960px;
+}
+
+.packing-purchase-head {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3) var(--space-4);
+}
+
+.packing-purchase-head > label {
+  min-width: 0;
+}
+
+.packing-purchase-wide {
+  grid-column: span 2;
+}
+
+.packing-purchase-total {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 16px;
+  margin: 0;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: var(--fill-subtle);
+}
+
+.packing-purchase-total strong {
+  margin-left: auto;
+  color: var(--ink);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The line's picker (and New packing inside it) opens under the line: the table grows with it,
+   never clipped by a scroll box, and its header no longer sticks over the page as it scrolls. */
+:root .packing-purchase-table.table-wrap {
+  max-height: none;
+  overflow: visible;
+}
+
+.packing-purchase-table th {
+  position: static;
+}
+
+/* Extra Large text forces tables to 920px; this one fits its card, so Amount and the trash stay. */
+:root[data-app-font-size] .packing-purchase-table table {
+  min-width: 0;
+}
+
+.packing-count-after {
+  margin: 0;
+}
+
+.packing-count-after strong {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+/* A size's count stays near its name on a wide screen, and Edit / Correct count sit in the same
+   place on every row whether or not Delete is there. */
+.packing-manage-rows .packing-row > button {
+  max-width: 720px;
+}
+
+.packing-manage-rows .packing-row-actions {
+  flex-wrap: nowrap;
+  justify-content: flex-start;
+  min-width: 252px;
+  margin-left: auto;
+}
+
+/* Recent movements wrap rather than scroll sideways at the larger text sizes. */
+.pm-table.packing-movements td {
+  white-space: normal;
+}
+
+.pm-table.packing-movements td:nth-child(4) {
+  white-space: nowrap;
+}
+
+/* At the larger text sizes the fixed columns would starve Items; let the table size itself. */
+:root[data-app-font-size="large"] .combo-table table,
+:root[data-app-font-size="extra-large"] .combo-table table {
+  table-layout: auto;
+}
+
+/* Two buttons in one cell are two buttons, not one. */
+.discount-actions-cell > * + * {
+  margin-left: 6px;
+}
+
+/* "Add item", "Add packing", "Add line": a button, not a full-width bar. */
+.combo-items > .compact-button {
+  justify-self: start;
+}
+
+/* Fieldset legends in these forms read as the section headings they are. */
+.combo-form legend {
+  padding: 0 4px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.combo-on-sale {
+  justify-self: start;
+}
+
+/* A box with a problem after Save: a red edge, and aria-invalid for a screen reader. */
+.combo-form :is(input, select)[aria-invalid="true"] {
+  border-color: var(--danger-ink);
+  box-shadow: 0 0 0 1px var(--danger-ink);
+}
+
+/* Column names over the packing rows. */
+.combo-row-head {
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.combo-pricing > label {
+  max-width: 320px;
+}
+
+.combo-pricing-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 260px));
+  gap: var(--space-3) var(--space-4);
+}
+
+/* The worked example is the answer to "what will the customer pay?": it stands out. */
+.combo-example {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-line-strong);
+  border-radius: var(--radius-md);
+  background: var(--accent-wash);
+  color: var(--ink-body);
+  font-size: 13px;
+}
+
+.combo-example strong {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+#combo-form,
+#combo-notice,
+#pack-node-form,
+#pack-adjust-form,
+#pack-setup-form,
+#pack-transfer-form,
+#pack-notice {
+  scroll-margin-top: 88px;
+}
+
+/* PEP Menu's four tables: the same columns in each, wrapping text instead of scrolling sideways. */
+.combo-table table {
+  table-layout: fixed;
+}
+
+.combo-table th:nth-child(1) { width: 22%; }
+.combo-table th:nth-child(2) { width: 17%; }
+.combo-table th:nth-child(3) { width: auto; }
+.combo-table th:nth-child(4) { width: calc(104px * var(--font-scale, 1)); }
+.combo-table th:nth-child(5) { width: calc(236px * var(--font-scale, 1)); }
+
+.pm-table.combo-table td {
+  overflow-wrap: break-word;
+  white-space: normal;
+}
+
+.pm-table.combo-table td.discount-actions-cell {
+  white-space: nowrap;
+}
+
+.pm-table.combo-table td.empty-cell {
+  white-space: normal;
+}
+
+/* A switched-off combo looks switched off: the row fades, its buttons stay clear. */
+.combo-table tr.combo-row-off > td:not(.discount-actions-cell) {
+  opacity: 0.62;
+}
+
+.combo-empty .cart-empty {
+  margin: 0;
+}
+
+@media (max-width: 760px) {
+  .packing-purchase-head {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .packing-manage-rows .packing-row-actions {
+    min-width: 0;
+    margin-left: 0;
+  }
+}
 /* The keys hint on its own line under the button, not run into it. */
 .packing-browser > small.form-note { display: block; margin-top: 6px; }
 

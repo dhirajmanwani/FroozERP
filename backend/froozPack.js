@@ -20,6 +20,10 @@
  *   stored and replayed forever -- so anything odd is skipped and written to the bill's audit trail,
  *   and a database failure is contained in a savepoint. A count may go negative.
  * - Cancelling a bill puts its packing back once (`restoreSalePacking`).
+ * - The Owner or an Admin can send packing from one shop of the company to another
+ *   (`recordPackingTransfer`): never more than the source has on hand, all lines or none, one
+ *   TRANSFER_OUT movement at the source and one TRANSFER_IN at the destination per size, and both
+ *   shops' counts published. Each shop can also still buy its own.
  * - Packing cost never enters a sale's cost or profit: it was expensed when it was bought.
  *
  * ## Sync
@@ -44,7 +48,12 @@ const PACKING_SIZE_NAMES = Object.freeze(["PETITE", "CLASSIC", "GRAND", "ROYAL"]
 const PACKING_SIZE_LABELS = Object.freeze({ PETITE: "Petite", CLASSIC: "Classic", GRAND: "Grand", ROYAL: "Royal" });
 const PACKING_PAYMENT_MODES = Object.freeze(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"]);
 const PACKING_EXPENSE_CATEGORY = "Packing Material";
-const MOVEMENT_TYPES = Object.freeze({ PURCHASE: "PURCHASE", SALE: "SALE", SALE_CANCEL: "SALE_CANCEL", ADJUST: "ADJUST" });
+// TRANSFER_OUT / TRANSFER_IN: packing sent from one shop of the company to another
+// (`recordPackingTransfer`). Each send writes one of each per size, the source's negative.
+const MOVEMENT_TYPES = Object.freeze({
+  PURCHASE: "PURCHASE", SALE: "SALE", SALE_CANCEL: "SALE_CANCEL", ADJUST: "ADJUST",
+  TRANSFER_OUT: "TRANSFER_OUT", TRANSFER_IN: "TRANSFER_IN",
+});
 const USAGE_SOURCES = Object.freeze(["FIXED", "CUSTOM"]);
 
 const CODES = Object.freeze({
@@ -61,6 +70,11 @@ const CODES = Object.freeze({
   PURCHASE_INVALID: "PACKING_PURCHASE_INVALID",
   PURCHASE_ALREADY_SAVED: "PACKING_PURCHASE_ALREADY_SAVED",
   ADJUSTMENT_INVALID: "PACKING_ADJUSTMENT_INVALID",
+  TRANSFER_INVALID: "PACKING_TRANSFER_INVALID",
+  TRANSFER_SAME_SHOP: "PACKING_TRANSFER_SAME_SHOP",
+  TRANSFER_SHOP_INVALID: "PACKING_TRANSFER_SHOP_INVALID",
+  TRANSFER_SHOP_INACTIVE: "PACKING_TRANSFER_SHOP_INACTIVE",
+  TRANSFER_NOT_ENOUGH: "PACKING_TRANSFER_NOT_ENOUGH",
   PURCHASE_EXPENSE: "PACKING_PURCHASE_EXPENSE",
   USAGE_SKIPPED: "PACKING_USAGE_SKIPPED",
   STORAGE_MISSING: "PACKING_STORAGE_MISSING",
@@ -72,6 +86,8 @@ const MESSAGES = Object.freeze({
   PURCHASE_EXPENSE: "This expense belongs to a Frooz Pack purchase.",
   PERMISSION_REQUIRED: "Only the Owner or an Admin can manage Frooz Pack.",
   COMPANY_REQUIRED: "This session has no shop and branch to keep packing for. Sign in at a counter of the shop.",
+  TRANSFER_SAME_SHOP: "Choose a different shop to send to. Packing cannot be sent to the shop it is already in.",
+  TRANSFER_SHOP_INVALID: "This shop was not found in your company. Pick the shops again.",
   STORAGE_MISSING: "Frooz Pack is not set up on this server yet. Ask the administrator to update the database.",
 });
 
@@ -85,6 +101,7 @@ const CLIENT_REF_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const MONEY_MAX = 10_000_000;
 const QUANTITY_MAX = 1_000_000_000;
 const LINES_MAX = 200;
+const TRANSFER_NOTE_MAX = 300;
 const INT_MAX = 2_147_483_647;
 
 // ---------------------------------------------------------------------------------------------
@@ -293,6 +310,43 @@ const validateAdjustmentInput = (body = {}) => {
   if (!reason) return refuse(CODES.ADJUSTMENT_INVALID, "Enter the reason for this adjustment.");
   if (reason.length > REMARKS_MAX) return refuse(CODES.ADJUSTMENT_INVALID, `Keep the reason to ${REMARKS_MAX} letters or fewer.`);
   return { ok: true, value: { size_ref: sizeRef, quantity: roundQuantity(quantity), reason } };
+};
+
+/** At most three decimals, the way quantities are kept (0.1 + 0.2 counts as 0.3). */
+const hasAtMostThreeDecimals = (value) => Math.abs(value * 1000 - Math.round(value * 1000)) < 1e-6;
+
+/**
+ * POST /api/v3/packing/transfers: {from_branch_id, to_branch_id, lines:[{size_id, quantity}], note?}.
+ * Two shops of the company (checked against `branches` by `recordPackingTransfer`), not the same
+ * one; 1..LINES_MAX lines, each size once, each quantity above zero with at most 3 decimals. A
+ * line's size may also be sent as `size` or `packing_size_id`. The note is optional, up to
+ * TRANSFER_NOTE_MAX letters.
+ */
+const validateTransferInput = (body = {}) => {
+  const input = body && typeof body === "object" ? body : {};
+  const fromBranchId = positiveInt(input.from_branch_id);
+  if (!fromBranchId) return refuse(CODES.TRANSFER_INVALID, "Choose the shop the packing goes from.");
+  const toBranchId = positiveInt(input.to_branch_id);
+  if (!toBranchId) return refuse(CODES.TRANSFER_INVALID, "Choose the shop to send the packing to.");
+  if (fromBranchId === toBranchId) return refuse(CODES.TRANSFER_SAME_SHOP, MESSAGES.TRANSFER_SAME_SHOP);
+  const note = text(input.note).replace(/\s+/g, " ");
+  if (note.length > TRANSFER_NOTE_MAX) return refuse(CODES.TRANSFER_INVALID, `Keep the note to ${TRANSFER_NOTE_MAX} letters or fewer.`);
+  if (!Array.isArray(input.lines) || input.lines.length === 0) return refuse(CODES.TRANSFER_INVALID, "Add at least one packing line to send.");
+  if (input.lines.length > LINES_MAX) return refuse(CODES.TRANSFER_INVALID, `A send can have at most ${LINES_MAX} lines.`);
+  const lines = [];
+  const seen = new Set();
+  for (const raw of input.lines) {
+    const sizeRef = readRef(raw?.size_id ?? raw?.size ?? raw?.packing_size_id);
+    if (!sizeRef) return refuse(CODES.TRANSFER_INVALID, "Every line needs a packing size.");
+    if (seen.has(sizeRef.ref)) return refuse(CODES.TRANSFER_INVALID, "A packing size appears twice in this send. Put it once, with the total quantity.");
+    seen.add(sizeRef.ref);
+    const quantity = finiteOrNull(raw?.quantity);
+    if (quantity === null || quantity <= 0 || quantity > QUANTITY_MAX || !hasAtMostThreeDecimals(quantity)) {
+      return refuse(CODES.TRANSFER_INVALID, "Every line needs a quantity above zero, with at most 3 decimals.");
+    }
+    lines.push({ size_ref: sizeRef, quantity: roundQuantity(quantity) });
+  }
+  return { ok: true, value: { from_branch_id: fromBranchId, to_branch_id: toBranchId, note: note || null, lines } };
 };
 
 /**
@@ -1444,6 +1498,183 @@ const recordPackingAdjustment = async (client, { companyId, branchId, actorId, b
 };
 
 // ---------------------------------------------------------------------------------------------
+// Sending packing from one shop of the company to another
+// ---------------------------------------------------------------------------------------------
+
+const shopName = (row) => text(row?.branch_name) || `Shop ${row?.id}`;
+const countWords = (value) => String(roundQuantity(finiteOrNull(value) ?? 0));
+const sizePathWords = (size) => {
+  const label = PACKING_SIZE_LABELS[size.size_name] || size.size_name;
+  return `${size.type_name} › ${size.design_name} › ${size.capacity ? `${label} · ${size.capacity}` : label}`;
+};
+
+/**
+ * GET /api/v3/packing/shops (Owner/Admin): the company's active shops, each with its count of
+ * every size of the company (0 where it has none), and which shop this session stands at. The
+ * PEP Pack screen offers "Send to another shop" only when there is more than one.
+ */
+const listTransferShops = async (client, { companyId, branchId }) => {
+  if (!companyId) return { shops: [], this_branch_id: null };
+  const shops = await client.query(
+    "SELECT id, branch_name FROM branches WHERE company_id = $1 AND active IS DISTINCT FROM FALSE ORDER BY id",
+    [companyId]
+  );
+  const ids = shops.rows.map((row) => Number(row.id));
+  const counts = ids.length === 0 ? { rows: [] } : await client.query(
+    `SELECT stock.branch_id, COALESCE(s.global_id, 'packing-size-' || s.id::TEXT) AS size_global_id, stock.qty_on_hand
+     FROM packing_stock stock
+     JOIN packing_sizes s ON s.id = stock.size_id
+     JOIN packing_designs d ON d.id = s.design_id
+     JOIN packing_types t ON t.id = d.type_id
+     WHERE t.company_id = $1 AND stock.branch_id = ANY($2::INTEGER[])`,
+    [companyId, ids]
+  );
+  const sizes = await client.query(
+    `SELECT COALESCE(s.global_id, 'packing-size-' || s.id::TEXT) AS size_global_id
+     FROM packing_sizes s
+     JOIN packing_designs d ON d.id = s.design_id
+     JOIN packing_types t ON t.id = d.type_id
+     WHERE t.company_id = $1`,
+    [companyId]
+  );
+  const byShop = new Map(ids.map((id) => [id, Object.fromEntries(sizes.rows.map((row) => [row.size_global_id, 0]))]));
+  for (const row of counts.rows) {
+    const shop = byShop.get(Number(row.branch_id));
+    if (shop) shop[row.size_global_id] = roundQuantity(finiteOrNull(row.qty_on_hand) ?? 0);
+  }
+  return {
+    shops: shops.rows.map((row) => ({ id: Number(row.id), name: shopName(row), counts: byShop.get(Number(row.id)) })),
+    this_branch_id: branchId || null,
+  };
+};
+
+/**
+ * POST /api/v3/packing/transfers: send packing from one shop of the company to another, at once.
+ *
+ * All or nothing, in the route's one transaction: both shops are this company's, active and not
+ * the same; every size is this company's and switched on; and no line asks for more than the
+ * source has on hand (409 PACKING_TRANSFER_NOT_ENOUGH, naming the size and its count). The two
+ * shops' rows of these sizes are locked first (FOR UPDATE, in branch-then-size order, so two sends
+ * between the same shops either way round queue rather than deadlock), so two sends cannot both
+ * pass the check on the same boxes.
+ *
+ * Each line moves the source's count down and the destination's up, with a TRANSFER_OUT movement at
+ * the source ("Sent to Ratanada") and a TRANSFER_IN at the destination ("Received from Main
+ * Branch"), the note after " · ". Both shops' counts are then published as `packing_stock`
+ * changes, each logged with its own branch: `packing_stock` is a company reference type
+ * (syncReferenceBootstrap.js), so the sending shop's and the receiving shop's counters both pull
+ * them -- a transfer is between two places, and both must be told.
+ *
+ * Not idempotent on a retry: packing_movements has no client reference to find a first send by,
+ * so the screen keeps one send in flight and says to check Recent movements when an answer is lost.
+ */
+const recordPackingTransfer = async (client, { companyId, actorId, body }, deps) => {
+  const parsed = validateTransferInput(body);
+  if (!parsed.ok) return refusal(parsed);
+  const transfer = parsed.value;
+  const fromId = transfer.from_branch_id;
+  const toId = transfer.to_branch_id;
+
+  const found = await client.query(
+    "SELECT id, company_id, branch_name, active FROM branches WHERE id = ANY($1::INTEGER[])",
+    [[fromId, toId]]
+  );
+  const shops = new Map(found.rows.map((row) => [Number(row.id), row]));
+  for (const id of [fromId, toId]) {
+    const shop = shops.get(id);
+    if (!shop || Number(shop.company_id) !== Number(companyId)) {
+      return answer(400, { code: CODES.TRANSFER_SHOP_INVALID, message: MESSAGES.TRANSFER_SHOP_INVALID });
+    }
+    if (shop.active === false) {
+      return answer(400, {
+        code: CODES.TRANSFER_SHOP_INACTIVE,
+        message: `${shopName(shop)} is switched off. Switch it on in Branches & Counters before sending packing ${id === fromId ? "from" : "to"} it.`,
+      });
+    }
+  }
+  const fromName = shopName(shops.get(fromId));
+  const toName = shopName(shops.get(toId));
+
+  const sizes = await resolveSizes(client, { companyId, refs: transfer.lines.map((line) => line.size_ref) });
+  for (const line of transfer.lines) {
+    const size = sizes.get(line.size_ref.ref);
+    if (!size) return answer(400, { code: CODES.TRANSFER_INVALID, message: "A packing size in this send was not found. Pick it again." });
+    if (size.active === false) {
+      return answer(400, { code: CODES.TRANSFER_INVALID, message: `${sizePathWords(size)} is switched off. Switch it on to send it.` });
+    }
+  }
+  const sizeIds = transfer.lines.map((line) => Number(sizes.get(line.size_ref.ref).id));
+  if (new Set(sizeIds).size !== sizeIds.length) {
+    return answer(400, { code: CODES.TRANSFER_INVALID, message: "A packing size appears twice in this send. Put it once, with the total quantity." });
+  }
+
+  const locked = await client.query(
+    `SELECT branch_id, size_id, qty_on_hand FROM packing_stock
+     WHERE branch_id = ANY($1::INTEGER[]) AND size_id = ANY($2::INTEGER[])
+     ORDER BY branch_id, size_id
+     FOR UPDATE`,
+    [[fromId, toId], sizeIds]
+  );
+  const onHand = new Map(locked.rows
+    .filter((row) => Number(row.branch_id) === fromId)
+    .map((row) => [Number(row.size_id), finiteOrNull(row.qty_on_hand) ?? 0]));
+  for (const [index, line] of transfer.lines.entries()) {
+    const have = onHand.get(sizeIds[index]) ?? 0;
+    if (Math.round(line.quantity * 1000) > Math.round(have * 1000)) {
+      const size = sizes.get(line.size_ref.ref);
+      const held = have > 0 ? `only ${countWords(have)}` : "none";
+      return answer(409, {
+        code: CODES.TRANSFER_NOT_ENOUGH,
+        message: `${fromName} has ${held} of ${sizePathWords(size)} on hand, and this send asks for ${countWords(line.quantity)}. Nothing was sent.`,
+        size_id: size.global_id,
+        on_hand: roundQuantity(have),
+        requested: line.quantity,
+      });
+    }
+  }
+
+  const note = transfer.note ? ` · ${transfer.note}` : "";
+  const lines = [];
+  for (const [index, line] of transfer.lines.entries()) {
+    const size = sizes.get(line.size_ref.ref);
+    const sizeId = sizeIds[index];
+    const source = await applyStockDelta(client, { companyId, branchId: fromId, sizeId, delta: -line.quantity });
+    const destination = await applyStockDelta(client, { companyId, branchId: toId, sizeId, delta: line.quantity });
+    await insertMovement(client, {
+      companyId, branchId: fromId, sizeId, movementType: MOVEMENT_TYPES.TRANSFER_OUT, quantity: -line.quantity, actorId,
+      reason: `Sent to ${toName}${note}`,
+    });
+    await insertMovement(client, {
+      companyId, branchId: toId, sizeId, movementType: MOVEMENT_TYPES.TRANSFER_IN, quantity: line.quantity, actorId,
+      reason: `Received from ${fromName}${note}`,
+    });
+    lines.push({
+      size_id: size.global_id, type_name: size.type_name, design_name: size.design_name, size_name: size.size_name,
+      capacity: size.capacity ?? null, quantity: line.quantity,
+      from_qty_on_hand: roundQuantity(finiteOrNull(source.qty_on_hand) ?? 0),
+      to_qty_on_hand: roundQuantity(finiteOrNull(destination.qty_on_hand) ?? 0),
+    });
+  }
+
+  // Both places must be told: the source's counters that the boxes left, the destination's that they came.
+  const stock = [
+    ...await publishPackingStock(client, { branchId: fromId, sizeIds }, deps),
+    ...await publishPackingStock(client, { branchId: toId, sizeIds }, deps),
+  ];
+
+  return answer(201, {
+    success: true,
+    transfer: {
+      from: { id: fromId, name: fromName },
+      to: { id: toId, name: toName },
+      note: transfer.note,
+      lines,
+    },
+    stock,
+  });
+};
+
+// ---------------------------------------------------------------------------------------------
 // Combos: the packing a FIXED combo uses
 // ---------------------------------------------------------------------------------------------
 
@@ -1681,6 +1912,7 @@ module.exports = {
   isPackingPurchaseExpense,
   listPacking,
   listPackingMovements,
+  listTransferShops,
   loadPackingTree,
   markPackingInUse,
   packingUseOf,
@@ -1695,6 +1927,7 @@ module.exports = {
   readSalePackingUsage,
   recordPackingAdjustment,
   recordPackingPurchase,
+  recordPackingTransfer,
   recordSalePackingUsage,
   replaceComboPacking,
   resolveComboPacking,
@@ -1709,5 +1942,6 @@ module.exports = {
   validatePurchaseInput,
   validateSetupInput,
   validateSizeInput,
+  validateTransferInput,
   validateTypeInput,
 };

@@ -261,16 +261,41 @@ const visibleTypes = (catalogue) => catalogueTypes(catalogue)
   .filter((type) => type && type.active !== false && visibleDesigns(type).length > 0);
 
 /**
- * A group's state from its sizes: every size out → "out"; any out or low → "low" (something
- * under it needs buying); otherwise any unknown → "unknown"; else "ok".
+ * A group's state from its sizes: every size out → "out"; some out → "some-out" (it used to say
+ * "Running low", which read as "a few left" when some sizes had none); any low → "low"; otherwise
+ * any unknown → "unknown"; else "ok". `stateOf` reads one size (the PEP Pack list passes
+ * `packingManageStockState`, so a size never bought does not count as out).
  */
-const groupStockState = (sizes) => {
-  const states = sizes.map((size) => packingStockState(size.qty_on_hand));
+const groupStockState = (sizes, stateOf = (size) => packingStockState(size.qty_on_hand)) => {
+  const all = sizes.map(stateOf);
+  // A size never bought is not "out": it is left out of the group's state, unless it is all there is.
+  const states = all.filter((state) => state !== "new");
+  if (all.length > 0 && states.length === 0) return "new";
   if (states.length > 0 && states.every((state) => state === "out")) return "out";
-  if (states.some((state) => state === "out" || state === "low")) return "low";
+  if (states.some((state) => state === "out")) return "some-out";
+  if (states.some((state) => state === "low")) return "low";
   if (states.some((state) => state === "unknown")) return "unknown";
   return "ok";
 };
+
+/**
+ * A size's state on the PEP Pack list: as `packingStockState`, except that a size the owner's list
+ * says nothing has used (`in_use === false`: never bought, billed, counted or put in a combo) and
+ * that has none on hand is "new" -- "Not bought yet", not a red "0 on hand" straight after it was
+ * made. Unknown (`in_use` null, the counter's snapshot) is never "new".
+ */
+export const packingManageStockState = (size) => {
+  const state = packingStockState(size?.qty_on_hand);
+  return state === "out" && size?.in_use === false ? "new" : state;
+};
+
+/** How a group's or a size's state reads, where it needs saying. "" for nothing to say. */
+export const PACKING_STATE_WORDS = Object.freeze({
+  out: "All out",
+  "some-out": "Some sizes out",
+  low: "Running low",
+  new: "Not bought yet",
+});
 
 const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
 
@@ -329,29 +354,73 @@ export const packingTypesWithoutSize = (catalogue) => (Array.isArray(catalogue) 
   .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
   .map((type) => text(type.name) || "A packing type");
 
-export const packingEmptyPickerMessage = (catalogue) => {
+/**
+ * `canCreate`: the picker has its own "New packing" button (the PEP Pack purchase table), so the
+ * message points at it instead of sending the owner to the screen they are already on.
+ */
+export const packingEmptyPickerMessage = (catalogue, { canCreate = false } = {}) => {
   const types = (Array.isArray(catalogue) ? catalogue : Array.isArray(catalogue?.types) ? catalogue.types : [])
     .filter((type) => type && type.active !== false);
-  if (types.length === 0) return "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
+  const none = canCreate
+    ? "No packing set up yet. Press New packing above to make a type, a design and its sizes."
+    : "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
+  if (types.length === 0) return none;
   const unfinished = types
     .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
     .map((type) => text(type.name) || "A packing type");
-  if (unfinished.length === 0) return "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
-  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. In PEP Pack, press New packing, choose ${unfinished.length === 1 ? "it" : "each one"}, name a design and tick its sizes.`;
+  if (unfinished.length === 0) return none;
+  const which = unfinished.length === 1 ? "it" : "each one";
+  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. ${canCreate ? "Press New packing above" : "In PEP Pack, press New packing"}, choose ${which}, name a design and tick its sizes.`;
+};
+
+/** Whether anything can be picked at all: a switched-on size under a switched-on design and type. */
+export const packingHasPickableSize = (catalogue) => visibleTypes(catalogue).length > 0;
+
+/**
+ * A packing size's cost, worded the same everywhere it is shown (the PEP Pack list and every
+ * picker): "₹1,500.00 each", or "No cost yet" when it was never set (stored as 0).
+ */
+export const formatPackingUnitCost = (value) => {
+  const cost = knownUnitCost(value);
+  return cost === null
+    ? "No cost yet"
+    : `₹${cost.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} each`;
+};
+
+/**
+ * What PEP Pack's in-list add button says where the owner is: at the top "New packing"; inside a
+ * type "Add a design to Gift Box"; inside a design "Add sizes to Window Box". One phrase, "New
+ * packing in X", used to mean both.
+ */
+export const packingAddHereLabel = (view) => {
+  if (view?.level === "sizes" && text(view?.design?.name)) return `Add sizes to ${text(view.design.name)}`;
+  if (view?.level === "designs" && text(view?.type?.name)) return `Add a design to ${text(view.type.name)}`;
+  return "New packing";
+};
+
+/**
+ * The count a correction leaves: on hand now + the typed change (signed), or null while either is
+ * not a number. Worked in thousandths, so 0.1 + 0.2 is 0.3. The server still decides.
+ */
+export const packingCountAfter = (qtyOnHand, change) => {
+  const now = toThousandths(qtyOnHand);
+  const typed = toThousandths(change);
+  if (now === null || typed === null) return null;
+  return (now + typed) / 1000;
 };
 
 const ROOT_CRUMB_LABEL = "Packing";
 
 /**
- * What a size row says under its name wherever packing is picked: "On hand 12 · last ₹4.50".
+ * What a size row says under its name wherever packing is picked: "On hand 12 · ₹4.50 each".
  * A count that has not reached this computer says "Count not known", and a size never bought
- * (cost unset, stored as 0) says "no rate yet" -- an unknown is never shown as 0.
+ * (cost unset, stored as 0) says "No cost yet" -- an unknown is never shown as 0. The cost is
+ * worded as on the PEP Pack list (`formatPackingUnitCost`).
  */
 export const packingLeafSublabel = (size) => {
   const qty = finiteOrNull(size?.qty_on_hand);
-  const cost = knownUnitCost(size?.unit_cost);
   const count = qty === null ? "Count not known" : `On hand ${formatCount(qty)}`;
-  return `${count} · ${cost === null ? "no rate yet" : `last ₹${cost.toFixed(2)}`}`;
+  return `${count} · ${formatPackingUnitCost(size?.unit_cost)}`;
 };
 
 /**
@@ -447,7 +516,7 @@ export const packingManageView = (catalogue, state) => {
   const designs = type && Array.isArray(type.designs) ? type.designs.filter((entry) => entry && typeof entry === "object") : [];
   const design = type && current.designId ? designs.find((entry) => nodeMatches(entry, current.designId)) || null : null;
   const rootCrumb = { level: "types", id: null, label: ROOT_CRUMB_LABEL };
-  const groupState = (sizes) => (sizes.length === 0 ? null : groupStockState(sizes));
+  const groupState = (sizes) => (sizes.length === 0 ? null : groupStockState(sizes, packingManageStockState));
 
   if (current.level === "sizes" && type && design) {
     const sizes = (Array.isArray(design.sizes) ? design.sizes : []).filter((entry) => entry && typeof entry === "object");
@@ -460,10 +529,10 @@ export const packingManageView = (catalogue, state) => {
       rows: sizes.map((size) => ({
         id: size.id,
         label: packingSizeLabel(size),
-        sublabel: knownUnitCost(size.unit_cost) === null ? "Cost not set" : `₹${size.unit_cost.toFixed(2)} each`,
+        sublabel: formatPackingUnitCost(size.unit_cost),
         active: size.active !== false,
         qty_on_hand: Number.isFinite(size.qty_on_hand) ? size.qty_on_hand : null,
-        stockState: packingStockState(size.qty_on_hand),
+        stockState: packingManageStockState(size),
         unit_cost: Number.isFinite(size.unit_cost) ? size.unit_cost : null,
         leaf: true,
         node: size,
@@ -522,6 +591,9 @@ export const PACKING_MOVEMENT_LABELS = Object.freeze({
   SALE: "Sold with a combo",
   SALE_CANCEL: "Bill cancelled, put back",
   ADJUST: "Count corrected",
+  // A send between two shops of the company; `packingMovementText` names the other shop.
+  TRANSFER_OUT: "Sent to another shop",
+  TRANSFER_IN: "Received from another shop",
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1106,6 +1178,254 @@ export const advancePackingPurchaseLine = (lines, key, field, makeLine) => {
   const fresh = typeof makeLine === "function" ? makeLine() : null;
   if (!fresh) return { lines: list, focus: null };
   return { lines: [...list, fresh], focus: { key: fresh.key, field: "pick" } };
+};
+
+// ---------------------------------------------------------------------------------------------
+// Sending packing to another shop of the company
+// ---------------------------------------------------------------------------------------------
+
+/** The server's note limit for a send (backend/froozPack.js TRANSFER_NOTE_MAX). */
+export const PACKING_TRANSFER_NOTE_MAX = 300;
+
+const SHOPS_UNREADABLE = "The list of shops could not be read, so packing cannot be sent to another shop from here.";
+
+/**
+ * `GET /api/v3/packing/shops` as a named state: `{status: "ready", shops: [{id, name, counts}],
+ * thisShopId}` or `{status: "invalid", message}`. Shop ids are opaque strings. `counts` maps a
+ * size's global id to that shop's count; a size not in it is not known (never 0).
+ */
+export const readPackingShops = (body) => {
+  if (!body || typeof body !== "object" || !Array.isArray(body.shops)) {
+    return { status: "invalid", shops: [], thisShopId: "", message: SHOPS_UNREADABLE };
+  }
+  const shops = body.shops
+    .filter((row) => row && typeof row === "object" && canonicalInventoryId(row.id) !== "")
+    .map((row) => {
+      const id = canonicalInventoryId(row.id);
+      return {
+        id,
+        name: text(row.name) || `Shop ${id}`,
+        counts: row.counts && typeof row.counts === "object" && !Array.isArray(row.counts) ? row.counts : {},
+      };
+    });
+  return { status: "ready", shops, thisShopId: canonicalInventoryId(body.this_branch_id), message: "" };
+};
+
+/**
+ * Whether "Send to another shop" is offered: only once the company's shops are known and there is
+ * more than one. With one shop (or while the list is loading or failed) the button is not there.
+ */
+export const packingTransferOffered = (shopsState) => shopsState?.status === "ready"
+  && Array.isArray(shopsState.shops) && shopsState.shops.length > 1;
+
+const shopsOf = (shopsState) => (Array.isArray(shopsState?.shops) ? shopsState.shops : []);
+const findShop = (shopsState, shopId) => {
+  const wanted = canonicalInventoryId(shopId);
+  return wanted === "" ? null : shopsOf(shopsState).find((shop) => inventoryIdsEqual(shop.id, wanted)) || null;
+};
+
+/** A shop's name, or "" when it is not one of the company's shops. */
+export const packingShopName = (shopsState, shopId) => findShop(shopsState, shopId)?.name || "";
+
+/** The shops a send from `fromId` can go to: every other shop. */
+export const packingTransferDestinations = (shopsState, fromId) => shopsOf(shopsState)
+  .filter((shop) => !inventoryIdsEqual(shop.id, canonicalInventoryId(fromId)));
+
+/** "here" for this computer's own shop, "at Ratanada" for another. */
+export const packingShopPlace = (shopsState, shopId) => {
+  const shop = findShop(shopsState, shopId);
+  if (!shop) return "here";
+  return inventoryIdsEqual(shop.id, shopsState?.thisShopId) ? "here" : `at ${shop.name}`;
+};
+
+/** One shop's count of one size, or null when it is not known. Ids are compared as opaque ids. */
+export const packingOnHandAt = (shopsState, shopId, sizeId) => {
+  const shop = findShop(shopsState, shopId);
+  const wanted = canonicalInventoryId(sizeId);
+  if (!shop || wanted === "") return null;
+  const key = Object.keys(shop.counts || {}).find((entry) => inventoryIdsEqual(canonicalInventoryId(entry), wanted));
+  return key === undefined ? null : finiteOrNull(shop.counts[key]);
+};
+
+/**
+ * The catalogue with each size's count replaced by `shopId`'s, so the picker of a send from
+ * another shop shows that shop's counts. A count not known there is null ("Count not known").
+ */
+export const packingCatalogueAtShop = (catalogue, shopsState, shopId) => {
+  if (catalogue?.status !== "ready") return catalogue;
+  return {
+    ...catalogue,
+    types: catalogueTypes(catalogue).map((type) => ({
+      ...type,
+      designs: (Array.isArray(type?.designs) ? type.designs : []).map((design) => ({
+        ...design,
+        sizes: (Array.isArray(design?.sizes) ? design.sizes : []).map((size) => ({
+          ...size,
+          qty_on_hand: packingOnHandAt(shopsState, shopId, nodeId(size)),
+        })),
+      })),
+    })),
+  };
+};
+
+export const createPackingTransferLine = (key) => ({ key: text(key), size_id: "", label: "", quantity: "" });
+
+/** Put a picked size on line `key` (its name for the button; the quantity stays). */
+export const applyPackingToTransferLine = (lines, key, row) => (Array.isArray(lines) ? lines : []).map((line) => (
+  line?.key !== key || !row ? line : { ...line, size_id: text(row.packing_size_id), label: packingPathLabel(row) }
+));
+
+/**
+ * A new send: from this computer's shop (or the first shop when this one is not in the list), to
+ * the only other shop when there is just one more, otherwise still to choose.
+ */
+export const createPackingTransferDraft = (shopsState, makeLine) => {
+  const from = findShop(shopsState, shopsState?.thisShopId) || shopsOf(shopsState)[0] || null;
+  const others = from ? packingTransferDestinations(shopsState, from.id) : [];
+  const line = typeof makeLine === "function" ? makeLine() : createPackingTransferLine("transfer-line-1");
+  return {
+    from_branch_id: from?.id || "",
+    to_branch_id: others.length === 1 ? others[0].id : "",
+    lines: [line],
+    note: "",
+  };
+};
+
+/** The draft with a new From. A To that is now the same shop is cleared (or, with two shops, swapped). */
+export const changePackingTransferFrom = (draft, shopsState, fromId) => {
+  const from = canonicalInventoryId(fromId);
+  const others = packingTransferDestinations(shopsState, from);
+  let to = canonicalInventoryId(draft?.to_branch_id);
+  if (to === "" || inventoryIdsEqual(to, from)) to = others.length === 1 ? others[0].id : "";
+  return { ...draft, from_branch_id: from, to_branch_id: to };
+};
+
+/**
+ * What a send line shows: the From shop's count of its size ("On hand here 50"), and what the
+ * typed quantity leaves there ("40 left here"), worked in thousandths. `short` when the quantity
+ * is more than is on hand. Nothing is claimed while the count or the quantity is not known.
+ */
+export const packingTransferLineView = (line, shopsState, fromId) => {
+  const place = packingShopPlace(shopsState, fromId);
+  const sizeId = canonicalInventoryId(line?.size_id);
+  if (sizeId === "") return { onHand: null, onHandText: "", after: null, afterText: "", short: false };
+  const onHand = packingOnHandAt(shopsState, fromId, sizeId);
+  const onHandText = onHand === null ? `Count ${place} not known` : `On hand ${place} ${formatCount(onHand)}`;
+  const quantity = finiteOrNull(line?.quantity);
+  if (onHand === null || quantity === null || quantity <= 0 || !hasAtMostDecimals(line?.quantity, 3)) {
+    return { onHand, onHandText, after: null, afterText: "", short: false };
+  }
+  const after = (toThousandths(onHand) - toThousandths(quantity)) / 1000;
+  if (after < 0) {
+    return { onHand, onHandText, after, afterText: onHand > 0 ? `Only ${formatCount(onHand)} ${place}` : `None ${place}`, short: true };
+  }
+  return { onHand, onHandText, after, afterText: `${formatCount(after)} left ${place}`, short: false };
+};
+
+const transferRows = (draft) => (Array.isArray(draft?.lines) ? draft.lines : [])
+  .map((line, index) => ({ line, position: index + 1 }))
+  .filter(({ line }) => !(lineSizeId(line) === "" && text(line?.quantity) === ""));
+
+const quantityWords = (quantity) => formatCount(quantity);
+
+const joinWithAnd = (parts) => (parts.length <= 1 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`);
+
+/**
+ * The one line above Send: "Sending 10 Gift Box › Window Box › Grand to Ratanada". Only lines with
+ * packing and a readable quantity are named; "" until there is a line like that and a To shop.
+ */
+export const packingTransferSummary = (draft, shopsState) => {
+  const toName = packingShopName(shopsState, draft?.to_branch_id);
+  const parts = transferRows(draft)
+    .filter(({ line }) => text(line?.label) !== "" && finiteOrNull(line?.quantity) !== null && finiteOrNull(line?.quantity) > 0)
+    .map(({ line }) => `${quantityWords(finiteOrNull(line.quantity))} ${text(line.label)}`);
+  if (parts.length === 0 || toName === "") return "";
+  return `Sending ${joinWithAnd(parts)} to ${toName}`;
+};
+
+/**
+ * What `POST /api/v3/packing/transfers` takes, or the first problem in words. A wholly blank line
+ * is left out. A line asking for more than the From shop is known to hold is refused here; the
+ * server checks again under a lock and has the last word.
+ */
+export const buildPackingTransferPayload = (draft = {}, shopsState = null) => {
+  const from = findShop(shopsState, draft?.from_branch_id);
+  if (!from) return refuse("Choose the shop the packing goes from.");
+  const to = findShop(shopsState, draft?.to_branch_id);
+  if (!to) return refuse("Choose the shop to send the packing to.");
+  if (inventoryIdsEqual(from.id, to.id)) return refuse("Choose a different shop to send to. Packing cannot be sent to the shop it is already in.");
+  const note = text(draft?.note).replace(/\s+/g, " ");
+  if (note.length > PACKING_TRANSFER_NOTE_MAX) return refuse(`Keep the note to ${PACKING_TRANSFER_NOTE_MAX} letters or fewer.`);
+  const rows = transferRows(draft);
+  if (rows.length === 0) return refuse("Add the packing to send.");
+  const lines = [];
+  const seen = [];
+  for (const { line, position } of rows) {
+    const sizeId = canonicalInventoryId(lineSizeId(line));
+    if (sizeId === "") return refuse(`Line ${position}: choose the packing to send.`);
+    if (seen.some((id) => inventoryIdsEqual(id, sizeId))) return refuse(`Line ${position}: this packing is listed twice. Put the whole quantity on one line.`);
+    seen.push(sizeId);
+    const quantity = finiteOrNull(line?.quantity);
+    if (quantity === null || quantity <= 0 || !hasAtMostDecimals(line.quantity, 3)) {
+      return refuse(`Line ${position}: enter how many to send, above 0, with at most 3 decimals.`);
+    }
+    const onHand = packingOnHandAt(shopsState, from.id, sizeId);
+    if (onHand !== null && toThousandths(quantity) > toThousandths(onHand)) {
+      const label = text(line?.label) || "this packing";
+      return refuse(onHand > 0
+        ? `Line ${position}: ${from.name} has only ${formatCount(onHand)} of ${label}. Send ${formatCount(onHand)} or fewer.`
+        : `Line ${position}: ${from.name} has none of ${label} to send.`);
+    }
+    lines.push({ size_id: sizeId, quantity });
+  }
+  const payload = { from_branch_id: from.id, to_branch_id: to.id, lines };
+  if (note !== "") payload.note = note;
+  return { ok: true, payload, message: "", summary: packingTransferSummary(draft, shopsState) };
+};
+
+/**
+ * The notice after a send went through, from the server's answer: what went where, and that the
+ * other shop's counters get it at their next sync. An answer that cannot be read still says it
+ * was sent (the server said 201), naming what the form held.
+ */
+export const packingTransferDoneText = (body, { summary = "", toName = "" } = {}) => {
+  const transfer = body?.transfer;
+  const lines = Array.isArray(transfer?.lines) ? transfer.lines : [];
+  const destination = text(transfer?.to?.name) || text(toName) || "the other shop";
+  const parts = lines
+    .map((line) => ({ quantity: finiteOrNull(line?.quantity), label: packingPathLabel(line) }))
+    .filter((line) => line.quantity !== null && line.label !== "")
+    .map((line) => `${quantityWords(line.quantity)} ${line.label}`);
+  const what = parts.length > 0
+    ? `Sent ${joinWithAnd(parts)} to ${destination}.`
+    : (text(summary) ? `${text(summary).replace(/^Sending /, "Sent ")}.` : `Sent to ${destination}.`);
+  return `${what} ${destination.charAt(0).toUpperCase()}${destination.slice(1)}'s counters get the new count at their next sync.`;
+};
+
+/**
+ * How one row of Recent movements reads: `what` (the "What" column) and `note`. A send reads
+ * "Sent to Ratanada" at the shop it left and "Received from Main Branch" at the shop it reached
+ * (the server writes that as the reason, with the note after " · "). Other rows keep their label,
+ * and their note is the reason, else the bill or purchase they came from.
+ */
+export const packingMovementText = (row) => {
+  const type = upper(row?.movement_type);
+  const reason = text(row?.reason);
+  if (type === "TRANSFER_OUT" || type === "TRANSFER_IN") {
+    const cut = reason.indexOf(" · ");
+    const head = cut === -1 ? reason : reason.slice(0, cut);
+    const rest = cut === -1 ? "" : reason.slice(cut + 3);
+    const prefix = type === "TRANSFER_OUT" ? "Sent to " : "Received from ";
+    if (head.startsWith(prefix) && head.length > prefix.length) return { what: head, note: rest };
+    return { what: PACKING_MOVEMENT_LABELS[type], note: reason };
+  }
+  const what = PACKING_MOVEMENT_LABELS[type] || text(row?.movement_type);
+  if (reason) return { what, note: reason };
+  if (text(row?.sale_id)) return { what, note: `Bill ${text(row?.invoice_no) || text(row.sale_id)}` };
+  if (text(row?.purchase_id)) {
+    return { what, note: text(row?.reference_number) ? `Purchase · bill ${text(row.reference_number)}` : `Purchase ${text(row.purchase_id)}` };
+  }
+  return { what, note: "" };
 };
 
 // ---------------------------------------------------------------------------------------------

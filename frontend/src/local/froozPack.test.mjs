@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyPackingToTransferLine,
+  buildPackingTransferPayload,
+  changePackingTransferFrom,
+  createPackingTransferDraft,
+  createPackingTransferLine,
+  packingCatalogueAtShop,
+  packingMovementText,
+  packingOnHandAt,
+  packingShopPlace,
+  packingTransferDestinations,
+  packingTransferDoneText,
+  packingTransferLineView,
+  packingTransferOffered,
+  packingTransferSummary,
+  readPackingShops,
+} from "./froozPack.js";
+import {
   packingEmptyPickerMessage,
   packingTypesWithoutSize,
   PACKING_LOW_STOCK_AT,
@@ -268,8 +285,8 @@ test("the types level shows only active types with an active size, with their st
   assert.equal(box.leaf, false);
   assert.equal(box.qty_on_hand, null);
   assert.equal(box.sublabel, "1 design");
-  // Petite is out and Grand is low: something under Gift Box needs buying.
-  assert.equal(box.stockState, "low");
+  // Petite is out and Grand is low: some sizes under Gift Box are out (not "running low").
+  assert.equal(box.stockState, "some-out");
   assert.equal(view.rows[1].stockState, "ok");
   assert.equal(view.rows[1].sublabel, "1 design");
 });
@@ -294,9 +311,9 @@ test("the designs level and the sizes level", () => {
   ]);
   const grand = sizes.rows[1];
   // Count and last rate on every leaf; an unknown count or an unset (₹0) cost is said, never 0.
-  assert.equal(grand.sublabel, "On hand 3 · last ₹45.00");
-  assert.equal(sizes.rows[0].sublabel, "On hand 0 · last ₹20.00");
-  assert.equal(sizes.rows[2].sublabel, "Count not known · no rate yet");
+  assert.equal(grand.sublabel, "On hand 3 · ₹45.00 each");
+  assert.equal(sizes.rows[0].sublabel, "On hand 0 · ₹20.00 each");
+  assert.equal(sizes.rows[2].sublabel, "Count not known · No cost yet");
   assert.deepEqual(
     [grand.packing_size_id, grand.type_name, grand.design_name, grand.size_name, grand.capacity, grand.unit_cost],
     ["packing-size-4", "Gift Box", "Window Box", "GRAND", "1 kg", 45],
@@ -656,7 +673,7 @@ test("the PEP Pack screen shows everything the picker hides, marked, and falls b
   // An unknown count is unknown, and an unset (₹0) cost is "not set" -- never 0.
   assert.equal(royal.qty_on_hand, null);
   assert.equal(royal.stockState, "unknown");
-  assert.equal(royal.sublabel, "Cost not set");
+  assert.equal(royal.sublabel, "No cost yet");
   assert.equal(sizes.rows.find((row) => row.label === "Classic").active, false);
 
   // A design that is no longer there falls back to its type; a type that is gone, to the top.
@@ -840,14 +857,15 @@ test("purchase table: Enter walks Packing → Qty → Rate → next line, adding
 });
 
 test("every picker's size row says the count and the last rate, and says when either is not known", () => {
-  assert.equal(packingLeafSublabel({ qty_on_hand: 12, unit_cost: 4.5 }), "On hand 12 · last ₹4.50");
-  assert.equal(packingLeafSublabel({ qty_on_hand: -2, unit_cost: 0 }), "On hand -2 · no rate yet");
-  assert.equal(packingLeafSublabel({ qty_on_hand: null, unit_cost: null }), "Count not known · no rate yet");
-  assert.equal(packingLeafSublabel({ qty_on_hand: 1234.5, unit_cost: 10 }), "On hand 1,234.5 · last ₹10.00");
+  assert.equal(packingLeafSublabel({ qty_on_hand: 12, unit_cost: 4.5 }), "On hand 12 · ₹4.50 each");
+  assert.equal(packingLeafSublabel({ qty_on_hand: -2, unit_cost: 0 }), "On hand -2 · No cost yet");
+  assert.equal(packingLeafSublabel({ qty_on_hand: null, unit_cost: null }), "Count not known · No cost yet");
+  assert.equal(packingLeafSublabel({ qty_on_hand: 1234.5, unit_cost: 10 }), "On hand 1,234.5 · ₹10.00 each");
+  assert.equal(packingLeafSublabel({ qty_on_hand: 3, unit_cost: 1500 }), "On hand 3 · ₹1,500.00 each", "en-IN grouping");
   // The API's NUMERIC strings read as numbers.
   const api = readPackingCatalogue(apiPacking());
   const view = packingDrillView(api, { level: "sizes", typeId: "packing-type-1", designId: "packing-design-2" });
-  assert.equal(view.rows[0].sublabel, "On hand 0 · last ₹45.00");
+  assert.equal(view.rows[0].sublabel, "On hand 0 · ₹45.00 each");
 });
 
 test("delete: only what the owner's list says is unused; unknown (the counter's snapshot) is never unused", () => {
@@ -884,7 +902,8 @@ import {
 import { readFileSync as readAppSource } from "node:fs";
 
 const packApp = readAppSource(new URL("../App.jsx", import.meta.url), "utf8");
-const packModule = packApp.slice(packApp.indexOf("function FroozPackModule("), packApp.indexOf("function FroozPackModule(") + 40000);
+// The whole module, up to the component after it (a fixed length ran out as the module grew).
+const packModule = packApp.slice(packApp.indexOf("function FroozPackModule("), packApp.indexOf("function PackingStockPanel("));
 
 const twoDesigns = () => ({
   type: { id: "packing-type-1", global_id: "packing-type-1", name: "Gift Box" },
@@ -979,4 +998,272 @@ test("New packing inside a switched-off type or design starts where the form can
   assert.equal(on.draft.design_id, "packing-design-4");
   assert.equal(on.note, "");
   assert.equal(packingSetupStart(catalogue).note, "");
+});
+
+import {
+  PACKING_STATE_WORDS,
+  formatPackingUnitCost,
+  packingAddHereLabel,
+  packingCountAfter,
+  packingHasPickableSize,
+  packingManageStockState,
+} from "./froozPack.js";
+
+test("a packing cost reads one way everywhere: ₹ with en-IN grouping and 'each', or No cost yet", () => {
+  assert.equal(formatPackingUnitCost(1500), "₹1,500.00 each");
+  assert.equal(formatPackingUnitCost("45.5"), "₹45.50 each");
+  assert.equal(formatPackingUnitCost(0), "No cost yet", "an unset cost is stored as 0");
+  assert.equal(formatPackingUnitCost(null), "No cost yet");
+  assert.equal(formatPackingUnitCost("abc"), "No cost yet");
+});
+
+test("a correction shows the count it leaves, worked in thousandths; unknown stays unknown", () => {
+  assert.equal(packingCountAfter(12, "-3"), 9);
+  assert.equal(packingCountAfter(12, "+10"), 22);
+  assert.equal(packingCountAfter(0.1, "0.2"), 0.3);
+  assert.equal(packingCountAfter(2, "-5"), -3, "the server decides; the preview does not clamp");
+  assert.equal(packingCountAfter(null, "3"), null, "a count not known is not 0");
+  assert.equal(packingCountAfter(5, ""), null);
+  assert.equal(packingCountAfter(5, "-"), null);
+});
+
+test("a size never bought reads 'Not bought yet' on the PEP Pack list, not out; unknown use is never new", () => {
+  assert.equal(packingManageStockState({ qty_on_hand: 0, in_use: false }), "new");
+  assert.equal(packingManageStockState({ qty_on_hand: 0, in_use: true }), "out");
+  assert.equal(packingManageStockState({ qty_on_hand: 0, in_use: null }), "out");
+  assert.equal(packingManageStockState({ qty_on_hand: 3, in_use: false }), "low");
+  assert.equal(packingManageStockState({ qty_on_hand: null, in_use: false }), "unknown");
+  assert.equal(PACKING_STATE_WORDS.new, "Not bought yet");
+  assert.equal(PACKING_STATE_WORDS["some-out"], "Some sizes out");
+
+  const catalogue = readPackingCatalogue({ types: [
+    { id: 1, global_id: "packing-type-1", name: "Gift Box", in_use: false, designs: [
+      { id: 2, global_id: "packing-design-2", name: "Window Box", in_use: false, sizes: [
+        { id: 3, global_id: "packing-size-3", size_name: "GRAND", qty_on_hand: 0, in_use: false },
+        { id: 4, global_id: "packing-size-4", size_name: "ROYAL", qty_on_hand: 0, in_use: false },
+      ] },
+    ] },
+    { id: 5, global_id: "packing-type-5", name: "Basket", in_use: true, designs: [
+      { id: 6, global_id: "packing-design-6", name: "Round", in_use: true, sizes: [
+        { id: 7, global_id: "packing-size-7", size_name: "GRAND", qty_on_hand: 0, in_use: true },
+        { id: 8, global_id: "packing-size-8", size_name: "ROYAL", qty_on_hand: 0, in_use: false },
+        { id: 9, global_id: "packing-size-9", size_name: "PETITE", qty_on_hand: 40, in_use: true },
+      ] },
+    ] },
+  ] });
+  const top = packingManageView(catalogue, createPackingDrill());
+  assert.deepEqual(top.rows.map((row) => [row.label, row.stockState]), [["Gift Box", "new"], ["Basket", "some-out"]]);
+  const sizes = packingManageView(catalogue, { level: "sizes", typeId: "packing-type-1", designId: "packing-design-2" });
+  assert.deepEqual(sizes.rows.map((row) => row.stockState), ["new", "new"]);
+  // The picker is unchanged: a counter's snapshot does not know what was used.
+  const picker = packingDrillView(catalogue, createPackingDrill());
+  assert.equal(picker.rows.find((row) => row.label === "Gift Box").stockState, "out");
+});
+
+test("the in-list add button says what it adds where the owner is", () => {
+  assert.equal(packingAddHereLabel({ level: "types" }), "New packing");
+  assert.equal(packingAddHereLabel({ level: "designs", type: { name: "Gift Box" } }), "Add a design to Gift Box");
+  assert.equal(packingAddHereLabel({ level: "sizes", type: { name: "Gift Box" }, design: { name: "Window Box" } }), "Add sizes to Window Box");
+  assert.equal(packingAddHereLabel(null), "New packing");
+});
+
+test("a picker with its own New packing button points at it; Packing purchase waits for a size", () => {
+  const unfinished = { status: "ready", types: [{ id: "packing-type-1", name: "Bottle", active: true, designs: [] }] };
+  assert.equal(
+    packingEmptyPickerMessage(unfinished, { canCreate: true }),
+    "Bottle has no size yet. Press New packing above, choose it, name a design and tick its sizes."
+  );
+  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }, { canCreate: true }), "No packing set up yet. Press New packing above to make a type, a design and its sizes.");
+  assert.match(packingEmptyPickerMessage(unfinished), /^Bottle has no size yet\. In PEP Pack, press New packing/);
+  assert.equal(packingHasPickableSize(readPackingCatalogue(unfinished)), false);
+  assert.equal(packingHasPickableSize(readPackingCatalogue({ types: [] })), false);
+  assert.equal(packingHasPickableSize(readPackingCatalogue({ types: [
+    { id: 1, name: "Bottle", designs: [{ id: 2, name: "Round", sizes: [{ id: 3, size_name: "GRAND" }] }] },
+  ] })), true);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Sending packing to another shop
+// ---------------------------------------------------------------------------------------------
+
+const SHOPS_BODY = {
+  this_branch_id: 1,
+  shops: [
+    { id: 1, name: "Main Branch", counts: { "packing-size-1": 50, "packing-size-2": 0.5 } },
+    { id: 2, name: "Ratanada", counts: { "packing-size-1": 3, "packing-size-2": 0 } },
+  ],
+};
+const GRAND_ROW = { packing_size_id: "packing-size-1", type_name: "Gift Box", design_name: "Window Box", size_name: "GRAND", capacity: "" };
+const PETITE_ROW = { packing_size_id: "packing-size-2", type_name: "Gift Box", design_name: "Window Box", size_name: "PETITE", capacity: "1 kg" };
+
+test("transfer: the shops list is read as a named state; the Send button shows only with more than one shop", () => {
+  const two = readPackingShops(SHOPS_BODY);
+  assert.equal(two.status, "ready");
+  assert.equal(two.thisShopId, "1");
+  assert.deepEqual(two.shops.map((shop) => [shop.id, shop.name]), [["1", "Main Branch"], ["2", "Ratanada"]]);
+  assert.equal(packingTransferOffered(two), true);
+
+  const one = readPackingShops({ this_branch_id: 1, shops: [SHOPS_BODY.shops[0]] });
+  assert.equal(one.status, "ready");
+  assert.equal(packingTransferOffered(one), false, "one shop: no Send button at all");
+  assert.equal(packingTransferOffered(readPackingShops({ shops: [] })), false);
+
+  for (const broken of [null, undefined, "shops", { shops: "x" }, {}]) {
+    const read = readPackingShops(broken);
+    assert.equal(read.status, "invalid", JSON.stringify(broken));
+    assert.ok(read.message.length > 0, "an unreadable list says so");
+    assert.equal(packingTransferOffered(read), false);
+  }
+  assert.equal(packingTransferOffered(null), false, "still loading: not offered");
+  assert.equal(packingTransferOffered({ status: "invalid", shops: SHOPS_BODY.shops }), false);
+  assert.equal(readPackingShops({ shops: [{ id: 7 }] }).shops[0].name, "Shop 7");
+  assert.equal(readPackingShops({ shops: [{ name: "No id" }, null] }).shops.length, 0);
+});
+
+test("transfer: counts are found by opaque id; unknown is null, never 0; ids are not coerced", () => {
+  const shops = readPackingShops({
+    this_branch_id: "004",
+    shops: [{ id: "004", name: "Old Town", counts: { "packing-size-1": 7 } }, { id: 4, name: "Four", counts: { "packing-size-1": 9 } }],
+  });
+  assert.equal(packingOnHandAt(shops, "004", "packing-size-1"), 7);
+  assert.equal(packingOnHandAt(shops, 4, "packing-size-1"), 9, "\"004\" and 4 are different shops");
+  assert.equal(packingOnHandAt(shops, "004", "packing-size-9"), null, "a size not in the list is not known");
+  assert.equal(packingOnHandAt(shops, "99", "packing-size-1"), null);
+  const ready = readPackingShops(SHOPS_BODY);
+  assert.equal(packingOnHandAt(ready, "2", "packing-size-2"), 0, "a known zero stays zero");
+  assert.equal(packingShopPlace(ready, "1"), "here");
+  assert.equal(packingShopPlace(ready, "2"), "at Ratanada");
+  assert.deepEqual(packingTransferDestinations(ready, "1").map((shop) => shop.name), ["Ratanada"]);
+
+  const catalogue = readPackingCatalogue({ types: [{ id: 1, global_id: "packing-type-1", name: "Gift Box", designs: [{ id: 1, global_id: "packing-design-1", name: "Window Box", sizes: [
+    { id: 1, global_id: "packing-size-1", size_name: "GRAND", qty_on_hand: 50 },
+    { id: 3, global_id: "packing-size-3", size_name: "ROYAL", qty_on_hand: 4 },
+  ] }] }] });
+  const atRatanada = packingCatalogueAtShop(catalogue, ready, "2");
+  assert.deepEqual(atRatanada.types[0].designs[0].sizes.map((size) => size.qty_on_hand), [3, null], "the picker shows the From shop's counts");
+  assert.equal(catalogue.types[0].designs[0].sizes[0].qty_on_hand, 50, "the screen's own catalogue is not changed");
+});
+
+test("transfer: a new send starts from this computer's shop, to the only other one; changing From never leaves From = To", () => {
+  const ready = readPackingShops(SHOPS_BODY);
+  const draft = createPackingTransferDraft(ready, () => createPackingTransferLine("t-1"));
+  assert.deepEqual(draft, { from_branch_id: "1", to_branch_id: "2", lines: [{ key: "t-1", size_id: "", label: "", quantity: "" }], note: "" });
+  assert.deepEqual(changePackingTransferFrom(draft, ready, "2"), { ...draft, from_branch_id: "2", to_branch_id: "1" }, "two shops: swapped");
+
+  const three = readPackingShops({ ...SHOPS_BODY, shops: [...SHOPS_BODY.shops, { id: 3, name: "Sardarpura", counts: {} }] });
+  const open = createPackingTransferDraft(three, () => createPackingTransferLine("t-1"));
+  assert.equal(open.from_branch_id, "1");
+  assert.equal(open.to_branch_id, "", "three shops: the owner chooses where");
+  assert.equal(changePackingTransferFrom({ ...open, to_branch_id: "3" }, three, "2").to_branch_id, "3", "a different To stays");
+  assert.equal(changePackingTransferFrom({ ...open, to_branch_id: "2" }, three, "2").to_branch_id, "", "a To that became From is cleared");
+  const elsewhere = readPackingShops({ ...SHOPS_BODY, this_branch_id: 9 });
+  assert.equal(createPackingTransferDraft(elsewhere).from_branch_id, "1", "this shop not listed: the first shop");
+});
+
+test("transfer: each line shows what is on hand and what is left after sending, in thousandths", () => {
+  const ready = readPackingShops(SHOPS_BODY);
+  const [line] = applyPackingToTransferLine([createPackingTransferLine("t-1")], "t-1", GRAND_ROW);
+  assert.deepEqual(line, { key: "t-1", size_id: "packing-size-1", label: "Gift Box › Window Box › Grand", quantity: "" });
+  assert.deepEqual(packingTransferLineView(line, ready, "1"), { onHand: 50, onHandText: "On hand here 50", after: null, afterText: "", short: false });
+  assert.deepEqual(packingTransferLineView({ ...line, quantity: "10" }, ready, "1"), { onHand: 50, onHandText: "On hand here 50", after: 40, afterText: "40 left here", short: false });
+  assert.equal(packingTransferLineView({ ...line, quantity: "50" }, ready, "1").afterText, "0 left here");
+  assert.deepEqual(packingTransferLineView({ ...line, quantity: "51" }, ready, "1"), { onHand: 50, onHandText: "On hand here 50", after: -1, afterText: "Only 50 here", short: true });
+  assert.equal(packingTransferLineView({ ...line, quantity: "1" }, ready, "2").afterText, "2 left at Ratanada");
+  assert.equal(packingTransferLineView({ ...line, quantity: "1" }, ready, "2").onHandText, "On hand at Ratanada 3");
+  const petite = { key: "t-2", size_id: "packing-size-2", label: "x", quantity: "0.2" };
+  assert.equal(packingTransferLineView(petite, ready, "1").after, 0.3, "0.5 - 0.2 is 0.3, not 0.30000000000000004");
+  assert.deepEqual(packingTransferLineView({ ...petite, quantity: "1" }, ready, "2"), { onHand: 0, onHandText: "On hand at Ratanada 0", after: -1, afterText: "None at Ratanada", short: true });
+  assert.equal(packingTransferLineView({ ...line, quantity: "1.0001" }, ready, "1").afterText, "", "nothing claimed for an unreadable quantity");
+  assert.equal(packingTransferLineView({ ...line, size_id: "packing-size-9", quantity: "1" }, ready, "1").onHandText, "Count here not known");
+  assert.equal(packingTransferLineView({ ...line, size_id: "packing-size-9", quantity: "1" }, ready, "1").afterText, "", "an unknown count is not 0");
+  assert.equal(packingTransferLineView(createPackingTransferLine("t-3"), ready, "1").onHandText, "");
+});
+
+test("transfer: the payload checks shops, lines, duplicates, quantities and what is on hand; the summary names it all", () => {
+  const ready = readPackingShops(SHOPS_BODY);
+  const grand = { key: "a", size_id: "packing-size-1", label: "Gift Box › Window Box › Grand", quantity: "10" };
+  const draft = { from_branch_id: "1", to_branch_id: "2", note: "  for  Diwali ", lines: [grand, createPackingTransferLine("blank")] };
+  const built = buildPackingTransferPayload(draft, ready);
+  assert.equal(built.ok, true, built.message);
+  assert.deepEqual(built.payload, { from_branch_id: "1", to_branch_id: "2", lines: [{ size_id: "packing-size-1", quantity: 10 }], note: "for Diwali" });
+  assert.equal(built.summary, "Sending 10 Gift Box › Window Box › Grand to Ratanada");
+  assert.equal(buildPackingTransferPayload({ ...draft, note: "" }, ready).payload.note, undefined, "no note, no key");
+
+  const two = { ...draft, lines: [grand, { key: "b", size_id: "packing-size-2", label: "Gift Box › Window Box › Petite · 1 kg", quantity: "0.5" }] };
+  assert.equal(packingTransferSummary(two, ready), "Sending 10 Gift Box › Window Box › Grand and 0.5 Gift Box › Window Box › Petite · 1 kg to Ratanada");
+  assert.equal(packingTransferSummary({ ...draft, to_branch_id: "" }, ready), "", "no To yet: no summary");
+  assert.equal(packingTransferSummary({ ...draft, lines: [createPackingTransferLine("x")] }, ready), "");
+
+  const refusals = [
+    [{ ...draft, from_branch_id: "" }, "Choose the shop the packing goes from."],
+    [{ ...draft, to_branch_id: "" }, "Choose the shop to send the packing to."],
+    [{ ...draft, to_branch_id: "9" }, "Choose the shop to send the packing to."],
+    [{ ...draft, to_branch_id: "1" }, "Choose a different shop to send to. Packing cannot be sent to the shop it is already in."],
+    [{ ...draft, lines: [createPackingTransferLine("x")] }, "Add the packing to send."],
+    [{ ...draft, lines: [{ ...grand, size_id: "" }] }, "Line 1: choose the packing to send."],
+    [{ ...draft, lines: [grand, { ...grand, key: "c", quantity: "1" }] }, "Line 2: this packing is listed twice. Put the whole quantity on one line."],
+    [{ ...draft, lines: [{ ...grand, quantity: "0" }] }, "Line 1: enter how many to send, above 0, with at most 3 decimals."],
+    [{ ...draft, lines: [{ ...grand, quantity: "-1" }] }, "Line 1: enter how many to send, above 0, with at most 3 decimals."],
+    [{ ...draft, lines: [{ ...grand, quantity: "1.0005" }] }, "Line 1: enter how many to send, above 0, with at most 3 decimals."],
+    [{ ...draft, lines: [{ ...grand, quantity: "" }] }, "Line 1: enter how many to send, above 0, with at most 3 decimals."],
+    [{ ...draft, lines: [{ ...grand, quantity: "51" }] }, "Line 1: Main Branch has only 50 of Gift Box › Window Box › Grand. Send 50 or fewer."],
+    [{ ...draft, from_branch_id: "2", to_branch_id: "1", lines: [{ ...grand, size_id: "packing-size-2", quantity: "1" }] }, "Line 1: Ratanada has none of Gift Box › Window Box › Grand to send."],
+    [{ ...draft, note: "x".repeat(301) }, "Keep the note to 300 letters or fewer."],
+  ];
+  for (const [bad, message] of refusals) {
+    const result = buildPackingTransferPayload(bad, ready);
+    assert.equal(result.ok, false, message);
+    assert.equal(result.message, message);
+  }
+  // A count not known here is left to the server, which checks under a lock.
+  assert.equal(buildPackingTransferPayload({ ...draft, lines: [{ ...grand, size_id: "packing-size-9" }] }, ready).ok, true);
+});
+
+test("transfer: the success notice says what went where and that the other shop's counters get it at their next sync", () => {
+  const body = { success: true, transfer: { from: { id: 1, name: "Main Branch" }, to: { id: 2, name: "Ratanada" }, lines: [
+    { size_id: "packing-size-1", type_name: "Gift Box", design_name: "Window Box", size_name: "GRAND", capacity: null, quantity: 10 },
+  ] } };
+  assert.equal(packingTransferDoneText(body), "Sent 10 Gift Box › Window Box › Grand to Ratanada. Ratanada's counters get the new count at their next sync.");
+  assert.equal(
+    packingTransferDoneText({}, { summary: "Sending 3 Basket › Round › Petite to Ratanada", toName: "Ratanada" }),
+    "Sent 3 Basket › Round › Petite to Ratanada. Ratanada's counters get the new count at their next sync.",
+    "an answer that cannot be read still names what the form held",
+  );
+  assert.equal(packingTransferDoneText(null), "Sent to the other shop. The other shop's counters get the new count at their next sync.");
+});
+
+test("movements: a send reads 'Sent to …' at one shop and 'Received from …' at the other; other rows keep their labels", () => {
+  assert.equal(PACKING_MOVEMENT_LABELS.TRANSFER_OUT, "Sent to another shop");
+  assert.equal(PACKING_MOVEMENT_LABELS.TRANSFER_IN, "Received from another shop");
+  assert.deepEqual(packingMovementText({ movement_type: "TRANSFER_OUT", reason: "Sent to Ratanada · For Diwali · rush" }), { what: "Sent to Ratanada", note: "For Diwali · rush" });
+  assert.deepEqual(packingMovementText({ movement_type: "transfer_in", reason: "Received from Main Branch" }), { what: "Received from Main Branch", note: "" });
+  assert.deepEqual(packingMovementText({ movement_type: "TRANSFER_IN", reason: "" }), { what: "Received from another shop", note: "" });
+  assert.deepEqual(packingMovementText({ movement_type: "TRANSFER_OUT", reason: "odd" }), { what: "Sent to another shop", note: "odd" });
+  assert.deepEqual(packingMovementText({ movement_type: "PURCHASE", reason: "Bought from Box Co" }), { what: "Bought", note: "Bought from Box Co" });
+  assert.deepEqual(packingMovementText({ movement_type: "SALE", sale_id: 12, invoice_no: "INV-7" }), { what: "Sold with a combo", note: "Bill INV-7" });
+  assert.deepEqual(packingMovementText({ movement_type: "SALE", sale_id: 12 }), { what: "Sold with a combo", note: "Bill 12" });
+  assert.deepEqual(packingMovementText({ movement_type: "PURCHASE", purchase_id: 4 }), { what: "Bought", note: "Purchase 4" });
+  assert.deepEqual(packingMovementText({ movement_type: "NEW_KIND" }), { what: "NEW_KIND", note: "" });
+});
+
+test("PEP Pack wires Send to another shop: hidden with one shop, same Local Only guard, form in view, server's words on failure", () => {
+  // Only when the shops are known and there is more than one.
+  assert.match(packModule, /\{packingTransferOffered\(shops\) && \(\s+<button[^>]*onClick=\{startTransfer\}><Icon name="truck" size=\{16\} \/>Send to another shop<\/button>/);
+  // The shops are read in loadPacking, which never runs while unavailableReason is set (Local Only,
+  // offline, no cloud): the same path as every other read and write here.
+  const load = packModule.slice(packModule.indexOf("const loadPacking = async"), packModule.indexOf("useEffect(() => {\n    if (unavailableReason) return;"));
+  assert.match(load, /canManage \? axios\.get\(`\$\{API_URL\}\/api\/v3\/packing\/shops`\) : Promise\.resolve\(null\)/);
+  assert.match(packModule, /useEffect\(\(\) => \{\s+if \(unavailableReason\) return;\s+loadPacking\(\);/);
+  assert.match(packModule, /actions=\{canManage && !unavailableReason && !failed/);
+  const save = packModule.slice(packModule.indexOf("const saveTransfer = async"), packModule.indexOf("const showQuickStart"));
+  assert.match(save, /if \(!transfer \|\| transfer\.saving \|\| disabled\) return;/, "disabled covers unavailableReason");
+  assert.match(save, /buildPackingTransferPayload\(transfer\.draft, shops\)/);
+  assert.match(save, /axios\.post\(`\$\{API_URL\}\/api\/v3\/packing\/transfers`, check\.payload\)/);
+  assert.match(save, /getErrorMessage\(error, /, "the server's own message, never a zero");
+  assert.match(save, /packingTransferDoneText\(response\?\.data/);
+  assert.match(save, /revealPackForm\("pack-notice"\)/);
+  assert.doesNotMatch(save, /user_id|x-user-id|created_by/, "no identity in the body");
+  assert.match(packModule, /const startTransfer = \(\) => \{[\s\S]*?revealPackForm\("pack-transfer-form"\);/);
+  assert.match(packModule, /id="pack-transfer-form"[\s\S]*?<select autoFocus/);
+  assert.match(packModule, /<td data-label="What">\{said\.what \|\| MISSING_VALUE\}<\/td>/);
 });

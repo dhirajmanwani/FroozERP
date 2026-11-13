@@ -185,8 +185,8 @@ import { expenseRecordStatus, expenseTotalExcludingCancelled } from "./local/exp
 import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
-import { COMBO_EDIT_REFUSAL, COMBO_IN_USE_NOTE, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboDeletable, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, defaultComboMargin, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft } from "./local/combos";
-import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, checkPackingNodeForm, newPackingPurchaseClientRef, packingSetupStart, startPackingNodeForm, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingTypesWithoutSize, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability } from "./local/froozPack";
+import { COMBO_EDIT_REFUSAL, COMBO_IN_USE_NOTE, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboDeletable, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft, COMBO_TYPE_FORM_LABELS, applyComboDraftChange, comboActiveTogglePayload, comboFieldId, comboInvalidFields, comboKindMenuLabel, comboMarginNote, comboPriceComparison, comboSectionHeading, orderComboErrors, posTabCountText } from "./local/combos";
+import { PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, checkPackingNodeForm, newPackingPurchaseClientRef, packingSetupStart, startPackingNodeForm, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, PACKING_STATE_WORDS, packingAddHereLabel, packingCountAfter, packingHasPickableSize, applyPackingToTransferLine, buildPackingTransferPayload, changePackingTransferFrom, createPackingTransferDraft, createPackingTransferLine, packingCatalogueAtShop, packingMovementText, packingShopName, packingShopPlace, packingTransferDestinations, packingTransferDoneText, packingTransferLineView, packingTransferOffered, packingTransferSummary, PACKING_TRANSFER_NOTE_MAX, readPackingShops } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -15677,10 +15677,13 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
 const formatPackCount = (value) => (Number.isFinite(value)
   ? value.toLocaleString("en-IN", { maximumFractionDigits: 3 })
   : MISSING_VALUE);
-// ok is fine, low is "buy soon", out is the danger tone, unknown is a neutral fact (never "out").
-const PACK_STOCK_TONE = Object.freeze({ ok: "stock-ok", low: "origin-rate", out: "stock-low", unknown: "tag" });
-const packCountText = (row) => (Number.isFinite(row?.qty_on_hand) ? `${formatPackCount(row.qty_on_hand)} on hand` : "Count not known");
-const packGroupText = (state) => (state === "out" ? "All out" : state === "low" ? "Running low" : "");
+// ok is fine, low is "buy soon", out is the danger tone, unknown is a neutral fact (never "out"),
+// and a size never bought ("new") is neutral too: it is not out, it has not started.
+const PACK_STOCK_TONE = Object.freeze({ ok: "stock-ok", low: "origin-rate", "some-out": "origin-rate", out: "stock-low", unknown: "tag", new: "tag" });
+const packCountText = (row) => (row?.stockState === "new"
+  ? PACKING_STATE_WORDS.new
+  : Number.isFinite(row?.qty_on_hand) ? `${formatPackCount(row.qty_on_hand)} on hand` : "Count not known");
+const packGroupText = (state) => PACKING_STATE_WORDS[state] || "";
 // A picker's size row already says its count and last rate underneath; the tag only flags trouble.
 const packLeafTag = (state) => (state === "out" ? "Out" : state === "low" ? "Running low" : "");
 const PACK_PAYMENT_LABELS = Object.freeze({ CASH: "Cash", UPI: "UPI", BANK_TRANSFER: "Bank transfer", CHEQUE: "Cheque" });
@@ -15692,11 +15695,12 @@ const packNodeRef = (node) => String(node?.global_id || node?.id || "");
 const packCrumbState = (crumb) => (crumb?.level === "designs" && crumb.id
   ? { level: "designs", typeId: crumb.id, designId: null }
   : createPackingDrill());
+// Shop time (IST) like every other screen, whatever this computer's own clock zone is.
 const formatPackWhen = (value) => {
   const date = new Date(value);
-  return Number.isNaN(date.getTime())
+  return value === null || value === undefined || value === "" || Number.isNaN(date.getTime())
     ? MISSING_VALUE
-    : date.toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    : formatKolkataDateTime(date);
 };
 
 /**
@@ -15813,9 +15817,9 @@ function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = f
       ) : status !== "ready" ? (
         <p className="warning-note" role="status">{catalogue?.message || "The packing list has not reached this computer yet."}</p>
       ) : rows.length === 0 ? (
-        <p className="form-note">{packingEmptyPickerMessage(catalogue)}</p>
-      ) : view.level === "types" && packingTypesWithoutSize(catalogue).length > 0 ? (
-        <p className="form-note">{`Not shown until it has a size: ${packingTypesWithoutSize(catalogue).join(", ")}. Give it a design and sizes with New packing in PEP Pack.`}</p>
+        // The empty list names the types that have no size yet; with its own New packing button,
+        // it points there rather than at the screen the owner is already on.
+        <p className="form-note">{packingEmptyPickerMessage(catalogue, { canCreate: Boolean(onCreate) })}</p>
       ) : null}
       {status === "ready" && rows.length > 0 && (
         <ul
@@ -15846,7 +15850,7 @@ function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = f
           ))}
         </ul>
       )}
-      <small className="form-note">→ opens, ← goes back, ↑ ↓ move, Enter picks a size.</small>
+      {status === "ready" && rows.length > 0 && <small className="form-note">→ opens, ← goes back, ↑ ↓ move, Enter picks a size.</small>}
     </div>
   );
 }
@@ -15856,7 +15860,7 @@ function PackingDrillPicker({ catalogue, onClose, onCreate, onPick, quantity = f
  * sizes ticked, each with its own capacity and optional unit cost. One Save makes all of it
  * (`POST /api/v3/packing/setup`). Every check is local/froozPack.js `buildPackingSetupPayload`.
  */
-function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChange, onSave, title = "New packing" }) {
+function PackingSetupForm({ catalogue, disabled = false, id, setup, onCancel, onChange, onSave, title = "New packing" }) {
   const { draft } = setup;
   const choices = packingSetupChoices(catalogue, draft);
   const newType = draft.type_id === "";
@@ -15867,7 +15871,7 @@ function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChan
   // Typing a capacity or a cost for a size means that size is wanted.
   const typeSize = (sizeName, field, value) => setSize(sizeName, { [field]: value, ...(String(value).trim() !== "" ? { checked: true } : {}) });
   return (
-    <div className="discount-block combo-form packing-setup">
+    <div className="discount-block combo-form packing-setup" id={id}>
       <h3>{title}</h3>
       {setup.note && <p className="warning-note" role="status">{setup.note}</p>}
       <div className="discount-form">
@@ -15890,20 +15894,26 @@ function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChan
         </Field>
         {newDesign && (
           <Field label={newType ? "New design name (leave blank to make only the type)" : "New design name"}>
-            <input disabled={disabled} maxLength={80} placeholder="Window Box, Round, Kraft" value={draft.design_name} onChange={(event) => onChange({ design_name: event.target.value })} />
+            {/* The cursor starts at the first thing still to fill: a new type's name, else a new design's. */}
+            <input autoFocus={!newType} disabled={disabled} maxLength={80} placeholder="Window Box, Round, Kraft" value={draft.design_name} onChange={(event) => onChange({ design_name: event.target.value })} />
           </Field>
         )}
         <fieldset className="combo-items packing-setup-sizes" disabled={disabled}>
           <legend>Sizes to make</legend>
           {choices.existingSizes.length > 0 && <p className="form-note">{`Already here: ${choices.existingSizes.join(", ")}.`}</p>}
-          {draft.sizes.map((row) => (
+          <div aria-hidden="true" className="packing-setup-size packing-setup-size-head">
+            <span>Size</span>
+            <span>Actual size (optional)</span>
+            <span>Cost ₹ each (optional)</span>
+          </div>
+          {draft.sizes.map((row, index) => (
             <div className="packing-setup-size" key={row.size_name}>
               <label className="check-field">
-                <input checked={row.checked} type="checkbox" onChange={(event) => setSize(row.size_name, { checked: event.target.checked })} />
+                <input autoFocus={index === 0 && !newType && !newDesign} checked={row.checked} type="checkbox" onChange={(event) => setSize(row.size_name, { checked: event.target.checked })} />
                 <span>{PACKING_SIZE_LABELS[row.size_name] || row.size_name}</span>
               </label>
-              <input aria-label={`${PACKING_SIZE_LABELS[row.size_name]} actual size`} maxLength={40} placeholder="1 kg, 300 ml (optional)" value={row.capacity} onChange={(event) => typeSize(row.size_name, "capacity", event.target.value)} />
-              <input aria-label={`${PACKING_SIZE_LABELS[row.size_name]} unit cost`} inputMode="decimal" min="0" placeholder="Cost ₹ (optional)" step="0.01" type="number" value={row.unit_cost} onChange={(event) => typeSize(row.size_name, "unit_cost", event.target.value)} />
+              <input aria-label={`${PACKING_SIZE_LABELS[row.size_name]} actual size`} maxLength={40} placeholder="1 kg, 300 ml" value={row.capacity} onChange={(event) => typeSize(row.size_name, "capacity", event.target.value)} />
+              <input aria-label={`${PACKING_SIZE_LABELS[row.size_name]} unit cost`} inputMode="decimal" min="0" placeholder="₹ each" step="0.01" type="number" value={row.unit_cost} onChange={(event) => typeSize(row.size_name, "unit_cost", event.target.value)} />
             </div>
           ))}
           <p className="form-note">Each purchase sets a size's cost to the rate paid, so the cost can be left blank now.</p>
@@ -15921,7 +15931,8 @@ function PackingSetupForm({ catalogue, disabled = false, setup, onCancel, onChan
 /**
  * PEP Pack: the Owner's or an Admin's packing, kept on the server (`/api/v3/packing`). The tree
  * (Type → Design → Size, each editable), each size's count at this branch and its unit cost, the
- * purchase form (which also books the expense under Packing Material) and count corrections.
+ * purchase form (which also books the expense under Packing Material), count corrections and, when
+ * the company has more than one shop, sending packing from one shop to another.
  * Local Only, offline and no cloud each say so and send nothing.
  */
 function FroozPackModule({ canManage = false, onSaved, unavailableReason = null }) {
@@ -15934,6 +15945,11 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const [nodeForm, setNodeForm] = useState(null);
   // { draft, pickingLine, error, saving }
   const [purchase, setPurchase] = useState(null);
+  // The company's shops and each one's counts (GET /api/v3/packing/shops, Owner/Admin): what
+  // "Send to another shop" needs. Read with the list; with one shop the button is not there.
+  const [shops, setShops] = useState({ status: "idle", shops: [], thisShopId: "", message: "" });
+  // A send to another shop: { draft: { from_branch_id, to_branch_id, lines, note }, pickingLine, error, saving }
+  const [transfer, setTransfer] = useState(null);
   // { row, draft: { quantity, reason }, error, saving }
   const [adjust, setAdjust] = useState(null);
   // Delete, asked once before it happens: { kind, ref, label, error, saving }
@@ -15962,9 +15978,10 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
 
   const loadPacking = async () => {
     setLoad((current) => ({ ...current, status: "loading", message: "" }));
-    const [packResult, movementResult] = await Promise.allSettled([
+    const [packResult, movementResult, shopsResult] = await Promise.allSettled([
       axios.get(`${API_URL}/api/v3/packing`),
       axios.get(`${API_URL}/api/v3/packing/movements`, { params: { limit: 30 } }),
+      canManage ? axios.get(`${API_URL}/api/v3/packing/shops`) : Promise.resolve(null),
     ]);
     if (packResult.status !== "fulfilled") {
       setLoad({ status: "failed", message: `Packing could not be loaded (${getErrorMessage(packResult.reason, "no answer from the server")}). Nothing on this screen is current.` });
@@ -15977,6 +15994,21 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
       return false;
     }
     setCatalogue(read);
+    if (canManage) {
+      // A list that did not load is said, never taken as "one shop": the Send button stays away
+      // until the shops are known.
+      const shopsRead = shopsResult.status === "fulfilled" ? readPackingShops(shopsResult.value?.data) : null;
+      setShops(shopsRead && shopsRead.status === "ready"
+        ? shopsRead
+        : {
+          status: "failed",
+          shops: [],
+          thisShopId: "",
+          message: shopsRead
+            ? shopsRead.message
+            : `The list of shops could not be loaded (${getErrorMessage(shopsResult.reason, "no answer from the server")}), so Send to another shop is not offered right now.`,
+        });
+    }
     const body = movementResult.status === "fulfilled" ? movementResult.value.data : null;
     const movementRows = Array.isArray(body?.movements) ? body.movements : Array.isArray(body) ? body : null;
     setMovements(movementRows
@@ -15995,6 +16027,8 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   useEffect(() => {
     if (unavailableReason) return;
     loadPacking();
+    // Loads once per availability change; `loadPacking` is a new function every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unavailableReason]);
 
   const failed = load.status === "failed";
@@ -16009,15 +16043,26 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const active = Math.min(highlight, Math.max(rows.length - 1, 0));
   const levelKind = PACK_LEVEL_KIND[view.level] || "type";
 
+  // A "Saved …" notice belongs to the level it was said on: moving away clears it (a warning stays).
+  const clearSuccessNotice = () => setNotice((current) => (current?.tone === "success" ? null : current));
   const goIn = (row) => {
     if (!row || row.leaf || busy) return;
     setDrill((current) => enterPackingDrill(current, row.id));
     setHighlight(0);
+    clearSuccessNotice();
   };
   const goBack = () => {
     if (busy) return;
     setDrill((current) => backPackingDrill(current));
     setHighlight(0);
+    clearSuccessNotice();
+  };
+
+  // The forms open above the list; pressing Edit far down it used to fill a form out of sight.
+  const revealPackForm = (elementId) => {
+    window.requestAnimationFrame(() => {
+      document.getElementById(elementId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   };
 
   const afterWrite = async (said) => {
@@ -16034,6 +16079,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const startNode = (kind, node = null) => {
     setNotice(null);
     setNodeForm(startPackingNodeForm(kind, node, view));
+    revealPackForm("pack-node-form");
   };
 
   const updateNode = (field, value) => setNodeForm((current) => (current
@@ -16093,6 +16139,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
       ? { draft: createPackingSetupDraft(), note: "" }
       : packingSetupStart(catalogue, { typeId: view.type?.id || "", designId: view.design?.id || "" });
     setSetup({ draft: start.draft, note: start.note, error: "", saving: false, forLine });
+    if (!forLine) revealPackForm("pack-setup-form");
   };
 
   const updateSetup = (patch) => setSetup((current) => (current
@@ -16254,6 +16301,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     // The heading's path is fixed now, like a node form's parent.
     const path = packingPathLabel({ type_name: view.type?.name, design_name: view.design?.name, size_name: row.node?.size_name, capacity: row.node?.capacity });
     setAdjust({ row, path, draft: { quantity: "", reason: "" }, error: "", saving: false });
+    revealPackForm("pack-adjust-form");
   };
 
   const saveAdjust = async () => {
@@ -16275,13 +16323,107 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     await afterWrite(`${label}: count ${check.payload.quantity > 0 ? "raised" : "lowered"} by ${formatPackCount(Math.abs(check.payload.quantity))}.`);
   };
 
-  const emptyText = view.level === "types"
-    ? "No packing set up yet. Press New packing to make a type, its design and sizes in one go."
-    : view.level === "designs"
-      ? `No designs under ${view.type?.name || "this type"} yet. Press "New packing" below to name one and tick its sizes.`
-      : `No sizes under ${view.design?.name || "this design"} yet. Press "New packing" below and tick Petite, Classic, Grand or Royal.`;
+  // --- Send to another shop ------------------------------------------------------------------
+  // Every rule and every word is local/froozPack.js; the server checks again under a row lock
+  // and refuses (409) a line asking for more than the From shop has.
+
+  const newTransferLine = () => {
+    lineSeq.current += 1;
+    return createPackingTransferLine(`pack-transfer-line-${lineSeq.current}`);
+  };
+
+  const startTransfer = () => {
+    setNotice(null);
+    setTransfer({ draft: createPackingTransferDraft(shops, newTransferLine), pickingLine: null, error: "", saving: false });
+    revealPackForm("pack-transfer-form");
+  };
+
+  const updateTransfer = (patch) => setTransfer((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, ...patch } }
+    : current));
+
+  const changeTransferFrom = (fromId) => setTransfer((current) => (current
+    ? { ...current, error: "", pickingLine: null, draft: changePackingTransferFrom(current.draft, shops, fromId) }
+    : current));
+
+  const updateTransferLine = (key, field, value) => setTransfer((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, lines: current.draft.lines.map((line) => (line.key === key ? { ...line, [field]: value } : line)) } }
+    : current));
+
+  const toggleTransferPicker = (key) => setTransfer((current) => (current ? { ...current, pickingLine: current.pickingLine === key ? null : key } : current));
+
+  const closeTransferPicker = (key) => {
+    setTransfer((current) => (current ? { ...current, pickingLine: null } : current));
+    pendingFocus.current = { key, field: "pick" };
+  };
+
+  const pickTransferLine = (key, row) => {
+    setTransfer((current) => (current
+      ? { ...current, pickingLine: null, error: "", draft: { ...current.draft, lines: applyPackingToTransferLine(current.draft.lines, key, row) } }
+      : current));
+    pendingFocus.current = { key, field: "quantity" };
+  };
+
+  /** Enter in Qty goes to the next line's Packing, adding a line at the end (as a purchase's Rate does). */
+  const transferEnter = (event, key) => {
+    if (event.key !== "Enter" || !transfer) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const next = advancePackingPurchaseLine(transfer.draft.lines, key, "rate", newTransferLine);
+    if (next.lines !== transfer.draft.lines) {
+      setTransfer((current) => (current ? { ...current, draft: { ...current.draft, lines: next.lines } } : current));
+      pendingFocus.current = next.focus;
+      return;
+    }
+    const element = next.focus ? purchaseFields.current.get(`${next.focus.key}:${next.focus.field}`) : null;
+    element?.focus();
+  };
+
+  const saveTransfer = async () => {
+    if (!transfer || transfer.saving || disabled) return;
+    const check = buildPackingTransferPayload(transfer.draft, shops);
+    if (!check.ok) {
+      setTransfer((current) => (current ? { ...current, error: check.message } : current));
+      return;
+    }
+    setTransfer((current) => (current ? { ...current, saving: true, error: "", pickingLine: null } : current));
+    let response;
+    try {
+      // No identity in the body: the server records who sent it from the signed session.
+      response = await axios.post(`${API_URL}/api/v3/packing/transfers`, check.payload);
+    } catch (error) {
+      const answered = Boolean(error?.response);
+      setTransfer((current) => (current
+        ? {
+          ...current,
+          saving: false,
+          error: answered
+            ? getErrorMessage(error, "The packing could not be sent. Nothing was changed.")
+            : "The send could not be confirmed: no answer from the server. Check Recent movements before pressing Send again, because it may already have gone.",
+        }
+        : current));
+      // Too few on hand, or no answer: show the counts as they are now.
+      if (!answered || error.response.status === 409) loadPacking().catch(() => null);
+      return;
+    }
+    const toName = packingShopName(shops, check.payload.to_branch_id);
+    setTransfer(null);
+    await afterWrite(packingTransferDoneText(response?.data, { summary: check.summary, toName }));
+    revealPackForm("pack-notice");
+  };
+
   const showQuickStart = canManage && !failed && load.status === "ready" && !quickStart.skipped && packingQuickStartOffered(catalogue);
-  const hereLabel = view.level !== "types" && view.crumbs.length > 1 ? view.crumbs[view.crumbs.length - 1].label : "";
+  // An empty level says what is missing once; the one button under it says what it adds there
+  // ("Add a design to Gift Box"). At the top the header's New packing (and Quick start) cover it.
+  const emptyText = view.level === "types"
+    ? (showQuickStart || !canManage ? "No packing set up yet." : "No packing set up yet. Press New packing above to make a type, a design and its sizes in one go.")
+    : view.level === "designs"
+      ? `No designs under ${view.type?.name || "this type"} yet.`
+      : `No sizes under ${view.design?.name || "this design"} yet.`;
+  const addHereLabel = packingAddHereLabel(view);
+  const showAddHere = canManage && !firstLoad && !(view.level === "types" && rows.length === 0);
+  // Packing purchase picks sizes; until one exists there is nothing to buy (New packing makes one).
+  const canBuy = packingHasPickableSize(catalogue);
 
   return (
     <section className="settings-layout">
@@ -16295,7 +16437,11 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
               <button className="secondary-button" disabled={busy || firstLoad} type="button" onClick={() => startSetup(null)}>
                 <Icon name="add" size={16} />New packing
               </button>
-              <button className="primary-button" disabled={busy || firstLoad || Boolean(purchase)} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
+              <button className="primary-button" disabled={busy || firstLoad || Boolean(purchase || transfer) || !canBuy} title={!firstLoad && !canBuy ? "Make a size first with New packing" : undefined} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
+              {/* Only when the company has more than one shop; with one, there is nowhere to send to. */}
+              {packingTransferOffered(shops) && (
+                <button className="secondary-button" disabled={busy || firstLoad || Boolean(purchase || transfer) || !canBuy} title={!firstLoad && !canBuy ? "Make a size first with New packing" : undefined} type="button" onClick={startTransfer}><Icon name="truck" size={16} />Send to another shop</button>
+              )}
             </>
           )
           : null}
@@ -16311,7 +16457,11 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
               </div>
             )}
             {!canManage && !failed && <p className="form-note">Only the Owner or an Admin can change packing.</p>}
-            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+            {canManage && !failed && load.status === "ready" && !canBuy && !purchase && !showQuickStart && (
+              <p className="form-note">Packing purchase opens once a packing size exists.</p>
+            )}
+            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} id="pack-notice" role="status">{notice.text}</p>}
+            {canManage && !failed && shops.status === "failed" && <p className="warning-note" role="status">{shops.message}</p>}
 
             {showQuickStart && (
               <div className="discount-block packing-quick-start">
@@ -16329,6 +16479,7 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
               <PackingSetupForm
                 catalogue={catalogue}
                 disabled={disabled}
+                id="pack-setup-form"
                 setup={setup}
                 onCancel={cancelSetup}
                 onChange={updateSetup}
@@ -16337,13 +16488,13 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
             )}
 
             {nodeForm && !failed && (
-              <div className="discount-block combo-form">
+              <div className="discount-block combo-form" id="pack-node-form">
                 <h3>{nodeForm.ref ? `Edit ${PACK_NODE_WORDS[nodeForm.kind]}` : `New ${PACK_NODE_WORDS[nodeForm.kind]}`}{nodeForm.where ? ` in ${nodeForm.where}` : ""}</h3>
                 <div className="discount-form">
                   {nodeForm.kind === "size" ? (
                     <>
                       <Field label="Size">
-                        <select disabled={disabled} value={nodeForm.draft.size_name} onChange={(event) => updateNode("size_name", event.target.value)}>
+                        <select autoFocus disabled={disabled} value={nodeForm.draft.size_name} onChange={(event) => updateNode("size_name", event.target.value)}>
                           {PACKING_SIZE_NAMES.map((name) => <option key={name} value={name}>{PACKING_SIZE_LABELS[name]}</option>)}
                         </select>
                       </Field>
@@ -16357,10 +16508,10 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                     </>
                   ) : (
                     <Field label="Name">
-                      <input disabled={disabled} maxLength={80} placeholder={nodeForm.kind === "type" ? "Gift Box, Basket, Bottle" : "Window Box, Round, Kraft"} value={nodeForm.draft.name} onChange={(event) => updateNode("name", event.target.value)} />
+                      <input autoFocus disabled={disabled} maxLength={80} placeholder={nodeForm.kind === "type" ? "Gift Box, Basket, Bottle" : "Window Box, Round, Kraft"} value={nodeForm.draft.name} onChange={(event) => updateNode("name", event.target.value)} />
                     </Field>
                   )}
-                  <Field label="Order">
+                  <Field label="Position in list (lower comes first)">
                     <input disabled={disabled} inputMode="numeric" step="1" type="number" value={nodeForm.draft.sort_order} onChange={(event) => updateNode("sort_order", event.target.value)} />
                   </Field>
                   <label className="check-field">
@@ -16396,21 +16547,29 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
             {purchase && !failed && (
               <div className="discount-block combo-form">
                 <h3>Packing purchase</h3>
-                <div className="discount-form">
-                  <Field label="Supplier (optional)">
-                    <input disabled={disabled} maxLength={160} value={purchase.draft.supplier_name} onChange={(event) => updatePurchase("supplier_name", event.target.value)} />
-                  </Field>
-                  <Field label="Date">
-                    <input disabled={disabled} type="date" value={purchase.draft.purchase_date} onChange={(event) => updatePurchase("purchase_date", event.target.value)} />
-                  </Field>
-                  <Field label="Paid by">
-                    <select disabled={disabled} value={purchase.draft.payment_mode} onChange={(event) => updatePurchase("payment_mode", event.target.value)}>
-                      {PACKING_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{PACK_PAYMENT_LABELS[mode] || mode}</option>)}
-                    </select>
-                  </Field>
-                  <Field label="Bill / reference number (optional)">
-                    <input disabled={disabled} maxLength={80} value={purchase.draft.reference_number} onChange={(event) => updatePurchase("reference_number", event.target.value)} />
-                  </Field>
+                <div className="discount-form packing-purchase-form">
+                  <div className="packing-purchase-head">
+                    <label className="packing-purchase-wide">
+                      <span>Supplier (optional)</span>
+                      <input disabled={disabled} maxLength={160} value={purchase.draft.supplier_name} onChange={(event) => updatePurchase("supplier_name", event.target.value)} />
+                    </label>
+                    <Field label="Date">
+                      <input disabled={disabled} type="date" value={purchase.draft.purchase_date} onChange={(event) => updatePurchase("purchase_date", event.target.value)} />
+                    </Field>
+                    <Field label="Paid by">
+                      <select disabled={disabled} value={purchase.draft.payment_mode} onChange={(event) => updatePurchase("payment_mode", event.target.value)}>
+                        {PACKING_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{PACK_PAYMENT_LABELS[mode] || mode}</option>)}
+                      </select>
+                    </Field>
+                    <label className="packing-purchase-wide">
+                      <span>Bill / reference number (optional)</span>
+                      <input disabled={disabled} maxLength={80} value={purchase.draft.reference_number} onChange={(event) => updatePurchase("reference_number", event.target.value)} />
+                    </label>
+                    <label className="packing-purchase-wide">
+                      <span>Remarks (optional)</span>
+                      <input disabled={disabled} maxLength={500} value={purchase.draft.remarks} onChange={(event) => updatePurchase("remarks", event.target.value)} />
+                    </label>
+                  </div>
                   <fieldset className="combo-items packing-purchase-items" disabled={disabled || purchase.saving}>
                     <legend>What was bought</legend>
                     <div className="table-wrap packing-purchase-table">
@@ -16474,10 +16633,10 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                     <button className="secondary-button compact-button" type="button" onClick={() => setPurchase((current) => (current ? { ...current, draft: { ...current.draft, lines: [...current.draft.lines, newPurchaseLine()] } } : current))}><Icon name="add" size={14} />Add line</button>
                     <small className="form-note">Enter in Qty goes to Rate; Enter in Rate goes to the next line (a new one is added at the end). A blank last line is left out.</small>
                   </fieldset>
-                  <p className="form-note combo-price-check"><strong>{`Total ${currency.format(purchaseTotal)}`}</strong> · booked as one expense under Packing Material.</p>
-                  <Field label="Remarks (optional)">
-                    <input disabled={disabled} maxLength={500} value={purchase.draft.remarks} onChange={(event) => updatePurchase("remarks", event.target.value)} />
-                  </Field>
+                  <p className="packing-purchase-total">
+                    <span className="form-note">Booked as one expense under Packing Material.</span>
+                    <strong>{`Total ${currency.format(purchaseTotal)}`}</strong>
+                  </p>
                   {purchase.error && <div className="inline-error" role="alert">{purchase.error}</div>}
                   <div className="button-row">
                     <button className="primary-button" disabled={disabled || purchase.saving || Boolean(setup?.forLine)} type="button" onClick={savePurchase}>{purchase.saving ? "Saving…" : "Save purchase"}</button>
@@ -16487,16 +16646,113 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
               </div>
             )}
 
+            {transfer && !failed && (() => {
+              const fromId = transfer.draft.from_branch_id;
+              const fromCatalogue = packingCatalogueAtShop(catalogue, shops, fromId);
+              const destinations = packingTransferDestinations(shops, fromId);
+              const summary = packingTransferSummary(transfer.draft, shops);
+              return (
+                <div className="discount-block combo-form" id="pack-transfer-form">
+                  <h3>Send packing to another shop</h3>
+                  <div className="discount-form packing-purchase-form packing-transfer-form">
+                    <p className="form-note">The packing leaves the From shop's count now and is added to the To shop's. Nothing is booked as an expense: that was done when it was bought.</p>
+                    <div className="packing-purchase-head">
+                      <Field label="From">
+                        <select autoFocus disabled={disabled || transfer.saving} value={fromId} onChange={(event) => changeTransferFrom(event.target.value)}>
+                          {shops.shops.map((shop) => <option key={shop.id} value={shop.id}>{packingShopPlace(shops, shop.id) === "here" ? `${shop.name} (this shop)` : shop.name}</option>)}
+                        </select>
+                      </Field>
+                      <Field label="To">
+                        <select disabled={disabled || transfer.saving} value={transfer.draft.to_branch_id} onChange={(event) => updateTransfer({ to_branch_id: event.target.value })}>
+                          {destinations.length !== 1 && <option value="">Choose a shop</option>}
+                          {destinations.map((shop) => <option key={shop.id} value={shop.id}>{shop.name}</option>)}
+                        </select>
+                      </Field>
+                    </div>
+                    <fieldset className="combo-items packing-purchase-items" disabled={disabled || transfer.saving}>
+                      <legend>What to send</legend>
+                      <div className="table-wrap packing-purchase-table">
+                        <table>
+                          <thead>
+                            <tr><th>Packing</th><th>Qty</th><th>After sending</th><th><span className="pm-sr-only">Remove</span></th></tr>
+                          </thead>
+                          <tbody>
+                            {transfer.draft.lines.map((line, index) => {
+                              const lineView = packingTransferLineView(line, shops, fromId);
+                              return (
+                                <React.Fragment key={line.key}>
+                                  <tr>
+                                    <td data-label="Packing">
+                                      <button className="secondary-button compact-button packing-line-pick" ref={purchaseFieldRef(line.key, "pick")} title={line.label || ""} type="button" onClick={() => toggleTransferPicker(line.key)}>
+                                        {line.label || "Choose packing"}
+                                      </button>
+                                      {lineView.onHandText && <small className="form-note packing-line-onhand">{lineView.onHandText}</small>}
+                                    </td>
+                                    <td data-label="Qty">
+                                      <input aria-label={`Line ${index + 1} quantity to send`} className="table-input" inputMode="decimal" min="0" placeholder="Qty" ref={purchaseFieldRef(line.key, "quantity")} step="0.001" type="number" value={line.quantity} onChange={(event) => updateTransferLine(line.key, "quantity", event.target.value)} onKeyDown={(event) => transferEnter(event, line.key)} />
+                                    </td>
+                                    <td className={lineView.short ? "packing-line-amount stock-low" : "packing-line-amount"} data-label="After sending">
+                                      {lineView.afterText || MISSING_VALUE}
+                                    </td>
+                                    <td>
+                                      <button aria-label={`Remove line ${index + 1}`} className="remove-button" disabled={transfer.draft.lines.length <= 1} type="button" onClick={() => setTransfer((current) => (current ? { ...current, error: "", pickingLine: current.pickingLine === line.key ? null : current.pickingLine, draft: { ...current.draft, lines: current.draft.lines.filter((other) => other.key !== line.key) } } : current))}><Icon name="trash" size={16} /></button>
+                                    </td>
+                                  </tr>
+                                  {transfer.pickingLine === line.key && (
+                                    <tr className="packing-line-picker-row">
+                                      <td colSpan={4}>
+                                        <PackingDrillPicker
+                                          catalogue={fromCatalogue}
+                                          title={`Line ${index + 1}`}
+                                          onClose={() => closeTransferPicker(line.key)}
+                                          onPick={(row) => pickTransferLine(line.key, row)}
+                                        />
+                                      </td>
+                                    </tr>
+                                  )}
+                                </React.Fragment>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <button className="secondary-button compact-button" type="button" onClick={() => setTransfer((current) => (current ? { ...current, draft: { ...current.draft, lines: [...current.draft.lines, newTransferLine()] } } : current))}><Icon name="add" size={14} />Add line</button>
+                      <small className="form-note">Enter in Qty goes to the next line (a new one is added at the end). A blank last line is left out.</small>
+                    </fieldset>
+                    <label className="packing-transfer-note">
+                      <span>Note (optional)</span>
+                      <input disabled={disabled || transfer.saving} maxLength={PACKING_TRANSFER_NOTE_MAX} placeholder="For the weekend rush" value={transfer.draft.note} onChange={(event) => updateTransfer({ note: event.target.value })} />
+                    </label>
+                    {summary && <p className="packing-purchase-total packing-transfer-summary" role="status"><strong>{summary}</strong></p>}
+                    {transfer.error && <div className="inline-error" role="alert">{transfer.error}</div>}
+                    <div className="button-row">
+                      <button className="primary-button" disabled={disabled || transfer.saving} type="button" onClick={saveTransfer}>{transfer.saving ? "Sending…" : "Send"}</button>
+                      <button className="secondary-button" disabled={transfer.saving} type="button" onClick={() => setTransfer(null)}>Cancel</button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
             {adjust && !failed && (
-              <div className="discount-block combo-form">
+              <div className="discount-block combo-form" id="pack-adjust-form">
                 <h3>{`Correct the count: ${adjust.path}`}</h3>
                 <div className="discount-form">
-                  <p className="form-note">{`Now ${packCountText(adjust.row)}. Enter how many to add, or with a minus how many to take off (for example -3 for torn boxes).`}</p>
-                  <Field label="Change">
-                    <input disabled={disabled} inputMode="decimal" placeholder="+10 or -3" step="0.001" type="number" value={adjust.draft.quantity} onChange={(event) => setAdjust((current) => (current ? { ...current, error: "", draft: { ...current.draft, quantity: event.target.value } } : current))} />
+                  <p className="form-note">{`Now ${Number.isFinite(adjust.row.qty_on_hand) ? `${formatPackCount(adjust.row.qty_on_hand)} on hand` : "the count is not known"}. Enter how many to add, or with a minus how many to take off (for example -3 for torn boxes).`}</p>
+                  <Field label="Add or take off (use − to take off)">
+                    <input autoFocus disabled={disabled} inputMode="decimal" placeholder="+10 or -3" step="0.001" type="number" value={adjust.draft.quantity} onChange={(event) => setAdjust((current) => (current ? { ...current, error: "", draft: { ...current.draft, quantity: event.target.value } } : current))} />
                   </Field>
+                  {(() => {
+                    // What the count will be, from local/froozPack.js; nothing while it cannot be worked out.
+                    const after = packingCountAfter(adjust.row.qty_on_hand, adjust.draft.quantity);
+                    return after === null ? null : (
+                      <p className={after < 0 ? "form-note packing-count-after stock-low" : "form-note packing-count-after"} role="status">
+                        After saving: <strong>{formatPackCount(after)}</strong> on hand
+                      </p>
+                    );
+                  })()}
                   <Field label="Reason">
-                    <input disabled={disabled} maxLength={300} placeholder="Counted the shelf, torn, given free" value={adjust.draft.reason} onChange={(event) => setAdjust((current) => (current ? { ...current, error: "", draft: { ...current.draft, reason: event.target.value } } : current))} />
+                    <input disabled={disabled} maxLength={300} placeholder="Torn, given free, recount" value={adjust.draft.reason} onChange={(event) => setAdjust((current) => (current ? { ...current, error: "", draft: { ...current.draft, reason: event.target.value } } : current))} />
                   </Field>
                   {adjust.error && <div className="inline-error" role="alert">{adjust.error}</div>}
                   <div className="button-row">
@@ -16556,14 +16812,14 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                     ))}
                   </ul>
                 )}
-                {canManage && !firstLoad && (
+                {showAddHere && (
                   // The header button is easy to miss, and an empty level is exactly when it is needed.
-                  // Inside a type or design the New-packing form starts there.
+                  // Inside a type or design the New-packing form starts there, and says so.
                   <button className="secondary-button compact-button packing-add-here" disabled={busy || disabled} type="button" onClick={() => startSetup(null)}>
-                    <Icon name="add" size={14} />{hereLabel ? `New packing in ${hereLabel}` : "New packing"}
+                    <Icon name="add" size={14} />{addHereLabel}
                   </button>
                 )}
-                <small className="form-note">→ opens, ← goes back, ↑ ↓ move. Counts are this branch's.</small>
+                {!firstLoad && rows.length > 0 && <small className="form-note">→ opens, ← goes back, ↑ ↓ move. Counts are this branch's.</small>}
               </div>
             )}
 
@@ -16573,18 +16829,20 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                 {movements.status === "failed" ? (
                   <div className="inline-error" role="alert">{movements.message}</div>
                 ) : (
-                  <DataTable className="pm-table" headers={["When", "Packing", "What", "Qty", "Note"]}>
+                  <DataTable className="pm-table packing-movements" headers={["When", "Packing", "What", "Qty", "Note"]}>
                     {movements.status !== "ready" && <tr><td className="empty-cell" colSpan={5}>Loading movements…</td></tr>}
-                    {movements.status === "ready" && movements.rows.length === 0 && <tr><td className="empty-cell" colSpan={5}>Nothing bought, sold or corrected yet.</td></tr>}
+                    {movements.status === "ready" && movements.rows.length === 0 && <tr><td className="empty-cell" colSpan={5}>Nothing bought, sold, sent or corrected yet.</td></tr>}
                     {movements.rows.map((row) => {
                       const quantity = Number(row.quantity);
+                      // "Sent to Ratanada" / "Received from Main Branch" for a send; the label otherwise.
+                      const said = packingMovementText(row);
                       return (
                         <tr key={String(row.id)}>
                           <td data-label="When">{formatPackWhen(row.created_at)}</td>
-                          <td className="primary-cell" data-label="Packing">{packingPathLabel(row) || MISSING_VALUE}</td>
-                          <td data-label="What">{PACKING_MOVEMENT_LABELS[String(row.movement_type || "").toUpperCase()] || row.movement_type || MISSING_VALUE}</td>
+                          <td data-label="Packing">{packingPathLabel(row) || MISSING_VALUE}</td>
+                          <td data-label="What">{said.what || MISSING_VALUE}</td>
                           <td className={Number.isFinite(quantity) && quantity < 0 ? "stock-low" : "stock-ok"} data-label="Qty">{Number.isFinite(quantity) ? `${quantity > 0 ? "+" : ""}${formatPackCount(quantity)}` : MISSING_VALUE}</td>
-                          <td data-label="Note">{row.reason || (row.sale_id ? `Bill ${row.invoice_no || row.sale_id}` : row.purchase_id ? `Purchase ${row.purchase_id}` : "")}</td>
+                          <td data-label="Note">{said.note}</td>
                         </tr>
                       );
                     })}
@@ -16687,6 +16945,8 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
   const [notice, setNotice] = useState(null);
   // The combo being deleted: { ref, name, saving, error }. Offered only for one no bill names.
   const [removal, setRemoval] = useState(null);
+  // The combo being switched on or off from its row (its ref), while the PUT is out.
+  const [toggling, setToggling] = useState(null);
   const roundingRule = saleRateSettings?.rounding_rule || "NEAREST_RUPEE";
   const targetMargin = parseTargetMargin(desiredMargin, saleRateSettings?.desired_margin_percent);
 
@@ -16746,6 +17006,24 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     : null;
   const packingCost = draft && fixed ? packingCostOf(draftPacking, packCatalogue) : null;
 
+  // Problems in the order their boxes sit on the form, and which boxes to mark (after a Save try).
+  const orderedErrors = draft ? orderComboErrors(check.errors, draft.combo_type) : [];
+  const invalidFields = attempted ? comboInvalidFields(check.errors) : new Set();
+  const fieldProps = (field) => ({ id: comboFieldId(field), "aria-invalid": invalidFields.has(field) ? true : undefined });
+
+  // The form opens above four tables; pressing Edit far down them used to fill a form out of sight.
+  const revealComboForm = () => {
+    window.requestAnimationFrame(() => {
+      document.getElementById("combo-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+  // A save or delete notice is said at the top; bring it into view from wherever the owner was.
+  const revealComboNotice = () => {
+    window.requestAnimationFrame(() => {
+      document.getElementById("combo-notice")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  };
+
   const startNew = () => {
     setDraft(newComboDraft({ kind: "COMBO_OFFER", desiredMargin: targetMargin }));
     setPackPicking(false);
@@ -16753,6 +17031,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     setAttempted(false);
     setSaveError("");
     setNotice(null);
+    revealComboForm();
   };
 
   const startEdit = (combo) => {
@@ -16762,22 +17041,14 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     setAttempted(false);
     setSaveError("");
     setNotice(null);
+    revealComboForm();
   };
 
+  // Each change is local/combos.js `applyComboDraftChange`: a new combo's margin follows its kind
+  // and type until the owner types one (a customer's-choice combo starts at none).
   const updateDraft = (field, value) => {
     setSaveError("");
-    setDraft((current) => {
-      if (!current) return current;
-      const next = { ...current, [field]: value };
-      // A new combo's margin follows its kind until the owner types one.
-      if (field === "kind" && !current.ref && !marginTouched) next.margin_percent = String(defaultComboMargin(value, targetMargin));
-      if (field === "combo_type" && value === "CUSTOM") next.price = "";
-      if (field === "combo_type" && value === "FIXED") {
-        next.extra_charge = "0";
-        if (next.items.length === 0) next.items = [{ product_id: "", product_name: "", unit: "", quantity: "" }];
-      }
-      return next;
-    });
+    setDraft((current) => applyComboDraftChange(current, field, value, { marginTouched, desiredMargin: targetMargin }));
     if (field === "margin_percent") setMarginTouched(true);
   };
 
@@ -16847,7 +17118,13 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     setAttempted(true);
     setSaveError("");
     setNotice(null);
-    if (!draft || !check.ok || saving || disabled) return;
+    if (draft && !check.ok) {
+      // The cursor goes to the first box with a problem, top to bottom.
+      const firstField = orderedErrors[0]?.field;
+      if (firstField) window.requestAnimationFrame(() => document.getElementById(comboFieldId(firstField))?.focus());
+      return;
+    }
+    if (!draft || saving || disabled) return;
     setSaving(true);
     const payload = buildComboPayload(draft);
     let response;
@@ -16869,6 +17146,37 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     const reloaded = await loadCombos();
     onSaved?.();
     const said = `${wasNew ? "Added" : "Saved"} ${savedName}. Counters get it at their next sync.`;
+    setNotice(reloaded
+      ? { tone: "success", text: said }
+      : { tone: "warning", text: `${said} The list could not be refreshed, so it may not show it yet.` });
+    revealComboNotice();
+  };
+
+  /**
+   * Switch off / Put on sale from the row: the same PUT the form's Save sends, built from the combo
+   * as its Edit form would be, with only "On sale in POS" changed (local/combos.js).
+   */
+  const toggleActive = async (combo) => {
+    const ref = combo.global_id || combo.id;
+    if (toggling || draft || removal || disabled || !ref) return;
+    const onSale = combo.active === false;
+    setNotice(null);
+    setToggling(ref);
+    try {
+      // No identity in the body: the server records who did it from the signed session.
+      await axios.put(`${API_URL}/api/v3/combos/${encodeURIComponent(String(ref))}`, comboActiveTogglePayload(combo, onSale));
+    } catch (error) {
+      setToggling(null);
+      setNotice({ tone: "warning", text: `${combo.name || "This combo"} could not be ${onSale ? "put on sale" : "switched off"}: ${getErrorMessage(error, "no answer from the server")}. Nothing was changed.` });
+      revealComboNotice();
+      return;
+    }
+    const reloaded = await loadCombos();
+    setToggling(null);
+    onSaved?.();
+    const said = onSale
+      ? `${combo.name} is on sale again. Counters get it at their next sync.`
+      : `${combo.name} is switched off. Counters stop selling it at their next sync.`;
     setNotice(reloaded
       ? { tone: "success", text: said }
       : { tone: "warning", text: `${said} The list could not be refreshed, so it may not show it yet.` });
@@ -16896,6 +17204,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
     setNotice(reloaded
       ? { tone: "success", text: said }
       : { tone: "warning", text: `${said} The list could not be refreshed, so it may still show it.` });
+    revealComboNotice();
   };
 
   const pricingText = (combo) => (combo.combo_type === "FIXED"
@@ -16929,7 +17238,7 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
             {!canManage && !failed && (
               <p className="form-note">Only the Owner or an Admin can add or change combos. You can see what is set up.</p>
             )}
-            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} id="combo-notice" role="status">{notice.text}</p>}
             {removal && !failed && (
               <div className="discount-block combo-form" role="alertdialog" aria-label={`Delete ${removal.name}`}>
                 <h3>Delete {removal.name}?</h3>
@@ -16942,134 +17251,158 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
               </div>
             )}
             {draft && !failed && (
-              <div className="discount-block combo-form">
+              <div className="discount-block combo-form" id="combo-form">
                 <h3>{draft.ref ? `Edit ${draft.name || "combo"}` : "New combo"}</h3>
                 <div className="discount-form">
+                  <label className="check-field combo-on-sale">
+                    <input checked={draft.active !== false} disabled={disabled} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} />
+                    <span>On sale in POS</span>
+                  </label>
+                  {draft.inUse && <p className="form-note">{COMBO_IN_USE_NOTE}</p>}
                   <Field label="Name">
-                    <input disabled={disabled} maxLength={120} value={draft.name} onChange={(event) => updateDraft("name", event.target.value)} />
+                    <input autoFocus disabled={disabled} maxLength={120} value={draft.name} onChange={(event) => updateDraft("name", event.target.value)} {...fieldProps("name")} />
                   </Field>
-                  <Field label="Kind">
-                    <select disabled={disabled} value={draft.kind} onChange={(event) => updateDraft("kind", event.target.value)}>
-                      {COMBO_KINDS.map((kind) => <option key={kind} value={kind}>{COMBO_KIND_LABELS[kind]}</option>)}
+                  <Field label="Menu section (POS tab)">
+                    <select disabled={disabled} value={draft.kind} onChange={(event) => updateDraft("kind", event.target.value)} {...fieldProps("kind")}>
+                      {COMBO_KINDS.map((kind) => <option key={kind} value={kind}>{comboKindMenuLabel(kind)}</option>)}
                     </select>
                   </Field>
-                  <Field label="Type">
-                    <select disabled={disabled} value={draft.combo_type} onChange={(event) => updateDraft("combo_type", event.target.value)}>
-                      {COMBO_TYPES.map((type) => <option key={type} value={type}>{COMBO_TYPE_LABELS[type]}</option>)}
+                  <Field label="What goes in">
+                    <select disabled={disabled} value={draft.combo_type} onChange={(event) => updateDraft("combo_type", event.target.value)} {...fieldProps("combo_type")}>
+                      {COMBO_TYPES.map((type) => <option key={type} value={type}>{COMBO_TYPE_FORM_LABELS[type] || COMBO_TYPE_LABELS[type]}</option>)}
                     </select>
-                  </Field>
-                  <Field label="Margin %">
-                    <input disabled={disabled} inputMode="decimal" min="0" max="1000" step="0.5" type="number" value={draft.margin_percent} onChange={(event) => updateDraft("margin_percent", event.target.value)} />
                   </Field>
                   {fixed ? (
                     <>
-                      <p className="form-note">The margin is what the suggested price is worked out from. Empty uses the Sale Rate desired margin ({targetMargin}%).</p>
                       <fieldset className="combo-items" disabled={disabled}>
                         <legend>Items in one combo</legend>
-                        {draft.items.map((item, index) => (
-                          <div className="combo-item-row" key={`item-${index}`}>
-                            <select aria-label={`Item ${index + 1} product`} value={String(item.product_id || "")} onChange={(event) => updateItem(index, "product_id", event.target.value)}>
-                              <option value="">Choose a product</option>
-                              {item.product_id && !productChoices.some((choice) => inventoryIdsEqual(choice.id, item.product_id)) && (
-                                <option value={String(item.product_id)}>{`${item.product_name || "A product"} (${comboItemProductNote(products, item) || "not offered"})`}</option>
-                              )}
-                              {productChoices.map((product) => (
-                                <option key={String(product.id)} value={String(product.id)}>{product.product_name}{product.unit ? ` (${product.unit})` : ""}</option>
-                              ))}
-                            </select>
-                            <input aria-label={`Item ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={item.quantity} onChange={(event) => updateItem(index, "quantity", event.target.value)} />
-                            <button aria-label={`Remove item ${index + 1}`} className="remove-button" disabled={draft.items.length <= 1} type="button" onClick={() => removeItemRow(index)}><Icon name="trash" size={16} /></button>
-                          </div>
-                        ))}
+                        {draft.items.map((item, index) => {
+                          const unit = item.unit || findComboProduct(products, item)?.unit || "";
+                          return (
+                            <div className="combo-item-row" key={`item-${index}`}>
+                              <select aria-label={`Item ${index + 1} product`} value={String(item.product_id || "")} onChange={(event) => updateItem(index, "product_id", event.target.value)} {...fieldProps(`items.${index}.product_id`)}>
+                                <option value="">Choose a product</option>
+                                {item.product_id && !productChoices.some((choice) => inventoryIdsEqual(choice.id, item.product_id)) && (
+                                  <option value={String(item.product_id)}>{`${item.product_name || "A product"} (${comboItemProductNote(products, item) || "not offered"})`}</option>
+                                )}
+                                {productChoices.map((product) => (
+                                  <option key={String(product.id)} value={String(product.id)}>{product.product_name}{product.unit ? ` (${product.unit})` : ""}</option>
+                                ))}
+                              </select>
+                              <input aria-label={`Item ${index + 1} quantity`} inputMode="decimal" min="0" placeholder={unit ? `Qty (${unit})` : "Qty"} step="0.001" type="number" value={item.quantity} onChange={(event) => updateItem(index, "quantity", event.target.value)} {...fieldProps(`items.${index}.quantity`)} />
+                              <button aria-label={`Remove item ${index + 1}`} className="remove-button" disabled={draft.items.length <= 1} type="button" onClick={() => removeItemRow(index)}><Icon name="trash" size={16} /></button>
+                            </div>
+                          );
+                        })}
                         <button className="secondary-button compact-button" type="button" onClick={addItemRow}><Icon name="add" size={14} />Add item</button>
                         <p className="form-note">Only fruits with stock are listed. A fruit with no stock appears here again once it arrives.</p>
                       </fieldset>
                       <fieldset className="combo-items combo-packing" disabled={disabled}>
-                        <legend>Packing (PEP Pack)</legend>
+                        <legend>Packing it goes out in</legend>
                         {!Array.isArray(draft.packing) && (
                           <p className="form-note">This combo's packing was not sent with it, so saving leaves its packing as it is. Adding packing here replaces it.</p>
                         )}
-                        {draftPacking.length === 0 && Array.isArray(draft.packing) && <p className="form-note">No packing. Add the box, basket or bottle one combo goes out in, so POS counts it off when it sells.</p>}
+                        {packing.status !== "failed" && draftPacking.length === 0 && Array.isArray(draft.packing) && <p className="form-note">No packing. Add the box, basket or bottle one combo goes out in, so POS counts it off when it sells.</p>}
+                        {draftPacking.length > 0 && (
+                          <div aria-hidden="true" className="combo-item-row combo-row-head">
+                            <span>Packing (PEP Pack)</span>
+                            <span>Per combo</span>
+                            <span />
+                          </div>
+                        )}
                         {draftPacking.map((entry, index) => (
                           <div className="combo-item-row" key={`packing-${entry.packing_size_id || index}`}>
                             <span className="packing-path">
                               {packingPathLabel(entry) || entry.packing_size_id || MISSING_VALUE}
                               {entry.size_active === false && <small className="cell-note inline-error">Switched off in PEP Pack.</small>}
                             </span>
-                            <input aria-label={`Packing ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="Qty" step="0.001" type="number" value={entry.quantity} onChange={(event) => updatePackingRow(index, event.target.value)} />
+                            <input aria-label={`Packing ${index + 1} quantity`} inputMode="decimal" min="0" placeholder="How many" step="0.001" type="number" value={entry.quantity} onChange={(event) => updatePackingRow(index, event.target.value)} {...fieldProps(`packing.${index}.quantity`)} />
                             <button aria-label={`Remove packing ${index + 1}`} className="remove-button" type="button" onClick={() => removePackingRow(index)}><Icon name="trash" size={16} /></button>
                           </div>
                         ))}
-                        {packPicking ? (
+                        {packing.status === "failed" ? (
+                          // Only the failure: no "No packing" line and no dead Add packing button beside it.
+                          <p className="warning-note" role="status">{`The packing list could not be loaded (${packing.message}), so packing cannot be added now. The combo can still be saved; its packing stays as it is.`}</p>
+                        ) : packPicking ? (
                           <PackingDrillPicker catalogue={packCatalogue} quantity title="Add packing" onClose={() => setPackPicking(false)} onPick={addPackingRow} />
                         ) : (
                           <button className="secondary-button compact-button" disabled={packing.status !== "ready"} type="button" onClick={() => setPackPicking(true)}><Icon name="add" size={14} />Add packing</button>
                         )}
-                        {packing.status === "failed" && (
-                          <p className="warning-note" role="status">{`The packing list could not be loaded (${packing.message}), so packing cannot be added now. The combo can still be saved; its packing stays as it is.`}</p>
-                        )}
                       </fieldset>
-                      <Field label="Combo price (₹)">
-                        <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.price} onChange={(event) => updateDraft("price", event.target.value)} />
-                      </Field>
-                      <p className="form-note combo-price-check">
-                        {`Items at today's rates ${itemsValue?.known ? currency.format(itemsValue.value) : MISSING_VALUE} vs combo price ${String(draft.price).trim() === "" ? MISSING_VALUE : currency.format(Number(draft.price) || 0)}`}
-                        {/* Only about a product actually chosen: a blank row is not "no sale rate". */}
-                        {draft.items.some((item) => String(item.product_id || "").trim() !== "" && productListRate(findComboProduct(products, item)) === null) ? " (an item has no sale rate yet)" : ""}
-                      </p>
-                      <p className="form-note combo-price-check">
-                        {`Cost today ${suggestion?.cost === null || suggestion?.cost === undefined ? MISSING_VALUE : currency.format(suggestion.cost)} · Suggested ${suggestion?.suggested === null || suggestion?.suggested === undefined ? MISSING_VALUE : currency.format(suggestion.suggested)}`}
-                        {suggestion?.suggested !== null && suggestion?.suggested !== undefined ? ` (at ${suggestion.margin}% margin)` : ""}{" "}
-                        <button
-                          className="secondary-button compact-button"
-                          disabled={disabled || suggestion?.suggested === null || suggestion?.suggested === undefined}
-                          type="button"
-                          onClick={() => updateDraft("price", String(suggestion.suggested))}
-                        >
-                          Use suggested
-                        </button>
-                      </p>
-                      {costs.status === "failed" && <p className="warning-note" role="status">Purchase costs could not be loaded, so there is no suggested price. The combo can still be saved.</p>}
-                      {draftPacking.length > 0 && packingCost && (
-                        <p className="form-note">
-                          {packingCost.known
-                            ? `Cost today includes ${currency.format(packingCost.cost)} of packing.`
-                            : "No suggestion: a packing size has no cost yet. Its first purchase in PEP Pack sets it, or set it there by hand."}
+                      <fieldset className="combo-items combo-pricing" disabled={disabled}>
+                        <legend>Price</legend>
+                        <Field label="Margin % (for the suggested price)">
+                          <input inputMode="decimal" min="0" max="1000" step="0.5" type="number" value={draft.margin_percent} onChange={(event) => updateDraft("margin_percent", event.target.value)} {...fieldProps("margin_percent")} />
+                        </Field>
+                        <p className="form-note">{comboMarginNote({ comboType: "FIXED", marginPercent: draft.margin_percent, desiredMargin: targetMargin })}</p>
+                        <p className="form-note combo-price-check">
+                          {`Cost today ${suggestion?.cost === null || suggestion?.cost === undefined ? MISSING_VALUE : currency.format(suggestion.cost)} · Suggested ${suggestion?.suggested === null || suggestion?.suggested === undefined ? MISSING_VALUE : currency.format(suggestion.suggested)}`}
+                          {suggestion?.suggested !== null && suggestion?.suggested !== undefined ? ` (at ${suggestion.margin}% margin)` : ""}{" "}
+                          <button
+                            className="secondary-button compact-button"
+                            disabled={disabled || suggestion?.suggested === null || suggestion?.suggested === undefined}
+                            type="button"
+                            onClick={() => updateDraft("price", String(suggestion.suggested))}
+                          >
+                            Use suggested
+                          </button>
                         </p>
-                      )}
-                      {costs.status === "ready" && suggestion?.cost === null && packingCost?.known !== false && draft.items.some((item) => String(item.product_id || "") !== "") && (
-                        <p className="form-note">No suggestion: an item has no purchase cost yet.</p>
-                      )}
+                        {costs.status === "failed" && <p className="warning-note" role="status">Purchase costs could not be loaded, so there is no suggested price. The combo can still be saved.</p>}
+                        {draftPacking.length > 0 && packingCost && (
+                          <p className="form-note">
+                            {packingCost.known
+                              ? `Cost today includes ${currency.format(packingCost.cost)} of packing.`
+                              : "No suggestion: a packing size has no cost yet. Its first purchase in PEP Pack sets it, or set it there by hand."}
+                          </p>
+                        )}
+                        {costs.status === "ready" && suggestion?.cost === null && packingCost?.known !== false && draft.items.some((item) => String(item.product_id || "") !== "") && (
+                          <p className="form-note">No suggestion: an item has no purchase cost yet.</p>
+                        )}
+                        <Field label="Combo price (₹)">
+                          <input inputMode="decimal" min="0" step="0.01" type="number" value={draft.price} onChange={(event) => updateDraft("price", event.target.value)} {...fieldProps("price")} />
+                        </Field>
+                        <p className="form-note combo-price-check">
+                          {comboPriceComparison({ itemsValue: itemsValue?.known ? itemsValue.value : null, price: draft.price }, (value) => currency.format(value))}
+                          {/* Only about a product actually chosen: a blank row is not "no sale rate". */}
+                          {draft.items.some((item) => String(item.product_id || "").trim() !== "" && productListRate(findComboProduct(products, item)) === null) ? " (an item has no sale rate yet)" : ""}
+                        </p>
+                      </fieldset>
                     </>
                   ) : (
                     <>
-                      <p className="form-note">The margin is added on top of the items' sale rates. Empty means 0%.</p>
-                      <p className="form-note">Packing for a customer's-choice combo is picked by the cashier at billing, from PEP Pack.</p>
-                      <Field label="Extra charge per combo (₹)">
-                        <input disabled={disabled} inputMode="decimal" min="0" step="0.01" type="number" value={draft.extra_charge} onChange={(event) => updateDraft("extra_charge", event.target.value)} />
-                      </Field>
-                      <p className="form-note combo-price-check">
-                        {`At the counter the cashier adds the customer's items and the bill shows one price: ${describeCustomPricing({ marginPercent: draft.margin_percent, extraCharge: draft.extra_charge }, (value) => currency.format(value))}, rounded. For example, ₹500 of fruit bills at ${(() => {
-                          const example = customComboPrice({ itemsValue: 500, marginPercent: draft.margin_percent, extraCharge: draft.extra_charge, roundingRule });
-                          return example === null ? MISSING_VALUE : currency.format(example);
-                        })()}.`}
-                      </p>
+                      <p className="form-note">The cashier adds the customer's fruit at the counter, and picks its packing there from PEP Pack.</p>
+                      <fieldset className="combo-items combo-pricing" disabled={disabled}>
+                        <legend>Price</legend>
+                        <div className="combo-pricing-pair">
+                          <Field label="Margin % on top of the items">
+                            <input inputMode="decimal" min="0" max="1000" placeholder="0" step="0.5" type="number" value={draft.margin_percent} onChange={(event) => updateDraft("margin_percent", event.target.value)} {...fieldProps("margin_percent")} />
+                          </Field>
+                          <Field label="Extra charge per combo (₹)">
+                            <input inputMode="decimal" min="0" step="0.01" type="number" value={draft.extra_charge} onChange={(event) => updateDraft("extra_charge", event.target.value)} {...fieldProps("extra_charge")} />
+                          </Field>
+                        </div>
+                        <p className="form-note">{comboMarginNote({ comboType: "CUSTOM", marginPercent: draft.margin_percent })}</p>
+                        <div className="combo-example" role="status">
+                          <span>{`The bill shows one price: ${describeCustomPricing({ marginPercent: draft.margin_percent, extraCharge: draft.extra_charge }, (value) => currency.format(value))}, rounded.`}</span>
+                          <strong>
+                            {`For example, ₹500 of fruit bills at ${(() => {
+                              const example = customComboPrice({ itemsValue: 500, marginPercent: draft.margin_percent, extraCharge: draft.extra_charge, roundingRule });
+                              return example === null ? MISSING_VALUE : currency.format(example);
+                            })()}.`}
+                          </strong>
+                        </div>
+                      </fieldset>
                     </>
                   )}
                   <Field label="Description (optional)">
                     <input disabled={disabled} maxLength={500} value={draft.description} onChange={(event) => updateDraft("description", event.target.value)} />
                   </Field>
-                  <Field label="Order in POS">
+                  <Field label="Position on the POS tab (lower comes first)">
                     <input disabled={disabled} inputMode="numeric" step="1" type="number" value={draft.sort_order} onChange={(event) => updateDraft("sort_order", event.target.value)} />
                   </Field>
-                  <label className="check-field">
-                    <input checked={draft.active !== false} disabled={disabled} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} />
-                    <span>On sale in POS</span>
-                  </label>
-                  {draft.inUse && <p className="form-note">{COMBO_IN_USE_NOTE}</p>}
                   {attempted && !check.ok && (
                     <div className="inline-error" role="alert">
-                      {check.errors.map((error) => <div key={`${error.code}-${error.message}`}>{error.message}</div>)}
+                      {orderedErrors.map((error) => <div key={`${error.code}-${error.field}-${error.message}`}>{error.message}</div>)}
                     </div>
                   )}
                   {saveError && <div className="inline-error" role="alert">{saveError}</div>}
@@ -17080,22 +17413,34 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                 </div>
               </div>
             )}
-            {!failed && COMBO_KINDS.map((kind) => {
+            {!failed && !firstLoad && sorted.length === 0 && (
+              // Nothing at all: one empty block, not four empty tables.
+              <div className="discount-block combo-empty">
+                <p className="cart-empty">
+                  {canManage
+                    ? "No combos yet. Press Add combo to make a juice, a cutting bowl, a gift hamper or an offer. Each shows on its own POS tab."
+                    : "No combos yet."}
+                </p>
+              </div>
+            )}
+            {!failed && (firstLoad || sorted.length > 0) && COMBO_KINDS.map((kind) => {
               const rows = sorted.filter((combo) => combo.kind === kind);
               return (
                 <div className="discount-block" key={kind}>
                   <div className="discount-block-head">
-                    <h3>{COMBO_KIND_LABELS[kind]}</h3>
+                    <h3>{comboSectionHeading(kind)}</h3>
                   </div>
                   <DataTable className="pm-table combo-table" headers={["Combo", "Price", "Items", "Status", ""]}>
                     {firstLoad && <tr><td className="empty-cell" colSpan={5}>Loading combos…</td></tr>}
                     {!firstLoad && rows.length === 0 && (
-                      <tr><td className="empty-cell" colSpan={5}>{`No ${COMBO_KIND_LABELS[kind]} combos yet.`}</td></tr>
+                      <tr><td className="empty-cell" colSpan={5}>{canManage ? "Nothing here yet. Press Add combo to make one." : "Nothing here yet."}</td></tr>
                     )}
                     {rows.map((combo) => {
                       const offSale = comboProductsNotOnSale(combo, products);
+                      const ref = combo.global_id || combo.id;
+                      const rowBusy = Boolean(draft) || Boolean(removal) || Boolean(toggling) || disabled;
                       return (
-                        <tr className={combo.active ? "" : "discount-row-past"} key={combo.global_id || combo.id}>
+                        <tr className={combo.active ? "" : "discount-row-past combo-row-off"} key={ref}>
                           <td className="primary-cell">
                             {combo.name}
                             <small className="cell-note">{COMBO_TYPE_LABELS[combo.combo_type] || combo.combo_type}{combo.margin_percent !== null ? ` · margin ${combo.margin_percent}%` : ""}</small>
@@ -17108,13 +17453,18 @@ function CombosModule({ canManage = false, desiredMargin = "", onSaved, saleRate
                             )}
                             {offSale.length > 0 && <small className="cell-note inline-error">{offSale.map((name) => `${name} is not on sale.`).join(" ")} POS will not sell this combo until it is.</small>}
                           </td>
-                          <td data-label="Status">{combo.active ? "On sale" : "Switched off"}</td>
+                          <td data-label="Status"><span className={combo.active ? "stock-ok" : "tag"}>{combo.active ? "On sale" : "Switched off"}</span></td>
                           <td className="discount-actions-cell">
                             {canManage && (
-                              <button className="secondary-button compact-button" disabled={Boolean(draft) || Boolean(removal) || disabled} type="button" onClick={() => startEdit(combo)}>Edit</button>
+                              <button className="secondary-button compact-button" disabled={rowBusy} type="button" onClick={() => startEdit(combo)}>Edit</button>
+                            )}
+                            {canManage && (
+                              <button className="secondary-button compact-button" disabled={rowBusy} type="button" onClick={() => toggleActive(combo)}>
+                                {toggling === ref ? "Saving…" : combo.active ? "Switch off" : "Put on sale"}
+                              </button>
                             )}
                             {canManage && comboDeletable(combo) && (
-                              <button className="danger-text-button compact-button" disabled={Boolean(draft) || Boolean(removal) || disabled} type="button" onClick={() => startRemoval(combo)}>Delete</button>
+                              <button className="danger-text-button compact-button" disabled={rowBusy} type="button" onClick={() => startRemoval(combo)}>Delete</button>
                             )}
                           </td>
                         </tr>
@@ -28597,7 +28947,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 title={section.blurb}
               >
                 <strong>{section.label}</strong>
-                <span>{(section.products ? posMatches.length : 0) + (comboTabCounts[section.key] || 0)}</span>
+                {/* A combo tab's count only once combos loaded here: "0" would read as "none" (local/combos.js). */}
+                <span>{posTabCountText({ productsTab: Boolean(section.products), productCount: posMatches.length, comboCount: comboTabCounts[section.key] || 0, combosReady: combosEnabled && combos?.status === "ready" && shelf.usable })}</span>
               </button>
             ))}
           </div>

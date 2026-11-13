@@ -61,5 +61,10 @@ test("purchase ids are compared as opaque strings, never Number() (BO-16)", () =
 });
 
 test("PEP Pack movements name a bill by its invoice number (BO-18)", () => {
-  assert.match(app, /Bill \$\{row\.invoice_no \|\| row\.sale_id\}/);
+  // The wording moved to local/froozPack.js `packingMovementText` (its behaviour is pinned in
+  // froozPack.test.mjs); the screen shows what it says.
+  const pack = readFileSync(new URL("./froozPack.js", import.meta.url), "utf8");
+  assert.match(pack, /`Bill \$\{text\(row\?\.invoice_no\) \|\| text\(row\.sale_id\)\}`/);
+  assert.match(app, /const said = packingMovementText\(row\);/);
+  assert.match(app, /<td data-label="Note">\{said\.note\}<\/td>/);
 });
