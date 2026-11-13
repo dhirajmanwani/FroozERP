@@ -98,8 +98,10 @@ const INDIRECT_ACTORS = [
  * `requireRateManager(req.auth.userId, client)` once for all of them.
  *
  * 59 -> 60 on 23 Oct 2026: deleting a combo nothing was billed with (`DELETE /api/v3/combos/:id`).
+ * 60 -> 61 on 13 Nov 2026: the shops a packing send can go between (`GET /api/v3/packing/shops`).
+ *   The send itself (`POST /api/v3/packing/transfers`) goes through `packingWriteRoute`'s one call.
  */
-const SESSION_DERIVED_RATE_MANAGER_CALLS = 60;
+const SESSION_DERIVED_RATE_MANAGER_CALLS = 61;
 
 /** Every `requireRateManager(` occurrence in the file, session-derived or listed above. */
 const TOTAL_RATE_MANAGER_CALLS = SESSION_DERIVED_RATE_MANAGER_CALLS + INDIRECT_ACTORS.length;

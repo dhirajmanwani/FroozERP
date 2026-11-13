@@ -186,7 +186,7 @@ import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMast
 import { DEFAULT_BRAND_IDENTITY, checkBrandLogo, createBrandIdentityStore, hasUnusableLogo, resolveBrandIdentity, shrinkBrandLogo } from "./local/brandIdentity";
 import { posTabFor, posTabsFor, posTileBadge, readPosTab, writePosTab } from "./local/posSections";
 import { COMBO_EDIT_REFUSAL, COMBO_IN_USE_NOTE, COMBO_KINDS, COMBO_KIND_LABELS, COMBO_RETURN_REFUSAL, COMBO_TAB_FOR_KIND, COMBO_TYPES, COMBO_TYPE_LABELS, buildComboPayload, cartItemCount, comboAvailability, comboDeletable, comboGroupTitle, comboItemProductNote, comboPickableProducts, comboStockNotifications, comboStockProblems, describeComboStockProblem, emptyComboTabMessage, comboGroupTotal, comboItemsValue, comboLineFields, comboProductsNotOnSale, comboDraftFrom, customComboPrice, customComboTag, describeCustomPricing, expandFixedCombo, findComboProduct, newComboDraft, productListRate, resolveComboAvailability, groupComboLines, isComboLine, isFixedComboLine, readCombos, repriceCustomCombo, saleHasCombos, sortCombos, suggestComboPrice, validateComboCart, validateComboDraft, COMBO_TYPE_FORM_LABELS, applyComboDraftChange, comboActiveTogglePayload, comboFieldId, comboInvalidFields, comboKindMenuLabel, comboMarginNote, comboPriceComparison, comboSectionHeading, orderComboErrors, posTabCountText } from "./local/combos";
-import { PACKING_MOVEMENT_LABELS, PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, checkPackingNodeForm, newPackingPurchaseClientRef, packingSetupStart, startPackingNodeForm, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, PACKING_STATE_WORDS, packingAddHereLabel, packingCountAfter, packingHasPickableSize } from "./local/froozPack";
+import { PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, checkPackingNodeForm, newPackingPurchaseClientRef, packingSetupStart, startPackingNodeForm, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, PACKING_STATE_WORDS, packingAddHereLabel, packingCountAfter, packingHasPickableSize, applyPackingToTransferLine, buildPackingTransferPayload, changePackingTransferFrom, createPackingTransferDraft, createPackingTransferLine, packingCatalogueAtShop, packingMovementText, packingShopName, packingShopPlace, packingTransferDestinations, packingTransferDoneText, packingTransferLineView, packingTransferOffered, packingTransferSummary, PACKING_TRANSFER_NOTE_MAX, readPackingShops } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
@@ -15931,7 +15931,8 @@ function PackingSetupForm({ catalogue, disabled = false, id, setup, onCancel, on
 /**
  * PEP Pack: the Owner's or an Admin's packing, kept on the server (`/api/v3/packing`). The tree
  * (Type → Design → Size, each editable), each size's count at this branch and its unit cost, the
- * purchase form (which also books the expense under Packing Material) and count corrections.
+ * purchase form (which also books the expense under Packing Material), count corrections and, when
+ * the company has more than one shop, sending packing from one shop to another.
  * Local Only, offline and no cloud each say so and send nothing.
  */
 function FroozPackModule({ canManage = false, onSaved, unavailableReason = null }) {
@@ -15944,6 +15945,11 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   const [nodeForm, setNodeForm] = useState(null);
   // { draft, pickingLine, error, saving }
   const [purchase, setPurchase] = useState(null);
+  // The company's shops and each one's counts (GET /api/v3/packing/shops, Owner/Admin): what
+  // "Send to another shop" needs. Read with the list; with one shop the button is not there.
+  const [shops, setShops] = useState({ status: "idle", shops: [], thisShopId: "", message: "" });
+  // A send to another shop: { draft: { from_branch_id, to_branch_id, lines, note }, pickingLine, error, saving }
+  const [transfer, setTransfer] = useState(null);
   // { row, draft: { quantity, reason }, error, saving }
   const [adjust, setAdjust] = useState(null);
   // Delete, asked once before it happens: { kind, ref, label, error, saving }
@@ -15972,9 +15978,10 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
 
   const loadPacking = async () => {
     setLoad((current) => ({ ...current, status: "loading", message: "" }));
-    const [packResult, movementResult] = await Promise.allSettled([
+    const [packResult, movementResult, shopsResult] = await Promise.allSettled([
       axios.get(`${API_URL}/api/v3/packing`),
       axios.get(`${API_URL}/api/v3/packing/movements`, { params: { limit: 30 } }),
+      canManage ? axios.get(`${API_URL}/api/v3/packing/shops`) : Promise.resolve(null),
     ]);
     if (packResult.status !== "fulfilled") {
       setLoad({ status: "failed", message: `Packing could not be loaded (${getErrorMessage(packResult.reason, "no answer from the server")}). Nothing on this screen is current.` });
@@ -15987,6 +15994,21 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
       return false;
     }
     setCatalogue(read);
+    if (canManage) {
+      // A list that did not load is said, never taken as "one shop": the Send button stays away
+      // until the shops are known.
+      const shopsRead = shopsResult.status === "fulfilled" ? readPackingShops(shopsResult.value?.data) : null;
+      setShops(shopsRead && shopsRead.status === "ready"
+        ? shopsRead
+        : {
+          status: "failed",
+          shops: [],
+          thisShopId: "",
+          message: shopsRead
+            ? shopsRead.message
+            : `The list of shops could not be loaded (${getErrorMessage(shopsResult.reason, "no answer from the server")}), so Send to another shop is not offered right now.`,
+        });
+    }
     const body = movementResult.status === "fulfilled" ? movementResult.value.data : null;
     const movementRows = Array.isArray(body?.movements) ? body.movements : Array.isArray(body) ? body : null;
     setMovements(movementRows
@@ -16005,6 +16027,8 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
   useEffect(() => {
     if (unavailableReason) return;
     loadPacking();
+    // Loads once per availability change; `loadPacking` is a new function every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unavailableReason]);
 
   const failed = load.status === "failed";
@@ -16299,6 +16323,95 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
     await afterWrite(`${label}: count ${check.payload.quantity > 0 ? "raised" : "lowered"} by ${formatPackCount(Math.abs(check.payload.quantity))}.`);
   };
 
+  // --- Send to another shop ------------------------------------------------------------------
+  // Every rule and every word is local/froozPack.js; the server checks again under a row lock
+  // and refuses (409) a line asking for more than the From shop has.
+
+  const newTransferLine = () => {
+    lineSeq.current += 1;
+    return createPackingTransferLine(`pack-transfer-line-${lineSeq.current}`);
+  };
+
+  const startTransfer = () => {
+    setNotice(null);
+    setTransfer({ draft: createPackingTransferDraft(shops, newTransferLine), pickingLine: null, error: "", saving: false });
+    revealPackForm("pack-transfer-form");
+  };
+
+  const updateTransfer = (patch) => setTransfer((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, ...patch } }
+    : current));
+
+  const changeTransferFrom = (fromId) => setTransfer((current) => (current
+    ? { ...current, error: "", pickingLine: null, draft: changePackingTransferFrom(current.draft, shops, fromId) }
+    : current));
+
+  const updateTransferLine = (key, field, value) => setTransfer((current) => (current
+    ? { ...current, error: "", draft: { ...current.draft, lines: current.draft.lines.map((line) => (line.key === key ? { ...line, [field]: value } : line)) } }
+    : current));
+
+  const toggleTransferPicker = (key) => setTransfer((current) => (current ? { ...current, pickingLine: current.pickingLine === key ? null : key } : current));
+
+  const closeTransferPicker = (key) => {
+    setTransfer((current) => (current ? { ...current, pickingLine: null } : current));
+    pendingFocus.current = { key, field: "pick" };
+  };
+
+  const pickTransferLine = (key, row) => {
+    setTransfer((current) => (current
+      ? { ...current, pickingLine: null, error: "", draft: { ...current.draft, lines: applyPackingToTransferLine(current.draft.lines, key, row) } }
+      : current));
+    pendingFocus.current = { key, field: "quantity" };
+  };
+
+  /** Enter in Qty goes to the next line's Packing, adding a line at the end (as a purchase's Rate does). */
+  const transferEnter = (event, key) => {
+    if (event.key !== "Enter" || !transfer) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const next = advancePackingPurchaseLine(transfer.draft.lines, key, "rate", newTransferLine);
+    if (next.lines !== transfer.draft.lines) {
+      setTransfer((current) => (current ? { ...current, draft: { ...current.draft, lines: next.lines } } : current));
+      pendingFocus.current = next.focus;
+      return;
+    }
+    const element = next.focus ? purchaseFields.current.get(`${next.focus.key}:${next.focus.field}`) : null;
+    element?.focus();
+  };
+
+  const saveTransfer = async () => {
+    if (!transfer || transfer.saving || disabled) return;
+    const check = buildPackingTransferPayload(transfer.draft, shops);
+    if (!check.ok) {
+      setTransfer((current) => (current ? { ...current, error: check.message } : current));
+      return;
+    }
+    setTransfer((current) => (current ? { ...current, saving: true, error: "", pickingLine: null } : current));
+    let response;
+    try {
+      // No identity in the body: the server records who sent it from the signed session.
+      response = await axios.post(`${API_URL}/api/v3/packing/transfers`, check.payload);
+    } catch (error) {
+      const answered = Boolean(error?.response);
+      setTransfer((current) => (current
+        ? {
+          ...current,
+          saving: false,
+          error: answered
+            ? getErrorMessage(error, "The packing could not be sent. Nothing was changed.")
+            : "The send could not be confirmed: no answer from the server. Check Recent movements before pressing Send again, because it may already have gone.",
+        }
+        : current));
+      // Too few on hand, or no answer: show the counts as they are now.
+      if (!answered || error.response.status === 409) loadPacking().catch(() => null);
+      return;
+    }
+    const toName = packingShopName(shops, check.payload.to_branch_id);
+    setTransfer(null);
+    await afterWrite(packingTransferDoneText(response?.data, { summary: check.summary, toName }));
+    revealPackForm("pack-notice");
+  };
+
   const showQuickStart = canManage && !failed && load.status === "ready" && !quickStart.skipped && packingQuickStartOffered(catalogue);
   // An empty level says what is missing once; the one button under it says what it adds there
   // ("Add a design to Gift Box"). At the top the header's New packing (and Quick start) cover it.
@@ -16324,7 +16437,11 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
               <button className="secondary-button" disabled={busy || firstLoad} type="button" onClick={() => startSetup(null)}>
                 <Icon name="add" size={16} />New packing
               </button>
-              <button className="primary-button" disabled={busy || firstLoad || Boolean(purchase) || !canBuy} title={!firstLoad && !canBuy ? "Make a size first with New packing" : undefined} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
+              <button className="primary-button" disabled={busy || firstLoad || Boolean(purchase || transfer) || !canBuy} title={!firstLoad && !canBuy ? "Make a size first with New packing" : undefined} type="button" onClick={startPurchase}><Icon name="cart" size={16} />Packing purchase</button>
+              {/* Only when the company has more than one shop; with one, there is nowhere to send to. */}
+              {packingTransferOffered(shops) && (
+                <button className="secondary-button" disabled={busy || firstLoad || Boolean(purchase || transfer) || !canBuy} title={!firstLoad && !canBuy ? "Make a size first with New packing" : undefined} type="button" onClick={startTransfer}><Icon name="truck" size={16} />Send to another shop</button>
+              )}
             </>
           )
           : null}
@@ -16343,7 +16460,8 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
             {canManage && !failed && load.status === "ready" && !canBuy && !purchase && !showQuickStart && (
               <p className="form-note">Packing purchase opens once a packing size exists.</p>
             )}
-            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} role="status">{notice.text}</p>}
+            {notice && <p className={notice.tone === "success" ? "form-note stock-ok" : "warning-note"} id="pack-notice" role="status">{notice.text}</p>}
+            {canManage && !failed && shops.status === "failed" && <p className="warning-note" role="status">{shops.message}</p>}
 
             {showQuickStart && (
               <div className="discount-block packing-quick-start">
@@ -16528,6 +16646,94 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
               </div>
             )}
 
+            {transfer && !failed && (() => {
+              const fromId = transfer.draft.from_branch_id;
+              const fromCatalogue = packingCatalogueAtShop(catalogue, shops, fromId);
+              const destinations = packingTransferDestinations(shops, fromId);
+              const summary = packingTransferSummary(transfer.draft, shops);
+              return (
+                <div className="discount-block combo-form" id="pack-transfer-form">
+                  <h3>Send packing to another shop</h3>
+                  <div className="discount-form packing-purchase-form packing-transfer-form">
+                    <p className="form-note">The packing leaves the From shop's count now and is added to the To shop's. Nothing is booked as an expense: that was done when it was bought.</p>
+                    <div className="packing-purchase-head">
+                      <Field label="From">
+                        <select autoFocus disabled={disabled || transfer.saving} value={fromId} onChange={(event) => changeTransferFrom(event.target.value)}>
+                          {shops.shops.map((shop) => <option key={shop.id} value={shop.id}>{packingShopPlace(shops, shop.id) === "here" ? `${shop.name} (this shop)` : shop.name}</option>)}
+                        </select>
+                      </Field>
+                      <Field label="To">
+                        <select disabled={disabled || transfer.saving} value={transfer.draft.to_branch_id} onChange={(event) => updateTransfer({ to_branch_id: event.target.value })}>
+                          {destinations.length !== 1 && <option value="">Choose a shop</option>}
+                          {destinations.map((shop) => <option key={shop.id} value={shop.id}>{shop.name}</option>)}
+                        </select>
+                      </Field>
+                    </div>
+                    <fieldset className="combo-items packing-purchase-items" disabled={disabled || transfer.saving}>
+                      <legend>What to send</legend>
+                      <div className="table-wrap packing-purchase-table">
+                        <table>
+                          <thead>
+                            <tr><th>Packing</th><th>Qty</th><th>After sending</th><th><span className="pm-sr-only">Remove</span></th></tr>
+                          </thead>
+                          <tbody>
+                            {transfer.draft.lines.map((line, index) => {
+                              const lineView = packingTransferLineView(line, shops, fromId);
+                              return (
+                                <React.Fragment key={line.key}>
+                                  <tr>
+                                    <td data-label="Packing">
+                                      <button className="secondary-button compact-button packing-line-pick" ref={purchaseFieldRef(line.key, "pick")} title={line.label || ""} type="button" onClick={() => toggleTransferPicker(line.key)}>
+                                        {line.label || "Choose packing"}
+                                      </button>
+                                      {lineView.onHandText && <small className="form-note packing-line-onhand">{lineView.onHandText}</small>}
+                                    </td>
+                                    <td data-label="Qty">
+                                      <input aria-label={`Line ${index + 1} quantity to send`} className="table-input" inputMode="decimal" min="0" placeholder="Qty" ref={purchaseFieldRef(line.key, "quantity")} step="0.001" type="number" value={line.quantity} onChange={(event) => updateTransferLine(line.key, "quantity", event.target.value)} onKeyDown={(event) => transferEnter(event, line.key)} />
+                                    </td>
+                                    <td className={lineView.short ? "packing-line-amount stock-low" : "packing-line-amount"} data-label="After sending">
+                                      {lineView.afterText || MISSING_VALUE}
+                                    </td>
+                                    <td>
+                                      <button aria-label={`Remove line ${index + 1}`} className="remove-button" disabled={transfer.draft.lines.length <= 1} type="button" onClick={() => setTransfer((current) => (current ? { ...current, error: "", pickingLine: current.pickingLine === line.key ? null : current.pickingLine, draft: { ...current.draft, lines: current.draft.lines.filter((other) => other.key !== line.key) } } : current))}><Icon name="trash" size={16} /></button>
+                                    </td>
+                                  </tr>
+                                  {transfer.pickingLine === line.key && (
+                                    <tr className="packing-line-picker-row">
+                                      <td colSpan={4}>
+                                        <PackingDrillPicker
+                                          catalogue={fromCatalogue}
+                                          title={`Line ${index + 1}`}
+                                          onClose={() => closeTransferPicker(line.key)}
+                                          onPick={(row) => pickTransferLine(line.key, row)}
+                                        />
+                                      </td>
+                                    </tr>
+                                  )}
+                                </React.Fragment>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <button className="secondary-button compact-button" type="button" onClick={() => setTransfer((current) => (current ? { ...current, draft: { ...current.draft, lines: [...current.draft.lines, newTransferLine()] } } : current))}><Icon name="add" size={14} />Add line</button>
+                      <small className="form-note">Enter in Qty goes to the next line (a new one is added at the end). A blank last line is left out.</small>
+                    </fieldset>
+                    <label className="packing-transfer-note">
+                      <span>Note (optional)</span>
+                      <input disabled={disabled || transfer.saving} maxLength={PACKING_TRANSFER_NOTE_MAX} placeholder="For the weekend rush" value={transfer.draft.note} onChange={(event) => updateTransfer({ note: event.target.value })} />
+                    </label>
+                    {summary && <p className="packing-purchase-total packing-transfer-summary" role="status"><strong>{summary}</strong></p>}
+                    {transfer.error && <div className="inline-error" role="alert">{transfer.error}</div>}
+                    <div className="button-row">
+                      <button className="primary-button" disabled={disabled || transfer.saving} type="button" onClick={saveTransfer}>{transfer.saving ? "Sending…" : "Send"}</button>
+                      <button className="secondary-button" disabled={transfer.saving} type="button" onClick={() => setTransfer(null)}>Cancel</button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
             {adjust && !failed && (
               <div className="discount-block combo-form" id="pack-adjust-form">
                 <h3>{`Correct the count: ${adjust.path}`}</h3>
@@ -16625,16 +16831,18 @@ function FroozPackModule({ canManage = false, onSaved, unavailableReason = null 
                 ) : (
                   <DataTable className="pm-table packing-movements" headers={["When", "Packing", "What", "Qty", "Note"]}>
                     {movements.status !== "ready" && <tr><td className="empty-cell" colSpan={5}>Loading movements…</td></tr>}
-                    {movements.status === "ready" && movements.rows.length === 0 && <tr><td className="empty-cell" colSpan={5}>Nothing bought, sold or corrected yet.</td></tr>}
+                    {movements.status === "ready" && movements.rows.length === 0 && <tr><td className="empty-cell" colSpan={5}>Nothing bought, sold, sent or corrected yet.</td></tr>}
                     {movements.rows.map((row) => {
                       const quantity = Number(row.quantity);
+                      // "Sent to Ratanada" / "Received from Main Branch" for a send; the label otherwise.
+                      const said = packingMovementText(row);
                       return (
                         <tr key={String(row.id)}>
                           <td data-label="When">{formatPackWhen(row.created_at)}</td>
                           <td data-label="Packing">{packingPathLabel(row) || MISSING_VALUE}</td>
-                          <td data-label="What">{PACKING_MOVEMENT_LABELS[String(row.movement_type || "").toUpperCase()] || row.movement_type || MISSING_VALUE}</td>
+                          <td data-label="What">{said.what || MISSING_VALUE}</td>
                           <td className={Number.isFinite(quantity) && quantity < 0 ? "stock-low" : "stock-ok"} data-label="Qty">{Number.isFinite(quantity) ? `${quantity > 0 ? "+" : ""}${formatPackCount(quantity)}` : MISSING_VALUE}</td>
-                          <td data-label="Note">{row.reason || (row.sale_id ? `Bill ${row.invoice_no || row.sale_id}` : row.purchase_id ? (row.reference_number ? `Purchase · bill ${row.reference_number}` : `Purchase ${row.purchase_id}`) : "")}</td>
+                          <td data-label="Note">{said.note}</td>
                         </tr>
                       );
                     })}

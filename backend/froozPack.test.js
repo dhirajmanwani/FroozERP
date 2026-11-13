@@ -191,7 +191,7 @@ const SCHEMA = `
   );
   CREATE TABLE sale_items (id SERIAL PRIMARY KEY, sale_id INTEGER);
   CREATE TABLE sales (id INTEGER PRIMARY KEY, branch_id INTEGER, invoice_no TEXT);
-  CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, active BOOLEAN DEFAULT TRUE);
+  CREATE TABLE branches (id INTEGER PRIMARY KEY, company_id INTEGER, active BOOLEAN DEFAULT TRUE, branch_name VARCHAR(120));
   CREATE TABLE sync_change_log (
     change_id BIGSERIAL PRIMARY KEY, company_id INTEGER, branch_id INTEGER, operational_location_id INTEGER,
     assignment_generation INTEGER, entity_type TEXT, entity_id TEXT, operation_type TEXT, entity_version INTEGER,
@@ -212,7 +212,8 @@ const SCHEMA = `
     id SERIAL PRIMARY KEY, sale_id INTEGER, action TEXT, field_name TEXT, old_value JSONB, new_value JSONB,
     reason TEXT, edited_by INTEGER, approved_by INTEGER
   );
-  INSERT INTO branches VALUES (1, 1, TRUE), (2, 1, TRUE), (3, 2, TRUE);
+  INSERT INTO branches (id, company_id, active, branch_name)
+    VALUES (1, 1, TRUE, 'Main Branch'), (2, 1, TRUE, 'Ratanada'), (3, 2, TRUE, 'Another Company Shop');
 `;
 
 /** The same change rows `logSyncChange` / `logMasterDataSyncChange` write, for the direct-call tests. */
@@ -1030,5 +1031,237 @@ test("routes: a bill's packing movement names the bill by its invoice number", a
     const bySale = Object.fromEntries(history.body.movements.map((row) => [row.sale_id, row.invoice_no]));
     assert.equal(bySale[4512], "INV-77");
     assert.equal(bySale[4513], null, "a bill of another branch is not looked up across branches");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Sending packing to another shop: POST /api/v3/packing/transfers, GET /api/v3/packing/shops
+// ---------------------------------------------------------------------------------------------
+
+const { readVisibleIncrementalChanges } = require("./syncReferenceBootstrap");
+
+/** Buy 50 Grand and 20 Petite at branch 1 (Main Branch) through the route, then forget the changes. */
+const stockMainBranch = async (db) => {
+  const tree = await buildTree();
+  const bought = await call("POST", "/api/v3/packing/purchases", {
+    payment_mode: "CASH", lines: [{ size_id: tree.grand.global_id, quantity: 50, rate: 10 }, { size_id: tree.petite.id, quantity: 20, rate: 3 }],
+  });
+  assert.equal(bought.status, 201, JSON.stringify(bought.body));
+  await db.query("DELETE FROM sync_change_log");
+  return tree;
+};
+const stockOf = async (db) => Object.fromEntries((await db.query("SELECT branch_id, size_id, qty_on_hand FROM packing_stock ORDER BY branch_id, size_id")).rows
+  .map((row) => [`${row.branch_id}:${row.size_id}`, Number(row.qty_on_hand)]));
+
+test("validate: a transfer names two different shops and lines above zero with at most 3 decimals, each size once", () => {
+  const good = pack.validateTransferInput({
+    from_branch_id: 1, to_branch_id: "2", note: "  for   Diwali ",
+    lines: [{ size_id: "packing-size-1", quantity: "10" }, { size: 2, quantity: 0.125 }],
+  });
+  assert.equal(good.ok, true, JSON.stringify(good));
+  assert.deepEqual(good.value, {
+    from_branch_id: 1, to_branch_id: 2, note: "for Diwali",
+    lines: [{ size_ref: { ref: "packing-size-1", intId: null }, quantity: 10 }, { size_ref: { ref: "2", intId: 2 }, quantity: 0.125 }],
+  });
+  assert.equal(pack.validateTransferInput({ from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: 1, quantity: 1 }] }).value.note, null);
+  const base = { from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: 1, quantity: 1 }] };
+  const refusals = [
+    [{ ...base, from_branch_id: undefined }, CODES.TRANSFER_INVALID],
+    [{ ...base, to_branch_id: "" }, CODES.TRANSFER_INVALID],
+    [{ ...base, to_branch_id: "x" }, CODES.TRANSFER_INVALID],
+    [{ ...base, to_branch_id: 1 }, CODES.TRANSFER_SAME_SHOP],
+    [{ ...base, to_branch_id: "1" }, CODES.TRANSFER_SAME_SHOP],
+    [{ ...base, lines: [] }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: "1" }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: [{ quantity: 1 }] }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: [{ size_id: 1, quantity: 0 }] }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: [{ size_id: 1, quantity: -2 }] }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: [{ size_id: 1, quantity: "lots" }] }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: [{ size_id: 1, quantity: 1.0005 }] }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: [{ size_id: 1, quantity: 1 }, { size_id: "1", quantity: 2 }] }, CODES.TRANSFER_INVALID],
+    [{ ...base, lines: Array.from({ length: 201 }, (_, index) => ({ size_id: index + 1, quantity: 1 })) }, CODES.TRANSFER_INVALID],
+    [{ ...base, note: "x".repeat(301) }, CODES.TRANSFER_INVALID],
+  ];
+  for (const [body, code] of refusals) {
+    const result = pack.validateTransferInput(body);
+    assert.equal(result.ok, false, JSON.stringify(body).slice(0, 120));
+    assert.equal(result.code, code, JSON.stringify(body).slice(0, 120));
+  }
+  assert.equal(pack.validateTransferInput({ ...base, to_branch_id: 1 }).message, pack.MESSAGES.TRANSFER_SAME_SHOP);
+  assert.equal(pack.MOVEMENT_TYPES.TRANSFER_OUT.length <= 20 && pack.MOVEMENT_TYPES.TRANSFER_IN.length <= 20, true, "movement_type is VARCHAR(20)");
+});
+
+test("routes: sending packing moves both counts, writes both movements and publishes both shops' counts", async () => {
+  await withPack(async ({ db }) => {
+    const { grand, petite } = await stockMainBranch(db);
+    const sent = await call("POST", "/api/v3/packing/transfers", {
+      from_branch_id: 1, to_branch_id: 2, note: "For Diwali",
+      lines: [{ size_id: grand.global_id, quantity: 10 }, { size: petite.id, quantity: 5.5 }],
+    });
+    assert.equal(sent.status, 201, JSON.stringify(sent.body));
+    assert.deepEqual(sent.body.transfer.from, { id: 1, name: "Main Branch" });
+    assert.deepEqual(sent.body.transfer.to, { id: 2, name: "Ratanada" });
+    assert.equal(sent.body.transfer.note, "For Diwali");
+    assert.deepEqual(sent.body.transfer.lines.map((line) => [line.size_id, line.type_name, line.design_name, line.size_name, line.capacity, line.quantity, line.from_qty_on_hand, line.to_qty_on_hand]), [
+      [grand.global_id, "Gift Box", "Window Box", "GRAND", "1 kg", 10, 40, 10],
+      [petite.global_id, "Gift Box", "Window Box", "PETITE", null, 5.5, 14.5, 5.5],
+    ]);
+
+    assert.deepEqual(await stockOf(db), {
+      [`1:${grand.id}`]: 40, [`1:${petite.id}`]: 14.5, [`2:${grand.id}`]: 10, [`2:${petite.id}`]: 5.5,
+    });
+    const moved = (await db.query("SELECT branch_id, size_id, movement_type, quantity, reason, created_by, sale_id, purchase_id FROM packing_movements WHERE movement_type LIKE 'TRANSFER%' ORDER BY id")).rows;
+    assert.deepEqual(moved.map((row) => [row.branch_id, row.size_id, row.movement_type, Number(row.quantity), row.reason, row.created_by, row.sale_id, row.purchase_id]), [
+      [1, grand.id, "TRANSFER_OUT", -10, "Sent to Ratanada · For Diwali", OWNER_ID, null, null],
+      [2, grand.id, "TRANSFER_IN", 10, "Received from Main Branch · For Diwali", OWNER_ID, null, null],
+      [1, petite.id, "TRANSFER_OUT", -5.5, "Sent to Ratanada · For Diwali", OWNER_ID, null, null],
+      [2, petite.id, "TRANSFER_IN", 5.5, "Received from Main Branch · For Diwali", OWNER_ID, null, null],
+    ]);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM expenses"), 1, "a send is not an expense: only the purchase's");
+
+    // Both shops are told, each change logged with its own branch and the company.
+    const changes = (await db.query("SELECT company_id, branch_id, entity_type, entity_id, payload FROM sync_change_log ORDER BY change_id")).rows;
+    assert.deepEqual(changes.map((row) => [row.company_id, row.branch_id, row.entity_type, row.entity_id, row.payload.qty_on_hand]), [
+      [1, 1, "packing_stock", `packing-stock-1-${grand.global_id}`, 40],
+      [1, 1, "packing_stock", `packing-stock-1-${petite.global_id}`, 14.5],
+      [1, 2, "packing_stock", `packing-stock-2-${grand.global_id}`, 10],
+      [1, 2, "packing_stock", `packing-stock-2-${petite.global_id}`, 5.5],
+    ]);
+    // ...and a counter at either shop pulls both, whatever its counter location: the sync's own filter.
+    for (const branchId of [1, 2]) {
+      const pulled = await readVisibleIncrementalChanges(db, { companyId: 1, branchId, operationalLocationId: 777 }, 0, 50);
+      assert.deepEqual(pulled.rows.map((row) => row.entity_id).sort(), changes.map((row) => row.entity_id).sort(), `branch ${branchId}'s counters pull both shops' counts`);
+    }
+    const otherCompany = await readVisibleIncrementalChanges(db, { companyId: 2, branchId: 3, operationalLocationId: 777 }, 0, 50);
+    assert.deepEqual(otherCompany.rows, [], "another company's counters pull nothing");
+
+    // Each shop's history is its own and reads the right way round.
+    const mainHistory = (await call("GET", "/api/v3/packing/movements")).body.movements.filter((row) => row.movement_type.startsWith("TRANSFER"));
+    assert.deepEqual(mainHistory.map((row) => [row.movement_type, row.quantity, row.reason]), [
+      ["TRANSFER_OUT", -5.5, "Sent to Ratanada · For Diwali"],
+      ["TRANSFER_OUT", -10, "Sent to Ratanada · For Diwali"],
+    ]);
+    const ratanadaHistory = (await call("GET", "/api/v3/packing/movements", undefined, headersFor({ branchId: 2 }))).body.movements;
+    assert.deepEqual(ratanadaHistory.map((row) => [row.movement_type, row.quantity, row.reason]), [
+      ["TRANSFER_IN", 5.5, "Received from Main Branch · For Diwali"],
+      ["TRANSFER_IN", 10, "Received from Main Branch · For Diwali"],
+    ]);
+    const ratanadaTree = (await call("GET", "/api/v3/packing", undefined, headersFor({ branchId: 2 }))).body;
+    assert.equal(ratanadaTree.types[0].designs[0].sizes.find((size) => size.id === grand.id).qty_on_hand, 10);
+
+    // With no note the reason is just the shop; a second send adds on.
+    const again = await call("POST", "/api/v3/packing/transfers", { from_branch_id: 2, to_branch_id: 1, lines: [{ size_id: grand.id, quantity: 4 }] });
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    const reasons = (await db.query("SELECT reason FROM packing_movements WHERE movement_type LIKE 'TRANSFER%' ORDER BY id DESC LIMIT 2")).rows.map((row) => row.reason);
+    assert.deepEqual(reasons, ["Received from Ratanada", "Sent to Main Branch"]);
+    assert.deepEqual(await stockOf(db), {
+      [`1:${grand.id}`]: 44, [`1:${petite.id}`]: 14.5, [`2:${grand.id}`]: 6, [`2:${petite.id}`]: 5.5,
+    });
+  });
+});
+
+test("routes: a send of more than is on hand is refused, names the size and the count, and changes nothing", async () => {
+  await withPack(async ({ db, statements }) => {
+    const { grand, petite } = await stockMainBranch(db);
+    const before = await stockOf(db);
+    const cases = [
+      [[{ size_id: grand.global_id, quantity: 50.001 }], "Main Branch has only 50 of Gift Box › Window Box › Grand · 1 kg on hand, and this send asks for 50.001. Nothing was sent."],
+      // All or nothing: the first line fits, the second does not, and neither moves.
+      [[{ size_id: grand.global_id, quantity: 5 }, { size_id: petite.global_id, quantity: 21 }], "Main Branch has only 20 of Gift Box › Window Box › Petite on hand, and this send asks for 21. Nothing was sent."],
+    ];
+    for (const [lines, message] of cases) {
+      statements.length = 0;
+      const refused = await call("POST", "/api/v3/packing/transfers", { from_branch_id: 1, to_branch_id: 2, lines });
+      assert.equal(refused.status, 409, JSON.stringify(refused.body));
+      assert.equal(refused.body.code, CODES.TRANSFER_NOT_ENOUGH);
+      assert.equal(refused.body.message, message);
+      assert.deepEqual(writes(statements), [], "refused before any write");
+      assert.ok(statements.some(({ sql }) => /FROM packing_stock .*FOR UPDATE/.test(sql)), "the counts were read under a row lock");
+    }
+    // A shop with none of it (no row at all) has none to send.
+    const empty = await call("POST", "/api/v3/packing/transfers", { from_branch_id: 2, to_branch_id: 1, lines: [{ size_id: grand.id, quantity: 1 }] });
+    assert.equal(empty.status, 409, JSON.stringify(empty.body));
+    assert.equal(empty.body.message, "Ratanada has none of Gift Box › Window Box › Grand · 1 kg on hand, and this send asks for 1. Nothing was sent.");
+    assert.deepEqual(await stockOf(db), before);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM packing_movements WHERE movement_type LIKE 'TRANSFER%'"), 0);
+    assert.equal(await count(db, "SELECT COUNT(*) AS n FROM sync_change_log"), 0);
+  });
+});
+
+test("routes: a send to the same shop, another company's shop, a missing or switched-off shop, or of a bad size is refused", async () => {
+  await withPack(async ({ db, statements }) => {
+    const { grand, petite } = await stockMainBranch(db);
+    await db.exec(`
+      INSERT INTO branches (id, company_id, active, branch_name) VALUES (4, 1, FALSE, 'Old Shop');
+      INSERT INTO packing_types (id, global_id, company_id, name) VALUES (90, 'packing-type-90', 2, 'Theirs');
+      INSERT INTO packing_designs (id, global_id, type_id, name) VALUES (90, 'packing-design-90', 90, 'Theirs');
+      INSERT INTO packing_sizes (id, global_id, design_id, size_name) VALUES (90, 'packing-size-90', 90, 'GRAND');
+    `);
+    await call("PUT", `/api/v3/packing/sizes/${petite.id}`, { size_name: "PETITE", active: false });
+    const before = await stockOf(db);
+    const line = [{ size_id: grand.id, quantity: 1 }];
+    const cases = [
+      [{ from_branch_id: 1, to_branch_id: 1, lines: line }, 400, CODES.TRANSFER_SAME_SHOP],
+      [{ from_branch_id: 1, to_branch_id: 3, lines: line }, 400, CODES.TRANSFER_SHOP_INVALID],
+      [{ from_branch_id: 3, to_branch_id: 1, lines: line }, 400, CODES.TRANSFER_SHOP_INVALID],
+      [{ from_branch_id: 1, to_branch_id: 99, lines: line }, 400, CODES.TRANSFER_SHOP_INVALID],
+      [{ from_branch_id: 1, to_branch_id: 4, lines: line }, 400, CODES.TRANSFER_SHOP_INACTIVE],
+      [{ from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: grand.id, quantity: 1 }, { size_id: grand.global_id, quantity: 1 }] }, 400, CODES.TRANSFER_INVALID],
+      [{ from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: grand.id, quantity: 1 }, { size_id: String(grand.id), quantity: 1 }] }, 400, CODES.TRANSFER_INVALID],
+      [{ from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: "packing-size-90", quantity: 1 }] }, 400, CODES.TRANSFER_INVALID],
+      [{ from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: "packing-size-999", quantity: 1 }] }, 400, CODES.TRANSFER_INVALID],
+      [{ from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: petite.global_id, quantity: 1 }] }, 400, CODES.TRANSFER_INVALID],
+    ];
+    for (const [body, status, code] of cases) {
+      statements.length = 0;
+      const response = await call("POST", "/api/v3/packing/transfers", body);
+      assert.equal(response.status, status, `${JSON.stringify(body)}: ${JSON.stringify(response.body)}`);
+      assert.equal(response.body.code, code, JSON.stringify(body));
+      assert.ok(typeof response.body.message === "string" && response.body.message.length > 0);
+      assert.deepEqual(writes(statements), [], `${JSON.stringify(body)} wrote nothing`);
+    }
+    const inactive = await call("POST", "/api/v3/packing/transfers", { from_branch_id: 1, to_branch_id: 4, lines: line });
+    assert.equal(inactive.body.message, "Old Shop is switched off. Switch it on in Branches & Counters before sending packing to it.");
+    assert.equal((await call("POST", "/api/v3/packing/transfers", { from_branch_id: 1, to_branch_id: 3, lines: line })).body.message, pack.MESSAGES.TRANSFER_SHOP_INVALID);
+    assert.deepEqual(await stockOf(db), before);
+
+    // A session of company 2 cannot move company 1's packing between company 1's shops.
+    const foreign = await call("POST", "/api/v3/packing/transfers", { from_branch_id: 1, to_branch_id: 2, lines: line }, headersFor({ companyId: 2, branchId: 3 }));
+    assert.equal(foreign.status, 400, JSON.stringify(foreign.body));
+    assert.equal(foreign.body.code, CODES.TRANSFER_SHOP_INVALID);
+    assert.deepEqual(await stockOf(db), before);
+  });
+});
+
+test("routes: only the Owner or an Admin sends packing or lists the shops", async () => {
+  await withPack(async ({ db, statements }) => {
+    await db.exec("INSERT INTO packing_types (id, global_id, company_id, name) VALUES (1, 'packing-type-1', 1, 'Gift Box')");
+    statements.length = 0;
+    const cashier = headersFor({ role: "Cashier" });
+    const sent = await call("POST", "/api/v3/packing/transfers", { from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: 1, quantity: 1 }] }, cashier);
+    assert.equal(sent.status, 403, JSON.stringify(sent.body));
+    assert.equal(sent.body.code, CODES.PERMISSION_REQUIRED);
+    const shops = await call("GET", "/api/v3/packing/shops", undefined, cashier);
+    assert.equal(shops.status, 403, JSON.stringify(shops.body));
+    assert.equal(shops.body.code, CODES.PERMISSION_REQUIRED);
+    assert.deepEqual(writes(statements), []);
+    assert.equal((await probe(app, "POST", "/api/v3/packing/transfers", {}, {})).status, 401, "no session, no send");
+    assert.equal((await probe(app, "GET", "/api/v3/packing/shops", {}, undefined)).status, 401);
+  }, { role: "Cashier" });
+});
+
+test("routes: the shops list is this company's active shops with every size's count, and this session's shop", async () => {
+  await withPack(async ({ db }) => {
+    const { grand, petite } = await stockMainBranch(db);
+    await db.exec("INSERT INTO branches (id, company_id, active, branch_name) VALUES (4, 1, FALSE, 'Old Shop'), (5, 1, NULL, NULL)");
+    await call("POST", "/api/v3/packing/transfers", { from_branch_id: 1, to_branch_id: 2, lines: [{ size_id: grand.id, quantity: 3 }] });
+    const listed = await call("GET", "/api/v3/packing/shops", undefined, headersFor({ branchId: 2 }));
+    assert.equal(listed.status, 200, JSON.stringify(listed.body));
+    assert.equal(listed.body.this_branch_id, 2);
+    assert.deepEqual(listed.body.shops, [
+      { id: 1, name: "Main Branch", counts: { [grand.global_id]: 47, [petite.global_id]: 20 } },
+      { id: 2, name: "Ratanada", counts: { [grand.global_id]: 3, [petite.global_id]: 0 } },
+      { id: 5, name: "Shop 5", counts: { [grand.global_id]: 0, [petite.global_id]: 0 } },
+    ], "switched-off shops and other companies' shops are not offered; a size a shop never had counts 0");
   });
 });

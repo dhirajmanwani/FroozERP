@@ -591,6 +591,9 @@ export const PACKING_MOVEMENT_LABELS = Object.freeze({
   SALE: "Sold with a combo",
   SALE_CANCEL: "Bill cancelled, put back",
   ADJUST: "Count corrected",
+  // A send between two shops of the company; `packingMovementText` names the other shop.
+  TRANSFER_OUT: "Sent to another shop",
+  TRANSFER_IN: "Received from another shop",
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1175,6 +1178,254 @@ export const advancePackingPurchaseLine = (lines, key, field, makeLine) => {
   const fresh = typeof makeLine === "function" ? makeLine() : null;
   if (!fresh) return { lines: list, focus: null };
   return { lines: [...list, fresh], focus: { key: fresh.key, field: "pick" } };
+};
+
+// ---------------------------------------------------------------------------------------------
+// Sending packing to another shop of the company
+// ---------------------------------------------------------------------------------------------
+
+/** The server's note limit for a send (backend/froozPack.js TRANSFER_NOTE_MAX). */
+export const PACKING_TRANSFER_NOTE_MAX = 300;
+
+const SHOPS_UNREADABLE = "The list of shops could not be read, so packing cannot be sent to another shop from here.";
+
+/**
+ * `GET /api/v3/packing/shops` as a named state: `{status: "ready", shops: [{id, name, counts}],
+ * thisShopId}` or `{status: "invalid", message}`. Shop ids are opaque strings. `counts` maps a
+ * size's global id to that shop's count; a size not in it is not known (never 0).
+ */
+export const readPackingShops = (body) => {
+  if (!body || typeof body !== "object" || !Array.isArray(body.shops)) {
+    return { status: "invalid", shops: [], thisShopId: "", message: SHOPS_UNREADABLE };
+  }
+  const shops = body.shops
+    .filter((row) => row && typeof row === "object" && canonicalInventoryId(row.id) !== "")
+    .map((row) => {
+      const id = canonicalInventoryId(row.id);
+      return {
+        id,
+        name: text(row.name) || `Shop ${id}`,
+        counts: row.counts && typeof row.counts === "object" && !Array.isArray(row.counts) ? row.counts : {},
+      };
+    });
+  return { status: "ready", shops, thisShopId: canonicalInventoryId(body.this_branch_id), message: "" };
+};
+
+/**
+ * Whether "Send to another shop" is offered: only once the company's shops are known and there is
+ * more than one. With one shop (or while the list is loading or failed) the button is not there.
+ */
+export const packingTransferOffered = (shopsState) => shopsState?.status === "ready"
+  && Array.isArray(shopsState.shops) && shopsState.shops.length > 1;
+
+const shopsOf = (shopsState) => (Array.isArray(shopsState?.shops) ? shopsState.shops : []);
+const findShop = (shopsState, shopId) => {
+  const wanted = canonicalInventoryId(shopId);
+  return wanted === "" ? null : shopsOf(shopsState).find((shop) => inventoryIdsEqual(shop.id, wanted)) || null;
+};
+
+/** A shop's name, or "" when it is not one of the company's shops. */
+export const packingShopName = (shopsState, shopId) => findShop(shopsState, shopId)?.name || "";
+
+/** The shops a send from `fromId` can go to: every other shop. */
+export const packingTransferDestinations = (shopsState, fromId) => shopsOf(shopsState)
+  .filter((shop) => !inventoryIdsEqual(shop.id, canonicalInventoryId(fromId)));
+
+/** "here" for this computer's own shop, "at Ratanada" for another. */
+export const packingShopPlace = (shopsState, shopId) => {
+  const shop = findShop(shopsState, shopId);
+  if (!shop) return "here";
+  return inventoryIdsEqual(shop.id, shopsState?.thisShopId) ? "here" : `at ${shop.name}`;
+};
+
+/** One shop's count of one size, or null when it is not known. Ids are compared as opaque ids. */
+export const packingOnHandAt = (shopsState, shopId, sizeId) => {
+  const shop = findShop(shopsState, shopId);
+  const wanted = canonicalInventoryId(sizeId);
+  if (!shop || wanted === "") return null;
+  const key = Object.keys(shop.counts || {}).find((entry) => inventoryIdsEqual(canonicalInventoryId(entry), wanted));
+  return key === undefined ? null : finiteOrNull(shop.counts[key]);
+};
+
+/**
+ * The catalogue with each size's count replaced by `shopId`'s, so the picker of a send from
+ * another shop shows that shop's counts. A count not known there is null ("Count not known").
+ */
+export const packingCatalogueAtShop = (catalogue, shopsState, shopId) => {
+  if (catalogue?.status !== "ready") return catalogue;
+  return {
+    ...catalogue,
+    types: catalogueTypes(catalogue).map((type) => ({
+      ...type,
+      designs: (Array.isArray(type?.designs) ? type.designs : []).map((design) => ({
+        ...design,
+        sizes: (Array.isArray(design?.sizes) ? design.sizes : []).map((size) => ({
+          ...size,
+          qty_on_hand: packingOnHandAt(shopsState, shopId, nodeId(size)),
+        })),
+      })),
+    })),
+  };
+};
+
+export const createPackingTransferLine = (key) => ({ key: text(key), size_id: "", label: "", quantity: "" });
+
+/** Put a picked size on line `key` (its name for the button; the quantity stays). */
+export const applyPackingToTransferLine = (lines, key, row) => (Array.isArray(lines) ? lines : []).map((line) => (
+  line?.key !== key || !row ? line : { ...line, size_id: text(row.packing_size_id), label: packingPathLabel(row) }
+));
+
+/**
+ * A new send: from this computer's shop (or the first shop when this one is not in the list), to
+ * the only other shop when there is just one more, otherwise still to choose.
+ */
+export const createPackingTransferDraft = (shopsState, makeLine) => {
+  const from = findShop(shopsState, shopsState?.thisShopId) || shopsOf(shopsState)[0] || null;
+  const others = from ? packingTransferDestinations(shopsState, from.id) : [];
+  const line = typeof makeLine === "function" ? makeLine() : createPackingTransferLine("transfer-line-1");
+  return {
+    from_branch_id: from?.id || "",
+    to_branch_id: others.length === 1 ? others[0].id : "",
+    lines: [line],
+    note: "",
+  };
+};
+
+/** The draft with a new From. A To that is now the same shop is cleared (or, with two shops, swapped). */
+export const changePackingTransferFrom = (draft, shopsState, fromId) => {
+  const from = canonicalInventoryId(fromId);
+  const others = packingTransferDestinations(shopsState, from);
+  let to = canonicalInventoryId(draft?.to_branch_id);
+  if (to === "" || inventoryIdsEqual(to, from)) to = others.length === 1 ? others[0].id : "";
+  return { ...draft, from_branch_id: from, to_branch_id: to };
+};
+
+/**
+ * What a send line shows: the From shop's count of its size ("On hand here 50"), and what the
+ * typed quantity leaves there ("40 left here"), worked in thousandths. `short` when the quantity
+ * is more than is on hand. Nothing is claimed while the count or the quantity is not known.
+ */
+export const packingTransferLineView = (line, shopsState, fromId) => {
+  const place = packingShopPlace(shopsState, fromId);
+  const sizeId = canonicalInventoryId(line?.size_id);
+  if (sizeId === "") return { onHand: null, onHandText: "", after: null, afterText: "", short: false };
+  const onHand = packingOnHandAt(shopsState, fromId, sizeId);
+  const onHandText = onHand === null ? `Count ${place} not known` : `On hand ${place} ${formatCount(onHand)}`;
+  const quantity = finiteOrNull(line?.quantity);
+  if (onHand === null || quantity === null || quantity <= 0 || !hasAtMostDecimals(line?.quantity, 3)) {
+    return { onHand, onHandText, after: null, afterText: "", short: false };
+  }
+  const after = (toThousandths(onHand) - toThousandths(quantity)) / 1000;
+  if (after < 0) {
+    return { onHand, onHandText, after, afterText: onHand > 0 ? `Only ${formatCount(onHand)} ${place}` : `None ${place}`, short: true };
+  }
+  return { onHand, onHandText, after, afterText: `${formatCount(after)} left ${place}`, short: false };
+};
+
+const transferRows = (draft) => (Array.isArray(draft?.lines) ? draft.lines : [])
+  .map((line, index) => ({ line, position: index + 1 }))
+  .filter(({ line }) => !(lineSizeId(line) === "" && text(line?.quantity) === ""));
+
+const quantityWords = (quantity) => formatCount(quantity);
+
+const joinWithAnd = (parts) => (parts.length <= 1 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`);
+
+/**
+ * The one line above Send: "Sending 10 Gift Box › Window Box › Grand to Ratanada". Only lines with
+ * packing and a readable quantity are named; "" until there is a line like that and a To shop.
+ */
+export const packingTransferSummary = (draft, shopsState) => {
+  const toName = packingShopName(shopsState, draft?.to_branch_id);
+  const parts = transferRows(draft)
+    .filter(({ line }) => text(line?.label) !== "" && finiteOrNull(line?.quantity) !== null && finiteOrNull(line?.quantity) > 0)
+    .map(({ line }) => `${quantityWords(finiteOrNull(line.quantity))} ${text(line.label)}`);
+  if (parts.length === 0 || toName === "") return "";
+  return `Sending ${joinWithAnd(parts)} to ${toName}`;
+};
+
+/**
+ * What `POST /api/v3/packing/transfers` takes, or the first problem in words. A wholly blank line
+ * is left out. A line asking for more than the From shop is known to hold is refused here; the
+ * server checks again under a lock and has the last word.
+ */
+export const buildPackingTransferPayload = (draft = {}, shopsState = null) => {
+  const from = findShop(shopsState, draft?.from_branch_id);
+  if (!from) return refuse("Choose the shop the packing goes from.");
+  const to = findShop(shopsState, draft?.to_branch_id);
+  if (!to) return refuse("Choose the shop to send the packing to.");
+  if (inventoryIdsEqual(from.id, to.id)) return refuse("Choose a different shop to send to. Packing cannot be sent to the shop it is already in.");
+  const note = text(draft?.note).replace(/\s+/g, " ");
+  if (note.length > PACKING_TRANSFER_NOTE_MAX) return refuse(`Keep the note to ${PACKING_TRANSFER_NOTE_MAX} letters or fewer.`);
+  const rows = transferRows(draft);
+  if (rows.length === 0) return refuse("Add the packing to send.");
+  const lines = [];
+  const seen = [];
+  for (const { line, position } of rows) {
+    const sizeId = canonicalInventoryId(lineSizeId(line));
+    if (sizeId === "") return refuse(`Line ${position}: choose the packing to send.`);
+    if (seen.some((id) => inventoryIdsEqual(id, sizeId))) return refuse(`Line ${position}: this packing is listed twice. Put the whole quantity on one line.`);
+    seen.push(sizeId);
+    const quantity = finiteOrNull(line?.quantity);
+    if (quantity === null || quantity <= 0 || !hasAtMostDecimals(line.quantity, 3)) {
+      return refuse(`Line ${position}: enter how many to send, above 0, with at most 3 decimals.`);
+    }
+    const onHand = packingOnHandAt(shopsState, from.id, sizeId);
+    if (onHand !== null && toThousandths(quantity) > toThousandths(onHand)) {
+      const label = text(line?.label) || "this packing";
+      return refuse(onHand > 0
+        ? `Line ${position}: ${from.name} has only ${formatCount(onHand)} of ${label}. Send ${formatCount(onHand)} or fewer.`
+        : `Line ${position}: ${from.name} has none of ${label} to send.`);
+    }
+    lines.push({ size_id: sizeId, quantity });
+  }
+  const payload = { from_branch_id: from.id, to_branch_id: to.id, lines };
+  if (note !== "") payload.note = note;
+  return { ok: true, payload, message: "", summary: packingTransferSummary(draft, shopsState) };
+};
+
+/**
+ * The notice after a send went through, from the server's answer: what went where, and that the
+ * other shop's counters get it at their next sync. An answer that cannot be read still says it
+ * was sent (the server said 201), naming what the form held.
+ */
+export const packingTransferDoneText = (body, { summary = "", toName = "" } = {}) => {
+  const transfer = body?.transfer;
+  const lines = Array.isArray(transfer?.lines) ? transfer.lines : [];
+  const destination = text(transfer?.to?.name) || text(toName) || "the other shop";
+  const parts = lines
+    .map((line) => ({ quantity: finiteOrNull(line?.quantity), label: packingPathLabel(line) }))
+    .filter((line) => line.quantity !== null && line.label !== "")
+    .map((line) => `${quantityWords(line.quantity)} ${line.label}`);
+  const what = parts.length > 0
+    ? `Sent ${joinWithAnd(parts)} to ${destination}.`
+    : (text(summary) ? `${text(summary).replace(/^Sending /, "Sent ")}.` : `Sent to ${destination}.`);
+  return `${what} ${destination.charAt(0).toUpperCase()}${destination.slice(1)}'s counters get the new count at their next sync.`;
+};
+
+/**
+ * How one row of Recent movements reads: `what` (the "What" column) and `note`. A send reads
+ * "Sent to Ratanada" at the shop it left and "Received from Main Branch" at the shop it reached
+ * (the server writes that as the reason, with the note after " · "). Other rows keep their label,
+ * and their note is the reason, else the bill or purchase they came from.
+ */
+export const packingMovementText = (row) => {
+  const type = upper(row?.movement_type);
+  const reason = text(row?.reason);
+  if (type === "TRANSFER_OUT" || type === "TRANSFER_IN") {
+    const cut = reason.indexOf(" · ");
+    const head = cut === -1 ? reason : reason.slice(0, cut);
+    const rest = cut === -1 ? "" : reason.slice(cut + 3);
+    const prefix = type === "TRANSFER_OUT" ? "Sent to " : "Received from ";
+    if (head.startsWith(prefix) && head.length > prefix.length) return { what: head, note: rest };
+    return { what: PACKING_MOVEMENT_LABELS[type], note: reason };
+  }
+  const what = PACKING_MOVEMENT_LABELS[type] || text(row?.movement_type);
+  if (reason) return { what, note: reason };
+  if (text(row?.sale_id)) return { what, note: `Bill ${text(row?.invoice_no) || text(row.sale_id)}` };
+  if (text(row?.purchase_id)) {
+    return { what, note: text(row?.reference_number) ? `Purchase · bill ${text(row.reference_number)}` : `Purchase ${text(row.purchase_id)}` };
+  }
+  return { what, note: "" };
 };
 
 // ---------------------------------------------------------------------------------------------

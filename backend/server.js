@@ -11480,6 +11480,23 @@ app.post("/api/v3/packing/setup", packingWriteRoute(froozPack.savePackingSetup))
 app.post("/api/v3/packing/quick-start", packingWriteRoute(froozPack.quickStartPacking));
 app.post("/api/v3/packing/purchases", packingWriteRoute(froozPack.recordPackingPurchase));
 app.post("/api/v3/packing/adjustments", packingWriteRoute(froozPack.recordPackingAdjustment));
+// Send packing from one shop of the company to another (both named in the body, both checked
+// against the session's company in froozPack.js; the actor is still the session's). The shops GET
+// is Owner/Admin like the write it serves: shop names and every shop's counts.
+app.post("/api/v3/packing/transfers", packingWriteRoute(froozPack.recordPackingTransfer));
+app.get("/api/v3/packing/shops", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ code: froozPack.CODES.PERMISSION_REQUIRED, message: froozPack.MESSAGES.PERMISSION_REQUIRED });
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return res.status(400).json({ code: froozPack.CODES.COMPANY_REQUIRED, message: froozPack.MESSAGES.COMPANY_REQUIRED });
+    return res.json(await froozPack.listTransferShops(pool, { companyId, branchId: parsePositiveInteger(req.auth.branchId) }));
+  } catch (error) {
+    console.error("Loading Frooz Pack shops failed", { code: error?.code, message: error?.message });
+    if (error?.code === "42P01") return res.status(500).json({ code: froozPack.CODES.STORAGE_MISSING, message: froozPack.MESSAGES.STORAGE_MISSING });
+    return res.status(500).json({ code: froozPack.CODES.LOAD_FAILED, message: "The list of shops could not be loaded." });
+  }
+});
 
 app.post("/settings/rebate-rules", async (req, res) => {
   try {

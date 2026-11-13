@@ -10938,6 +10938,19 @@ button.shortcut-sheet-row:focus-visible {
   padding-top: 0;
 }
 
+/* Send to another shop: Packing (with the From shop's count under it) → Qty → After sending. */
+.packing-transfer-form .packing-purchase-table th:nth-child(3) { width: 160px; }
+.packing-transfer-form .packing-purchase-table th:nth-child(4) { width: 52px; }
+.packing-transfer-form .packing-line-amount { white-space: normal; }
+
+.discount-form > label.packing-transfer-note { max-width: 640px; }
+.packing-purchase-total.packing-transfer-summary strong { margin-left: 0; }
+
+.packing-line-onhand {
+  display: block;
+  margin-top: 4px;
+}
+
 /* New packing: one row per size -- tick, actual size, cost. */
 .packing-setup-size {
   display: grid;
@@ -11188,7 +11201,9 @@ button.shortcut-sheet-row:focus-visible {
 #combo-notice,
 #pack-node-form,
 #pack-adjust-form,
-#pack-setup-form {
+#pack-setup-form,
+#pack-transfer-form,
+#pack-notice {
   scroll-margin-top: 88px;
 }
 
