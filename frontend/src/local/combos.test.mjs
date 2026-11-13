@@ -668,3 +668,111 @@ test("Delete is offered only for a combo the server says no bill names; unknown 
   assert.equal("in_use" in buildComboPayload(draft), false);
   assert.match(COMBO_IN_USE_NOTE, /On sale in POS/);
 });
+
+import {
+  COMBO_TYPE_FORM_LABELS,
+  applyComboDraftChange,
+  comboActiveTogglePayload,
+  comboFieldId,
+  comboInvalidFields,
+  comboKindMenuLabel,
+  comboMarginNote,
+  comboPriceComparison,
+  comboSectionHeading,
+  orderComboErrors,
+  posTabCountText,
+} from "./combos.js";
+
+test("the form names each kind by the POS tab it sells on", () => {
+  assert.equal(comboKindMenuLabel("JUICE"), "Juice — Bar by PEP");
+  assert.equal(comboKindMenuLabel("THE_CUTTING"), "The Cutting — Bar by PEP");
+  assert.equal(comboKindMenuLabel("GIFTING"), "Gifting — PEP Presents");
+  assert.equal(comboKindMenuLabel("COMBO_OFFER"), "Combo / Offer — PEP Drops");
+  assert.equal(comboSectionHeading("THE_CUTTING"), "The Cutting · sold on Bar by PEP");
+  assert.equal(COMBO_TYPE_FORM_LABELS.FIXED, "A fixed set of fruit");
+  assert.equal(COMBO_TYPE_FORM_LABELS.CUSTOM, "Customer picks at the counter");
+});
+
+test("a new customer's-choice combo starts with no margin, so nothing is added to every bill unasked", () => {
+  const fresh = newComboDraft({ kind: "GIFTING", desiredMargin: 25 });
+  assert.equal(fresh.margin_percent, "40", "a fixed combo starts at its kind's default");
+  const custom = applyComboDraftChange(fresh, "combo_type", "CUSTOM", { desiredMargin: 25 });
+  assert.equal(custom.margin_percent, "", "empty is 0% on the bill");
+  assert.equal(custom.price, "");
+  // Changing kind while customer's-choice keeps it empty.
+  assert.equal(applyComboDraftChange(custom, "kind", "JUICE", { desiredMargin: 25 }).margin_percent, "");
+  // Back to fixed, the kind default returns while untouched.
+  const back = applyComboDraftChange(applyComboDraftChange(custom, "kind", "JUICE", { desiredMargin: 25 }), "combo_type", "FIXED", { desiredMargin: 25 });
+  assert.equal(back.margin_percent, "30");
+  assert.equal(back.extra_charge, "0");
+  assert.equal(applyComboDraftChange(fresh, "kind", "COMBO_OFFER", { desiredMargin: 25 }).margin_percent, "25");
+  // A margin the owner typed stays, whatever the type.
+  const typed = applyComboDraftChange(fresh, "margin_percent", "12", { desiredMargin: 25 });
+  assert.equal(applyComboDraftChange(typed, "combo_type", "CUSTOM", { marginTouched: true, desiredMargin: 25 }).margin_percent, "12");
+  // An existing combo keeps its stored margin.
+  const stored = { ...fresh, ref: "combo-4", margin_percent: "15" };
+  assert.equal(applyComboDraftChange(stored, "combo_type", "CUSTOM", { desiredMargin: 25 }).margin_percent, "15");
+  assert.equal(applyComboDraftChange(stored, "kind", "JUICE", { desiredMargin: 25 }).margin_percent, "15");
+  // The bill of an existing customer's-choice combo is priced as before.
+  assert.equal(customComboPrice({ itemsValue: 500, marginPercent: "", extraCharge: 0 }), 500);
+  assert.equal(applyComboDraftChange(null, "name", "x"), null);
+});
+
+test("the margin note states the margin that will be used", () => {
+  assert.match(comboMarginNote({ comboType: "FIXED", marginPercent: "40", desiredMargin: 25 }), /adds 40%/);
+  assert.match(comboMarginNote({ comboType: "FIXED", marginPercent: "", desiredMargin: 25 }), /desired margin, 25%/);
+  assert.match(comboMarginNote({ comboType: "CUSTOM", marginPercent: "10" }), /adds 10% on top/);
+  assert.match(comboMarginNote({ comboType: "CUSTOM", marginPercent: "" }), /\(0%\)/);
+  assert.match(comboMarginNote({ comboType: "CUSTOM", marginPercent: "0" }), /\(0%\)/);
+});
+
+test("the price comparison reads as bought separately against this combo, with the difference", () => {
+  const money = (value) => `₹${Number(value).toFixed(2)}`;
+  assert.equal(comboPriceComparison({ itemsValue: 360, price: "368" }, money), "Bought separately ₹360.00 · This combo ₹368.00 (₹8.00 more)");
+  assert.equal(comboPriceComparison({ itemsValue: 360, price: "340.5" }, money), "Bought separately ₹360.00 · This combo ₹340.50 (₹19.50 less)");
+  assert.equal(comboPriceComparison({ itemsValue: 360, price: "360" }, money), "Bought separately ₹360.00 · This combo ₹360.00 (the same)");
+  assert.equal(comboPriceComparison({ itemsValue: null, price: "360" }, money), "Bought separately — · This combo ₹360.00");
+  assert.equal(comboPriceComparison({ itemsValue: 360, price: "" }, money), "Bought separately ₹360.00 · This combo —");
+});
+
+test("validation problems name their box and come in the order the form shows them", () => {
+  const draft = { name: "", kind: "JUICE", combo_type: "FIXED", price: "", margin_percent: "-1", items: [{ product_id: "", quantity: "" }, { product_id: "p2", quantity: "" }], packing: [{ packing_size_id: "packing-size-1", quantity: "0" }] };
+  const check = validateComboDraft(draft);
+  const ordered = orderComboErrors(check.errors, "FIXED");
+  assert.deepEqual(ordered.map((error) => error.field), ["name", "items.0.product_id", "items.1.quantity", "packing.0.quantity", "margin_percent", "price"]);
+  assert.equal(comboFieldId("items.1.quantity"), "combo-field-items-1-quantity");
+  assert.equal(comboFieldId("name"), "combo-field-name");
+  assert.ok(comboInvalidFields(check.errors).has("price"));
+  const custom = validateComboDraft({ name: "", kind: "JUICE", combo_type: "CUSTOM", extra_charge: "-1", margin_percent: "-1" });
+  assert.deepEqual(orderComboErrors(custom.errors, "CUSTOM").map((error) => error.field), ["name", "margin_percent", "extra_charge"]);
+  assert.equal(validateComboDraft({ name: "A", kind: "JUICE", combo_type: "CUSTOM" }).ok, true);
+});
+
+test("switching a combo on or off from its row sends what its Edit form would, only active changed", () => {
+  const combo = normaliseCombo({
+    id: 7, global_id: "combo-7", name: "Mixed Juice", kind: "JUICE", combo_type: "FIXED", price: "98.00", extra_charge: "0", margin_percent: "30",
+    description: "Fresh", active: true, sort_order: 2,
+    items: [{ product_id: "004", product_global_id: "product-4", product_name: "Orange", unit: "KG", quantity: "0.25" }],
+    packing: [{ packing_size_id: "packing-size-3", quantity: "1" }],
+  });
+  const asForm = buildComboPayload(comboDraftFrom(combo));
+  const off = comboActiveTogglePayload(combo, false);
+  assert.deepEqual(off, { ...asForm, active: false });
+  assert.equal(off.items[0].product_id, "004", "an id stays as it is");
+  assert.deepEqual(off.packing, [{ packing_size_id: "packing-size-3", quantity: 1, sort_order: 0 }]);
+  assert.equal(comboActiveTogglePayload({ ...combo, active: false }, true).active, true);
+  // A combo whose packing was not sent keeps its stored packing (no key).
+  const unknown = normaliseCombo({ id: 8, name: "Old", kind: "JUICE", combo_type: "CUSTOM", margin_percent: null, items: [] });
+  const payload = comboActiveTogglePayload(unknown, false);
+  assert.equal(Object.hasOwn(payload, "packing"), false);
+  assert.equal(payload.margin_percent, null, "a blank margin stays blank");
+});
+
+test("a POS combo tab shows a count only once combos loaded; PEP Market counts its products", () => {
+  assert.equal(posTabCountText({ productsTab: false, comboCount: 0, combosReady: false }), "–");
+  assert.equal(posTabCountText({ productsTab: false, comboCount: 3, combosReady: false }), "–");
+  assert.equal(posTabCountText({ productsTab: false, comboCount: 0, combosReady: true }), "0");
+  assert.equal(posTabCountText({ productsTab: false, comboCount: 3, combosReady: true }), "3");
+  assert.equal(posTabCountText({ productsTab: true, productCount: 12, combosReady: false }), "12");
+  assert.equal(posTabCountText({ productsTab: true, productCount: 12, comboCount: 1, combosReady: true }), "13");
+});

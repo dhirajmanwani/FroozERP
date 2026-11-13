@@ -27,6 +27,7 @@ import { lotAvailableQuantity } from "./posInventory.js";
 import { parseTargetMargin, roundSuggestedRate, suggestSaleRate } from "./saleRateUpdate.js";
 import { packingCostOf } from "./froozPack.js";
 import { COMBO_STOCK_REMINDER_KEY_PREFIX, FROST_STOCK_REMINDER_LABEL } from "./frostBellNotifications.js";
+import { posTabFor } from "./posSections.js";
 
 export const COMBO_KINDS = Object.freeze(["COMBO_OFFER", "THE_CUTTING", "JUICE", "GIFTING"]);
 export const COMBO_TYPES = Object.freeze(["FIXED", "CUSTOM"]);
@@ -63,6 +64,32 @@ export const COMBO_TAB_FOR_KIND = Object.freeze({
   THE_CUTTING: "bar",
   GIFTING: "moments",
   COMBO_OFFER: "combos",
+});
+
+/** The POS tab a kind is sold on, by name ("Bar by PEP"); "" for a kind with no tab. */
+export const comboKindTabLabel = (kind) => {
+  const key = COMBO_TAB_FOR_KIND[upper(kind)];
+  return key ? posTabFor(key).label : "";
+};
+
+/** The form's "Menu section (POS tab)" choice: "Juice — Bar by PEP", so the owner sees where it sells. */
+export const comboKindMenuLabel = (kind) => {
+  const label = COMBO_KIND_LABELS[upper(kind)] || text(kind);
+  const tab = comboKindTabLabel(kind);
+  return tab ? `${label} — ${tab}` : label;
+};
+
+/** The PEP Menu list's heading for a kind: "The Cutting · sold on Bar by PEP". */
+export const comboSectionHeading = (kind) => {
+  const label = COMBO_KIND_LABELS[upper(kind)] || text(kind);
+  const tab = comboKindTabLabel(kind);
+  return tab ? `${label} · sold on ${tab}` : label;
+};
+
+/** "What goes in": the form's words for a combo's type. */
+export const COMBO_TYPE_FORM_LABELS = Object.freeze({
+  FIXED: "A fixed set of fruit",
+  CUSTOM: "Customer picks at the counter",
 });
 
 export const COMBO_EDIT_REFUSAL = "This bill has a combo on it, so it can't be edited. Cancel the bill and bill it again instead.";
@@ -195,7 +222,8 @@ export const normaliseCombo = (row) => {
     active: row?.active !== false && row?.active !== 0 && row?.active !== "false",
     sort_order: finiteOrNull(row?.sort_order) ?? 0,
     items,
-    packing_known: Array.isArray(row?.packing),
+    // A row normalised once already keeps its word: its `packing` is [] by then either way.
+    packing_known: row?.packing_known === false ? false : Array.isArray(row?.packing),
     packing: (Array.isArray(row?.packing) ? row.packing : [])
       .filter((entry) => entry && typeof entry === "object")
       .map(normalisePackingRow)
@@ -247,43 +275,45 @@ export const findComboProduct = (products, item) => {
  */
 export const validateComboDraft = (draft = {}, { products = null } = {}) => {
   const errors = [];
-  const add = (code, message) => errors.push({ code, message });
-  if (text(draft.name) === "") add("COMBO_NAME_REQUIRED", "Give the combo a name.");
-  else if (text(draft.name).length > 120) add("COMBO_NAME_REQUIRED", "Keep the name to 120 letters or fewer.");
+  // `field` names the form box the problem is about (`comboFieldId` makes its element id), so the
+  // form can mark it and put the cursor in the first one (`orderComboErrors`).
+  const add = (code, message, field = "") => errors.push({ code, message, field });
+  if (text(draft.name) === "") add("COMBO_NAME_REQUIRED", "Give the combo a name.", "name");
+  else if (text(draft.name).length > 120) add("COMBO_NAME_REQUIRED", "Keep the name to 120 letters or fewer.", "name");
   const kind = upper(draft.kind);
-  if (!COMBO_KINDS.includes(kind)) add("COMBO_KIND_INVALID", "Choose what kind of combo this is.");
+  if (!COMBO_KINDS.includes(kind)) add("COMBO_KIND_INVALID", "Choose what kind of combo this is.", "kind");
   const type = upper(draft.combo_type);
-  if (!COMBO_TYPES.includes(type)) add("COMBO_TYPE_INVALID", "Choose Fixed items or Customer's choice.");
+  if (!COMBO_TYPES.includes(type)) add("COMBO_TYPE_INVALID", "Choose Fixed items or Customer's choice.", "combo_type");
 
   const extraBlank = text(draft.extra_charge) === "";
   const extra = extraBlank ? 0 : finiteOrNull(draft.extra_charge);
   if (type === "FIXED") {
     if (extra === null || extra !== 0) {
-      add("COMBO_CHARGE_INVALID", "A fixed combo has no extra charge: put it in the price.");
+      add("COMBO_CHARGE_INVALID", "A fixed combo has no extra charge: put it in the price.", "extra_charge");
     }
     const price = finiteOrNull(draft.price);
     if (price === null || price <= 0 || !hasAtMostDecimals(draft.price, 2)) {
-      add("COMBO_PRICE_INVALID", "A fixed combo needs a selling price above ₹0, with at most 2 decimals.");
+      add("COMBO_PRICE_INVALID", "A fixed combo needs a selling price above ₹0, with at most 2 decimals.", "price");
     }
     const items = Array.isArray(draft.items) ? draft.items : [];
-    if (items.length === 0) add("COMBO_ITEMS_REQUIRED", "Add at least one item to a fixed combo.");
+    if (items.length === 0) add("COMBO_ITEMS_REQUIRED", "Add at least one item to a fixed combo.", "items.0.product_id");
     const seen = [];
     items.forEach((item, index) => {
       const row = index + 1;
       const key = canonicalInventoryId(item?.product_id) || canonicalInventoryId(item?.product_global_id);
       const quantity = finiteOrNull(item?.quantity);
       if (key === "") {
-        add("COMBO_ITEM_INVALID", `Item ${row}: choose a product.`);
+        add("COMBO_ITEM_INVALID", `Item ${row}: choose a product.`, `items.${index}.product_id`);
         return;
       }
       if (quantity === null || quantity <= 0 || !hasAtMostDecimals(item.quantity, 3)) {
-        add("COMBO_ITEM_INVALID", `Item ${row}: enter a quantity above 0, with at most 3 decimals.`);
+        add("COMBO_ITEM_INVALID", `Item ${row}: enter a quantity above 0, with at most 3 decimals.`, `items.${index}.quantity`);
       }
       if (Array.isArray(products) && !findComboProduct(products, item)) {
-        add("COMBO_ITEM_INVALID", `Item ${row}: that product is not in the product list.`);
+        add("COMBO_ITEM_INVALID", `Item ${row}: that product is not in the product list.`, `items.${index}.product_id`);
       }
       if (seen.some((other) => inventoryIdsEqual(other, key))) {
-        add("COMBO_ITEM_INVALID", `Item ${row}: ${text(item?.product_name) || "this product"} is listed twice. Put the whole quantity on one row.`);
+        add("COMBO_ITEM_INVALID", `Item ${row}: ${text(item?.product_name) || "this product"} is listed twice. Put the whole quantity on one row.`, `items.${index}.product_id`);
       }
       seen.push(key);
     });
@@ -293,34 +323,70 @@ export const validateComboDraft = (draft = {}, { products = null } = {}) => {
       const row = index + 1;
       const sizeKey = canonicalInventoryId(entry?.packing_size_id) || canonicalInventoryId(entry?.size_id);
       if (sizeKey === "") {
-        add("COMBO_PACKING_INVALID", `Packing ${row}: choose a packing size.`);
+        add("COMBO_PACKING_INVALID", `Packing ${row}: choose a packing size.`, `packing.${index}.quantity`);
         return;
       }
       const quantity = finiteOrNull(entry?.quantity);
       if (quantity === null || quantity <= 0 || !hasAtMostDecimals(entry.quantity, 3)) {
-        add("COMBO_PACKING_INVALID", `Packing ${row}: enter a quantity above 0, with at most 3 decimals.`);
+        add("COMBO_PACKING_INVALID", `Packing ${row}: enter a quantity above 0, with at most 3 decimals.`, `packing.${index}.quantity`);
       }
       if (seenSizes.some((other) => inventoryIdsEqual(other, sizeKey))) {
-        add("COMBO_PACKING_INVALID", `Packing ${row}: this size is listed twice. Put the whole quantity on one row.`);
+        add("COMBO_PACKING_INVALID", `Packing ${row}: this size is listed twice. Put the whole quantity on one row.`, `packing.${index}.quantity`);
       }
       seenSizes.push(sizeKey);
     });
   } else if (type === "CUSTOM") {
     if (finiteOrNull(draft.price) !== null) {
-      add("COMBO_PRICE_INVALID", "A customer's-choice combo has no price of its own; items are billed at their rates.");
+      add("COMBO_PRICE_INVALID", "A customer's-choice combo has no price of its own; items are billed at their rates.", "price");
     }
     if (extra === null || extra < 0 || (!extraBlank && !hasAtMostDecimals(draft.extra_charge, 2))) {
-      add("COMBO_CHARGE_INVALID", "The extra charge must be ₹0 or more, with at most 2 decimals.");
+      add("COMBO_CHARGE_INVALID", "The extra charge must be ₹0 or more, with at most 2 decimals.", "extra_charge");
     }
   }
   if (text(draft.margin_percent) !== "") {
     const margin = finiteOrNull(draft.margin_percent);
     if (margin === null || margin < 0 || margin > COMBO_MARGIN_MAX || !hasAtMostDecimals(draft.margin_percent, 2)) {
-      add("COMBO_MARGIN_INVALID", `The margin must be between 0% and ${COMBO_MARGIN_MAX}%, with at most 2 decimals.`);
+      add("COMBO_MARGIN_INVALID", `The margin must be between 0% and ${COMBO_MARGIN_MAX}%, with at most 2 decimals.`, "margin_percent");
     }
   }
   return { ok: errors.length === 0, errors, first: errors[0] || null };
 };
+
+/**
+ * Where each box sits in the combo form, top to bottom, by type. A fixed combo's Margin sits after
+ * its items and packing, beside the price it suggests; a customer's-choice combo's beside its extra
+ * charge. Item and packing rows go in row order, product before quantity.
+ */
+const COMBO_FORM_ORDER = Object.freeze({
+  FIXED: Object.freeze(["name", "kind", "combo_type", "items", "packing", "margin_percent", "price", "extra_charge"]),
+  CUSTOM: Object.freeze(["name", "kind", "combo_type", "margin_percent", "extra_charge", "price"]),
+});
+
+const fieldRank = (field, type) => {
+  const order = COMBO_FORM_ORDER[upper(type)] || COMBO_FORM_ORDER.FIXED;
+  const [head, row, part] = text(field).split(".");
+  const place = order.indexOf(head);
+  const rowNumber = Number.parseInt(row, 10);
+  return [
+    place === -1 ? order.length : place,
+    Number.isInteger(rowNumber) ? rowNumber : 0,
+    part === "quantity" ? 1 : 0,
+  ];
+};
+
+/** `errors` (from `validateComboDraft`) in the order their boxes appear on the form, ties kept. */
+export const orderComboErrors = (errors, comboType) => (Array.isArray(errors) ? errors : [])
+  .map((error, index) => ({ error, index, rank: fieldRank(error?.field, comboType) }))
+  .sort((left, right) => (
+    (left.rank[0] - right.rank[0]) || (left.rank[1] - right.rank[1]) || (left.rank[2] - right.rank[2]) || (left.index - right.index)
+  ))
+  .map(({ error }) => error);
+
+/** The element id of a combo form box: "items.0.quantity" → "combo-field-items-0-quantity". */
+export const comboFieldId = (field) => `combo-field-${text(field).replace(/[^A-Za-z0-9_-]+/g, "-")}`;
+
+/** The fields that have a problem, for `aria-invalid` and the red edge. */
+export const comboInvalidFields = (errors) => new Set((Array.isArray(errors) ? errors : []).map((error) => text(error?.field)).filter(Boolean));
 
 /** A blank form for a new combo of `kind`, its margin pre-filled by kind (`defaultComboMargin`). */
 export const newComboDraft = ({ kind = "COMBO_OFFER", desiredMargin } = {}) => ({
@@ -337,6 +403,79 @@ export const newComboDraft = ({ kind = "COMBO_OFFER", desiredMargin } = {}) => (
   items: [{ product_id: "", product_name: "", unit: "", quantity: "" }],
   packing: [],
 });
+
+/**
+ * One change to the combo form's draft (what the form's `updateDraft` does), as a pure step.
+ *
+ * A new combo's margin follows the form until the owner types one (`marginTouched`): its kind's
+ * default (`defaultComboMargin`) for a fixed combo, whose margin only works out a suggested price;
+ * and empty (0%) for a customer's-choice one, whose margin is added to every bill it makes -- a
+ * default there would put 30-40% on top of every customer's basket without the owner choosing it.
+ * Back to fixed, the kind's default returns. An existing combo keeps its stored margin always.
+ */
+export const applyComboDraftChange = (current, field, value, { marginTouched = false, desiredMargin } = {}) => {
+  if (!current) return current;
+  const next = { ...current, [field]: value };
+  const follows = !current.ref && !marginTouched && field !== "margin_percent";
+  if (field === "combo_type" && value === "CUSTOM") next.price = "";
+  if (field === "combo_type" && value === "FIXED") {
+    next.extra_charge = "0";
+    if (!Array.isArray(next.items) || next.items.length === 0) next.items = [{ product_id: "", product_name: "", unit: "", quantity: "" }];
+  }
+  if (follows && (field === "kind" || field === "combo_type")) {
+    next.margin_percent = upper(next.combo_type) === "CUSTOM" ? "" : String(defaultComboMargin(next.kind, desiredMargin));
+  }
+  return next;
+};
+
+/**
+ * What the Margin box means, stated with the value that will actually be used.
+ * Fixed: the suggested price's margin (its own, or the Sale Rate desired margin when blank).
+ * Customer's choice: what is added on top of the items on every bill (blank is 0%).
+ */
+export const comboMarginNote = ({ comboType, marginPercent, desiredMargin } = {}) => {
+  const own = text(marginPercent) === "" ? null : finiteOrNull(marginPercent);
+  if (upper(comboType) === "CUSTOM") {
+    return own !== null && own > 0
+      ? `Every bill adds ${own}% on top of the items' sale rates.`
+      : "Nothing is added on top of the items' sale rates (0%). Type a margin to add one to every bill.";
+  }
+  return own !== null && own >= 0
+    ? `The suggested price adds ${own}% to what the items and packing cost today. It only suggests; the bill uses the combo price.`
+    : `Margin is empty, so the suggested price uses the Sale Rate desired margin, ${parseTargetMargin(desiredMargin)}%.`;
+};
+
+/**
+ * "Bought separately ₹360.00 · This combo ₹368.00 (₹8.00 more)": the items at today's sale rates
+ * against the price typed, from figures already worked out. An unknown side is "—", and no
+ * difference is claimed then. `money` formats rupees.
+ */
+export const comboPriceComparison = ({ itemsValue = null, price = "" } = {}, money = (value) => `₹${value}`) => {
+  const separate = finiteOrNull(itemsValue);
+  const combo = text(price) === "" ? null : finiteOrNull(price);
+  const head = `Bought separately ${separate === null ? "—" : money(separate)} · This combo ${combo === null ? "—" : money(combo)}`;
+  if (separate === null || combo === null) return head;
+  const difference = toPaise(combo) - toPaise(separate);
+  if (difference === 0) return `${head} (the same)`;
+  return `${head} (${money(Math.abs(difference) / 100)} ${difference > 0 ? "more" : "less"})`;
+};
+
+/**
+ * The body that switches a combo on or off from its row: exactly what saving its Edit form with
+ * only "On sale in POS" changed would send, so nothing else about it moves.
+ */
+export const comboActiveTogglePayload = (combo, active) => buildComboPayload({ ...comboDraftFrom(combo), active: active === true });
+
+/**
+ * The count on a POS tab. PEP Market counts its products. A combo tab counts combos only once they
+ * loaded on this counter: before that (or when they could not be read) it shows "–", because "0"
+ * would say "this shop sells no juices" when the truth is "not known here yet".
+ */
+export const posTabCountText = ({ productsTab = false, productCount = 0, comboCount = 0, combosReady = false } = {}) => {
+  if (productsTab) return String(Math.max(Number(productCount) || 0, 0) + (combosReady ? Math.max(Number(comboCount) || 0, 0) : 0));
+  if (!combosReady) return "–";
+  return String(Math.max(Number(comboCount) || 0, 0));
+};
 
 /**
  * The form for an existing combo, every number as the text a box shows. `ref` is what PUT takes.

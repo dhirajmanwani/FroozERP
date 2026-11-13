@@ -268,8 +268,8 @@ test("the types level shows only active types with an active size, with their st
   assert.equal(box.leaf, false);
   assert.equal(box.qty_on_hand, null);
   assert.equal(box.sublabel, "1 design");
-  // Petite is out and Grand is low: something under Gift Box needs buying.
-  assert.equal(box.stockState, "low");
+  // Petite is out and Grand is low: some sizes under Gift Box are out (not "running low").
+  assert.equal(box.stockState, "some-out");
   assert.equal(view.rows[1].stockState, "ok");
   assert.equal(view.rows[1].sublabel, "1 design");
 });
@@ -294,9 +294,9 @@ test("the designs level and the sizes level", () => {
   ]);
   const grand = sizes.rows[1];
   // Count and last rate on every leaf; an unknown count or an unset (₹0) cost is said, never 0.
-  assert.equal(grand.sublabel, "On hand 3 · last ₹45.00");
-  assert.equal(sizes.rows[0].sublabel, "On hand 0 · last ₹20.00");
-  assert.equal(sizes.rows[2].sublabel, "Count not known · no rate yet");
+  assert.equal(grand.sublabel, "On hand 3 · ₹45.00 each");
+  assert.equal(sizes.rows[0].sublabel, "On hand 0 · ₹20.00 each");
+  assert.equal(sizes.rows[2].sublabel, "Count not known · No cost yet");
   assert.deepEqual(
     [grand.packing_size_id, grand.type_name, grand.design_name, grand.size_name, grand.capacity, grand.unit_cost],
     ["packing-size-4", "Gift Box", "Window Box", "GRAND", "1 kg", 45],
@@ -656,7 +656,7 @@ test("the PEP Pack screen shows everything the picker hides, marked, and falls b
   // An unknown count is unknown, and an unset (₹0) cost is "not set" -- never 0.
   assert.equal(royal.qty_on_hand, null);
   assert.equal(royal.stockState, "unknown");
-  assert.equal(royal.sublabel, "Cost not set");
+  assert.equal(royal.sublabel, "No cost yet");
   assert.equal(sizes.rows.find((row) => row.label === "Classic").active, false);
 
   // A design that is no longer there falls back to its type; a type that is gone, to the top.
@@ -840,14 +840,15 @@ test("purchase table: Enter walks Packing → Qty → Rate → next line, adding
 });
 
 test("every picker's size row says the count and the last rate, and says when either is not known", () => {
-  assert.equal(packingLeafSublabel({ qty_on_hand: 12, unit_cost: 4.5 }), "On hand 12 · last ₹4.50");
-  assert.equal(packingLeafSublabel({ qty_on_hand: -2, unit_cost: 0 }), "On hand -2 · no rate yet");
-  assert.equal(packingLeafSublabel({ qty_on_hand: null, unit_cost: null }), "Count not known · no rate yet");
-  assert.equal(packingLeafSublabel({ qty_on_hand: 1234.5, unit_cost: 10 }), "On hand 1,234.5 · last ₹10.00");
+  assert.equal(packingLeafSublabel({ qty_on_hand: 12, unit_cost: 4.5 }), "On hand 12 · ₹4.50 each");
+  assert.equal(packingLeafSublabel({ qty_on_hand: -2, unit_cost: 0 }), "On hand -2 · No cost yet");
+  assert.equal(packingLeafSublabel({ qty_on_hand: null, unit_cost: null }), "Count not known · No cost yet");
+  assert.equal(packingLeafSublabel({ qty_on_hand: 1234.5, unit_cost: 10 }), "On hand 1,234.5 · ₹10.00 each");
+  assert.equal(packingLeafSublabel({ qty_on_hand: 3, unit_cost: 1500 }), "On hand 3 · ₹1,500.00 each", "en-IN grouping");
   // The API's NUMERIC strings read as numbers.
   const api = readPackingCatalogue(apiPacking());
   const view = packingDrillView(api, { level: "sizes", typeId: "packing-type-1", designId: "packing-design-2" });
-  assert.equal(view.rows[0].sublabel, "On hand 0 · last ₹45.00");
+  assert.equal(view.rows[0].sublabel, "On hand 0 · ₹45.00 each");
 });
 
 test("delete: only what the owner's list says is unused; unknown (the counter's snapshot) is never unused", () => {
@@ -979,4 +980,86 @@ test("New packing inside a switched-off type or design starts where the form can
   assert.equal(on.draft.design_id, "packing-design-4");
   assert.equal(on.note, "");
   assert.equal(packingSetupStart(catalogue).note, "");
+});
+
+import {
+  PACKING_STATE_WORDS,
+  formatPackingUnitCost,
+  packingAddHereLabel,
+  packingCountAfter,
+  packingHasPickableSize,
+  packingManageStockState,
+} from "./froozPack.js";
+
+test("a packing cost reads one way everywhere: ₹ with en-IN grouping and 'each', or No cost yet", () => {
+  assert.equal(formatPackingUnitCost(1500), "₹1,500.00 each");
+  assert.equal(formatPackingUnitCost("45.5"), "₹45.50 each");
+  assert.equal(formatPackingUnitCost(0), "No cost yet", "an unset cost is stored as 0");
+  assert.equal(formatPackingUnitCost(null), "No cost yet");
+  assert.equal(formatPackingUnitCost("abc"), "No cost yet");
+});
+
+test("a correction shows the count it leaves, worked in thousandths; unknown stays unknown", () => {
+  assert.equal(packingCountAfter(12, "-3"), 9);
+  assert.equal(packingCountAfter(12, "+10"), 22);
+  assert.equal(packingCountAfter(0.1, "0.2"), 0.3);
+  assert.equal(packingCountAfter(2, "-5"), -3, "the server decides; the preview does not clamp");
+  assert.equal(packingCountAfter(null, "3"), null, "a count not known is not 0");
+  assert.equal(packingCountAfter(5, ""), null);
+  assert.equal(packingCountAfter(5, "-"), null);
+});
+
+test("a size never bought reads 'Not bought yet' on the PEP Pack list, not out; unknown use is never new", () => {
+  assert.equal(packingManageStockState({ qty_on_hand: 0, in_use: false }), "new");
+  assert.equal(packingManageStockState({ qty_on_hand: 0, in_use: true }), "out");
+  assert.equal(packingManageStockState({ qty_on_hand: 0, in_use: null }), "out");
+  assert.equal(packingManageStockState({ qty_on_hand: 3, in_use: false }), "low");
+  assert.equal(packingManageStockState({ qty_on_hand: null, in_use: false }), "unknown");
+  assert.equal(PACKING_STATE_WORDS.new, "Not bought yet");
+  assert.equal(PACKING_STATE_WORDS["some-out"], "Some sizes out");
+
+  const catalogue = readPackingCatalogue({ types: [
+    { id: 1, global_id: "packing-type-1", name: "Gift Box", in_use: false, designs: [
+      { id: 2, global_id: "packing-design-2", name: "Window Box", in_use: false, sizes: [
+        { id: 3, global_id: "packing-size-3", size_name: "GRAND", qty_on_hand: 0, in_use: false },
+        { id: 4, global_id: "packing-size-4", size_name: "ROYAL", qty_on_hand: 0, in_use: false },
+      ] },
+    ] },
+    { id: 5, global_id: "packing-type-5", name: "Basket", in_use: true, designs: [
+      { id: 6, global_id: "packing-design-6", name: "Round", in_use: true, sizes: [
+        { id: 7, global_id: "packing-size-7", size_name: "GRAND", qty_on_hand: 0, in_use: true },
+        { id: 8, global_id: "packing-size-8", size_name: "ROYAL", qty_on_hand: 0, in_use: false },
+        { id: 9, global_id: "packing-size-9", size_name: "PETITE", qty_on_hand: 40, in_use: true },
+      ] },
+    ] },
+  ] });
+  const top = packingManageView(catalogue, createPackingDrill());
+  assert.deepEqual(top.rows.map((row) => [row.label, row.stockState]), [["Gift Box", "new"], ["Basket", "some-out"]]);
+  const sizes = packingManageView(catalogue, { level: "sizes", typeId: "packing-type-1", designId: "packing-design-2" });
+  assert.deepEqual(sizes.rows.map((row) => row.stockState), ["new", "new"]);
+  // The picker is unchanged: a counter's snapshot does not know what was used.
+  const picker = packingDrillView(catalogue, createPackingDrill());
+  assert.equal(picker.rows.find((row) => row.label === "Gift Box").stockState, "out");
+});
+
+test("the in-list add button says what it adds where the owner is", () => {
+  assert.equal(packingAddHereLabel({ level: "types" }), "New packing");
+  assert.equal(packingAddHereLabel({ level: "designs", type: { name: "Gift Box" } }), "Add a design to Gift Box");
+  assert.equal(packingAddHereLabel({ level: "sizes", type: { name: "Gift Box" }, design: { name: "Window Box" } }), "Add sizes to Window Box");
+  assert.equal(packingAddHereLabel(null), "New packing");
+});
+
+test("a picker with its own New packing button points at it; Packing purchase waits for a size", () => {
+  const unfinished = { status: "ready", types: [{ id: "packing-type-1", name: "Bottle", active: true, designs: [] }] };
+  assert.equal(
+    packingEmptyPickerMessage(unfinished, { canCreate: true }),
+    "Bottle has no size yet. Press New packing above, choose it, name a design and tick its sizes."
+  );
+  assert.equal(packingEmptyPickerMessage({ status: "ready", types: [] }, { canCreate: true }), "No packing set up yet. Press New packing above to make a type, a design and its sizes.");
+  assert.match(packingEmptyPickerMessage(unfinished), /^Bottle has no size yet\. In PEP Pack, press New packing/);
+  assert.equal(packingHasPickableSize(readPackingCatalogue(unfinished)), false);
+  assert.equal(packingHasPickableSize(readPackingCatalogue({ types: [] })), false);
+  assert.equal(packingHasPickableSize(readPackingCatalogue({ types: [
+    { id: 1, name: "Bottle", designs: [{ id: 2, name: "Round", sizes: [{ id: 3, size_name: "GRAND" }] }] },
+  ] })), true);
 });

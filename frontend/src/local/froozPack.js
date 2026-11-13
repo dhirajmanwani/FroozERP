@@ -261,16 +261,41 @@ const visibleTypes = (catalogue) => catalogueTypes(catalogue)
   .filter((type) => type && type.active !== false && visibleDesigns(type).length > 0);
 
 /**
- * A group's state from its sizes: every size out → "out"; any out or low → "low" (something
- * under it needs buying); otherwise any unknown → "unknown"; else "ok".
+ * A group's state from its sizes: every size out → "out"; some out → "some-out" (it used to say
+ * "Running low", which read as "a few left" when some sizes had none); any low → "low"; otherwise
+ * any unknown → "unknown"; else "ok". `stateOf` reads one size (the PEP Pack list passes
+ * `packingManageStockState`, so a size never bought does not count as out).
  */
-const groupStockState = (sizes) => {
-  const states = sizes.map((size) => packingStockState(size.qty_on_hand));
+const groupStockState = (sizes, stateOf = (size) => packingStockState(size.qty_on_hand)) => {
+  const all = sizes.map(stateOf);
+  // A size never bought is not "out": it is left out of the group's state, unless it is all there is.
+  const states = all.filter((state) => state !== "new");
+  if (all.length > 0 && states.length === 0) return "new";
   if (states.length > 0 && states.every((state) => state === "out")) return "out";
-  if (states.some((state) => state === "out" || state === "low")) return "low";
+  if (states.some((state) => state === "out")) return "some-out";
+  if (states.some((state) => state === "low")) return "low";
   if (states.some((state) => state === "unknown")) return "unknown";
   return "ok";
 };
+
+/**
+ * A size's state on the PEP Pack list: as `packingStockState`, except that a size the owner's list
+ * says nothing has used (`in_use === false`: never bought, billed, counted or put in a combo) and
+ * that has none on hand is "new" -- "Not bought yet", not a red "0 on hand" straight after it was
+ * made. Unknown (`in_use` null, the counter's snapshot) is never "new".
+ */
+export const packingManageStockState = (size) => {
+  const state = packingStockState(size?.qty_on_hand);
+  return state === "out" && size?.in_use === false ? "new" : state;
+};
+
+/** How a group's or a size's state reads, where it needs saying. "" for nothing to say. */
+export const PACKING_STATE_WORDS = Object.freeze({
+  out: "All out",
+  "some-out": "Some sizes out",
+  low: "Running low",
+  new: "Not bought yet",
+});
 
 const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
 
@@ -329,29 +354,73 @@ export const packingTypesWithoutSize = (catalogue) => (Array.isArray(catalogue) 
   .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
   .map((type) => text(type.name) || "A packing type");
 
-export const packingEmptyPickerMessage = (catalogue) => {
+/**
+ * `canCreate`: the picker has its own "New packing" button (the PEP Pack purchase table), so the
+ * message points at it instead of sending the owner to the screen they are already on.
+ */
+export const packingEmptyPickerMessage = (catalogue, { canCreate = false } = {}) => {
   const types = (Array.isArray(catalogue) ? catalogue : Array.isArray(catalogue?.types) ? catalogue.types : [])
     .filter((type) => type && type.active !== false);
-  if (types.length === 0) return "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
+  const none = canCreate
+    ? "No packing set up yet. Press New packing above to make a type, a design and its sizes."
+    : "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
+  if (types.length === 0) return none;
   const unfinished = types
     .filter((type) => !(Array.isArray(type.designs) ? type.designs : []).some((design) => design && design.active !== false && activeSizes(design).length > 0))
     .map((type) => text(type.name) || "A packing type");
-  if (unfinished.length === 0) return "No packing set up yet. The Owner or an Admin adds it in PEP Pack.";
-  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. In PEP Pack, press New packing, choose ${unfinished.length === 1 ? "it" : "each one"}, name a design and tick its sizes.`;
+  if (unfinished.length === 0) return none;
+  const which = unfinished.length === 1 ? "it" : "each one";
+  return `${unfinished.join(", ")} ${unfinished.length === 1 ? "has" : "have"} no size yet. ${canCreate ? "Press New packing above" : "In PEP Pack, press New packing"}, choose ${which}, name a design and tick its sizes.`;
+};
+
+/** Whether anything can be picked at all: a switched-on size under a switched-on design and type. */
+export const packingHasPickableSize = (catalogue) => visibleTypes(catalogue).length > 0;
+
+/**
+ * A packing size's cost, worded the same everywhere it is shown (the PEP Pack list and every
+ * picker): "₹1,500.00 each", or "No cost yet" when it was never set (stored as 0).
+ */
+export const formatPackingUnitCost = (value) => {
+  const cost = knownUnitCost(value);
+  return cost === null
+    ? "No cost yet"
+    : `₹${cost.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} each`;
+};
+
+/**
+ * What PEP Pack's in-list add button says where the owner is: at the top "New packing"; inside a
+ * type "Add a design to Gift Box"; inside a design "Add sizes to Window Box". One phrase, "New
+ * packing in X", used to mean both.
+ */
+export const packingAddHereLabel = (view) => {
+  if (view?.level === "sizes" && text(view?.design?.name)) return `Add sizes to ${text(view.design.name)}`;
+  if (view?.level === "designs" && text(view?.type?.name)) return `Add a design to ${text(view.type.name)}`;
+  return "New packing";
+};
+
+/**
+ * The count a correction leaves: on hand now + the typed change (signed), or null while either is
+ * not a number. Worked in thousandths, so 0.1 + 0.2 is 0.3. The server still decides.
+ */
+export const packingCountAfter = (qtyOnHand, change) => {
+  const now = toThousandths(qtyOnHand);
+  const typed = toThousandths(change);
+  if (now === null || typed === null) return null;
+  return (now + typed) / 1000;
 };
 
 const ROOT_CRUMB_LABEL = "Packing";
 
 /**
- * What a size row says under its name wherever packing is picked: "On hand 12 · last ₹4.50".
+ * What a size row says under its name wherever packing is picked: "On hand 12 · ₹4.50 each".
  * A count that has not reached this computer says "Count not known", and a size never bought
- * (cost unset, stored as 0) says "no rate yet" -- an unknown is never shown as 0.
+ * (cost unset, stored as 0) says "No cost yet" -- an unknown is never shown as 0. The cost is
+ * worded as on the PEP Pack list (`formatPackingUnitCost`).
  */
 export const packingLeafSublabel = (size) => {
   const qty = finiteOrNull(size?.qty_on_hand);
-  const cost = knownUnitCost(size?.unit_cost);
   const count = qty === null ? "Count not known" : `On hand ${formatCount(qty)}`;
-  return `${count} · ${cost === null ? "no rate yet" : `last ₹${cost.toFixed(2)}`}`;
+  return `${count} · ${formatPackingUnitCost(size?.unit_cost)}`;
 };
 
 /**
@@ -447,7 +516,7 @@ export const packingManageView = (catalogue, state) => {
   const designs = type && Array.isArray(type.designs) ? type.designs.filter((entry) => entry && typeof entry === "object") : [];
   const design = type && current.designId ? designs.find((entry) => nodeMatches(entry, current.designId)) || null : null;
   const rootCrumb = { level: "types", id: null, label: ROOT_CRUMB_LABEL };
-  const groupState = (sizes) => (sizes.length === 0 ? null : groupStockState(sizes));
+  const groupState = (sizes) => (sizes.length === 0 ? null : groupStockState(sizes, packingManageStockState));
 
   if (current.level === "sizes" && type && design) {
     const sizes = (Array.isArray(design.sizes) ? design.sizes : []).filter((entry) => entry && typeof entry === "object");
@@ -460,10 +529,10 @@ export const packingManageView = (catalogue, state) => {
       rows: sizes.map((size) => ({
         id: size.id,
         label: packingSizeLabel(size),
-        sublabel: knownUnitCost(size.unit_cost) === null ? "Cost not set" : `₹${size.unit_cost.toFixed(2)} each`,
+        sublabel: formatPackingUnitCost(size.unit_cost),
         active: size.active !== false,
         qty_on_hand: Number.isFinite(size.qty_on_hand) ? size.qty_on_hand : null,
-        stockState: packingStockState(size.qty_on_hand),
+        stockState: packingManageStockState(size),
         unit_cost: Number.isFinite(size.unit_cost) ? size.unit_cost : null,
         leaf: true,
         node: size,
