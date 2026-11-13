@@ -76,5 +76,10 @@ assert.ok(rustSource.includes("UPDATE_TRANSACTION_FILE"), "Rust updater lifecycl
 assert.ok(rustSource.includes("reconcile_update_transaction"), "Rust startup must reconcile post-restart update success");
 assert.ok(rustSource.includes("stop_verified_backend_pid"), "Rust updater preflight must stop only verified FroozERP backend processes");
 assert.ok(rustSource.includes("wait_for_file_unlock(&backend_executable"), "Rust updater preflight must verify backend executable unlock");
+// A per-machine install lives under Program Files, where the unelevated app is never allowed to
+// open the backend executable for writing. The unlock check must not read "not allowed" as "in use"
+// (laptop B, 13 Nov 2026: every in-app update failed with UPDATE_INSTALL_FAILED).
+assert.ok(rustSource.includes("!executable_has_running_process(path)"), "Backend unlock must fall back to a running-process check when write access is denied");
+assert.ok(/Ok\(output\) if output\.status\.success\(\) => output,\s*_ => return true,/.test(rustSource), "A failed process listing must count as running, never as unlocked");
 
 console.log("Update Center static tests passed");
