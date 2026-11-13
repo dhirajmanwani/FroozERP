@@ -1697,11 +1697,75 @@ fn froozerp_install_diagnostics(package_version: String) -> InstallDiagnostics {
     }
 }
 
+/// Whether the backend executable can be replaced by the installer right now.
+///
+/// The first test is the direct one: open the file for writing. A running executable refuses that
+/// with a sharing violation, so success proves nothing holds it.
+///
+/// That test alone failed every in-app update on a real install (laptop B, 13 Nov 2026,
+/// `UPDATE_INSTALL_FAILED`): the app installs per machine under `C:\Program Files\FroozERP`, and
+/// the app itself runs without elevation, so Windows refuses it write access to that folder
+/// whether or not anything is running. "Cannot open for write" there means "not allowed", not
+/// "in use". So when the write test fails, ask the question the installer actually cares about:
+/// is a process running from this exact executable? Anything unknown (tasklist failing, a
+/// process whose path cannot be read) counts as running, so the answer can only err towards
+/// refusing. The elevated installer's PREINSTALL hook still checks the unlock itself.
 fn is_file_unlocked(path: &Path) -> bool {
     if !path.exists() {
         return true;
     }
-    OpenOptions::new().read(true).write(true).open(path).is_ok()
+    if OpenOptions::new().read(true).write(true).open(path).is_ok() {
+        return true;
+    }
+    !executable_has_running_process(path)
+}
+
+/// PIDs from `tasklist /FO CSV /NH` output. Rows look like
+/// `"froozerp-backend-node.exe","1234","Console","1","45,000 K"`; the "no tasks" line is
+/// localized and does not start with a quote, so it yields nothing.
+fn parse_tasklist_csv_pids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('"') {
+                return None;
+            }
+            let mut fields = line.split("\",\"");
+            fields.next()?;
+            fields.next()?.trim_matches('"').trim().parse::<u32>().ok()
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn executable_has_running_process(path: &Path) -> bool {
+    let Some(image_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return true;
+    };
+    let filter = format!("IMAGENAME eq {}", image_name);
+    let mut tasklist = Command::new("tasklist.exe");
+    hide_child_console(&mut tasklist);
+    let output = match tasklist
+        .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return true,
+    };
+    let target = normalize_path(path);
+    parse_tasklist_csv_pids(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .any(|pid| match windows_process_executable_path(pid) {
+            Some(running) => normalize_path(&running) == target,
+            None => true,
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn executable_has_running_process(_path: &Path) -> bool {
+    // No per-machine install outside Windows; keep the strict answer.
+    true
 }
 
 fn wait_for_file_unlock(path: &Path, attempts: usize, delay: Duration) -> bool {
@@ -2989,6 +3053,29 @@ fn purchase_queue_local(
 #[tauri::command]
 fn purchase_list_local(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
     local_db::list_local_purchase_intents(&app)
+}
+
+#[cfg(test)]
+mod update_unlock_tests {
+    use super::*;
+
+    #[test]
+    fn tasklist_rows_give_their_pids() {
+        let output = "\"froozerp-backend-node.exe\",\"1234\",\"Console\",\"1\",\"45,000 K\"\r\n\"froozerp-backend-node.exe\",\"98\",\"Services\",\"0\",\"1,024 K\"\r\n";
+        assert_eq!(parse_tasklist_csv_pids(output), vec![1234, 98]);
+    }
+
+    #[test]
+    fn the_no_tasks_line_gives_nothing_in_any_language() {
+        assert!(parse_tasklist_csv_pids("INFO: No tasks are running which match the specified criteria.\r\n").is_empty());
+        assert!(parse_tasklist_csv_pids("INFORMATIONEN: Es werden keine Aufgaben ausgef\u{fc}hrt.\r\n").is_empty());
+        assert!(parse_tasklist_csv_pids("").is_empty());
+    }
+
+    #[test]
+    fn a_missing_executable_is_unlocked() {
+        assert!(is_file_unlocked(Path::new("/definitely/not/here/froozerp-backend-node.exe")));
+    }
 }
 
 #[cfg(test)]
