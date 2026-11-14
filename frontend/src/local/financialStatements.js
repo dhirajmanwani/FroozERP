@@ -117,3 +117,35 @@ export const balanceSheetAsAtInput = ({ range = "today", customRange = {}, resol
     return "";
   }
 };
+
+/**
+ * The Opening and Closing Balance printed on an Accounts ledger statement for a date range.
+ *
+ * The server builds every ledger (customer and supplier alike) as a running `balance` that grows
+ * by `debit − credit`, oldest first, with an "Opening Balance" row first when the account has one.
+ * So the balance brought forward into the range is the first shown row's balance with its own
+ * debit and credit taken back out — the formula the screen already used, which is right.
+ *
+ * What was wrong is what it did with nothing to go on: with no account chosen, and with a range
+ * holding no entries, both figures printed ₹0.00, even for an account owing thousands. Now:
+ * - no account: `null` for both (the screen prints "—");
+ * - a range with no entries: the balance carried in from before the range, for both;
+ * - otherwise opening from the first row in range, closing from the last.
+ *
+ * `rows` is the full ledger as the server sent it; `dateKey` turns a row date into YYYY-MM-DD.
+ */
+export const ledgerStatementBounds = (rows, { dateFrom = "", dateTo = "", hasAccount = true, dateKey = (value) => String(value || "").slice(0, 10) } = {}) => {
+  if (!hasAccount || !Array.isArray(rows)) return { opening: null, closing: null };
+  const inRange = (row) => (!dateFrom || dateKey(row.date) >= dateFrom) && (!dateTo || dateKey(row.date) <= dateTo);
+  const shown = rows.filter(inRange);
+  if (shown.length) {
+    const first = shown[0];
+    return {
+      opening: round2(figure(first.balance) - figure(first.debit) + figure(first.credit)),
+      closing: round2(figure(shown.at(-1).balance)),
+    };
+  }
+  const before = dateFrom ? rows.filter((row) => dateKey(row.date) < dateFrom) : [];
+  const carried = before.length ? round2(figure(before.at(-1).balance)) : 0;
+  return { opening: carried, closing: carried };
+};

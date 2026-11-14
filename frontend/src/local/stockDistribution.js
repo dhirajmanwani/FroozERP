@@ -121,6 +121,31 @@ const ACTION_WORDS = Object.freeze({
   cancel: { label: "Cancel", detail: "Drop this consignment before it goes anywhere." },
 });
 
+/** What each action did, in the past tense, for "could not be …" when it fails. */
+const ACTION_PAST = Object.freeze({
+  submit: "sent for approval",
+  approve: "approved",
+  reject: "refused",
+  dispatch: "dispatched",
+  receive: "received",
+  partial_receive: "part received",
+  discrepancy: "flagged as not matching",
+  return: "sent back",
+  source_receive: "taken back in",
+  resolve: "settled",
+  close: "closed",
+  cancel: "cancelled",
+});
+
+/**
+ * The fallback sentence when a consignment action fails and the server gave no words of its own.
+ * Built as `${action}ed` it read "approveed", "receiveed" and "submited".
+ */
+export const transferActionFailureMessage = (action) => {
+  const past = ACTION_PAST[text(action).toLowerCase()];
+  return past ? `The consignment could not be ${past}.` : "The consignment could not be updated.";
+};
+
 const text = (value) => String(value ?? "").trim();
 const rows = (value) => (Array.isArray(value) ? value : []);
 

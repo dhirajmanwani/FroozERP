@@ -196,7 +196,7 @@ test("Report Center loads orders itself rather than trusting another screen to h
 test("an order report with unread orders says so instead of showing zeros", () => {
   // The pair that keeps a failed read from reading as a quiet day: no summary figures at all, and
   // an empty table that names the reason rather than claiming no records were found.
-  assert.match(app, /return \[\["Orders", "-", true\], \["Status", orderReportsState\.notice/);
+  assert.match(app, /return \[\["Orders", MISSING_VALUE, true\], \["Status", orderReportsState\.notice/);
   assert.match(app, /isOrderReport && !orderReportsState\.ready\s*\n?\s*\? orderReportsState\.notice/);
 });
 

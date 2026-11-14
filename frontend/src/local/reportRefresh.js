@@ -93,3 +93,25 @@ export function reportLoadParams(requested, remembered) {
   if (remembered?.range) return { ...remembered, ...asked };
   return asked;
 }
+
+/** The plain name of each report request `loadReports` makes, for a failure message. */
+const REPORT_REQUEST_NAMES = Object.freeze({
+  summary: "Report figures",
+  cashBook: "Cash book",
+  inventory: "Stock inventory",
+  sales: "Sales",
+});
+
+/**
+ * One sentence for the requests a report refresh could not load. The internal request keys
+ * ("cashBook: Network Error") were shown to staff as they were.
+ */
+export function describeReportRefreshFailures(failures = []) {
+  const rows = (Array.isArray(failures) ? failures : []).filter(Boolean);
+  if (!rows.length) return "";
+  return rows.map((failure) => {
+    const name = REPORT_REQUEST_NAMES[failure.key] || "A report";
+    const reason = String(failure.message ?? "").trim();
+    return reason ? `${name} could not be loaded (${reason}).` : `${name} could not be loaded.`;
+  }).join(" ");
+}

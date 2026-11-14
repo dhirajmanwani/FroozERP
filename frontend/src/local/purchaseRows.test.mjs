@@ -134,3 +134,19 @@ test("the purchase screen completes several fruits together and the reports use 
   assert.doesNotMatch(app, /disabled=\{Boolean\(changeBlock\)\} onClick=\{\(event\) => \{ event\.stopPropagation\(\); onCompletePurchase/, "Complete Bill is offered for a bill with several fruits");
   assert.doesNotMatch(app, /\|\| Boolean\(changeBlock\)\} onClick=\{\(\) => completePendingPurchase/);
 });
+
+test("after a save, an edited or completed purchase is let go; a forgotten item keeps date and supplier", async () => {
+  const { PURCHASE_FORM_AFTER_SAVE, purchaseFormAfterSave } = await import("./purchaseRows.js");
+  assert.equal(purchaseFormAfterSave({ wasEditing: true, amendmentMode: true }), PURCHASE_FORM_AFTER_SAVE.RESET_FORM,
+    "the edit id must not survive: the next save would PUT the old purchase again");
+  assert.equal(purchaseFormAfterSave({ wasEditing: true, amendmentMode: false }), PURCHASE_FORM_AFTER_SAVE.RESET_FORM);
+  assert.equal(purchaseFormAfterSave({ wasEditing: false, amendmentMode: true }), PURCHASE_FORM_AFTER_SAVE.CLEAR_ITEMS);
+  assert.equal(purchaseFormAfterSave({}), PURCHASE_FORM_AFTER_SAVE.RESET_FORM);
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const save = app.slice(app.indexOf("  const savePurchase = async () => {"), app.indexOf("  const loadInvoice = async"));
+  assert.match(save, /purchaseFormAfterSave\(\{ wasEditing, amendmentMode: purchaseAmendmentMode \}\) === PURCHASE_FORM_AFTER_SAVE\.CLEAR_ITEMS/);
+  // resetPurchaseForm is what clears editingPurchaseId and leaves amendment mode.
+  const reset = app.slice(app.indexOf("  const resetPurchaseForm = () => {"), app.indexOf("  const resetPurchaseItemFields = () => {"));
+  assert.match(reset, /setEditingPurchaseId\(null\);/);
+  assert.match(reset, /setPurchaseAmendmentMode\(false\);/);
+});
