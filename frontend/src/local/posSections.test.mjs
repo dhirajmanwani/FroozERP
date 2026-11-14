@@ -104,7 +104,8 @@ test("a tile shows the fruit's colour and first letter, readable on either", () 
 
 test("saving a product on the desktop pulls it at once, so POS shows the new section", () => {
   const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
-  const start = app.indexOf('const savedMessage = wasEditing ? "Product Updated" : "Product Added";');
+  // The message now names the product ("Product "Kiwi" added"); the sync must still follow it.
+  const start = app.indexOf("const savedMessage = wasEditing ? `Product \"${savedName}\" saved` : `Product \"${savedName}\" added`;");
   assert.ok(start > 0, "product save message not found");
   const after = app.slice(start, start + 900);
   assert.match(after, /shouldSyncAfterPurchaseSave\(\{ tauriRuntime: isTauriRuntime\(\), queuedOffline: false \}\)/);

@@ -51,7 +51,7 @@ export const groupPurchaseBills = (rows = []) => {
 export const purchaseChangeBlock = (itemCount) => {
   const count = Number(itemCount);
   if (!Number.isFinite(count) || count <= 1) return "";
-  return `This bill has ${count} fruits. Edit works on one fruit only for now. Cancel the bill and enter it again to change it.`;
+  return `This bill has ${count} fruits, so its items cannot be edited one by one. Cancel the bill and enter it again to change it.`;
 };
 
 /**

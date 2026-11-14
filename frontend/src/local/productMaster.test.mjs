@@ -77,6 +77,9 @@ test("units read as words on screen and keep their stored value", () => {
   assert.equal(unitDisplayName("PIECE"), "Piece");
   assert.equal(unitDisplayName("DOZEN"), "Dozen");
   assert.equal(unitDisplayName("CRATE"), "CRATE");
+  // Other spellings of the same units read the same way.
+  assert.equal(unitDisplayName("PCS"), "Piece");
+  assert.equal(unitDisplayName("kgs"), "Kg");
   assert.equal(unitDisplayName(""), MISSING_VALUE);
   assert.equal(unitDisplayName(null), MISSING_VALUE);
 });

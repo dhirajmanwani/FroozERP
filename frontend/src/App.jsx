@@ -180,8 +180,9 @@ import { deviceKind, deviceSeenParts, formatDeviceDate, shortDeviceId } from "./
 import { billNoFloorKey, billNumbersOf, displayBillNo, nextBillNo, parseBillNo } from "./local/billNumber";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { FeedbackDialogHost, SaveNotice } from "./feedbackDialogs";
-import { appDialogQueue, useSaveInFlight, useSaveNotice } from "./feedbackContext";
-import { errorNotice, successNotice } from "./local/feedback";
+import { appDialogQueue, useAskReason, useConfirm, useSaveInFlight, useSaveNotice } from "./feedbackContext";
+import { errorNotice, successNotice, warningNotice } from "./local/feedback";
+import { costPerUnitSummary, distributionLotOptions, distributionStatusClass, formatQuantityWithUnit, isPendingBillCompletion, pendingItemNarration, pendingPurchasesPresentation, purchaseEntryHeadings, purchaseSavedMessage, stockLotName, wasteProductOptionLabel } from "./local/stockScreens";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
@@ -1459,6 +1460,23 @@ const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
 
 const toDateKey = (date) =>
   typeof date === "string" ? date.slice(0, 10) : date.toLocaleDateString("en-CA");
+// Puts the cursor in the field a notice is about (by its id), after React has drawn it. The page
+// is not scrolled by the focus itself unless asked; a smooth scroll is usually already running.
+const focusField = (id, { scroll = true } = {}) => {
+  window.requestAnimationFrame(() => {
+    const element = document.getElementById(id);
+    if (!element) return;
+    if (scroll) element.scrollIntoView({ behavior: "smooth", block: "center" });
+    element.focus({ preventScroll: true });
+  });
+};
+// The question asked before a second lot with the same name, supplier, grade and date is added.
+const duplicateLotQuestion = (lotName) => ({
+  title: "This lot already exists",
+  message: `A lot called "${lotName}" with the same supplier, grade and date is already there. Add this one as a separate lot anyway?`,
+  confirmLabel: "Add as a separate lot",
+  cancelLabel: "Go back",
+});
 const formatDisplayDate = (dateValue) => {
   const key = toDateKey(dateValue || "");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return key || MISSING_VALUE;
@@ -2573,6 +2591,26 @@ function App() {
   const [customers, setCustomers] = useState([]);
   const [purchases, setPurchases] = useState([]);
   const [purchaseSaveBusy, setPurchaseSaveBusy] = useState(false);
+  // The stock screens' in-app notices and boxes, in place of the browser's alert, confirm and
+  // prompt (local/feedback.js). Each notice is drawn next to the button whose result it reports.
+  const confirmDialog = useConfirm();
+  const askReason = useAskReason();
+  const [productNotice, showProductNotice, clearProductNotice] = useSaveNotice();
+  const [productListNotice, showProductListNotice, clearProductListNotice] = useSaveNotice();
+  const [categoryNotice, showCategoryNotice, clearCategoryNotice] = useSaveNotice();
+  const [lotPanelNotice, showLotPanelNotice, clearLotPanelNotice] = useSaveNotice();
+  const [lotNotice, showLotNotice, clearLotNotice] = useSaveNotice();
+  const [purchaseNotice, showPurchaseNotice, clearPurchaseNotice] = useSaveNotice();
+  const [purchaseItemNotice, showPurchaseItemNotice, clearPurchaseItemNotice] = useSaveNotice();
+  const [purchaseActionNotice, showPurchaseActionNotice, clearPurchaseActionNotice] = useSaveNotice();
+  // A purchase notice with no field to point at (a save that worked, or one that failed as a
+  // whole) sits under the Save button, often below the fold: bring it into view so it is seen.
+  useEffect(() => {
+    if (!purchaseNotice || purchaseNotice.field) return;
+    document.getElementById("purchase-save-notice")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [purchaseNotice]);
+  // Set when a pending bill has just been completed, so Purchase Entry offers the way back.
+  const [purchaseCompletedFor, setPurchaseCompletedFor] = useState("");
   const purchaseSaveInFlightRef = useRef(false);
   const purchaseSubmissionRef = useRef(createPurchaseSubmissionTracker());
   const reportRequestGateRef = useRef(createLatestRequestGate());
@@ -2616,6 +2654,8 @@ function App() {
   // register and ₹0.00.
   const [expensesLoad, setExpensesLoad] = useState({ status: "idle", message: "" });
   const [wasteLoad, setWasteLoad] = useState({ status: "idle", message: "" });
+  // Pending Bills reads the purchases list; a failed read must not look like "nothing pending".
+  const [purchasesLoad, setPurchasesLoad] = useState({ status: "idle", message: "" });
   // Kept as one object rather than three pieces of state so the view can never render a stale
   // payload beside a fresh error, which is how a failed refresh ends up looking like real figures.
   const [allShopsState, setAllShopsState] = useState({ loadState: "idle", loadError: "", payload: null, dateTo: "" });
@@ -2631,6 +2671,8 @@ function App() {
     loadState: "idle", loadError: "", transfers: [], destinations: [],
   });
   const [distributionBusy, setDistributionBusy] = useState(false);
+  // What the last consignment action did, said on the board rather than in the shell's banner.
+  const [distributionNotice, showDistributionNotice, clearDistributionNotice] = useSaveNotice();
   // Where a purchase's goods were actually received. Empty means "this counter", which is what the
   // backend assumes when no destination is sent -- so an untouched picker changes nothing.
   const [purchaseDestinationId, setPurchaseDestinationId] = useState("");
@@ -4594,6 +4636,7 @@ function App() {
         netPayable: 0,
         balanceAmount: 0,
         effectiveCostPerUnit: expectedRate,
+        costPerUnit: costPerUnitSummary([{ quantity, unit: selectedPurchaseProduct?.unit }], quantity * expectedRate),
         paymentStatus: "Bill Pending",
       };
     }
@@ -4622,6 +4665,7 @@ function App() {
       netPayable,
       balanceAmount: Math.max(netPayable - paidAmount, 0),
       effectiveCostPerUnit: quantity > 0 ? netPayable / quantity : 0,
+      costPerUnit: costPerUnitSummary([{ quantity, unit: selectedPurchaseProduct?.unit }], netPayable),
       paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
   }, [expectedPurchaseRate, purchaseBillStatus, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
@@ -4632,11 +4676,13 @@ function App() {
       purchase_rate: Number(line.purchase_rate || 0),
       expected_purchase_rate: Number(line.expected_rate || 0),
       origin_type: line.origin_type || "LOCAL",
+      unit: line.unit,
     })) : editingPurchaseId ? [{
       quantity: Number(purchaseQuantity || 0),
       purchase_rate: Number(purchaseRateInput || 0),
       expected_purchase_rate: Number(expectedPurchaseRate || 0),
       origin_type: selectedPurchaseProduct?.origin_type || "LOCAL",
+      unit: selectedPurchaseProduct?.unit,
     }] : purchaseCart;
     const itemCount = items.length;
     const receivedQuantity = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
@@ -4660,6 +4706,8 @@ function App() {
         netPayable: 0,
         balanceAmount: 0,
         effectiveCostPerUnit: receivedQuantity > 0 ? provisionalCost / receivedQuantity : 0,
+        // Per unit only when every item is in one unit (logic C, local/stockScreens.js).
+        costPerUnit: costPerUnitSummary(items, provisionalCost),
         paymentStatus: "Bill Pending",
       };
     }
@@ -4696,9 +4744,35 @@ function App() {
       netPayable,
       balanceAmount: Math.max(netPayable - paidAmount, 0),
       effectiveCostPerUnit: receivedQuantity > 0 ? netPayable / receivedQuantity : 0,
+      costPerUnit: costPerUnitSummary(items, netPayable),
       paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
   }, [completionLines, editingPurchaseId, expectedPurchaseRate, purchaseBillStatus, purchaseCart, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
+
+  // Purchase Entry opened with "Complete Bill": a pending bill being finished, not amended.
+  const purchaseCompleting = isPendingBillCompletion({
+    editingPurchaseId,
+    billStatus: purchaseBillStatus,
+    originalBillStatus: purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status,
+  });
+  const purchaseHeadings = purchaseEntryHeadings({
+    completing: purchaseCompleting,
+    editing: Boolean(editingPurchaseId),
+    pending: purchaseBillStatus === "BILL_PENDING",
+    multiFruit: completionLines?.length || 0,
+    supplierName: activeSuppliers.find((supplier) => String(supplier.id) === String(purchaseSupplierId))?.supplier_name || "",
+  });
+  // Field labels carry the chosen product's unit: "Quantity (Kg)", "Purchase rate (₹ per kg)".
+  const purchaseUnitName = selectedPurchaseProduct ? unitDisplayName(selectedPurchaseProduct.unit) : MISSING_VALUE;
+  const purchaseUnitLabel = (label) => (purchaseUnitName === MISSING_VALUE ? label : `${label} (${purchaseUnitName})`);
+  const purchaseRateLabel = (label) => (purchaseUnitName === MISSING_VALUE ? `${label} (₹)` : `${label} (₹ per ${purchaseUnitName.toLowerCase()})`);
+  // Enter in an item box adds the line, as the Add item button does. Only on a new bill's cart:
+  // never while one saved item is being corrected, where there is no cart to add to.
+  const addPurchaseLineOnEnter = (event) => {
+    if (event.key !== "Enter" || editingPurchaseId || completionLines) return;
+    event.preventDefault();
+    addPurchaseCartItem();
+  };
 
   const applySettingsBundle = (bundle = {}) => {
     const nextSaleRateSettings = { ...defaultSaleRateSettings, ...(bundle.saleRateSettings || {}) };
@@ -4748,6 +4822,7 @@ function App() {
     setCustomers((current) => preserveVerifiedLocalCollection(snapshot?.customers, current));
     setSalesHistory((current) => preserveVerifiedLocalCollection(snapshot?.sales_history, current));
     setPurchases(snapshot?.offline_purchases || bundle.offlinePurchases || []);
+    setPurchasesLoad({ status: "ready", message: "" });
     setSuppliers(bundle.offlineSuppliers || []);
     setAccounts(bundle.offlineAccounts || []);
     // `{}` when the saved bundle has none: the Outstanding tab then says "not available" instead of
@@ -5878,13 +5953,21 @@ function App() {
   };
 
   const loadPurchases = async () => {
-    if (isTauriRuntime() && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
-      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
-      setPurchases(snapshot?.offline_purchases || snapshot?.settings_bundle?.offlinePurchases || await listLocalPurchases());
-      return;
+    setPurchasesLoad((current) => (current.status === "ready" ? current : { status: "loading", message: "" }));
+    try {
+      if (isTauriRuntime() && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
+        const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+        setPurchases(snapshot?.offline_purchases || snapshot?.settings_bundle?.offlinePurchases || await listLocalPurchases());
+        setPurchasesLoad({ status: "ready", message: "" });
+        return;
+      }
+      const response = await axios.get(`${API_URL}/purchases`);
+      setPurchases(response.data);
+      setPurchasesLoad({ status: "ready", message: "" });
+    } catch (error) {
+      setPurchasesLoad({ status: "failed", message: `The purchases could not be loaded: ${getErrorMessage(error, "no answer from the server")}.` });
+      throw error;
     }
-    const response = await axios.get(`${API_URL}/purchases`);
-    setPurchases(response.data);
   };
 
   const loadSettingsData = async (currentUser = user) => {
@@ -7113,10 +7196,10 @@ function App() {
       });
       await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
       await loadDistribution();
-      setSyncMessage("Request sent. The other shop decides what to send and when.");
+      showDistributionNotice(successNotice("Request sent. The other shop decides what to send and when."));
       return true;
     } catch (error) {
-      setSyncMessage(getErrorMessage(error, "The request could not be sent"));
+      showDistributionNotice(errorNotice(getErrorMessage(error, "The request could not be sent.")));
       return false;
     } finally {
       setDistributionBusy(false);
@@ -7154,7 +7237,7 @@ function App() {
     } catch (error) {
       setDistributionState({
         loadState: "error",
-        loadError: getErrorMessage(error, "Consignments could not be loaded"),
+        loadError: getErrorMessage(error, "There was no answer from the server. Nothing has changed; check the connection and try again."),
         transfers: [],
         destinations: [],
       });
@@ -7182,9 +7265,9 @@ function App() {
       // The shelf changed: approving holds stock, dispatching takes it off, receiving adds it. POS
       // reads its own snapshot, so without this the till would go on offering fruit that has left.
       setPosRefreshToken((token) => token + 1);
-      setSyncMessage("");
+      clearDistributionNotice();
     } catch (error) {
-      setSyncMessage(getErrorMessage(error, transferActionFailureMessage(action)));
+      showDistributionNotice(errorNotice(getErrorMessage(error, transferActionFailureMessage(action))));
     } finally {
       setDistributionBusy(false);
     }
@@ -7225,10 +7308,10 @@ function App() {
       });
       await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
       await loadDistribution();
-      setSyncMessage("Consignment created. It is not sent until it has been approved and dispatched.");
+      showDistributionNotice(successNotice("Consignment created. It is not sent until it has been approved and dispatched."));
       return true;
     } catch (error) {
-      setSyncMessage(getErrorMessage(error, "The consignment could not be created"));
+      showDistributionNotice(errorNotice(getErrorMessage(error, "The consignment could not be created.")));
       return false;
     } finally {
       setDistributionBusy(false);
@@ -8036,6 +8119,11 @@ function App() {
   };
 
   const addProduct = async () => {
+    clearProductNotice();
+    const refuse = (message, fieldId) => {
+      showProductNotice(errorNotice(message, fieldId));
+      focusField(fieldId);
+    };
     try {
       const wasEditing = Boolean(editingProductId);
       const editingKeys = wasEditing
@@ -8045,21 +8133,24 @@ function App() {
       const finalCategoryName = selectedCategory?.category_name || newProductCategoryName.trim() || productCategory.trim();
       const duplicateProduct = findDuplicateProductName(products, productName, editingKeys);
       if (duplicateProduct) {
-        alert("This product already exists.");
+        refuse(`A product called "${productName.trim()}" already exists. Use another name, or edit that product.`, "product-name-input");
         return;
       }
       if (!finalCategoryName) {
-        alert("Please select or add product category.");
+        refuse("Choose a category, or add a new one.", "product-category-input");
         return;
       }
       const parsedSellingRate = Number(sellingRate);
       const parsedMinimumStock = Number(productMinimumStock || 0);
       if (!productName.trim() || !unit || !Number.isFinite(parsedSellingRate) || parsedSellingRate <= 0) {
-        alert("Enter a product name, a unit and a sale price above zero.");
+        refuse(
+          "Enter a product name, a unit and a sale price above zero.",
+          !productName.trim() ? "product-name-input" : !unit ? "product-unit-input" : "product-sale-price-input",
+        );
         return;
       }
       if (!Number.isFinite(parsedMinimumStock) || parsedMinimumStock < 0) {
-        alert("Enter a valid low-stock alert quantity (zero or more).");
+        refuse("Enter a valid low-stock alert quantity (zero or more).", "product-min-stock-input");
         return;
       }
       const normalizedOpeningStockLots = (addOpeningStock ? openingStockLots : [])
@@ -8115,7 +8206,7 @@ function App() {
       if (wasEditing) {
         const resolved = await serverIdForProduct(editingKeys);
         if (!resolved.ok) {
-          alert(resolved.message);
+          showProductNotice(errorNotice(resolved.message));
           return;
         }
         const serverProductId = resolved.id;
@@ -8144,13 +8235,14 @@ function App() {
       // The photo is saved after the product, separately. If it fails the product is still saved,
       // and the owner is told the photo is not, rather than the whole save looking like a success.
       const photoProblem = productPhotoDraft.changed ? await saveProductPhoto(savedProductId, productPhotoDraft.dataUrl, savedProductGlobalId) : "";
+      const savedName = productName.trim();
       resetProductForm();
       // The product is saved at this point. Reloading the lists afterwards is a separate matter: a
       // failed reload used to land in the catch below and report "Error Adding Product" for a
       // product that had in fact been saved, so the owner would try again and make a duplicate.
       const reloads = await Promise.allSettled([loadProducts(), loadProductCategories(), loadDashboardData()]);
       const reloadFailure = reloads.find((result) => result.status === "rejected");
-      const savedMessage = wasEditing ? "Product Updated" : "Product Added";
+      const savedMessage = wasEditing ? `Product "${savedName}" saved` : `Product "${savedName}" added`;
       // POS on this desktop reads SQLite, which learns of the change (a new POS section, a rate) only
       // at the next background cycle. Pull it now, as after a purchase save; never fails the save, and
       // LOCAL_ONLY is refused inside runSyncNow before any request.
@@ -8164,7 +8256,8 @@ function App() {
         reloadFailure ? `the list could not be refreshed (${productSaveErrorMessage(reloadFailure.reason, "no answer")}); open Product Master again to see it` : "",
       ].filter(Boolean);
       if (reloadFailure) console.error("Product list refresh after save failed", reloadFailure.reason);
-      alert(notes.length ? `${savedMessage}, but ${notes.join("; and ")}.` : savedMessage);
+      // Saved either way; a photo or a refresh that did not follow is a warning, not a failure.
+      showProductNotice(notes.length ? warningNotice(`${savedMessage}, but ${notes.join("; and ")}.`) : successNotice(`${savedMessage}.`));
     } catch (error) {
       console.error("Product save failed", {
         status: error.response?.status,
@@ -8172,7 +8265,7 @@ function App() {
         message: error.message,
         error,
       });
-      alert(productSaveErrorMessage(error, editingProductId ? "The product could not be updated." : "The product could not be added."));
+      showProductNotice(errorNotice(productSaveErrorMessage(error, editingProductId ? "The product could not be updated." : "The product could not be added.")));
     }
   };
 
@@ -8212,15 +8305,19 @@ function App() {
   };
 
   const saveProductCategory = async () => {
+    clearCategoryNotice();
+    // The Categories tab and the product form's "+ New category" each have a name box; one shows.
+    const nameField = document.getElementById("category-new-name") ? "category-new-name" : "category-inline-name";
     try {
       const categoryName = newProductCategoryName.trim();
       if (!categoryName) {
-        alert("Please enter category name.");
+        showCategoryNotice(errorNotice("Enter a name for the new category.", nameField));
+        focusField(nameField, { scroll: false });
         return;
       }
       const duplicate = productCategories.find((category) => category.category_name?.trim().toLowerCase() === categoryName.toLowerCase());
       if (duplicate) {
-        alert("Category already exists.");
+        showCategoryNotice(errorNotice(`A category called "${duplicate.category_name}" already exists. It is now chosen for this product.`, nameField));
         setProductCategoryId(String(duplicate.id));
         setProductCategory(duplicate.category_name);
         return;
@@ -8238,14 +8335,22 @@ function App() {
       setProductCategoryId(String(response.data.id));
       setProductCategory(response.data.category_name);
       setNewProductCategoryName("");
-      alert("Category saved");
+      showCategoryNotice(successNotice(`Category "${response.data.category_name || categoryName}" added.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save category"));
+      showCategoryNotice(errorNotice(getErrorMessage(error, "The category could not be saved.")));
     }
   };
 
   const editProductCategory = async (category) => {
-    const nextName = window.prompt("Edit category name", category.category_name);
+    clearCategoryNotice();
+    // Not required: an empty name, like Cancel, leaves the category as it is (as the prompt did).
+    const nextName = await askReason({
+      title: `Rename the category "${category.category_name}"`,
+      label: "New name",
+      defaultValue: category.category_name,
+      confirmLabel: "Rename",
+      required: false,
+    });
     if (!nextName?.trim()) return;
     try {
       const categoryWrite = createOperationalWrite(user, {
@@ -8261,14 +8366,21 @@ function App() {
         categoryWrite.config
       );
       await Promise.all([loadProductCategories(), loadProducts()]);
-      alert("Category updated");
+      showCategoryNotice(successNotice(`Category renamed to "${nextName.trim()}".`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update category"));
+      showCategoryNotice(errorNotice(getErrorMessage(error, "The category could not be renamed.")));
     }
   };
 
   const deactivateProductCategory = async (category) => {
-    const reason = window.prompt(`Reason for deactivating the category ${category.category_name}`);
+    clearCategoryNotice();
+    const reason = await askReason({
+      title: `Deactivate the category "${category.category_name}"?`,
+      message: "New products can no longer be put in it. Past bills and reports keep it.",
+      label: "Reason for deactivating",
+      confirmLabel: "Deactivate",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       const categoryWrite = createOperationalWrite(user, { updated_by: user.id, reason });
@@ -8277,10 +8389,10 @@ function App() {
         data: categoryWrite.body,
       });
       await loadProductCategories();
-      alert("Category removed");
+      showCategoryNotice(successNotice(`Category "${category.category_name}" is no longer active.`));
     } catch (error) {
-      await loadProductCategories();
-      alert(getErrorMessage(error, "This category has products or transactions. It can only be deactivated."));
+      await loadProductCategories().catch(() => null);
+      showCategoryNotice(errorNotice(getErrorMessage(error, "This category has products or transactions. It can only be deactivated.")));
     }
   };
 
@@ -8311,22 +8423,19 @@ function App() {
     });
   };
 
-  const buildOpeningStockLotFromDraft = () => {
+  // `show` is the notice of the card the lot form is in (the product form, or the stock lots card).
+  const buildOpeningStockLotFromDraft = async (show) => {
     const quantity = Number(openingStockDraft.quantity || 0);
     const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
     const saleRate = Number(openingStockDraft.sale_rate || sellingRate || 0);
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      alert("Enter the lot quantity.");
+    const refuse = (message, fieldId) => {
+      show(errorNotice(message, fieldId));
+      focusField(fieldId);
       return null;
-    }
-    if (!Number.isFinite(purchaseRate) || purchaseRate <= 0) {
-      alert("Enter the lot cost price.");
-      return null;
-    }
-    if (!Number.isFinite(saleRate) || saleRate <= 0) {
-      alert("Enter the lot sale price.");
-      return null;
-    }
+    };
+    if (!Number.isFinite(quantity) || quantity <= 0) return refuse("Enter the lot quantity.", "opening-lot-quantity");
+    if (!Number.isFinite(purchaseRate) || purchaseRate <= 0) return refuse("Enter the lot cost price.", "opening-lot-cost");
+    if (!Number.isFinite(saleRate) || saleRate <= 0) return refuse("Enter the lot sale price.", "opening-lot-sale");
     const nextLotName = getOpeningLotName(openingStockDraft, productLots.length + openingStockLots.length + 1);
     const nextLot = {
       ...openingStockDraft,
@@ -8336,27 +8445,29 @@ function App() {
     };
     const duplicateLot = [...productLots, ...openingStockLots].find((lot) => isSameOpeningLot(lot, nextLot));
     if (duplicateLot) {
-      const confirmed = window.confirm("This lot already exists. Add as separate lot anyway?");
+      const confirmed = await confirmDialog(duplicateLotQuestion(nextLot.lot_name));
       if (!confirmed) return null;
       nextLot.allow_duplicate_lot = true;
     }
     return nextLot;
   };
 
-  const addOpeningStockLot = () => {
-    const nextLot = buildOpeningStockLotFromDraft();
+  const addOpeningStockLot = async () => {
+    clearProductNotice();
+    const nextLot = await buildOpeningStockLotFromDraft(showProductNotice);
     if (!nextLot) return;
     setOpeningStockLots((current) => [...current, nextLot]);
     resetOpeningStockDraft();
   };
 
   const saveNewOpeningStockLot = async () => {
+    clearLotPanelNotice();
     const activeProductId = editingProductId || lotPanelProduct?.id;
     if (!activeProductId) {
-      alert("Product id missing. Close this form and reopen it from the product lot panel.");
+      showLotPanelNotice(errorNotice("This product could not be found. Close the stock lots and open them again from the product list."));
       return;
     }
-    const nextLot = buildOpeningStockLotFromDraft();
+    const nextLot = await buildOpeningStockLotFromDraft(showLotPanelNotice);
     if (!nextLot) return;
     try {
       const payload = {
@@ -8371,7 +8482,7 @@ function App() {
         : productIdentityKeys(lotPanelProduct);
       const resolved = await serverIdForProduct(activeKeys);
       if (!resolved.ok) {
-        alert(resolved.message);
+        showLotPanelNotice(errorNotice(resolved.message));
         return;
       }
       try {
@@ -8383,7 +8494,7 @@ function App() {
         );
       } catch (error) {
         const message = getErrorMessage(error, "Unable to add opening stock lot");
-        if (message.includes("Add as separate lot anyway?") && window.confirm("This lot already exists. Add as separate lot anyway?")) {
+        if (message.includes("Add as separate lot anyway?") && await confirmDialog(duplicateLotQuestion(nextLot.lot_name))) {
           const duplicateWrite = createOperationalWrite(user, { ...payload, allow_duplicate_lot: true });
           await axios.post(
             `${API_URL}/api/v3/products/${resolved.id}/opening-stock-lots`,
@@ -8398,9 +8509,9 @@ function App() {
       setShowOpeningLotForm(false);
       setAddOpeningStock(false);
       await refreshLotContext(lotPanelProduct || { id: activeProductId, product_name: productName });
-      alert("Stock lot added");
+      showLotPanelNotice(successNotice(`Stock lot "${nextLot.lot_name}" added.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to add opening stock lot"));
+      showLotPanelNotice(errorNotice(getErrorMessage(error, "The stock lot could not be added.")));
     }
   };
 
@@ -8416,7 +8527,7 @@ function App() {
     try {
       const resolved = await serverIdForProduct(productIdentityKeys(product));
       if (!resolved.ok) {
-        alert(resolved.message);
+        showProductListNotice(errorNotice(resolved.message));
         return;
       }
       const response = await axios.get(`${API_URL}/products/${resolved.id}/lots`);
@@ -8424,11 +8535,13 @@ function App() {
       setProductLotAudit(response.data.audit || []);
       if (showPanel) setLotPanelProduct(product);
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to load product lots"));
+      showProductListNotice(errorNotice(`The stock lots of ${product?.product_name || "this product"} could not be loaded: ${getErrorMessage(error, "no answer from the server")}.`));
     }
   };
 
   const openLotAction = (type, lot) => {
+    clearLotNotice();
+    clearLotPanelNotice();
     setLotAction({ type, lot });
     setLotDraft({
       lot_name: lot.lot_name || lot.batch_no || "",
@@ -8448,6 +8561,7 @@ function App() {
   };
 
   const closeLotAction = () => {
+    clearLotNotice();
     setLotAction(null);
     setLotDraft({
       lot_name: "",
@@ -8475,6 +8589,13 @@ function App() {
 
   const saveLotAction = async () => {
     if (!lotAction?.lot?.id) return;
+    clearLotNotice();
+    const refuse = (message, fieldId) => {
+      showLotNotice(errorNotice(message, fieldId));
+      focusField(fieldId, { scroll: false });
+    };
+    const lotName = lotAction.lot.lot_name || lotAction.lot.batch_no || "the lot";
+    let doneMessage = "";
     try {
       const selectedSupplier = activeSuppliers.find((supplier) => String(supplier.id) === String(lotDraft.supplier_id));
       const basePayload = {
@@ -8486,15 +8607,15 @@ function App() {
         const nextQty = Number(lotDraft.purchase_qty || 0);
         const nextCost = Number(lotDraft.purchase_rate || 0);
         if (!lotDraft.lot_name.trim()) {
-          alert("Enter a lot name.");
+          refuse("Enter a lot name.", "lot-action-name");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Enter a valid lot quantity.");
+          refuse("Enter a valid lot quantity.", "lot-action-quantity");
           return;
         }
         if (!Number.isFinite(nextCost) || nextCost <= 0) {
-          alert("Enter a cost price above zero.");
+          refuse("Enter a cost price above zero.", "lot-action-cost");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8515,11 +8636,11 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Lot updated");
+        doneMessage = `Lot "${lotDraft.lot_name.trim()}" saved.`;
       }
       if (lotAction.type === "add") {
         if (Number(lotDraft.quantity || 0) <= 0) {
-          alert("Enter quantity to add.");
+          refuse("Enter the quantity to add.", "lot-action-add-quantity");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8532,16 +8653,16 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Quantity added");
+        doneMessage = `${formatQuantityWithUnit(lotDraft.quantity, lotAction.lot.unit || lotPanelProduct?.unit)} added to "${lotName}".`;
       }
       if (lotAction.type === "adjust") {
         const nextQty = Number(lotDraft.new_quantity || 0);
         if (!lotDraft.reason.trim()) {
-          alert("Enter a reason for the count correction.");
+          refuse("Enter a reason for the count correction.", "lot-action-reason");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Enter a valid counted quantity.");
+          refuse("Enter a valid counted quantity.", "lot-action-counted");
           return;
         }
         const adjustmentWrite = createOperationalWrite(user, {
@@ -8557,11 +8678,11 @@ function App() {
           adjustmentWrite.body,
           adjustmentWrite.config
         );
-        alert("Count corrected");
+        doneMessage = `Count of "${lotName}" corrected to ${formatQuantityWithUnit(lotDraft.new_quantity, lotAction.lot.unit || lotPanelProduct?.unit)}.`;
       }
       if (lotAction.type === "deactivate") {
         if (!lotDraft.reason.trim()) {
-          alert("Reason is required to deactivate a lot.");
+          refuse("Enter a reason to deactivate the lot.", "lot-action-reason");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8574,11 +8695,11 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Lot deactivated");
+        doneMessage = `Lot "${lotName}" deactivated.`;
       }
       if (lotAction.type === "reactivate") {
         if (!lotDraft.reason.trim()) {
-          alert("Reason is required to reactivate a lot.");
+          refuse("Enter a reason to reactivate the lot.", "lot-action-reason");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8591,12 +8712,14 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Lot reactivated");
+        doneMessage = `Lot "${lotName}" reactivated.`;
       }
       closeLotAction();
+      // Said in the stock lots card the box closed back to, so it is seen.
+      if (doneMessage) showLotPanelNotice(successNotice(doneMessage));
       await refreshLotContext();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update lot"));
+      showLotNotice(errorNotice(getErrorMessage(error, "The lot could not be updated.")));
     }
   };
 
@@ -8646,30 +8769,35 @@ function App() {
     setEditingPurchaseItemLineId(null);
   };
 
-  const addPurchaseCartItem = () => {
+  const addPurchaseCartItem = async () => {
     const product = selectedPurchaseProduct;
     const quantity = Number(purchaseQuantity || 0);
     const purchaseRate = Number(purchaseRateInput || 0);
     const temporaryRate = Number(temporarySaleRate || 0);
     const expectedRate = Number(expectedPurchaseRate || 0);
+    clearPurchaseItemNotice();
+    const refuse = (message, fieldId) => {
+      showPurchaseItemNotice(errorNotice(message, fieldId));
+      focusField(fieldId);
+    };
     if (!purchaseSupplierId) {
-      alert("Select supplier before adding purchase items.");
+      refuse("Choose the supplier before adding items.", "purchase-supplier");
       return;
     }
     if (!product || quantity <= 0) {
-      alert("Select product and enter quantity.");
+      refuse(product ? `Enter the quantity of ${product.product_name}.` : "Choose a product and enter its quantity.", product ? "purchase-quantity" : "purchase-product");
       return;
     }
     if (!purchaseLotName.trim()) {
-      alert("Please enter lot name / size.");
+      refuse("Enter a lot name or number.", "purchase-lot-name");
       return;
     }
     if (purchaseBillStatus === "BILL_PENDING" && temporaryRate <= 0) {
-      alert("Pending bill stock requires a temporary sale rate.");
+      refuse("Stock waiting for its bill needs a temporary sale rate.", "purchase-temp-rate");
       return;
     }
     if (purchaseBillStatus === "BILL_COMPLETED" && purchaseRate <= 0) {
-      alert("Completed bill items require a purchase rate.");
+      refuse("Enter the purchase rate.", "purchase-rate");
       return;
     }
     const item = {
@@ -8687,43 +8815,57 @@ function App() {
       lot_size: purchaseLotSize,
       remarks: purchaseItemRemarks,
     };
-    setPurchaseCart((currentCart) => {
-      const nextCart = [...currentCart];
-      const itemIdentity = buildPurchaseLineIdentity(item);
-      if (editingPurchaseItemLineId !== null) {
-        const editingIndex = nextCart.findIndex((cartItem) => cartItem.line_id === editingPurchaseItemLineId);
-        if (editingIndex < 0) return currentCart;
-        const duplicateIndex = nextCart.findIndex((cartItem) =>
-          cartItem.line_id !== editingPurchaseItemLineId &&
-          buildPurchaseLineIdentity(cartItem) === itemIdentity
-        );
-        if (duplicateIndex >= 0) {
-          const shouldMerge = window.confirm("This edited item exactly matches another purchase-cart row. Add this quantity to the existing row and remove the edited row?");
-          if (!shouldMerge) return currentCart;
-          nextCart[duplicateIndex] = {
-            ...nextCart[duplicateIndex],
-            quantity: Number(nextCart[duplicateIndex].quantity || 0) + quantity,
-          };
-          nextCart.splice(editingIndex, 1);
-        } else {
-          nextCart[editingIndex] = item;
-        }
+    // Worked out on the cart as it is now, so the merge question can be asked in the app's own box
+    // (which waits for an answer) before anything changes. Declining leaves the cart and the typed
+    // item as they were.
+    const nextCart = [...purchaseCart];
+    const itemIdentity = buildPurchaseLineIdentity(item);
+    const quantityWords = formatQuantityWithUnit(quantity, product.unit);
+    if (editingPurchaseItemLineId !== null) {
+      const editingIndex = nextCart.findIndex((cartItem) => cartItem.line_id === editingPurchaseItemLineId);
+      if (editingIndex < 0) return;
+      const duplicateIndex = nextCart.findIndex((cartItem) =>
+        cartItem.line_id !== editingPurchaseItemLineId &&
+        buildPurchaseLineIdentity(cartItem) === itemIdentity
+      );
+      if (duplicateIndex >= 0) {
+        const shouldMerge = await confirmDialog({
+          title: "This item is already on the bill",
+          message: `Another line has the same ${product.product_name} lot. Add ${quantityWords} to that line and remove this one?`,
+          confirmLabel: "Add to that line",
+          cancelLabel: "Go back",
+        });
+        if (!shouldMerge) return;
+        nextCart[duplicateIndex] = {
+          ...nextCart[duplicateIndex],
+          quantity: Number(nextCart[duplicateIndex].quantity || 0) + quantity,
+        };
+        nextCart.splice(editingIndex, 1);
       } else {
-        const existingIndex = nextCart.findIndex((cartItem) => buildPurchaseLineIdentity(cartItem) === itemIdentity);
-        if (existingIndex >= 0) {
-          const shouldMerge = window.confirm("This exact product lot already exists in the purchase cart. Add this quantity to the existing row?");
-          if (!shouldMerge) return currentCart;
-          nextCart[existingIndex] = {
-            ...nextCart[existingIndex],
-            quantity: Number(nextCart[existingIndex].quantity || 0) + quantity,
-          };
-        } else {
-          nextCart.push(item);
-        }
+        nextCart[editingIndex] = item;
       }
-      return nextCart;
-    });
+    } else {
+      const existingIndex = nextCart.findIndex((cartItem) => buildPurchaseLineIdentity(cartItem) === itemIdentity);
+      if (existingIndex >= 0) {
+        const shouldMerge = await confirmDialog({
+          title: "This lot is already on the bill",
+          message: `${product.product_name}, lot "${purchaseLotName.trim()}", is already a line. Add ${quantityWords} to that line?`,
+          confirmLabel: "Add to that line",
+          cancelLabel: "Go back",
+        });
+        if (!shouldMerge) return;
+        nextCart[existingIndex] = {
+          ...nextCart[existingIndex],
+          quantity: Number(nextCart[existingIndex].quantity || 0) + quantity,
+        };
+      } else {
+        nextCart.push(item);
+      }
+    }
+    setPurchaseCart(nextCart);
     resetPurchaseItemFields();
+    // Ready for the next fruit on the same bill.
+    focusField("purchase-product", { scroll: false });
   };
 
   const editPurchaseCartItem = (lineId) => {
@@ -8745,54 +8887,72 @@ function App() {
     if (editingPurchaseItemLineId === lineId) resetPurchaseItemFields();
   };
 
+  // The first thing stopping the save, as `{ message, field }` (the field's id, to put the cursor
+  // there), or null. The same checks, in the same order, as before; only the words changed.
   const validatePurchaseBeforeSave = () => {
-    if (!purchaseSupplierId) return "Please select supplier";
+    const problem = (message, field = "") => ({ message, field });
+    if (!purchaseSupplierId) return problem("Choose the supplier.", "purchase-supplier");
     if (editingPurchaseId && completionLines) {
       const linesProblem = completionLinesProblem(completionLines);
-      if (linesProblem) return linesProblem;
-      if (!purchaseRebateRuleId) return "Please select rebate rule";
-      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
-      return "";
+      if (linesProblem) return problem(linesProblem);
+      if (!purchaseRebateRuleId) return problem("Choose the payment timing and rebate.", "purchase-rebate");
+      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return problem("Enter the amount paid.", "purchase-paid");
+      return null;
     }
     if (editingPurchaseId) {
-      const productName = selectedPurchaseProduct?.product_name || "selected item";
-      if (!purchaseProductId) return "Please select product";
-      if (Number(purchaseQuantity || 0) <= 0) return `Please enter quantity for ${productName}`;
+      const productName = selectedPurchaseProduct?.product_name || "the item";
+      if (!purchaseProductId) return problem("Choose the product.", "purchase-product");
+      if (Number(purchaseQuantity || 0) <= 0) return problem(`Enter the quantity of ${productName}.`, "purchase-quantity");
       if (purchaseBillStatus === "BILL_COMPLETED") {
-        if (Number(purchaseRateInput || 0) <= 0) return `Please enter purchase rate for ${productName}`;
-        if (!purchaseRebateRuleId) return "Please select rebate rule";
-        if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
+        if (Number(purchaseRateInput || 0) <= 0) return problem(`Enter the purchase rate of ${productName}.`, "purchase-rate");
+        if (!purchaseRebateRuleId) return problem("Choose the payment timing and rebate.", "purchase-rebate");
+        if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return problem("Enter the amount paid.", "purchase-paid");
       }
-      if (purchaseBillStatus === "BILL_PENDING" && Number(temporarySaleRate || 0) <= 0) return `Please enter temporary sale rate for ${productName}`;
-      return "";
+      if (purchaseBillStatus === "BILL_PENDING" && Number(temporarySaleRate || 0) <= 0) return problem(`Enter a temporary sale rate for ${productName}.`, "purchase-temp-rate");
+      return null;
     }
-    if (purchaseCart.length === 0) return "Please add at least one item";
+    if (purchaseCart.length === 0) return problem("Add at least one item to the bill.", "purchase-product");
     if (purchaseBillStatus === "BILL_COMPLETED") {
       const missingRate = purchaseCart.find((item) => Number(item.purchase_rate || 0) <= 0);
-      if (missingRate) return `Please enter purchase rate for ${missingRate.product_name}`;
-      if (!purchaseRebateRuleId) return "Please select rebate rule";
-      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
+      if (missingRate) return problem(`Enter the purchase rate of ${missingRate.product_name} (Edit its line).`);
+      if (!purchaseRebateRuleId) return problem("Choose the payment timing and rebate.", "purchase-rebate");
+      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return problem("Enter the amount paid.", "purchase-paid");
     }
     if (purchaseBillStatus === "BILL_PENDING") {
       const missingTempRate = purchaseCart.find((item) => Number(item.temporary_sale_rate || 0) <= 0);
-      if (missingTempRate) return `Please enter temporary sale rate for ${missingTempRate.product_name}`;
+      if (missingTempRate) return problem(`Enter a temporary sale rate for ${missingTempRate.product_name} (Edit its line).`);
     }
-    return "";
+    return null;
   };
 
   const savePurchase = async () => {
     if (purchaseSaveInFlightRef.current) return;
     purchaseSaveInFlightRef.current = true;
     setPurchaseSaveBusy(true);
+    clearPurchaseNotice();
+    setPurchaseCompletedFor("");
     try {
       const wasEditing = Boolean(editingPurchaseId);
-      const validationMessage = validatePurchaseBeforeSave();
-      if (validationMessage) {
-        alert(validationMessage);
+      // Finishing a pending bill is not an edit and asks for no edit reason; the server records it
+      // as "Pending purchase bill completed" when no reason is sent.
+      const completing = purchaseCompleting;
+      const savedSupplierName = getSupplierLabel(purchaseSupplierId);
+      const savedAsPending = purchaseBillStatus === "BILL_PENDING";
+      const validation = validatePurchaseBeforeSave();
+      if (validation) {
+        showPurchaseNotice(errorNotice(validation.message, validation.field));
+        if (validation.field) focusField(validation.field);
         return;
       }
-      const reason = editingPurchaseId ? window.prompt("Enter purchase edit reason") : "";
-      if (editingPurchaseId && !reason?.trim()) return;
+      const reason = editingPurchaseId && !completing
+        ? await askReason({
+          title: "Why is this purchase being corrected?",
+          message: "The reason is kept in the purchase's history.",
+          label: "Reason for the change",
+          confirmLabel: "Save correction",
+        })
+        : "";
+      if (editingPurchaseId && !completing && !reason?.trim()) return;
       const purchaseDestination = distributionState.destinations.find(
         (row) => String(row.operational_location_id) === String(purchaseDestinationId),
       ) || null;
@@ -8869,10 +9029,12 @@ function App() {
         setInventory(snapshot?.inventory_lots || inventory);
         resetPurchaseForm();
         await refreshSyncStatus();
-        alert("Purchase saved locally — pending cloud acknowledgement.");
+        showPurchaseNotice(successNotice(purchaseSavedMessage({ queuedOffline: true, supplierName: savedSupplierName })));
         return;
       }
-      if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
+      // A pending bill being finished (`purchaseCompleting`: being saved as completed, and pending
+      // when it was opened) goes to complete-bill, exactly as before.
+      if (completing) {
         // Several fruits: every fruit's final rate goes together, so the bill is never half done.
         const completionWrite = createOperationalWrite(
           user,
@@ -8892,7 +9054,8 @@ function App() {
         );
       } else {
         if (purchaseCart.length === 0) {
-          alert("Add at least one purchase item before saving.");
+          showPurchaseNotice(errorNotice("Add at least one item to the bill before saving.", "purchase-product"));
+          focusField("purchase-product");
           return;
         }
         const purchaseWrite = createOperationalWrite(user, aggregatePayload, aggregateOperationId);
@@ -8932,9 +9095,15 @@ function App() {
           writeDiagnosticLog("WARN", "post-purchase-sync-failed", { message: getErrorMessage(syncError, "Sync after purchase save failed") });
         });
       }
-      alert(purchaseBillStatus === "BILL_PENDING" ? "Stock Arrival Saved - Bill Pending" : wasEditing ? "Purchase Updated" : "Purchase Saved");
+      showPurchaseNotice(successNotice(purchaseSavedMessage({
+        completing,
+        editing: wasEditing,
+        pending: savedAsPending,
+        supplierName: savedSupplierName,
+      })));
+      if (completing) setPurchaseCompletedFor(savedSupplierName || "the supplier");
     } catch (error) {
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Purchase Error"));
+      showPurchaseNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The purchase could not be saved. Nothing was changed; try again.")));
     } finally {
       purchaseSaveInFlightRef.current = false;
       setPurchaseSaveBusy(false);
@@ -9188,11 +9357,14 @@ function App() {
     setEditingProductKeys(productIdentityKeys(product));
     setProductPhotoDraft({ dataUrl: photoForProduct(productPhotoIndex, product), changed: false });
     setProductPhotoMessage("");
+    clearProductNotice();
     loadProductLots(product, true);
     // The form sits above a long product list; pressing Edit far down the list used to fill a form
-    // the owner could not see. Take them to it, after React has rendered it as "Edit Item".
+    // the owner could not see. Take them to it, after React has rendered it as "Edit Item", with
+    // the cursor in its first box rather than left on the Edit button.
     window.requestAnimationFrame(() => {
       document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("product-name-input")?.focus({ preventScroll: true });
     });
   };
 
@@ -9209,9 +9381,11 @@ function App() {
   // "Add product" in the page header: a clean form, on screen.
   const startNewProduct = () => {
     resetProductForm();
+    clearProductNotice();
     setProductMasterTab("products");
     window.requestAnimationFrame(() => {
       document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("product-name-input")?.focus({ preventScroll: true });
     });
   };
 
@@ -9233,12 +9407,19 @@ function App() {
   };
 
   const deactivateProduct = async (product) => {
-    const reason = window.prompt(`Reason for deactivating ${product.product_name}`);
+    clearProductListNotice();
+    const reason = await askReason({
+      title: `Deactivate ${product.product_name}?`,
+      message: "It is hidden from the POS. Past bills and reports keep it.",
+      label: "Reason for deactivating",
+      confirmLabel: "Deactivate",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       const resolved = await serverIdForProduct(productIdentityKeys(product));
       if (!resolved.ok) {
-        alert(resolved.message);
+        showProductListNotice(errorNotice(resolved.message));
         return;
       }
       const deactivationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
@@ -9248,9 +9429,9 @@ function App() {
         deactivationWrite.config
       );
       await Promise.all([loadProducts(), loadDashboardData()]);
-      alert("Product marked inactive");
+      showProductListNotice(successNotice(`${product.product_name} is now inactive.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update product status"));
+      showProductListNotice(errorNotice(getErrorMessage(error, `${product.product_name} could not be deactivated.`)));
     }
   };
 
@@ -9285,7 +9466,12 @@ function App() {
     setPurchaseLotSize(purchase.lot_size || purchase.item_lot_size || "");
     setPurchaseCart([]);
     setEditingPurchaseItemLineId(null);
-    setActiveView("purchase");
+    clearPurchaseNotice();
+    clearPurchaseItemNotice();
+    setPurchaseCompletedFor("");
+    // navigate(), not setActiveView: the address then names Purchase Entry, and Back returns to
+    // the list this was opened from.
+    if (activeView !== "purchase") navigate("purchase");
   };
 
   const openPurchaseAmendment = (purchase) => {
@@ -9309,7 +9495,8 @@ function App() {
     setPurchaseRemarks(purchase.remarks || "");
     setPurchaseCart([]);
     resetPurchaseItemFields();
-    setActiveView("purchase");
+    clearPurchaseActionNotice();
+    if (activeView !== "purchase") navigate("purchase");
   };
 
   const openBlankPurchaseAmendment = () => {
@@ -9333,12 +9520,15 @@ function App() {
     setPurchaseRemarks("");
     setPurchaseCart([]);
     resetPurchaseItemFields();
-    setActiveView("purchase");
+    clearPurchaseActionNotice();
+    if (activeView !== "purchase") navigate("purchase");
   };
 
   const startForgottenPurchaseItem = () => {
+    clearPurchaseActionNotice();
     if (!amendmentDate || !amendmentSupplierId) {
-      alert("Select purchase date and supplier first.");
+      showPurchaseActionNotice(errorNotice("Choose the purchase date and the supplier first.", amendmentDate ? "amendment-supplier" : "amendment-date"));
+      focusField(amendmentDate ? "amendment-supplier" : "amendment-date", { scroll: false });
       return;
     }
     setEditingPurchaseId(null);
@@ -9346,6 +9536,7 @@ function App() {
     setPurchaseSupplierId(amendmentSupplierId);
     if (purchaseBillStatus === "BILL_PENDING") setPurchaseType("CREDIT");
     resetPurchaseItemFields();
+    focusField("purchase-product");
   };
 
   const cancelPurchaseAmendment = () => {
@@ -9354,13 +9545,14 @@ function App() {
   };
 
   const completePendingPurchase = (purchase) => {
+    clearPurchaseActionNotice();
     // An arrival with several fruits is completed in one go, with a final rate for each fruit.
     const billRows = purchases.filter((row) => inventoryIdsEqual(row.id, purchase.id));
     let lines = null;
     if (billRows.length > 1) {
       const prepared = pendingCompletionLines(billRows);
       if (prepared.error) {
-        alert(prepared.error);
+        reportPurchaseAction(errorNotice(prepared.error));
         return;
       }
       lines = prepared.lines;
@@ -9379,8 +9571,31 @@ function App() {
     setPurchaseBillDate(toDateKey(new Date()));
   };
 
+  // Pending Bills, Purchase Entry and Reports all start these; the notice is drawn on the first two,
+  // and Reports (which has no place for it) gets it as a notification instead.
+  const reportPurchaseAction = (notice) => {
+    showPurchaseActionNotice(notice);
+    if (activeView === "reports" && notice) {
+      notify({
+        severity: notice.tone === "success" ? "info" : "warning",
+        title: notice.tone === "success" ? "Purchase updated" : "Purchase not changed",
+        message: notice.text,
+        source: "Purchases",
+      });
+    }
+  };
+
   const cancelPurchase = async (purchase) => {
-    const reason = window.prompt(`Enter cancellation reason for Purchase #${purchase.id}`);
+    clearPurchaseActionNotice();
+    const supplier = purchase.supplier_name ? ` from ${purchase.supplier_name}` : "";
+    const reason = await askReason({
+      title: `Cancel purchase #${purchase.id}${supplier}?`,
+      message: "The purchase stays in the history, marked cancelled.",
+      label: "Reason for cancelling",
+      confirmLabel: "Cancel purchase",
+      cancelLabel: "Keep it",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       const cancellationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
@@ -9390,9 +9605,9 @@ function App() {
         cancellationWrite.config
       );
       await Promise.all([loadPurchases(), loadDashboardData(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
-      alert("Purchase cancelled");
+      reportPurchaseAction(successNotice(`Purchase #${purchase.id}${supplier} cancelled.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to cancel purchase"));
+      reportPurchaseAction(errorNotice(getErrorMessage(error, `Purchase #${purchase.id} could not be cancelled.`)));
     }
   };
 
@@ -9588,6 +9803,9 @@ function App() {
       if (view === "sales") await loadOrders().catch(() => null);
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
+      // The board is a cloud read; it used to load only the first time the screen opened, so a
+      // consignment sent since then never appeared. This path is never reached in Local Only.
+      if (view === "distribution" && distributionState.loadState !== "idle") await loadDistribution();
       if (view === "dashboard") await loadDashboardData();
       // Branches & Counters shows the device list the licences are issued against and the screen
       // lock, both of which come from the settings bundle.
@@ -9959,6 +10177,11 @@ function App() {
 
   // One set of lot fields for both lot forms on Product Master: the lots staged with a new product,
   // and "Add stock lot" on an existing one. Both edit `openingStockDraft`, and never at the same time.
+  // The unit of the product the new lot is for: the one being edited, else the stock lots card's.
+  const openingLotUnit = lotPanelProduct && !editingProductId ? lotPanelProduct.unit : unit;
+  // The lot box's quantities carry the lot's unit (its own, else its product's).
+  const lotActionUnit = lotAction?.lot?.unit || lotPanelProduct?.unit || "";
+  const lotActionUnitLabel = (label) => (lotActionUnit ? `${label} (${unitDisplayName(lotActionUnit)})` : label);
   const openingLotFields = (
     <div className="form-grid supplier-form-grid">
       <Field label="Supplier (optional)">
@@ -9969,9 +10192,9 @@ function App() {
       </Field>
       <Field label="Lot name"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Named for you if left blank" /></Field>
       <Field label="Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Example: Small, Premium" /></Field>
-      <Field label={<RequiredLabel>Quantity</RequiredLabel>}><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
-      <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
-      <Field label={<RequiredLabel>Sale price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>{openingLotUnit ? `Quantity (${unitDisplayName(openingLotUnit)})` : "Quantity"}</RequiredLabel>}><input id="opening-lot-quantity" type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input id="opening-lot-cost" type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Sale price (₹)</RequiredLabel>}><input id="opening-lot-sale" type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
       <Field label="Stock date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
       <Field label="Notes"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
     </div>
@@ -10607,6 +10830,7 @@ function App() {
               >
                 {!canManageRates && <p className="pm-hint">Only the Owner or an Admin can add or switch off products, manage categories or change sale prices.</p>}
                 {productDuplicateWarning && <p className="pm-notice" role="status">{productDuplicateWarning}</p>}
+                <SaveNotice notice={productListNotice} />
                 <div className="purchase-summary-grid pm-summary">
                   <SummaryMetric featured label="Products" value={productCounts.note} />
                   <SummaryMetric label="Categories" value={`${activeProductCategories.length} active`} />
@@ -10632,11 +10856,12 @@ function App() {
                   {canManageRates && (
                     <div className="pm-inline-form">
                       <Field label="New category">
-                        <input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
+                        <input id="category-new-name" value={newProductCategoryName} onChange={(event) => { setNewProductCategoryName(event.target.value); clearCategoryNotice(); }} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
                       </Field>
                       <button className="primary-button" onClick={saveProductCategory} type="button">Add category</button>
                     </div>
                   )}
+                  <SaveNotice notice={categoryNotice} />
                   <DataTable className="pm-table pm-category-table" headers={["Category", <span className="pm-num-head" key="products">Products</span>, "Status", "Actions"]}>
                     {productCategories.map((category) => (
                       <tr key={category.id}>
@@ -10762,14 +10987,14 @@ function App() {
 
                   {/* A new product is Owner/Admin only; anyone else gets this form for Edit. */}
                   {(canManageRates || Boolean(editingProductId)) && (
-                  <ModuleCard id="product-item-form" eyebrow={editingProductId ? "Edit product" : "New product"} title={editingProductId ? `Edit ${productEditingName}` : "Add product"} subtitle="Used by the POS, purchases, stock and reports.">
+                  <ModuleCard id="product-item-form" eyebrow={editingProductId ? "Edit product" : "New product"} onChange={clearProductNotice} title={editingProductId ? `Edit ${productEditingName}` : "Add product"} subtitle="Used by the POS, purchases, stock and reports.">
                     <div className="pm-form-section">
                       <h3>Basics</h3>
                       <div className="form-grid supplier-form-grid">
-                        <Field label={<RequiredLabel>Product name</RequiredLabel>}><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar mango" /></Field>
+                        <Field label={<RequiredLabel>Product name</RequiredLabel>}><input id="product-name-input" value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar mango" /></Field>
                         <div className="pm-category-field">
                           <Field label="Category">
-                            <select value={productCategoryId} onChange={(event) => {
+                            <select id="product-category-input" value={productCategoryId} onChange={(event) => {
                               const selected = productCategories.find((category) => String(category.id) === event.target.value);
                               setProductCategoryId(event.target.value);
                               setProductCategory(selected?.category_name || "");
@@ -10785,13 +11010,14 @@ function App() {
                           )}
                           {canManageRates && showInlineCategoryForm && (
                             <div className="pm-inline-form pm-inline-form-compact">
-                              <Field label="New category name"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
+                              <Field label="New category name"><input id="category-inline-name" value={newProductCategoryName} onChange={(event) => { setNewProductCategoryName(event.target.value); clearCategoryNotice(); }} placeholder="Example: Mango" /></Field>
                               <button className="secondary-button" onClick={saveProductCategory} type="button">Save category</button>
                             </div>
                           )}
+                          {canManageRates && showInlineCategoryForm && <SaveNotice notice={categoryNotice} />}
                         </div>
                         <Field label={<RequiredLabel>Unit</RequiredLabel>}>
-                          <select value={unit} onChange={(event) => setUnit(event.target.value)}>
+                          <select id="product-unit-input" value={unit} onChange={(event) => setUnit(event.target.value)}>
                             <option value="">Choose a unit</option>
                             {PRODUCT_UNITS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                           </select>
@@ -10840,7 +11066,7 @@ function App() {
                     <div className="pm-form-section">
                       <h3>Price</h3>
                       <div className="form-grid supplier-form-grid">
-                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input readOnly={!canManageRates} type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => { if (canManageRates) setSellingRate(event.target.value); }} /></Field>
+                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input id="product-sale-price-input" readOnly={!canManageRates} type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => { if (canManageRates) setSellingRate(event.target.value); }} /></Field>
                       </div>
                       {!canManageRates && <p className="pm-hint">Only the Owner or an Admin changes sale prices (Sale Rate Update).</p>}
                     </div>
@@ -10848,7 +11074,7 @@ function App() {
                     <div className="pm-form-section">
                       <h3>Stock</h3>
                       <div className="form-grid supplier-form-grid">
-                        <Field label="Low-stock alert at"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
+                        <Field label="Low-stock alert at"><input id="product-min-stock-input" type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
                       </div>
                       {editingProductId && <p className="pm-hint">To add stock or correct a count, use the stock lots below.</p>}
                       {!editingProductId && !showOpeningLotForm && (
@@ -10903,8 +11129,12 @@ function App() {
                       <button className="secondary-button" onClick={cancelProductEdit} type="button">Cancel</button>
                       <span className="pm-required-legend"><span aria-hidden="true" className="pm-required">*</span> Required</span>
                     </div>
+                    <SaveNotice notice={productNotice} />
                   </ModuleCard>
                   )}
+                  {/* Someone who may only edit loses the form once the edit is saved; the result is
+                      said here instead, where they are. */}
+                  {!(canManageRates || Boolean(editingProductId)) && <SaveNotice notice={productNotice} />}
 
                   {lotPanelProduct && (
                     <ModuleCard id="product-lots-card" eyebrow="Stock lots" title={`Stock lots — ${lotPanelProduct.product_name}`} subtitle="Each delivery or opening count is its own lot. A lot's quantity cannot go below what has already been sold or used.">
@@ -10932,12 +11162,15 @@ function App() {
                       </div>
                       <DataTable
                         className="pm-table pm-lot-table"
-                        headers={["Lot", "Supplier", "Grade", "Stock date", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="sold">Sold</span>, <span className="pm-num-head" key="in">In stock</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Actions"]}
+                        headers={["Lot", "Supplier", "Stock date", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="sold">Sold</span>, <span className="pm-num-head" key="in">In stock</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Actions"]}
                       >
                         {filteredProductLots.length ? filteredProductLots.map((lot) => {
-                          const lotLabel = lot.lot_name || lot.batch_no || `Lot #${lot.id}`;
+                          // A lot is named for people, never by its row id (local/stockScreens.js).
+                          const lotLabel = stockLotName(lot, formatDisplayDate);
                           const lotCancelled = lot.batch_status === "CANCELLED";
-                          const lotNotes = String(lot.remarks || "").trim();
+                          // The grade rides under the lot name, so the ten columns fit at 1366.
+                          const lotGrade = String(lot.lot_size || "").trim();
+                          const lotNotes = [lotGrade ? `Grade ${lotGrade}` : "", String(lot.remarks || "").trim()].filter(Boolean).join(" · ");
                           return (
                             <tr key={lot.id}>
                               <td className="pm-lot-cell" title={lotNotes ? `${lotLabel} · ${lotNotes}` : lotLabel}>
@@ -10945,7 +11178,6 @@ function App() {
                                 <small className="pm-product-note"><span className={lotStatusClass(lot)}>{lotStatusLabel(lot)}</span>{lotNotes ? ` · ${lotNotes}` : ""}</small>
                               </td>
                               <td title={lot.supplier_name || "None"}>{lot.supplier_name || "None"}</td>
-                              <td title={lot.lot_size || ""}>{lot.lot_size || MISSING_VALUE}</td>
                               <td>{lot.purchase_date ? formatDisplayDate(lot.purchase_date) : MISSING_VALUE}</td>
                               <td className="pm-num">{formatOptionalQuantity(lot.purchase_qty)}</td>
                               <td className="pm-num">{formatOptionalQuantity(lot.sold_qty)}</td>
@@ -10963,9 +11195,10 @@ function App() {
                             </tr>
                           );
                         }) : (
-                          <tr><td colSpan="10" className="empty-cell">{lotListEmptyMessage({ totalCount: productLots.length, search: lotListSearch, showSoldOut: showEmptyLots })}</td></tr>
+                          <tr><td colSpan="9" className="empty-cell">{lotListEmptyMessage({ totalCount: productLots.length, search: lotListSearch, showSoldOut: showEmptyLots })}</td></tr>
                         )}
                       </DataTable>
+                      <SaveNotice notice={lotPanelNotice} />
                       {!showOpeningLotForm && (
                         lotPanelAcceptsNewLot
                           ? (
@@ -11024,7 +11257,7 @@ function App() {
             <section className="settings-layout">
               {purchases.some((purchase) => purchase.operation_id) && (
                 <ModuleCard eyebrow="Saved while offline" title="Purchases waiting to send" subtitle="Purchases entered on this computer stay listed here until the cloud has them.">
-                  <DataTable headers={["Reference", "Purchase Date", "Bill State", "Sync State", "Detail"]}>
+                  <DataTable headers={["Reference", "Purchase date", "Bill", "Sending", "Detail"]}>
                     {Array.from(new Map(
                       purchases
                         .filter((purchase) => purchase.operation_id)
@@ -11032,43 +11265,50 @@ function App() {
                     ).values()).map((purchase) => (
                       <tr key={purchase.operation_id}>
                         <td className="primary-cell">{purchase.provisional_reference || purchase.offline_purchase_ref}</td>
-                        <td>{purchase.purchase_date}</td>
-                        <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : purchase.purchase_type === "CASH" ? "Paid Purchase" : "Credit Purchase"}</td>
-                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Sending" : purchase.sync_status === "completed" ? "Sent to cloud" : purchase.sync_status === "failed" ? "Not sent - can be retried" : purchase.sync_status === "conflict" ? "Clashes with cloud - needs checking" : "Waiting to send"}</span></td>
+                        <td>{formatDisplayDate(purchase.purchase_date)}</td>
+                        <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Bill pending" : purchase.purchase_type === "CASH" ? "Paid purchase" : "Credit purchase"}</td>
+                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Sending" : purchase.sync_status === "completed" ? "Sent to cloud" : purchase.sync_status === "failed" ? "Not sent, can be retried" : purchase.sync_status === "conflict" ? "Clashes with cloud, needs checking" : "Waiting to send"}</span></td>
                         <td>{purchase.last_error || (purchase.sync_status === "completed" ? "Sent, and matched to the cloud copy" : "Saved safely on this computer")}</td>
                       </tr>
                     ))}
                   </DataTable>
                 </ModuleCard>
               )}
-              {purchaseAmendmentMode && (
-                <ModuleCard eyebrow="Purchase Amendment" title="Add / Edit Purchase" subtitle="Select date and supplier to amend old purchase entries without deleting history.">
+              {/* Hidden while a pending bill is being completed: that is one bill, and this card's
+                  list of every purchase on the day only got in the way of it. */}
+              {purchaseAmendmentMode && !purchaseCompleting && (
+                <ModuleCard eyebrow="Earlier purchases" title="Find an earlier purchase" subtitle="Choose the date and the supplier to add a forgotten item, correct an item or cancel a purchase. Nothing is deleted; every change is kept in the history.">
                   <div className="form-grid supplier-form-grid">
-                    <Field label="Purchase Date">
-                      <input type="date" value={amendmentDate} onChange={(event) => {
+                    <Field label="Purchase date">
+                      <input id="amendment-date" type="date" value={amendmentDate} onChange={(event) => {
                         setAmendmentDate(event.target.value);
                         setPurchaseDate(event.target.value);
                         setAmendmentSupplierId("");
                         setPurchaseSupplierId("");
                         setEditingPurchaseId(null);
+                        clearPurchaseActionNotice();
                       }} />
                     </Field>
-                    <Field label="Supplier On Date">
-                      <select value={amendmentSupplierId} onChange={(event) => {
+                    <Field label="Supplier on that date">
+                      <select id="amendment-supplier" value={amendmentSupplierId} onChange={(event) => {
                         setAmendmentSupplierId(event.target.value);
                         setPurchaseSupplierId(event.target.value);
                         setEditingPurchaseId(null);
+                        clearPurchaseActionNotice();
                       }}>
-                        <option value="">Select supplier for this date</option>
+                        <option value="">Choose a supplier</option>
                         {amendmentSuppliers.map((purchase) => (
                           <option key={purchase.supplier_id || purchase.supplier_name} value={purchase.supplier_id || ""}>{purchase.supplier_name}</option>
                         ))}
                       </select>
                     </Field>
-                    <button className="secondary-button" onClick={startForgottenPurchaseItem}>Add Forgotten Item</button>
-                    <button className="secondary-button" onClick={resetPurchaseForm}>Exit Amendment</button>
                   </div>
-                  <DataTable headers={["Purchase", "Item", "Qty", "Rate", "Status", "Net", "Actions"]}>
+                  <div className="button-row">
+                    <button className="secondary-button" onClick={startForgottenPurchaseItem} type="button">Add forgotten item</button>
+                    <button className="secondary-button" onClick={resetPurchaseForm} type="button">Close</button>
+                  </div>
+                  <SaveNotice notice={purchaseActionNotice} />
+                  <DataTable className="purchase-amendment-table" headers={markNumericColumns(["Bill", "Item", "Quantity", "Rate", "Status", "Net", "Actions"])}>
                     {amendmentPurchases.map((purchase, rowIndex) => {
                       // One row per item. A bill with several items is completed with a rate per
                       // fruit, and edited only by cancelling it and entering it again
@@ -11076,21 +11316,23 @@ function App() {
                       const itemCount = amendmentItemCounts.get(canonicalInventoryId(purchase.id)) || 1;
                       const changeBlock = purchaseChangeBlock(itemCount);
                       const rowNet = purchaseRowNet(purchase, itemCount);
+                      // The lot as staff named it; the internal batch code is not shown.
+                      const lotWords = [purchase.lot_name || purchase.item_lot_name, purchase.lot_size || purchase.item_lot_size].filter(Boolean).join(" / ");
                       return (
                       <tr key={`${canonicalInventoryId(purchase.id)}-${purchase.inventory_batch_id ?? rowIndex}`}>
                         <td><span className="batch-id">#{purchase.id}</span>{itemCount > 1 && <small className="cell-note">{itemCount} fruits on this bill</small>}</td>
-                        <td className="primary-cell">{purchase.product_name}<small className="cell-note">{purchase.batch_no || MISSING_VALUE}</small></td>
-                        <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit ? labelFor("unit", purchase.unit) : ""}</td>
+                        <td className="primary-cell">{purchase.product_name}{lotWords && <small className="cell-note">{lotWords}</small>}</td>
+                        <td>{formatQuantityWithUnit(purchase.quantity, purchase.unit)}</td>
                         <td>{currency.format(Number(purchase.purchase_rate || purchase.expected_purchase_rate || 0))}</td>
-                        <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : "Completed Bill"}</span></td>
+                        <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Bill pending" : "Bill complete"}</span></td>
                         <td>{rowNet === null ? MISSING_VALUE : currency.format(rowNet)}</td>
                         <td>
                           {/* Edit, complete and cancel are Owner/Admin on the server (requireRateManager). */}
                           {canManagePendingPurchaseBills(user.role) ? (
                             <div className="button-row table-actions-row">
                               <button className="table-action" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => editPurchase(purchase)} title={changeBlock || undefined}>Edit</button>
-                              {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
-                              <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
+                              {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button compact-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete bill</button>}
+                              <button className="danger-text-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
                             </div>
                           ) : <small className="cell-note">Only the Owner or an Admin can edit, complete or cancel a purchase.</small>}
                           {changeBlock && purchase.purchase_status !== "CANCELLED" && <small className="cell-note">{changeBlock}</small>}
@@ -11099,28 +11341,29 @@ function App() {
                       );
                     })}
                   </DataTable>
-                  {amendmentDate && amendmentSupplierId && amendmentPurchases.length === 0 && <div className="cart-empty">No purchases found for selected date and supplier.</div>}
+                  {amendmentDate && amendmentSupplierId && amendmentPurchases.length === 0 && <div className="cart-empty">No purchases from this supplier on that date.</div>}
                 </ModuleCard>
               )}
-              <ModuleCard eyebrow="Procurement" title={editingPurchaseId ? `Add / Edit Purchase #${editingPurchaseId}` : "Purchase Entry"} subtitle={editingPurchaseId ? "Amend one historical purchase item with inventory protection." : "Select supplier once, add multiple fruit items, then save one purchase workflow."}>
+              <ModuleCard eyebrow={purchaseHeadings.eyebrow} onChange={() => { if (purchaseItemNotice?.field === "purchase-supplier") clearPurchaseItemNotice(); }} title={purchaseHeadings.title} subtitle={purchaseHeadings.subtitle}>
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Entry Type">
+                  <Field label="Entry type">
                     <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(completionLines) || Boolean(editingPurchaseId && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
-                      <option value="BILL_COMPLETED">Completed Bill</option>
-                      <option value="BILL_PENDING">Stock Arrival / Pending Bill</option>
+                      <option value="BILL_COMPLETED">Bill in hand</option>
+                      <option value="BILL_PENDING">Stock arrived, bill to follow</option>
                     </select>
                   </Field>
-                  <Field label="Supplier Account">
-                    <select value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
-                      <option value="">Select saved supplier</option>
+                  <Field label={<RequiredLabel>Supplier</RequiredLabel>}>
+                    {/* The first box a new purchase needs, so the cursor starts here. */}
+                    <select autoFocus={!editingPurchaseId && !purchaseAmendmentMode} id="purchase-supplier" value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
+                      <option value="">Choose a supplier</option>
                       {activeSuppliers.map((supplier) => (
                         <option key={supplier.id} value={supplier.id}>
-                          {supplier.supplier_name}{supplier.firm_name ? ` - ${supplier.firm_name}` : ""}
+                          {supplier.supplier_name}{supplier.firm_name ? ` — ${supplier.firm_name}` : ""}
                         </option>
                       ))}
                     </select>
                   </Field>
-                  <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival Date" : "Purchase Date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
+                  <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival date" : "Purchase date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
                   {/* Where the fruit physically landed, which is not always where it was typed in.
                       Bought in bulk into a warehouse, then distributed -- see
                       docs/stock-distribution-decision.md. Only offered when there is somewhere else
@@ -11140,128 +11383,153 @@ function App() {
                   )}
                   {purchaseBillStatus === "BILL_COMPLETED" && (
                     <>
-                      <Field label="Bill Number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
-                      <Field label="Bill Date"><input type="date" value={purchaseBillDate} onChange={(event) => setPurchaseBillDate(event.target.value)} /></Field>
+                      <Field label="Bill number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
+                      <Field label="Bill date"><input type="date" value={purchaseBillDate} onChange={(event) => setPurchaseBillDate(event.target.value)} /></Field>
                     </>
                   )}
                 </div>
+                {/* "Choose the supplier first" is said beside the supplier box it points at. */}
+                {purchaseItemNotice?.field === "purchase-supplier" && <SaveNotice notice={purchaseItemNotice} />}
               </ModuleCard>
 
-              <ModuleCard eyebrow={completionLines ? "Complete Pending Bill" : editingPurchaseId ? "Purchase Item Amendment" : "Purchase Cart"} title={completionLines ? "Final Rate per Fruit" : editingPurchaseId ? "Edit Purchase Item" : "Add Fruit Items"} subtitle={completionLines ? `This arrival has ${completionLines.length} fruits. Enter the final purchase rate from the supplier's bill for each one.` : editingPurchaseId ? "Quantity reductions are blocked if stock from this batch has already been sold." : "Add all products from this supplier before saving the bill."}>
+              <ModuleCard eyebrow={purchaseHeadings.itemsEyebrow} onChange={clearPurchaseItemNotice} title={purchaseHeadings.itemsTitle} subtitle={purchaseHeadings.itemsSubtitle}>
                 {completionLines && (
-                  <DataTable headers={["Product", "Lot / Size", "Qty", "Arrival Rate", "Final Purchase Rate"]}>
+                  <DataTable headers={["Product", "Lot / grade", "Quantity", { label: "Arrival rate", numeric: true }, "Final rate (₹)"]}>
                     {completionLines.map((line, index) => (
                       <tr key={canonicalInventoryId(line.purchase_item_id)}>
                         <td className="primary-cell">{line.product_name}<small className="cell-note">{labelFor("origin", line.origin_type)}</small></td>
                         <td>{line.lot_name || MISSING_VALUE}{line.lot_size ? ` / ${line.lot_size}` : ""}</td>
                         <td><input type="number" min="0" step="0.001" aria-label={`Quantity of ${line.product_name}`} value={line.quantity} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, quantity: event.target.value } : entry))} />{line.unit && <small className="cell-note">{labelFor("unit", line.unit)}</small>}</td>
                         <td>{line.expected_rate > 0 ? currency.format(line.expected_rate) : MISSING_VALUE}</td>
-                        <td><input type="number" min="0" step="0.01" aria-label={`Final purchase rate of ${line.product_name}`} value={line.purchase_rate} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, purchase_rate: event.target.value } : entry))} /></td>
+                        <td><input autoFocus={index === 0} type="number" min="0" step="0.01" aria-label={`Final purchase rate of ${line.product_name}`} value={line.purchase_rate} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, purchase_rate: event.target.value } : entry))} /></td>
                       </tr>
                     ))}
                   </DataTable>
                 )}
                 {!completionLines && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Product">
-                    <select value={purchaseProductId} onChange={selectPurchaseProduct}>
-                      <option value="">Select product</option>
-                      {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.category || "Fruit"} - {product.product_name} ({product.unit})</option>)}
+                  <Field label={<RequiredLabel>Product</RequiredLabel>}>
+                    <select id="purchase-product" value={purchaseProductId} onChange={selectPurchaseProduct}>
+                      <option value="">Choose a product</option>
+                      {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} ({unitDisplayName(product.unit)}){product.category ? ` — ${product.category}` : ""}</option>)}
                     </select>
                   </Field>
-                  <Field label="Lot Name / Number"><input value={purchaseLotName} onChange={(event) => setPurchaseLotName(event.target.value)} placeholder="Lot A / Supplier Bill Lot" /></Field>
-                  <Field label="Size / Grade"><input value={purchaseLotSize} onChange={(event) => setPurchaseLotSize(event.target.value)} placeholder="Small / Premium" /></Field>
-                  <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
+                  <Field label={<RequiredLabel>Lot name or number</RequiredLabel>}><input id="purchase-lot-name" value={purchaseLotName} onChange={(event) => setPurchaseLotName(event.target.value)} onKeyDown={addPurchaseLineOnEnter} placeholder="Example: Lot A, or the bill's lot number" /></Field>
+                  <Field label="Grade"><input value={purchaseLotSize} onChange={(event) => setPurchaseLotSize(event.target.value)} onKeyDown={addPurchaseLineOnEnter} placeholder="Example: Small, Premium" /></Field>
+                  <Field label={<RequiredLabel>{purchaseUnitLabel("Quantity")}</RequiredLabel>}><input id="purchase-quantity" type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                   {purchaseBillStatus === "BILL_PENDING" ? (
                     <>
-                      <Field label="Temporary Sale Rate"><input type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} /></Field>
-                      <Field label="Expected Purchase Rate"><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} /></Field>
+                      <Field label={<RequiredLabel>{purchaseRateLabel("Temporary sale rate")}</RequiredLabel>}><input id="purchase-temp-rate" type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
+                      <Field label={purchaseRateLabel("Expected purchase rate")}><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                     </>
                   ) : (
-                    <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} /></Field>
+                    <Field label={<RequiredLabel>{purchaseRateLabel("Purchase rate")}</RequiredLabel>}><input id="purchase-rate" type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                   )}
-                  <Field label="Origin Type"><input value={selectedPurchaseProduct?.origin_type || "Select product"} readOnly /></Field>
-                  <Field label="Item Remarks"><input value={purchaseItemRemarks} onChange={(event) => setPurchaseItemRemarks(event.target.value)} /></Field>
+                  <Field label="Origin"><input value={selectedPurchaseProduct ? labelFor("origin", selectedPurchaseProduct.origin_type || "LOCAL") : MISSING_VALUE} readOnly tabIndex={-1} /></Field>
+                  <Field label="Item notes"><input value={purchaseItemRemarks} onChange={(event) => setPurchaseItemRemarks(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                 </div>
                 )}
                 {!editingPurchaseId && (
                   <div className="button-row">
-                    <button className="secondary-button" onClick={addPurchaseCartItem}>{editingPurchaseItemLineId !== null ? "Update Item" : purchaseAmendmentMode ? "Add Forgotten Item" : "Add Item"}</button>
-                    {editingPurchaseItemLineId !== null && <button className="secondary-button" onClick={resetPurchaseItemFields}>Cancel Item Edit</button>}
+                    <button className="secondary-button" onClick={addPurchaseCartItem} type="button">{editingPurchaseItemLineId !== null ? "Update item" : purchaseAmendmentMode ? "Add forgotten item" : "Add item"}</button>
+                    {editingPurchaseItemLineId !== null && <button className="secondary-button" onClick={resetPurchaseItemFields} type="button">Cancel item edit</button>}
+                    <span className="pm-required-legend">Press Enter in any box to add the item.</span>
                   </div>
                 )}
+                {purchaseItemNotice?.field !== "purchase-supplier" && <SaveNotice notice={purchaseItemNotice} />}
                 {!editingPurchaseId && (
-                  <DataTable headers={["Product", "Lot / Size", "Qty", "Unit", "Origin", "Purchase / Expected Rate", "Temp Sale Rate", "Remarks", "Actions"]}>
+                  <DataTable className="purchase-cart-table" headers={[
+                    "Product",
+                    "Lot / grade",
+                    { label: "Quantity", numeric: true },
+                    "Origin",
+                    { label: purchaseBillStatus === "BILL_PENDING" ? "Expected rate" : "Rate", numeric: true },
+                    ...(purchaseBillStatus === "BILL_PENDING" ? [{ label: "Sale rate", numeric: true }] : []),
+                    "Notes",
+                    "Actions",
+                  ]}>
                     {purchaseCart.map((item) => (
                       <tr key={item.line_id}>
                         <td className="primary-cell">{item.product_name}</td>
                         <td>{item.lot_name || MISSING_VALUE}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
-                        <td>{item.quantity}</td>
-                        <td>{labelFor("unit", item.unit)}</td>
+                        <td>{formatQuantityWithUnit(item.quantity, item.unit)}</td>
                         <td><span className="origin-rate">{labelFor("origin", item.origin_type)}</span></td>
-                        <td>{currency.format(Number(item.purchase_rate || item.expected_purchase_rate || 0))}</td>
-                        <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : MISSING_VALUE}</td>
+                        <td>{Number(item.purchase_rate || item.expected_purchase_rate || 0) > 0 ? currency.format(Number(item.purchase_rate || item.expected_purchase_rate)) : MISSING_VALUE}</td>
+                        {purchaseBillStatus === "BILL_PENDING" && <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : MISSING_VALUE}</td>}
                         <td>{item.remarks || MISSING_VALUE}</td>
                         <td>
                           <div className="button-row table-actions-row">
                             <button className="table-action" onClick={() => editPurchaseCartItem(item.line_id)}>Edit</button>
-                            <button className="remove-button" onClick={() => removePurchaseCartItem(item.line_id)}>Remove</button>
+                            <button className="danger-text-button" onClick={() => removePurchaseCartItem(item.line_id)}>Remove</button>
                           </div>
                         </td>
                       </tr>
                     ))}
                   </DataTable>
                 )}
-                {!editingPurchaseId && purchaseCart.length === 0 && <div className="cart-empty">No purchase items added yet.</div>}
+                {!editingPurchaseId && purchaseCart.length === 0 && <div className="cart-empty">No items on this bill yet. Choose a product above and press Add item.</div>}
               </ModuleCard>
 
-              <ModuleCard eyebrow="Bill Details" title="Charges, Rebate and Payment" subtitle="These values are allocated across items by value when the bill is saved.">
+              <ModuleCard eyebrow="Bill details" onChange={clearPurchaseNotice} title="Charges, rebate and payment" subtitle="Charges are shared across the items by value when the bill is saved.">
                 {purchaseBillStatus === "BILL_COMPLETED" && (
                   <div className="form-grid supplier-form-grid">
-                    <Field label="Freight Charges"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
-                    <Field label="Labour Charges"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
-                    <Field label="Other Charges"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
-                    <Field label="Payment Timing / Rebate Rule">
-                      <select value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
-                        <option value="">Select rebate rule</option>
-                        {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} - {rule.pay_within_days} days - {rule.rebate_percent}%</option>)}
+                    <Field label="Freight charges (₹)"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
+                    <Field label="Labour charges (₹)"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
+                    <Field label="Other charges (₹)"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
+                    <Field label={<RequiredLabel>Payment timing and rebate</RequiredLabel>}>
+                      <select id="purchase-rebate" value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
+                        <option value="">Choose when it is paid</option>
+                        {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} — pay within {rule.pay_within_days} days, {rule.rebate_percent}% rebate</option>)}
                       </select>
                     </Field>
-                    <Field label="Payment Type">
+                    <Field label="Payment type">
                       <select value={purchaseType} onChange={(event) => setPurchaseType(event.target.value)}>
-                        <option value="CREDIT">Credit Purchase</option>
-                        <option value="CASH">Cash Purchase</option>
+                        <option value="CREDIT">Credit (pay later)</option>
+                        <option value="CASH">Paid now</option>
                       </select>
                     </Field>
                     {purchaseType === "CASH" && (
                       <>
-                        <Field label="Payment Mode">
+                        <Field label="Payment mode">
                           <select value={purchasePaymentMode} onChange={(event) => setPurchasePaymentMode(event.target.value)}>
                             {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                           </select>
                         </Field>
-                        <Field label="Paid Amount"><input type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
-                        <Field label="Payment Reference"><input value={purchasePaymentReference} onChange={(event) => setPurchasePaymentReference(event.target.value)} /></Field>
-                        <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
+                        <Field label={<RequiredLabel>Amount paid (₹)</RequiredLabel>}><input id="purchase-paid" type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
+                        <Field label="Payment reference"><input value={purchasePaymentReference} onChange={(event) => setPurchasePaymentReference(event.target.value)} /></Field>
+                        <Field label="Payment date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
                       </>
                     )}
                   </div>
                 )}
-                <Field label="Bill Remarks"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
-                {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
-                {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">Purchase bill pending. Inventory will increase immediately and profit from this stock will be provisional until the bill is completed.</p>}
+                <Field label="Bill notes"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
+                {activeSuppliers.length === 0 && <p className="form-note">No suppliers yet. Add one with Add supplier before saving a purchase.</p>}
+                {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">The stock goes into the shop now. Profit on it stays provisional until the bill is completed in Pending Bills.</p>}
                 <PurchaseSummary summary={editingPurchaseId && !completionLines ? purchaseSummary : purchaseCartSummary} />
                 <div className="button-row">
                   <button className="primary-button" disabled={purchaseSaveBusy} onClick={savePurchase}>
                     {purchaseSaveBusy
                       ? "Saving…"
-                      : purchaseBillStatus === "BILL_PENDING"
-                        ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival"
-                        : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}
+                      : purchaseCompleting
+                        ? "Complete bill"
+                        : purchaseBillStatus === "BILL_PENDING"
+                          ? editingPurchaseId ? "Save arrival changes" : "Save stock arrival"
+                          : editingPurchaseId ? "Save correction" : "Save purchase"}
                   </button>
-                  {editingPurchaseId && <button className="secondary-button" onClick={purchaseAmendmentMode ? cancelPurchaseAmendment : resetPurchaseForm}>Cancel Amendment</button>}
-                  <button className="secondary-button" onClick={() => navigate("accounts")}>Add New Supplier</button>
+                  {editingPurchaseId && (
+                    <button className="secondary-button" onClick={purchaseCompleting
+                      ? () => { resetPurchaseForm(); navigate("pending-bills"); }
+                      : purchaseAmendmentMode ? cancelPurchaseAmendment : resetPurchaseForm}
+                    >
+                      {purchaseCompleting ? "Cancel" : "Cancel correction"}
+                    </button>
+                  )}
+                  {purchaseCompletedFor && (
+                    <button className="secondary-button" onClick={() => { setPurchaseCompletedFor(""); clearPurchaseNotice(); navigate("pending-bills"); }} type="button">Back to Pending Bills</button>
+                  )}
+                  {!editingPurchaseId && !purchaseCompletedFor && <button className="secondary-button" onClick={() => navigate("accounts")}>Add supplier</button>}
                 </div>
+                <div id="purchase-save-notice"><SaveNotice notice={purchaseNotice} /></div>
               </ModuleCard>
             </section>
           )}
@@ -11282,7 +11550,9 @@ function App() {
               }}
               onOpenPurchaseAmendment={openPurchaseAmendment}
               onViewInvoice={loadInvoice}
+              purchaseActionNotice={purchaseActionNotice}
               purchases={purchases}
+              purchasesLoad={purchasesLoad}
               user={user}
             />
           )}
@@ -11473,7 +11743,9 @@ function App() {
           )}
 
           {activeView === "sale-rates" && canManageRates && (
-            <>
+            // One stack with the shared gap: Combos and the website export sat flush against the
+            // rates (0px) because they were siblings outside any layout.
+            <section className="settings-layout sale-rate-page">
               <SaleRateManager
                 history={saleRateHistory}
                 loadState={saleRatesLoad}
@@ -11522,7 +11794,7 @@ function App() {
                 lots={inventory}
                 shop={websiteShopDetails}
               />
-            </>
+            </section>
           )}
 
           {activeView === "settings" && (
@@ -11650,10 +11922,11 @@ function App() {
               busy={distributionBusy}
               destinations={distributionState.destinations}
               inventory={inventory}
+              notice={distributionNotice}
               onAction={runDistributionAction}
-              onNothingToReceive={() => setSyncMessage(
+              onNothingToReceive={() => showDistributionNotice(warningNotice(
                 "This consignment has no dispatched quantity to receive. Ask the sender to check it.",
-              )}
+              ))}
               onReload={loadDistribution}
               onRequest={requestConsignment}
               onSend={sendConsignment}
@@ -11820,11 +12093,22 @@ function App() {
       {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
       {lotAction && (
         <div className="modal-backdrop">
-          <section className="invoice-modal change-history-modal">
+          {/* Esc closes the box, as every other box in the app does. */}
+          <section
+            aria-labelledby="lot-action-title"
+            aria-modal="true"
+            className="invoice-modal change-history-modal"
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              event.stopPropagation();
+              closeLotAction();
+            }}
+            role="dialog"
+          >
             <div className="invoice-toolbar">
               <div>
                 <span className="eyebrow">Stock lot</span>
-                <strong>
+                <strong id="lot-action-title">
                   {lotAction.type === "edit" && "Edit lot"}
                   {lotAction.type === "add" && "Add quantity"}
                   {lotAction.type === "adjust" && "Correct count"}
@@ -11838,9 +12122,9 @@ function App() {
               <div className="purchase-summary-grid supplier-payment-preview">
                 <SummaryMetric label="Product" value={lotAction.lot.product_name || lotPanelProduct?.product_name || MISSING_VALUE} />
                 <SummaryMetric label="Lot" value={lotAction.lot.lot_name || lotAction.lot.batch_no || `#${lotAction.lot.id}`} />
-                <SummaryMetric label="Quantity" value={formatOptionalQuantity(lotAction.lot.purchase_qty)} />
-                <SummaryMetric label="Sold or used" value={formatOptionalQuantity(pickQuantity(lotAction.lot.sold_qty) ?? (pickQuantity(lotAction.lot.purchase_qty) !== null && pickQuantity(lotAction.lot.remaining_qty) !== null ? pickQuantity(lotAction.lot.purchase_qty) - pickQuantity(lotAction.lot.remaining_qty) : null))} />
-                <SummaryMetric label="Stock in system" value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} featured />
+                <SummaryMetric label="Quantity" value={formatQuantityWithUnit(lotAction.lot.purchase_qty, lotActionUnit)} />
+                <SummaryMetric label="Sold or used" value={formatQuantityWithUnit(pickQuantity(lotAction.lot.sold_qty) ?? (pickQuantity(lotAction.lot.purchase_qty) !== null && pickQuantity(lotAction.lot.remaining_qty) !== null ? pickQuantity(lotAction.lot.purchase_qty) - pickQuantity(lotAction.lot.remaining_qty) : null), lotActionUnit)} />
+                <SummaryMetric label="Stock in system" value={formatQuantityWithUnit(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} featured />
               </div>
 
               {lotAction.type === "edit" && (
@@ -11851,11 +12135,11 @@ function App() {
                       {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
                     </select>
                   </Field>
-                  <Field label={<RequiredLabel>Lot name</RequiredLabel>}><input value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>Lot name</RequiredLabel>}><input autoFocus id="lot-action-name" value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
                   <Field label="Grade"><input value={lotDraft.lot_size} onChange={(event) => setLotDraft({ ...lotDraft, lot_size: event.target.value })} /></Field>
-                  <Field label="Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
-                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
-                  <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
+                  <Field label={lotActionUnitLabel("Quantity")}><input id="lot-action-quantity" min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
+                  <Field label="Stock in system"><input readOnly value={formatQuantityWithUnit(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} /></Field>
+                  <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input id="lot-action-cost" min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
                   <Field label="Sale price (₹)"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
                   <Field label="Stock date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
                   <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
@@ -11865,16 +12149,16 @@ function App() {
 
               {lotAction.type === "add" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Quantity to add"><input min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>{lotActionUnitLabel("Quantity to add")}</RequiredLabel>}><input autoFocus id="lot-action-add-quantity" min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter") saveLotAction(); }} /></Field>
                   <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Example: missed opening stock count" /></Field>
                 </div>
               )}
 
               {lotAction.type === "adjust" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
-                  <Field label="Counted quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
-                  <Field label="Difference"><input readOnly value={pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty) === null ? MISSING_VALUE : formatOptionalQuantity(Number(lotDraft.new_quantity || 0) - pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label="Stock in system"><input readOnly value={formatQuantityWithUnit(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} /></Field>
+                  <Field label={lotActionUnitLabel("Counted quantity")}><input autoFocus id="lot-action-counted" min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
+                  <Field label="Difference"><input readOnly value={pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty) === null ? MISSING_VALUE : formatQuantityWithUnit(Number(lotDraft.new_quantity || 0) - pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} /></Field>
                   <Field label="Type of correction">
                     <select value={lotDraft.adjustment_type} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_type: event.target.value })}>
                       <option>Increase Stock</option>
@@ -11887,25 +12171,26 @@ function App() {
                     </select>
                   </Field>
                   <Field label="Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
-                  <Field label={<RequiredLabel>Reason</RequiredLabel>}><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>Reason</RequiredLabel>}><input id="lot-action-reason" value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} /></Field>
                   <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
                 </div>
               )}
 
               {lotAction.type === "deactivate" && (
-                <Field label="Reason"><textarea value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory. Lots with used stock cannot be deactivated." /></Field>
+                <Field label={<RequiredLabel>Reason</RequiredLabel>}><textarea autoFocus id="lot-action-reason" value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="A lot with stock already sold or used cannot be deactivated." /></Field>
               )}
 
               {lotAction.type === "reactivate" && (
-                <Field label="Reason"><textarea value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory. Reactivated lots return available unsold quantity to active stock." /></Field>
+                <Field label={<RequiredLabel>Reason</RequiredLabel>}><textarea autoFocus id="lot-action-reason" value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="The unsold quantity goes back into stock." /></Field>
               )}
 
               <div className="button-row">
-                <button className="primary-button" onClick={saveLotAction} type="button">
+                <button className={lotAction.type === "deactivate" ? "primary-button primary-button-danger" : "primary-button"} onClick={saveLotAction} type="button">
                   {{ edit: "Save lot", add: "Add quantity", adjust: "Correct count", deactivate: "Deactivate lot", reactivate: "Reactivate lot" }[lotAction.type] || "Save"}
                 </button>
                 <button className="secondary-button" onClick={closeLotAction} type="button">Cancel</button>
               </div>
+              <SaveNotice notice={lotNotice} />
             </div>
           </section>
         </div>
@@ -15430,19 +15715,16 @@ const matchesPendingBillSearch = (values, search) => {
   return values.some((value) => String(value ?? "").toLowerCase().includes(text));
 };
 
-function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, purchases, search = "" }) {
+function PendingPurchaseBillsModule({ actionNotice = null, canManagePending = false, loadState = { status: "ready", message: "" }, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, purchases, search = "" }) {
   const [selectedSupplierKey, setSelectedSupplierKey] = useState("");
+  // A failed or unfinished read of the purchases is said, never shown as "nothing pending" (logic E).
+  const presentation = pendingPurchasesPresentation(loadState);
   const basePendingRows = purchases.filter((purchase) =>
     purchase.purchase_status !== "CANCELLED" &&
     purchase.purchase_bill_status === "BILL_PENDING"
   );
-  const narration = (purchase) => {
-    const product = purchase.product_name || "Item";
-    const qty = Number(purchase.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
-    const unit = String(purchase.unit || "").toLowerCase();
-    const rate = pendingItemRate(purchase);
-    return `${product} ${qty}${unit} @ ${receiptCurrency.format(rate)} = ${receiptCurrency.format(Number(purchase.quantity || 0) * rate)}`;
-  };
+  // "Apple 5.000 Kg × ₹95.00 = ₹475.00" (local/stockScreens.js).
+  const narration = (purchase) => pendingItemNarration(purchase, pendingItemRate(purchase), (value) => currency.format(value));
   const estimatedValue = (purchase) => Number(purchase.quantity || 0) * pendingItemRate(purchase);
   const pendingRows = basePendingRows.filter((purchase) => matchesPendingBillSearch([
     purchase.supplier_name,
@@ -15468,7 +15750,7 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
     const summary = map.get(key) || {
       key,
       supplier_id: purchase.supplier_id,
-      supplier_name: purchase.supplier_name || "Unknown Supplier",
+      supplier_name: purchase.supplier_name || "Unknown supplier",
       from: toDateKey(purchase.purchase_date),
       to: toDateKey(purchase.purchase_date),
       billCount: 0,
@@ -15488,55 +15770,71 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
   }, new Map()).values()].sort((left, right) => left.supplier_name.localeCompare(right.supplier_name));
   const selectedSupplier = supplierSummaries.find((summary) => summary.key === selectedSupplierKey);
   const selectedRows = selectedSupplier?.rows || [];
+  const showFigures = presentation.figures;
 
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Supplier bills" title="Waiting for a bill, by supplier" subtitle="Stock that has arrived but whose supplier bill is not complete yet.">
+        {presentation.kind === "failed" && (
+          <div className="error-banner" role="alert">
+            {`${presentation.message} What is shown may be out of date.`}{" "}
+            <button className="secondary-button compact-button" onClick={() => onReload?.().catch(() => null)} type="button">Try again</button>
+          </div>
+        )}
+        {!selectedSupplier && <SaveNotice notice={actionNotice} />}
         <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Pending Suppliers" value={supplierSummaries.length} featured />
-          <SummaryMetric label="Pending Bills" value={pendingBills.length} />
-          <SummaryMetric label="Estimated Value" value={currency.format(pendingRows.reduce((sum, row) => sum + estimatedValue(row), 0))} />
+          <SummaryMetric label="Suppliers waiting" value={showFigures ? supplierSummaries.length : MISSING_VALUE} featured />
+          <SummaryMetric label="Bills waiting" value={showFigures ? pendingBills.length : MISSING_VALUE} />
+          <SummaryMetric label="Estimated value" value={showFigures ? currency.format(pendingRows.reduce((sum, row) => sum + estimatedValue(row), 0)) : MISSING_VALUE} />
         </div>
-        <DataTable headers={markNumericColumns(["Supplier Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Pending Items", "Estimated Value", "Action"])}>
+        <DataTable className="pending-bills-table" headers={["Supplier", "From", "To", { label: "Bills", numeric: true }, { label: "Items", numeric: true }, { label: "Value", numeric: true }, ""]}>
           {supplierSummaries.map((summary) => (
             <tr key={summary.key}>
               <td className="primary-cell">{summary.supplier_name}</td>
               <td>{formatDisplayDate(summary.from)}</td>
               <td>{formatDisplayDate(summary.to)}</td>
-              <td>{summary.billCount} bills</td>
-              <td>{summary.itemCount} items</td>
+              <td>{summary.billCount}</td>
+              <td>{summary.itemCount}</td>
               <td>{currency.format(summary.estimatedValue)}</td>
-              <td><button className="table-action" onClick={() => setSelectedSupplierKey(summary.key)}>View</button></td>
+              <td><button className="table-action" onClick={() => setSelectedSupplierKey(summary.key)} type="button">View bills</button></td>
             </tr>
           ))}
+          {supplierSummaries.length === 0 && (
+            <tr>
+              <td className="empty-cell" colSpan={7}>
+                {presentation.kind === "loading" ? "Loading pending bills…" : presentation.kind === "failed" ? MISSING_VALUE : basePendingRows.length ? "No pending bills match the search." : "No bills are waiting. Stock entered as \"bill to follow\" appears here."}
+              </td>
+            </tr>
+          )}
         </DataTable>
-        {supplierSummaries.length === 0 && <div className="cart-empty">{basePendingRows.length ? "No matching pending bills found." : "No pending purchase bills."}</div>}
       </ModuleCard>
 
       {selectedSupplier && (
-        <ModuleCard eyebrow="Supplier Drill-Down" title={selectedSupplier.supplier_name} subtitle="Complete, edit or safely cancel pending bill entries for this supplier.">
-          <DataTable headers={markNumericColumns(["Date", "Items Narration", "Estimated Total", "Status", "Action"])}>
+        <ModuleCard eyebrow="Bills from one supplier" title={selectedSupplier.supplier_name} subtitle="Complete a bill when the supplier's bill comes in. Edit or cancel an entry that was wrong.">
+          <SaveNotice notice={actionNotice} />
+          <DataTable className="pending-bills-table" headers={["Arrived", "Items", { label: "Estimated", numeric: true }, "Actions"]}>
             {selectedRows.map((bill) => {
               const purchase = bill.items[0];
               const itemsNarration = bill.items.map(narration).join("; ");
               const changeBlock = purchaseChangeBlock(bill.itemCount);
               return (
-              <tr className="report-row-clickable" key={bill.key} onClick={() => onOpenPurchaseAmendment(purchase)} tabIndex={0} onKeyDown={activateOnEnter(() => onOpenPurchaseAmendment(purchase))}>
-                <td>{formatDisplayDate(purchase.purchase_date)}</td>
+              // No row click: it used to open the amendment screen without saying so. The buttons
+              // say what each one does.
+              <tr key={bill.key}>
+                <td>{formatDisplayDate(purchase.purchase_date)}<small className="cell-note">{`Bill #${purchase.id}`}</small></td>
                 <td className="primary-cell purchase-items-cell">
                   <span title={itemsNarration}>{itemsNarration}</span>
                   {changeBlock && <small className="cell-note">{changeBlock}</small>}
                 </td>
                 <td>{currency.format(bill.items.reduce((sum, item) => sum + estimatedValue(item), 0))}</td>
-                <td><span className="origin-rate">Pending Bill</span></td>
                 <td>
                   {/* The server lets only Owner and Admin complete, edit or cancel a pending bill
                       (requireRateManager). Anyone else got three buttons that could only fail. */}
                   {canManagePending ? (
                     <div className="button-row table-actions-row">
-                      <button className="primary-button" onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }}>Complete Bill</button>
-                      <button className="table-action" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }} title={changeBlock || undefined}>Edit Pending Entry</button>
-                      <button className="remove-button" onClick={(event) => { event.stopPropagation(); onCancelPurchase(purchase); }}>Cancel Pending Entry</button>
+                      <button className="primary-button compact-button" onClick={() => onCompletePurchase(purchase)} type="button">Complete bill</button>
+                      <button className="table-action" disabled={Boolean(changeBlock)} onClick={() => onEditPurchase(purchase)} title={changeBlock || undefined} type="button">Edit</button>
+                      <button className="danger-text-button" onClick={() => onCancelPurchase(purchase)} type="button">Cancel</button>
                     </div>
                   ) : <small className="cell-note">{PENDING_BILL_MANAGER_NOTE}</small>}
                 </td>
@@ -15545,8 +15843,8 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
             })}
           </DataTable>
           <div className="button-row">
-            <button className="secondary-button" onClick={() => onOpenPurchaseAmendment(selectedRows[0]?.items[0])}>Add Forgotten Item</button>
-            <button className="secondary-button" onClick={() => setSelectedSupplierKey("")}>Back to Supplier Summary</button>
+            <button className="secondary-button" onClick={() => onOpenPurchaseAmendment(selectedRows[0]?.items[0])} type="button">Add forgotten item</button>
+            <button className="secondary-button" onClick={() => setSelectedSupplierKey("")} type="button">Back to all suppliers</button>
           </div>
         </ModuleCard>
       )}
@@ -15554,10 +15852,14 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
   );
 }
 
-function PendingBillsModule({ canManagePending = false, canReceivePayment = false, customerPendingBills = { summary: [], invoices: [] }, customerPendingBillsError = "", customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchases, user }) {
+const CUSTOMER_PAYMENT_MODES = Object.freeze([["CASH", "Cash"], ["UPI", "UPI"], ["CARD", "Card"], ["BANK_TRANSFER", "Bank transfer"]]);
+
+function PendingBillsModule({ canManagePending = false, canReceivePayment = false, customerPendingBills = { summary: [], invoices: [] }, customerPendingBillsError = "", customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchaseActionNotice = null, purchases, purchasesLoad = { status: "ready", message: "" }, user }) {
   const [activeTab, setActiveTab] = useState("purchase");
   const [selectedCustomerKey, setSelectedCustomerKey] = useState("");
   const [pendingSearch, setPendingSearch] = useState("");
+  const [paymentNotice, showPaymentNotice, clearPaymentNotice] = useSaveNotice();
+  const [paymentSaving, runPaymentSave] = useSaveInFlight();
   const [paymentDraft, setPaymentDraft] = useState({
     customer_id: "",
     payment_date: toDateKey(new Date()),
@@ -15566,6 +15868,13 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
     reference_number: "",
     remarks: "",
   });
+  // Opened before the purchases were ever read (a fresh start on this screen): read them now,
+  // the way the menu would have.
+  const purchasesNeverLoaded = purchasesLoad.status === "idle";
+  useEffect(() => {
+    if (purchasesNeverLoaded) onReload?.().catch(() => null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [purchasesNeverLoaded]);
   const rawSummaries = Array.isArray(customerPendingBills.summary) ? customerPendingBills.summary : [];
   const summaries = rawSummaries
     .map((summary) => {
@@ -15610,10 +15919,12 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
       summary.balance,
     ], pendingSearch) || summary.rows.length > 0);
   const selectedCustomer = summaries.find((summary) => summary.key === selectedCustomerKey);
+  const emptyPaymentDraft = () => ({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" });
 
   const openReceivePayment = (summary, invoice = null) => {
+    clearPaymentNotice();
     if (!summary?.customer_id) {
-      alert("Customer account is required before receiving payment.");
+      showPaymentNotice(errorNotice(`${summary?.customer_name || "This customer"} has no customer account, so a payment cannot be recorded against them. Add the account in Accounts first.`));
       return;
     }
     setSelectedCustomerKey(summary.key);
@@ -15625,30 +15936,37 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
       reference_number: "",
       remarks: invoice?.invoice_no ? `Against credit invoice ${invoice.invoice_no}` : "Against customer pending bills",
     });
+    // The receipt form opens under the list; take the cursor to its amount.
+    focusField("customer-payment-amount");
   };
 
-  const saveCustomerPayment = async () => {
+  const saveCustomerPayment = () => runPaymentSave(async () => {
+    clearPaymentNotice();
     if (!canReceivePayment) {
-      alert("Your role cannot receive customer payments.");
+      showPaymentNotice(errorNotice("Your role cannot receive customer payments. Ask the Owner or an Admin."));
       return;
     }
     if (!paymentDraft.customer_id || Number(paymentDraft.payment_amount || 0) <= 0) {
-      alert("Enter valid customer payment details.");
+      const field = paymentDraft.customer_id ? "customer-payment-amount" : "customer-payment-customer";
+      showPaymentNotice(errorNotice(paymentDraft.customer_id ? "Enter an amount above ₹0." : "Choose the customer.", field));
+      focusField(field, { scroll: false });
       return;
     }
+    const customerName = customers.find((customer) => String(customer.id) === String(paymentDraft.customer_id))?.customer_name || "the customer";
+    const amountWords = currency.format(Number(paymentDraft.payment_amount));
     try {
       await axios.post(`${API_URL}/customer-payments`, {
         ...paymentDraft,
         branch_id: user.branch_id,
         created_by: user.id,
       });
-      setPaymentDraft({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" });
+      setPaymentDraft(emptyPaymentDraft());
       await onReload();
-      alert("Customer payment saved");
+      showPaymentNotice(successNotice(`Payment of ${amountWords} from ${customerName} saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save customer payment"));
+      showPaymentNotice(errorNotice(getErrorMessage(error, "The payment could not be saved. Nothing was recorded; try again.")));
     }
-  };
+  });
 
   return (
     <section className="settings-layout">
@@ -15656,24 +15974,28 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
         <label className="icon-input table-search-input">
           <Icon name="search" />
           <input
-            placeholder="Search pending bill, customer, supplier, invoice..."
+            aria-label="Search pending bills"
+            placeholder="Search supplier, customer, invoice or fruit"
             value={pendingSearch}
             onChange={(event) => setPendingSearch(event.target.value)}
           />
         </label>
         <div className="settings-tabs">
-          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Supplier bills</button>
-          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer credit</button>
+          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")} type="button">Supplier bills</button>
+          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")} type="button">Customer credit</button>
         </div>
       </ModuleCard>
 
       {activeTab === "purchase" && (
         <PendingPurchaseBillsModule
+          actionNotice={purchaseActionNotice}
           canManagePending={canManagePending}
+          loadState={purchasesLoad}
           onCancelPurchase={onCancelPurchase}
           onCompletePurchase={onCompletePurchase}
           onEditPurchase={onEditPurchase}
           onOpenPurchaseAmendment={onOpenPurchaseAmendment}
+          onReload={onReload}
           purchases={purchases}
           search={pendingSearch}
         />
@@ -15681,92 +16003,96 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
 
       {activeTab === "customer" && (
         <>
-          <ModuleCard eyebrow="Customer Credit" title="Customer-Wise Pending Bills" subtitle="Credit POS bills stay here until customer receipts are entered.">
+          <ModuleCard eyebrow="Customer credit" title="Credit bills, by customer" subtitle="Credit POS bills stay here until the customer pays.">
             {/* A failed read is said, not shown as "no customers owe anything". */}
             {customerPendingBillsError && <div className="error-banner" role="alert">{`Customer pending bills could not be loaded: ${customerPendingBillsError}. What is shown may be out of date.`}</div>}
+            {!paymentDraft.customer_id && <SaveNotice notice={paymentNotice} />}
             <div className="purchase-summary-grid supplier-payment-preview">
-              <SummaryMetric label="Customers Pending" value={customerPendingBillsError ? UNKNOWN_FIGURE : summaries.length} featured />
-              <SummaryMetric label="Credit Amount" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
+              <SummaryMetric label="Customers owing" value={customerPendingBillsError ? UNKNOWN_FIGURE : summaries.length} featured />
+              <SummaryMetric label="Credit amount" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
               <SummaryMetric label="Balance" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.balance || 0), 0))} />
             </div>
-            <DataTable headers={markNumericColumns(["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Returned", "Balance", "Action"])}>
+            <DataTable className="pending-bills-table" headers={["Customer", "From", "To", { label: "Bills", numeric: true }, { label: "Credit", numeric: true }, { label: "Received", numeric: true }, { label: "Returned", numeric: true }, { label: "Balance", numeric: true }, ""]}>
               {summaries.map((summary) => (
                 <tr key={summary.key}>
                   <td className="primary-cell">{summary.customer_name}</td>
                   <td>{formatDisplayDate(summary.from)}</td>
                   <td>{formatDisplayDate(summary.to)}</td>
-                  <td>{summary.pending_bill_count} bills</td>
+                  <td>{summary.pending_bill_count}</td>
                   <td>{currency.format(Number(summary.total_credit_amount || 0))}</td>
                   <td>{currency.format(Number(summary.amount_received || 0))}</td>
                   {/* Goods returned on a credit note or future adjustment, so Credit - Received - Returned = Balance. */}
                   <td>{currency.format(Number(summary.amount_returned || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(summary.balance || 0))}</td>
-                  <td><button className="table-action" onClick={() => setSelectedCustomerKey(summary.key)}>View</button></td>
+                  <td><button className="table-action" onClick={() => setSelectedCustomerKey(summary.key)} type="button">View bills</button></td>
                 </tr>
               ))}
+              {summaries.length === 0 && (
+                <tr><td className="empty-cell" colSpan={9}>{customerPendingBillsError ? MISSING_VALUE : rawSummaries.length ? "No credit bills match the search." : "No customer owes anything on credit."}</td></tr>
+              )}
             </DataTable>
-            {summaries.length === 0 && <div className="cart-empty">{rawSummaries.length ? "No matching pending bills found." : "No customer pending bills."}</div>}
           </ModuleCard>
 
           {selectedCustomer && (
-            <ModuleCard eyebrow="Customer Drill-Down" title={selectedCustomer.customer_name} subtitle="Receive payment, view invoices and print customer credit statement.">
-              <DataTable headers={markNumericColumns(["Bill Date", "Invoice Number", "Items / Narration", "Gross Amount", "Discount", "Net Amount", "Received", "Returned", "Balance", "Due Date", "Status", "Action"])}>
-                {selectedCustomer.rows.map((invoice) => (
+            <ModuleCard eyebrow="Bills of one customer" title={selectedCustomer.customer_name} subtitle="Receive a payment, open an invoice or print the customer's statement.">
+              <DataTable className="pending-bills-table customer-credit-bills" headers={["Bill", "Items", { label: "Net", numeric: true }, { label: "Received", numeric: true }, { label: "Balance", numeric: true }, "Due", "Status", "Actions"]}>
+                {selectedCustomer.rows.map((invoice) => {
+                  const discount = Number(invoice.item_discount_amount || 0) + Number(invoice.invoice_discount_amount || 0);
+                  const returned = Number(invoice.returned_amount || 0);
+                  // Gross, discount and returns are on the Net cell's tooltip and note, so the row
+                  // fits a 1366 screen without scrolling sideways.
+                  const netNote = [discount > 0 ? `after ${currency.format(discount)} off` : "", returned > 0 ? `${currency.format(returned)} returned` : ""].filter(Boolean).join(", ");
+                  return (
                   <tr key={invoice.id}>
-                    <td>{formatDisplayDate(invoice.sale_date)}</td>
-                    <td><span className="batch-id">{invoice.invoice_no || `#${invoice.id}`}</span></td>
+                    <td><span className="batch-id">{invoice.invoice_no || `#${invoice.id}`}</span><small className="cell-note">{formatDisplayDate(invoice.sale_date)}</small></td>
                     <td className="primary-cell purchase-items-cell"><span title={invoice.item_narration}>{String(invoice.item_narration || "").split("\n").slice(0, 2).join(", ")}</span></td>
-                    <td>{currency.format(Number(invoice.gross_amount || 0))}</td>
-                    <td>{currency.format(Number(invoice.item_discount_amount || 0) + Number(invoice.invoice_discount_amount || 0))}</td>
-                    <td>{currency.format(Number(invoice.total_amount || 0))}</td>
+                    <td title={`Gross ${currency.format(Number(invoice.gross_amount || 0))}`}>{currency.format(Number(invoice.total_amount || 0))}{netNote && <small className="cell-note">{netNote}</small>}</td>
                     <td>{currency.format(Number(invoice.received_amount || 0))}</td>
-                    <td>{currency.format(Number(invoice.returned_amount || 0))}</td>
                     <td className="balance-cell">{currency.format(Number(invoice.balance_amount || 0))}</td>
                     <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : MISSING_VALUE}</td>
                     <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{labelFor("credit_status", invoice.credit_status)}</span></td>
                     <td>
                       <div className="button-row table-actions-row">
-                        <button className="primary-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)}>Receive Payment</button>
-                        <button className="table-action" onClick={() => onViewInvoice(invoice.id)}>View Invoice</button>
+                        <button className="primary-button compact-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)} type="button">Receive</button>
+                        <button className="table-action" onClick={() => onViewInvoice(invoice.id)} type="button">Invoice</button>
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </DataTable>
               <div className="button-row">
-                <button className="secondary-button" onClick={() => openReceivePayment(selectedCustomer)}>Receive General Payment</button>
-                <button className="secondary-button" onClick={() => window.print()}>Print Statement</button>
-                <button className="secondary-button" onClick={() => setSelectedCustomerKey("")}>Back to Customer Summary</button>
+                <button className="secondary-button" onClick={() => openReceivePayment(selectedCustomer)} type="button">Receive a general payment</button>
+                <button className="secondary-button" onClick={() => window.print()} type="button">Print statement</button>
+                <button className="secondary-button" onClick={() => setSelectedCustomerKey("")} type="button">Back to all customers</button>
               </div>
             </ModuleCard>
           )}
 
           {paymentDraft.customer_id && (
-            <ModuleCard eyebrow="Customer Receipt" title="Receive Payment Against Credit" subtitle="Payment will reduce customer receivable and update Cash Book based on payment mode.">
+            <ModuleCard eyebrow="Customer receipt" onChange={clearPaymentNotice} title="Receive a payment" subtitle="The payment lowers what the customer owes and goes into the cash or bank book by its mode.">
               <div className="form-grid supplier-form-grid">
-                <Field label="Customer">
-                  <select value={paymentDraft.customer_id} onChange={(event) => setPaymentDraft({ ...paymentDraft, customer_id: event.target.value })}>
-                    <option value="">Select customer</option>
+                <Field label={<RequiredLabel>Customer</RequiredLabel>}>
+                  <select id="customer-payment-customer" value={paymentDraft.customer_id} onChange={(event) => setPaymentDraft({ ...paymentDraft, customer_id: event.target.value })}>
+                    <option value="">Choose a customer</option>
                     {customers.filter((customer) => customer.active !== false).map((customer) => <option key={customer.id} value={customer.id}>{customer.customer_name}</option>)}
                   </select>
                 </Field>
-                <Field label="Payment Date"><input type="date" value={paymentDraft.payment_date} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_date: event.target.value })} /></Field>
-                <Field label="Payment Amount"><input min="0" step="0.01" type="number" value={paymentDraft.payment_amount} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_amount: event.target.value })} /></Field>
-                <Field label="Payment Mode">
+                <Field label="Payment date"><input type="date" value={paymentDraft.payment_date} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_date: event.target.value })} /></Field>
+                <Field label={<RequiredLabel>Amount (₹)</RequiredLabel>}><input id="customer-payment-amount" min="0" step="0.01" type="number" value={paymentDraft.payment_amount} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_amount: event.target.value })} /></Field>
+                <Field label="Payment mode">
                   <select value={paymentDraft.payment_mode} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_mode: event.target.value })}>
-                    <option value="CASH">Cash</option>
-                    <option value="UPI">UPI</option>
-                    <option value="CARD">Card</option>
-                    <option value="BANK_TRANSFER">Bank</option>
+                    {CUSTOMER_PAYMENT_MODES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                   </select>
                 </Field>
-                <Field label="Reference Number"><input value={paymentDraft.reference_number} onChange={(event) => setPaymentDraft({ ...paymentDraft, reference_number: event.target.value })} /></Field>
-                <Field label="Remarks"><input value={paymentDraft.remarks} onChange={(event) => setPaymentDraft({ ...paymentDraft, remarks: event.target.value })} /></Field>
+                <Field label="Reference number"><input value={paymentDraft.reference_number} onChange={(event) => setPaymentDraft({ ...paymentDraft, reference_number: event.target.value })} /></Field>
+                <Field label="Notes"><input value={paymentDraft.remarks} onChange={(event) => setPaymentDraft({ ...paymentDraft, remarks: event.target.value })} /></Field>
               </div>
               <div className="button-row">
-                <button className="primary-button" onClick={saveCustomerPayment}>Save Payment</button>
-                <button className="secondary-button" onClick={() => setPaymentDraft({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" })}>Cancel</button>
+                <button className="primary-button" disabled={paymentSaving} onClick={saveCustomerPayment} type="button">{paymentSaving ? "Saving…" : "Save payment"}</button>
+                <button className="secondary-button" onClick={() => { setPaymentDraft(emptyPaymentDraft()); clearPaymentNotice(); }} type="button">Cancel</button>
               </div>
+              <SaveNotice notice={paymentNotice} />
             </ModuleCard>
           )}
         </>
@@ -17618,7 +17944,8 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
       setCombos(read.combos);
       setLoad({ status: "ready", message: "" });
     } catch (error) {
-      setLoad({ status: "failed", message: `Combos could not be loaded (${getErrorMessage(error, error?.message || "no answer from the server")}).` });
+      // The server's words when it answered; otherwise one plain phrase, never axios's "Network Error".
+      setLoad({ status: "failed", message: `Combos could not be loaded (${getErrorMessage(error, "no answer from the server")}).` });
     }
   };
 
@@ -17674,7 +18001,7 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
         </div>
       )}
       {load.status !== "failed" && (
-        <DataTable className="pm-table combo-table" headers={["Combo", "Margin", "Cost today", "Suggested", "Current price", "New price"]}>
+        <DataTable className="pm-table sale-rate-combo-table" headers={["Combo", { label: "Margin", numeric: true }, { label: "Cost today", numeric: true }, { label: "Suggested", numeric: true }, { label: "Current price", numeric: true }, "New price (₹)"]}>
           {load.status !== "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>Loading combos…</td></tr>}
           {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in PEP Menu.</td></tr>}
           {rows.map((row) => (
@@ -19612,7 +19939,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const renderFilters = () => selectedReport === "stockInventory" ? (
     <div className="ledger-toolbar">
-      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing…" : "Refresh Inventory"}</button>
+      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing…" : "Refresh"}</button>
       {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   ) : (
@@ -20399,7 +20726,8 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const [auditFocus, setAuditFocus] = useState(null);
   const [selectedLotDetail, setSelectedLotDetail] = useState(null);
   const money = (value) => currency.format(Number(value || 0));
-  const qty = (value) => Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
+  // Quantities carry three decimals everywhere else in the app; this screen showed "71.5".
+  const qty = (value) => Number(value || 0).toLocaleString("en-IN", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
   const lotBalance = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
   const lotOpening = (lot) => Number(lot.purchase_qty || 0);
   const lotUsed = (lot) => Number(lot.sold_qty ?? Math.max(lotOpening(lot) - Number(lot.remaining_qty || 0), 0));
@@ -20426,7 +20754,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const statusClass = (status) => status === "Active" ? "stock-ok" : status === "Sold Out" ? "origin-rate" : "stock-low";
   const formatUnitGroups = (groups) => [...groups.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([unit, value]) => `${qty(value)} ${unit}`)
+    .map(([unit, value]) => `${qty(value)} ${unitDisplayName(unit)}`)
     .join(" • ") || MISSING_VALUE;
   const addUnitValue = (groups, unit, value) => {
     const key = normalizeUnit(unit);
@@ -20489,12 +20817,12 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const lotOptions = selectedProductLots.map((lot) => [
     String(lot.id),
     [
-      lot.lot_name || lot.batch_no || "No Lot Number",
+      stockLotName(lot, formatDisplayDate),
       lot.lot_size,
       lot.supplier_name,
-      `${qty(lotBalance(lot))} ${normalizeUnit(lot.unit)}`,
+      `${qty(lotBalance(lot))} ${unitDisplayName(normalizeUnit(lot.unit))}`,
       money(lotSaleRate(lot)),
-    ].filter(Boolean).join(" / "),
+    ].filter(Boolean).join(" · "),
   ]);
   const updateProductFilter = (productId) => {
     setFilters((current) => ({ ...current, product: productId, lot: "", lotSearch: "" }));
@@ -20725,16 +21053,16 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
       </tr>
     );
   });
-  const compactLotHeaders = ["Product", "Lot Number", "Supplier", "Stock", "Unit", "Arrival Date", ...(canManageStock ? ["Purchase / Expected Rate"] : []), "Sale Rate", ...(canManageStock ? ["Stock Value"] : []), "Status"];
+  const compactLotHeaders = markNumericColumns(["Product", "Lot", "Supplier", "In stock", "Unit", "Arrived", ...(canManageStock ? ["Cost price"] : []), "Sale rate", ...(canManageStock ? ["Stock value"] : []), "Status"], { also: ["In stock", "Cost price"] });
   const renderCompactLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
       <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)} tabIndex={0} onKeyDown={activateOnEnter(() => openLotDetail(lot))}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.category || ""}</small></td>
-        <td className="primary-cell">{lot.lot_name || lot.batch_no || "No Lot Number"}<small className="cell-note">{lot.lot_size || ""}</small></td>
+        <td className="primary-cell">{stockLotName(lot, formatDisplayDate)}<small className="cell-note">{lot.lot_size || ""}</small></td>
         <td>{lot.supplier_name || MISSING_VALUE}</td>
         <td><span className={lotBalance(lot) <= 0 ? "origin-rate" : "stock-ok"}>{qty(lotBalance(lot))}</span></td>
-        <td>{normalizeUnit(lot.unit)}</td>
+        <td>{unitDisplayName(normalizeUnit(lot.unit))}</td>
         <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
         {canManageStock && <td>{money(lotCost(lot))}</td>}
         <td>{money(lotSaleRate(lot))}</td>
@@ -20748,13 +21076,13 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
     <section className="stock-inventory-report">
       <div className="purchase-summary-grid supplier-payment-preview">
         {/* A failed load is not an empty shop: every figure reads "—" beside the error, never ₹0.00 or 0. */}
-        <SummaryMetric featured label="Total Stock Value" value={!canManageStock ? "Restricted" : inventoryUnavailable ? MISSING_VALUE : money(totalStockValue)} />
+        <SummaryMetric featured label="Total stock value" value={!canManageStock ? "Restricted" : inventoryUnavailable ? MISSING_VALUE : money(totalStockValue)} />
         <SummaryMetric label="Products" value={inventoryPresentation.countLabel} />
-        <SummaryMetric label="Active Lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
+        <SummaryMetric label="Active lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
         <SummaryMetric label="Stock" value={inventoryUnavailable ? MISSING_VALUE : formatUnitGroups(filteredUnitGroups)} />
-        <SummaryMetric label="Out-of-Stock Lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
-        <SummaryMetric label="Low Stock Items" value={inventoryUnavailable ? MISSING_VALUE : lowStockItems} />
-        <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : auditError ? MISSING_VALUE : adjustmentCount} />
+        <SummaryMetric label="Sold-out lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
+        <SummaryMetric label="Low-stock items" value={inventoryUnavailable ? MISSING_VALUE : lowStockItems} />
+        <SummaryMetric label="Stock corrections" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : auditError ? MISSING_VALUE : adjustmentCount} />
       </div>
       {inventoryLoading && <div className="cart-empty">{inventoryPresentation.message}</div>}
       {inventoryUnavailable && <div className="error-banner" role="alert" data-report-note="">{inventoryPresentation.message}</div>}
@@ -20763,19 +21091,19 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
       {auditError && <div className="error-banner" role="alert" data-report-note="">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
-          <Field label="Product Search / Selector">
+          <Field label="Product">
             <div className="stacked-control">
-              <input placeholder="Search or select product..." value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} />
+              <input placeholder="Search products…" value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} />
               <select value={filters.product} onChange={(event) => updateProductFilter(event.target.value)}>
                 <option value="">All products</option>
                 {productOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
               </select>
             </div>
           </Field>
-          <Field label="View Mode">
+          <Field label="Show">
             <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
-              <option value="PRODUCT">Product View</option>
-              <option value="LOT">Lot View</option>
+              <option value="PRODUCT">By product</option>
+              <option value="LOT">By lot</option>
             </select>
           </Field>
           <div className="stock-filter-actions">
@@ -20793,26 +21121,26 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
             >
               More
             </button>
-            {activeFilterChips.length > 0 && <button className="secondary-button stock-clear-button" onClick={clearFilters}>Clear All Filters</button>}
+            {activeFilterChips.length > 0 && <button className="secondary-button stock-clear-button" onClick={clearFilters}>Clear filters</button>}
           </div>
         </div>
         <div className="quick-filter-row no-print">
-          <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Today&apos;s Arrivals</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Arrived today</button>
           <button className="filter-chip" onClick={() => {
             const date = new Date();
             date.setDate(date.getDate() - 6);
             setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
-          }}>Last 7 Days</button>
+          }}>Last 7 days</button>
           <button className="filter-chip" onClick={() => {
             const date = new Date();
             date.setDate(date.getDate() - 29);
             setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
-          }}>Last 30 Days</button>
-          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "LOW_STOCK" })}>Low Stock</button>
-          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "OUT_OF_STOCK", showEmpty: true })}>Out of Stock</button>
+          }}>Last 30 days</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "LOW_STOCK" })}>Low stock</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "OUT_OF_STOCK", showEmpty: true })}>Out of stock</button>
           <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "IMPORTED" })}>Imported</button>
           <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "LOCAL" })}>Local</button>
-          <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently Updated</button>
+          <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently updated</button>
         </div>
         {/* Every effective filter stays named here even while the panel below is collapsed. */}
         <div className="active-filter-chip-row no-print">
@@ -20910,7 +21238,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         )}
       </div>
       {viewMode === "PRODUCT" && (
-        <DataTable headers={markNumericColumns(["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"])}>
+        <DataTable className="stock-inventory-products" headers={markNumericColumns(["Product", "Category", "In stock", "Lots", "Average cost", "Sale rate", "Stock value", "Low-stock alert", "Status"], { also: ["In stock", "Lots", "Low-stock alert"] })}>
           {filteredProductRows.map((product) => {
             const visibleBalance = product.visible_lots.reduce((sum, lot) => sum + lotBalance(lot), 0);
             const visibleValue = product.filtered_stock_value;
@@ -20920,7 +21248,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
             return (
               <React.Fragment key={product.product_id}>
                 <tr className="report-row-clickable" data-inventory-product-row={String(product.product_id)} onClick={toggleProduct} tabIndex={0} onKeyDown={activateOnEnter(toggleProduct)}>
-                  <td className="primary-cell">{product.product_name}<small className="cell-note">Click to view lots</small></td>
+                  <td className="primary-cell">{product.product_name}<small className="cell-note">{expandedProductId === String(product.product_id) ? "Hide lots" : "Show lots"}</small></td>
                   <td>{product.category}</td>
                   <td>{product.total_stock_summary}</td>
                   <td>{product.filtered_active_lots}</td>
@@ -20928,7 +21256,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
                   <td>{money(product.sale_rate)}</td>
                   <td>{canManageStock ? money(visibleValue) : "Restricted"}</td>
                   <td>{qty(product.minimum_stock)}</td>
-                  <td><span className={low ? "stock-low" : "stock-ok"}>{low ? "Low Stock" : "OK"}</span></td>
+                  <td><span className={low ? "stock-low" : "stock-ok"}>{low ? "Low stock" : "In stock"}</span></td>
                 </tr>
                 {expandedProductId === String(product.product_id) && (
                   <tr className="sales-history-drilldown-row">
@@ -21348,16 +21676,33 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
     return stock;
   }, new Map());
   const mostWasted = [...entries].reduce((map, entry) => {
-    const current = map.get(entry.product_name) || { product_name: entry.product_name, quantity: 0, cost: 0 };
+    const current = map.get(entry.product_name) || { product_name: entry.product_name, quantity: 0, cost: 0, unit: entry.unit };
     current.quantity += Number(entry.quantity || 0);
     current.cost += Number(entry.cost_amount || 0);
     map.set(entry.product_name, current);
     return map;
   }, new Map());
   const mostWastedProducts = [...mostWasted.values()].sort((left, right) => right.quantity - left.quantity).slice(0, 5);
+  const [wasteNotice, showWasteNotice, clearWasteNotice] = useSaveNotice();
+  const wasteProducts = products.filter((product) => product.active !== false);
+  const draftProduct = wasteProducts.find((product) => String(product.id) === String(draft.product_id)) || null;
   // One save at a time: a double click used to record the same waste twice and take the stock twice.
   const [wasteSaving, runWasteSave] = useSaveInFlight();
   const saveWaste = () => runWasteSave(async () => {
+    clearWasteNotice();
+    // The server refuses these too; asked here first so the cursor lands where the gap is.
+    if (!draft.product_id) {
+      showWasteNotice(errorNotice("Choose the product that was wasted.", "waste-product"));
+      focusField("waste-product", { scroll: false });
+      return;
+    }
+    if (!(Number(draft.quantity) > 0)) {
+      showWasteNotice(errorNotice("Enter the quantity wasted.", "waste-quantity"));
+      focusField("waste-quantity", { scroll: false });
+      return;
+    }
+    const savedWords = `${formatQuantityWithUnit(draft.quantity, draftProduct?.unit)} of ${draftProduct?.product_name || "the product"}`;
+    const savedType = labelFor("wasteType", draft.waste_type);
     try {
       const wasteWrite = createOperationalWrite(user, {
         ...draft,
@@ -21370,65 +21715,68 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
       });
       await axios.post(`${API_URL}/api/v3/waste-entries`, wasteWrite.body, wasteWrite.config);
       setDraft({ product_id: "", quantity: "", waste_type: "DAAGI", waste_date: toDateKey(new Date()), remarks: "" });
-      await onReload();
-      alert("Waste entry saved and stock reduced");
+      // Saved; a list that does not refresh afterwards is a warning, not a failed save.
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const saved = `${savedWords} recorded as ${savedType}. The stock is reduced.`;
+      showWasteNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Try again on the register.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save waste entry"));
+      showWasteNotice(errorNotice(getErrorMessage(error, "The waste entry could not be saved. Nothing was taken off the stock.")));
     }
   });
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Record waste" title="Fruit taken off the shelf" subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
+      <ModuleCard eyebrow="Record waste" onChange={clearWasteNotice} title="Fruit taken off the shelf" subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
         <div className="form-grid supplier-form-grid">
-          <Field label="Product">
-            <select value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
-              <option value="">Select product</option>
-              {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} - Stock {(stockByProduct.get(canonicalInventoryId(product.id)) || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</option>)}
+          <Field label={<RequiredLabel>Product</RequiredLabel>}>
+            <select autoFocus id="waste-product" value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
+              <option value="">Choose a product</option>
+              {/* "—" when this product's stock is not known here, never "Stock 0" (logic E). */}
+              {wasteProducts.map((product) => <option key={product.id} value={product.id}>{wasteProductOptionLabel(product, stockByProduct.get(canonicalInventoryId(product.id)))}</option>)}
             </select>
           </Field>
-          <Field label="Quantity"><input min="0" step="0.001" type="number" value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: event.target.value })} /></Field>
-          <Field label="Waste Type">
+          <Field label={<RequiredLabel>{draftProduct ? `Quantity (${unitDisplayName(draftProduct.unit)})` : "Quantity"}</RequiredLabel>}><input id="waste-quantity" min="0" step="0.001" type="number" value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: event.target.value })} /></Field>
+          <Field label="Type of waste">
             <select value={draft.waste_type} onChange={(event) => setDraft({ ...draft, waste_type: event.target.value })}>
-              <option value="DAAGI">Daagi</option>
-              <option value="SAMPLING">Sampling</option>
-              <option value="PERSONAL_USE">Personal Use</option>
-              <option value="OTHER">Other</option>
+              {["DAAGI", "SAMPLING", "PERSONAL_USE", "OTHER"].map((type) => <option key={type} value={type}>{labelFor("wasteType", type)}</option>)}
             </select>
           </Field>
           <Field label="Date"><input type="date" value={draft.waste_date} onChange={(event) => setDraft({ ...draft, waste_date: event.target.value })} /></Field>
-          <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
-        <button className="primary-button" disabled={wasteSaving} onClick={saveWaste}>{wasteSaving ? "Saving…" : "Save Waste Entry"}</button>
+        <Field label="Notes"><textarea rows={2} value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
+        <div className="button-row">
+          <button className="primary-button" disabled={wasteSaving} onClick={saveWaste}>{wasteSaving ? "Saving…" : "Save waste entry"}</button>
+        </div>
+        <SaveNotice notice={wasteNotice} />
       </ModuleCard>
       <ModuleCard eyebrow="Top five" title="Most wasted products" subtitle="The products lost most, by quantity.">
         <div className="top-product-list">
           {mostWastedProducts.length ? mostWastedProducts.map((item) => (
             <article className="top-product-row" key={item.product_name}>
-              <div><strong>{item.product_name}</strong><span>{item.quantity.toLocaleString("en-IN")} quantity wasted</span></div>
+              <div><strong>{item.product_name}</strong><span>{`${formatQuantityWithUnit(item.quantity, item.unit)} wasted`}</span></div>
               <strong>{currency.format(item.cost)}</strong>
             </article>
           )) : loadFailed ? <div className="empty-inline">{MISSING_VALUE}</div> : <div className="empty-inline">No waste entries yet.</div>}
         </div>
       </ModuleCard>
-      <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Each entry's quantity and what that fruit cost to buy. The waste reports are built from these.">
+      <ModuleCard eyebrow="History" title="Waste register" subtitle="Each entry's quantity and what that fruit cost to buy. The waste reports are built from these.">
         {loadFailed && (
           <div className="error-banner" role="alert">
             {loadState.message || "The waste entries could not be loaded."}{" "}
             <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Try again</button>
           </div>
         )}
-        <DataTable headers={markNumericColumns(["Date", "Product", "Type", "Quantity", "Cost", "Remarks"])}>
+        <DataTable headers={markNumericColumns(["Date", "Product", "Type", "Quantity", "Cost", "Notes"])}>
           {entries.map((entry) => (
             <tr key={entry.id}>
-              <td>{toDateKey(entry.waste_date)}</td>
-              <td className="primary-cell">{entry.product_name}<small className="cell-note">{labelFor("unit", entry.unit)}</small></td>
+              <td>{formatDisplayDate(entry.waste_date)}</td>
+              <td className="primary-cell">{entry.product_name}</td>
               <td><span className="tag">{labelFor("wasteType", entry.waste_type)}</span></td>
-              <td>{Number(entry.quantity || 0).toLocaleString("en-IN")}</td>
+              <td>{formatQuantityWithUnit(entry.quantity, entry.unit)}</td>
               <td>{currency.format(Number(entry.cost_amount || 0))}</td>
               <td>{entry.remarks || MISSING_VALUE}</td>
             </tr>
           ))}
-          {entries.length === 0 && !loadFailed && <tr><td className="empty-cell" colSpan={6}>No waste entries yet.</td></tr>}
+          {entries.length === 0 && !loadFailed && <tr><td className="empty-cell" colSpan={6}>No waste entries yet. Record one above.</td></tr>}
         </DataTable>
       </ModuleCard>
     </section>
@@ -21466,7 +21814,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
  * same screen and want opposite halves of it, and "what is waiting for me" is the only question
  * that answers both.
  */
-function DistributionModule({ busy = false, destinations = [], inventory = [], onAction, onNothingToReceive, onReload, onRequest, onSend, products = [], scope, state }) {
+function DistributionModule({ busy = false, destinations = [], inventory = [], notice = null, onAction, onNothingToReceive, onReload, onRequest, onSend, products = [], scope, state }) {
   const [composing, setComposing] = useState(false);
   // "SEND" moves this counter's own stock out; "ASK" requests somebody else's. They are the same
   // form with the crate column removed, because a request cannot name crates it cannot see.
@@ -21548,7 +21896,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       const lot = sendableLots.find((row) => inventoryIdsEqual(row?.id, entry.source_lot_id)) || null;
       return {
         ...entry,
-        lot_label: lot ? `${productName(lot)} ${lot.lot_no || lot.id}` : "",
+        lot_label: lot ? `${productName(lot)} ${stockLotName(lot, formatDisplayDate)}` : "",
         available_quantity: lot ? lotAvailableQuantity(lot) : null,
       };
     });
@@ -21601,126 +21949,56 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
     setAllocations({});
   };
 
+  const lotOptionArgs = {
+    available: (lot) => lotAvailableQuantity(lot),
+    productName,
+    unitFor: (lot) => lot?.unit || products.find((product) => inventoryIdsEqual(product?.id, lot?.product_id))?.unit || "",
+    formatDate: formatDisplayDate,
+  };
+  // Lot name, date in and what is left with its unit, oldest first per product; never a raw id
+  // (local/stockScreens.js).
+  const sendLotOptions = distributionLotOptions(sendableLots, lotOptionArgs);
+  const boardReady = board.status === DISTRIBUTION_BOARD_STATUS.READY;
+  const closeCompose = () => {
+    setComposing(false);
+    setDraftLines([]);
+  };
+
   return (
-    <section className="content-card">
-      <div className="card-heading">
-        <div>
-          <h2>Consignments between shops</h2>
-          <p className="muted-note">
-            Fruit moving between the warehouse and the shops. Stock leaves the sender when it is
-            dispatched and joins the receiver when it is received.
-          </p>
-        </div>
-        <div className="button-row">
-          {/* The count is `countLabel`, never `transfers.length`: an unanswerable board must not
-              report a total of zero. */}
-          <span className="pill">{board.countLabel} total</span>
-          {board.counts.waitingOnYou > 0 && <span className="pill stock-low">{board.counts.waitingOnYou} need you</span>}
-          <button className="secondary-button" disabled={busy} onClick={onReload}>Refresh</button>
-          {board.status === DISTRIBUTION_BOARD_STATUS.READY && destinations.length > 0 && (
-            <button className="primary-button" disabled={busy} onClick={() => setComposing((open) => !open)}>
-              {composing ? "Close" : "Send stock"}
-            </button>
-          )}
-        </div>
-      </div>
+    <section className="settings-layout distribution-page">
+      <ModuleCard
+        actions={(
+          <>
+            {/* The count is `countLabel`, never `transfers.length`, and only when the board was read:
+                an unanswerable board must not report a total, not even "Unavailable total". */}
+            {boardReady && <span className="pill">{board.countLabel} in all</span>}
+            {boardReady && board.counts.waitingOnYou > 0 && <span className="pill origin-rate">{board.counts.waitingOnYou} need you</span>}
+            <button className="secondary-button" disabled={busy} onClick={onReload} type="button"><Icon name="refresh" size={15} />Refresh</button>
+            {boardReady && destinations.length > 0 && !composing && (
+              <button className="primary-button" disabled={busy} onClick={() => setComposing(true)} type="button"><Icon name="add" size={16} />Send or ask for stock</button>
+            )}
+          </>
+        )}
+        eyebrow="Stock distribution"
+        subtitle="Fruit moving between the warehouse and the shops. Stock leaves the sender when it is dispatched and joins the receiver when it is received."
+        title="Consignments between shops"
+      >
+        {boardReady && destinations.length === 0 && (
+          <p className="form-note">Sending stock needs a second shop or a warehouse to send it to. Add one in Branches &amp; Counters; if there is one already, press Refresh.</p>
+        )}
 
-      {board.status === DISTRIBUTION_BOARD_STATUS.READY && destinations.length === 0 && (
-        <p className="form-note">Sending stock needs a second shop or a warehouse to send it to. Add one in Branches &amp; Counters; if there is one already, press Refresh.</p>
-      )}
-
-      {board.message && (
-        <div className="startup-status-panel startup-status-error" role="alert">
-          <p><strong>{board.status === DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN ? "This counter has no shop set" : "Consignments unavailable"}</strong></p>
-          <p>{board.message}</p>
-        </div>
-      )}
-
-      {composing && (
-        <div className="content-card">
-          <h3>{asking ? "Ask another shop for stock" : "Send stock to another shop"}</h3>
-          <div className="button-row">
-            <button
-              className={asking ? "secondary-button" : "primary-button"}
-              onClick={() => { setDirection("SEND"); setDraftLines([]); }}
-            >
-              Send my stock
-            </button>
-            <button
-              className={asking ? "primary-button" : "secondary-button"}
-              onClick={() => { setDirection("ASK"); setDraftLines([]); }}
-            >
-              Ask for stock
-            </button>
+        {board.message && (
+          <div className="error-banner" role="alert">
+            <strong>{board.status === DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN ? "This counter has no shop set. " : "Consignments could not be loaded. "}</strong>
+            {board.message}{" "}
+            {board.status !== DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN && <button className="secondary-button compact-button" disabled={busy} onClick={onReload} type="button">Try again</button>}
           </div>
-          <p className="muted-note">
-            {asking
-              ? "Say what you need. The other shop chooses which lots to send, and can refuse."
-              : "You choose the lots. The receiving shop confirms what actually arrives."}
-          </p>
+        )}
 
-          <Field label={asking ? "Ask" : "Send to"}>
-            <select value={destinationId} onChange={(event) => setDestinationId(event.target.value)}>
-              <option value="">Choose a shop</option>
-              {destinations.map((row) => (
-                <option key={row.operational_location_id} value={row.operational_location_id}>
-                  {row.branch_name} — {row.location_name}
-                </option>
-              ))}
-            </select>
-          </Field>
+        <SaveNotice notice={notice} />
 
-          {(asking ? draftLines : resolvedLines).map((line) => (
-            <div className="button-row" key={line.key}>
-              {asking ? (
-                // A request names the product only. There is no lot column, because the crates
-                // belong to the other shop and this counter cannot see them -- offering an empty
-                // dropdown would look like a fault rather than a rule.
-                <select value={line.product_id || ""} onChange={(event) => updateLine(line.key, { product_id: event.target.value })}>
-                  <option value="">Choose a product</option>
-                  {products.filter((product) => product.active !== false).map((product) => (
-                    <option key={product.id} value={product.id}>{product.product_name}</option>
-                  ))}
-                </select>
-              ) : (
-                <select value={line.source_lot_id} onChange={(event) => updateLine(line.key, { source_lot_id: event.target.value })}>
-                  <option value="">Choose a lot</option>
-                  {sendableLots.map((lot) => (
-                    <option key={lot.id} value={lot.id}>
-                      {productName(lot)} — {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
-                    </option>
-                  ))}
-                </select>
-              )}
-              <input
-                inputMode="decimal"
-                placeholder="Quantity"
-                value={line.requested_quantity}
-                onChange={(event) => updateLine(line.key, { requested_quantity: event.target.value })}
-              />
-              <button className="remove-button" onClick={() => removeLine(line.key)}>Remove</button>
-            </div>
-          ))}
-
-          <div className="button-row">
-            <button className="secondary-button" onClick={addLine}>Add a product</button>
-            <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={submitDraft}>
-              {busy ? "Sending…" : (asking ? "Send request" : "Create consignment")}
-            </button>
-          </div>
-
-          {/* Every problem, named, while it can still be fixed. The server checks all of this again;
-              this exists so a person is not told "no" after a round trip with no reason. */}
-          {!checkedDraft.ok && draftLines.length > 0 && (
-            <ul className="form-note">
-              {checkedDraft.problems.map((problem) => <li key={problem}>{problem}</li>)}
-            </ul>
-          )}
-        </div>
-      )}
-
-      {board.status === DISTRIBUTION_BOARD_STATUS.READY && (
-        <DataTable headers={["Number", "From", "To", "Status", "What you can do"]}>
+        {boardReady && (
+          <DataTable className="distribution-board" headers={["Number", "From", "To", "Status", "What you can do"]}>
             {board.transfers.map((entry) => {
               // The board's entries are the *described* form; the crates need the raw lines. Looked
               // up by the same canonical id `describeTransfer` derived, never by `Number()`.
@@ -21732,15 +22010,19 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
               // "Receive part" and "Take back in" need a quantity per line that this screen has no
               // box for; drawn, they could only come back 422 (local/distributionWrites.js).
               const { drawn: drawnActions, heldBack } = drawableTransferActions(entry.actions);
+              const allocating = canApprove && toAllocate.length > 0;
               return (
-              <tr key={entry.id}>
-                <td className="primary-cell">
+              <React.Fragment key={entry.id}>
+              <tr>
+                <td className="primary-cell distribution-number">
                   {entry.number}
-                  {entry.waitingOnYou && <small className="cell-note stock-low">Waiting for you</small>}
+                  {entry.waitingOnYou && <small className="cell-note"><span className="origin-rate">Waiting for you</span></small>}
                 </td>
                 <td>{entry.from}</td>
                 <td>{entry.to}</td>
-                <td><span className={entry.tone === "done" ? "stock-ok" : "stock-low"}>{entry.label}</span></td>
+                {/* Waiting and on the way are warnings, done is success, cancelled is neutral and
+                    refused is danger (local/stockScreens.js). */}
+                <td><span className={distributionStatusClass(entry.status)}>{entry.label}</span></td>
                 <td>
                   <div className="table-actions">
                     {drawnActions.map((option) => (
@@ -21753,6 +22035,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                           disabled={busy}
                           key={option.action}
                           title={option.detail}
+                          type="button"
                           onClick={() => (option.action === "receive"
                             ? receiveInFull(entry, raw)
                             : onAction?.(transferActionId(entry), option.action))}
@@ -21764,43 +22047,52 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                     {/* Not blank. "Nothing for you to do here" and "this screen forgot to draw the
                         buttons" look identical when the cell is empty. */}
                     {entry.actions.length === 0 && <small className="cell-note">Nothing for you to do</small>}
+                    {allocating && <small className="cell-note">Choose what to send below.</small>}
                     {heldBack && <small className="cell-note">{UNDRAWN_TRANSFER_ACTION_NOTE}</small>}
                   </div>
-
-                  {canApprove && toAllocate.length > 0 && (
-                    <div className="content-card">
-                      <strong>Choose what to send</strong>
+                </td>
+              </tr>
+              {/* The crate choice gets its own full-width row under the consignment: inside the
+                  "What you can do" cell it pushed the whole board sideways at 1366. */}
+              {allocating && (
+                <tr className="distribution-allocation-row">
+                  <td colSpan={5}>
+                    <div className="distribution-allocation">
+                      <strong>{`Choose what to send for ${entry.number}`}</strong>
                       {toAllocate.map((line) => {
                         const { chosen, checked } = allocationFor(line);
+                        const lineLots = distributionLotOptions(
+                          sendableLots.filter((lot) => inventoryIdsEqual(lot?.product_id, line.productId)),
+                          lotOptionArgs,
+                        );
                         return (
-                          <div key={line.id}>
+                          <div className="distribution-allocation-line" key={line.id}>
                             <p className="muted-note">
-                              {line.productName}: {line.requested === null ? "quantity not recorded" : `${line.requested} ${line.unit || ""}`.trim()} asked for
+                              {`${line.productName}: ${line.requested === null ? "quantity not recorded" : formatQuantityWithUnit(line.requested, line.unit)} asked for`}
                             </p>
                             {chosen.map((choice, index) => (
-                              <div className="button-row" key={`${line.id}-${index}`}>
-                                <select
-                                  value={choice.source_lot_id}
-                                  onChange={(event) => setAllocation(line.id, index, { source_lot_id: event.target.value })}
-                                >
-                                  <option value="">Choose a lot</option>
-                                  {sendableLots
-                                    .filter((lot) => inventoryIdsEqual(lot?.product_id, line.productId))
-                                    .map((lot) => (
-                                      <option key={lot.id} value={lot.id}>
-                                        {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
-                                      </option>
-                                    ))}
-                                </select>
-                                <input
-                                  inputMode="decimal"
-                                  placeholder="Quantity"
-                                  value={choice.quantity}
-                                  onChange={(event) => setAllocation(line.id, index, { quantity: event.target.value })}
-                                />
+                              <div className="distribution-line" key={`${line.id}-${index}`}>
+                                <Field label="Lot">
+                                  <select
+                                    value={choice.source_lot_id}
+                                    onChange={(event) => setAllocation(line.id, index, { source_lot_id: event.target.value })}
+                                  >
+                                    <option value="">Choose a lot</option>
+                                    {lineLots.map((option) => <option key={option.id} value={option.id}>{option.shortLabel}</option>)}
+                                  </select>
+                                </Field>
+                                <Field label={line.unit ? `Quantity (${unitDisplayName(line.unit)})` : "Quantity"}>
+                                  <input
+                                    inputMode="decimal"
+                                    value={choice.quantity}
+                                    onChange={(event) => setAllocation(line.id, index, { quantity: event.target.value })}
+                                  />
+                                </Field>
                               </div>
                             ))}
-                            <button className="secondary-button" onClick={() => addAllocation(line.id)}>Add a lot</button>
+                            <div className="button-row">
+                              <button className="secondary-button compact-button" onClick={() => addAllocation(line.id)} type="button"><Icon name="add" size={15} />Add a lot</button>
+                            </div>
                             {!checked.ok && chosen.length > 0 && (
                               <ul className="form-note">
                                 {checked.problems.map((problem) => <li key={problem}>{problem}</li>)}
@@ -21809,23 +22101,112 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                           </div>
                         );
                       })}
-                      <button
-                        className="primary-button"
-                        disabled={busy || !toAllocate.every((line) => allocationFor(line).checked.ok)}
-                        onClick={() => approveWithCrates(entry, toAllocate)}
-                      >
-                        Approve and hold this stock
-                      </button>
+                      <div className="button-row">
+                        <button
+                          className="primary-button"
+                          disabled={busy || !toAllocate.every((line) => allocationFor(line).checked.ok)}
+                          onClick={() => approveWithCrates(entry, toAllocate)}
+                          type="button"
+                        >
+                          Approve and hold this stock
+                        </button>
+                      </div>
                     </div>
-                  )}
-                </td>
-              </tr>
+                  </td>
+                </tr>
+              )}
+              </React.Fragment>
               );
             })}
             {board.transfers.length === 0 && (
               <tr><td className="empty-cell" colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
             )}
-        </DataTable>
+          </DataTable>
+        )}
+      </ModuleCard>
+
+      {composing && (
+        <ModuleCard
+          actions={<button className="secondary-button" onClick={closeCompose} type="button">Close</button>}
+          eyebrow="New consignment"
+          subtitle={asking
+            ? "Say what you need. The other shop chooses which lots to send, and can refuse."
+            : "You choose the lots. The receiving shop confirms what actually arrives."}
+          title={asking ? "Ask another shop for stock" : "Send stock to another shop"}
+        >
+          <div aria-label="Send or ask" className="account-tabs" role="tablist">
+            <button aria-selected={!asking} className={asking ? "account-tab" : "account-tab account-tab-active"} onClick={() => { setDirection("SEND"); setDraftLines([]); }} role="tab" type="button">Send my stock</button>
+            <button aria-selected={asking} className={asking ? "account-tab account-tab-active" : "account-tab"} onClick={() => { setDirection("ASK"); setDraftLines([]); }} role="tab" type="button">Ask for stock</button>
+          </div>
+
+          <div className="form-grid supplier-form-grid">
+            <Field label={<RequiredLabel>{asking ? "Ask which shop" : "Send to"}</RequiredLabel>}>
+              <select value={destinationId} onChange={(event) => setDestinationId(event.target.value)}>
+                <option value="">Choose a shop</option>
+                {destinations.map((row) => (
+                  <option key={row.operational_location_id} value={row.operational_location_id}>
+                    {row.branch_name} — {row.location_name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </div>
+
+          {(asking ? draftLines : resolvedLines).map((line, index) => {
+            // A send line knows its product through the lot it names; a request names it directly.
+            const lineProduct = products.find((product) => inventoryIdsEqual(product?.id, line.product_id));
+            const lineUnit = lineProduct?.unit
+              || sendableLots.find((row) => inventoryIdsEqual(row?.id, line.source_lot_id))?.unit
+              || "";
+            return (
+            <div className="distribution-line" key={line.key}>
+              {asking ? (
+                // A request names the product only. There is no lot column, because the crates
+                // belong to the other shop and this counter cannot see them -- offering an empty
+                // dropdown would look like a fault rather than a rule.
+                <Field label={`Product ${index + 1}`}>
+                  <select value={line.product_id || ""} onChange={(event) => updateLine(line.key, { product_id: event.target.value })}>
+                    <option value="">Choose a product</option>
+                    {products.filter((product) => product.active !== false).map((product) => (
+                      <option key={product.id} value={product.id}>{product.product_name} ({unitDisplayName(product.unit)})</option>
+                    ))}
+                  </select>
+                </Field>
+              ) : (
+                <Field label={`Lot ${index + 1}`}>
+                  <select value={line.source_lot_id} onChange={(event) => updateLine(line.key, { source_lot_id: event.target.value })}>
+                    <option value="">Choose a lot</option>
+                    {sendLotOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+                  </select>
+                </Field>
+              )}
+              <Field label={lineUnit ? `Quantity (${unitDisplayName(lineUnit)})` : "Quantity"}>
+                <input
+                  inputMode="decimal"
+                  value={line.requested_quantity}
+                  onChange={(event) => updateLine(line.key, { requested_quantity: event.target.value })}
+                />
+              </Field>
+              <button className="danger-text-button" onClick={() => removeLine(line.key)} type="button">Remove</button>
+            </div>
+            );
+          })}
+
+          <div className="button-row">
+            <button className="secondary-button" onClick={addLine} type="button"><Icon name="add" size={15} />{asking ? "Add a product" : "Add a lot"}</button>
+            <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={submitDraft} type="button">
+              {busy ? "Sending…" : (asking ? "Send request" : "Create consignment")}
+            </button>
+          </div>
+
+          {/* Every problem, named, while it can still be fixed. The server checks all of this again;
+              this exists so a person is not told "no" after a round trip with no reason. */}
+          {!checkedDraft.ok && draftLines.length > 0 && (
+            <ul className="form-note">
+              {checkedDraft.problems.map((problem) => <li key={problem}>{problem}</li>)}
+            </ul>
+          )}
+        </ModuleCard>
       )}
     </section>
   );
@@ -22315,6 +22696,8 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
   );
 }
 
+const EXPENSE_PAYMENT_MODES = Object.freeze(["CASH", "UPI", "BANK_TRANSFER"]);
+
 function ExpensesModule({ canCancel = false, expenses, loadState = { status: "idle", message: "" }, onReload, user }) {
   const expenseCategories = ["Rent", "Staff Salary", "Electricity", "Transport", "Loading / Hamali", "Packing Material", "Repair & Maintenance", "Food / Tea / Misc", "Other"];
   const emptyExpense = {
@@ -22343,9 +22726,15 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
   });
   const totalActiveExpenses = expenseTotalExcludingCancelled(filteredExpenses);
 
+  const askReason = useAskReason();
+  const [expenseNotice, showExpenseNotice, clearExpenseNotice] = useSaveNotice();
+  const [registerNotice, showRegisterNotice, clearRegisterNotice] = useSaveNotice();
   // One save at a time: a double click used to record the same expense twice.
   const [expenseSaving, runExpenseSave] = useSaveInFlight();
   const saveExpense = () => runExpenseSave(async () => {
+    clearExpenseNotice();
+    const wasEditing = Boolean(editingId);
+    const savedWords = `${draft.category || "Expense"} of ${currency.format(Number(draft.amount || 0))}`;
     try {
       const payload = {
         ...draft,
@@ -22356,20 +22745,30 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
         edited_by: user.id,
       };
       if (editingId) {
-        const reason = window.prompt("Enter reason for editing this expense", "Expense updated");
+        // No ready-made reason: "Expense updated" said nothing a later reader could use.
+        const reason = await askReason({
+          title: "Why is this expense being changed?",
+          message: "The reason is kept with the expense.",
+          label: "Reason for the change",
+          placeholder: "Example: wrong amount typed",
+          confirmLabel: "Save change",
+        });
         if (!reason) return;
         await axios.put(`${API_URL}/expenses/${editingId}`, { ...payload, reason });
       }
       else await axios.post(`${API_URL}/expenses`, payload);
       setDraft(emptyExpense);
       setEditingId(null);
-      await onReload();
-      alert(editingId ? "Expense updated" : "Expense saved");
+      // Saved; a register that does not refresh afterwards is a warning, not a failed save.
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the register did not refresh"));
+      const saved = `${savedWords} ${wasEditing ? "updated" : "saved"}.`;
+      showExpenseNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Refresh on the register.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save expense"));
+      showExpenseNotice(errorNotice(getErrorMessage(error, "The expense could not be saved. Nothing was recorded; try again.")));
     }
   });
   const editExpense = (expense) => {
+    clearExpenseNotice();
     setEditingId(expense.id);
     setDraft({
       expense_date: toDateKey(expense.expense_date),
@@ -22380,61 +22779,73 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
       vendor_name: expense.vendor_name || expense.paid_to || "",
       remarks: expense.remarks || "",
     });
+    // The form is at the top of the screen and the register below it: take the person to the form,
+    // with the cursor in its first box.
+    window.requestAnimationFrame(() => {
+      document.getElementById("expense-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("expense-date")?.focus({ preventScroll: true });
+    });
   };
   const cancelExpense = async (expense) => {
-    const reason = window.prompt(`Enter cancellation reason for ${expense.category}`);
+    clearRegisterNotice();
+    const amountWords = currency.format(Number(expense.amount || 0));
+    const reason = await askReason({
+      title: `Cancel the ${expense.category} expense of ${amountWords}?`,
+      message: "It stays in the register, marked cancelled, and leaves the totals.",
+      label: "Reason for cancelling",
+      confirmLabel: "Cancel expense",
+      cancelLabel: "Keep it",
+      tone: "danger",
+    });
     if (!reason) return;
     try {
       await axios.post(`${API_URL}/expenses/${expense.id}/cancel`, { reason, cancelled_by: user.id });
-      await onReload();
-      alert("Expense cancelled");
+      await onReload().catch(() => null);
+      showRegisterNotice(successNotice(`${expense.category} expense of ${amountWords} cancelled.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to cancel expense"));
+      showRegisterNotice(errorNotice(getErrorMessage(error, "The expense could not be cancelled.")));
     }
   };
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow={editingId ? "Editing" : "New expense"} title={editingId ? "Edit expense" : "Record an expense"} subtitle="Rent, wages, transport and the other costs of running the shop.">
+      <ModuleCard eyebrow={editingId ? "Editing" : "New expense"} id="expense-form" onChange={clearExpenseNotice} title={editingId ? "Edit expense" : "Record an expense"} subtitle="Rent, wages, transport and the other costs of running the shop.">
         <div className="form-grid supplier-form-grid">
-          <Field label="Expense Date"><input type="date" value={draft.expense_date} onChange={(event) => setDraft({ ...draft, expense_date: event.target.value })} /></Field>
+          <Field label="Date"><input autoFocus id="expense-date" type="date" value={draft.expense_date} onChange={(event) => setDraft({ ...draft, expense_date: event.target.value })} /></Field>
           <Field label="Category">
             <select value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })}>
               {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
             </select>
           </Field>
-          <Field label="Amount"><input min="0" step="0.01" type="number" value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })} /></Field>
-          <Field label="Payment Mode">
+          <Field label={<RequiredLabel>Amount (₹)</RequiredLabel>}><input min="0" step="0.01" type="number" value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })} /></Field>
+          <Field label="Payment mode">
             <select value={draft.payment_mode} onChange={(event) => setDraft({ ...draft, payment_mode: event.target.value })}>
-              <option value="CASH">Cash</option>
-              <option value="UPI">UPI</option>
-              <option value="BANK_TRANSFER">Bank</option>
+              {EXPENSE_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{labelFor("paymentMode", mode)}</option>)}
             </select>
           </Field>
-          <Field label="Reference Number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
-          <Field label="Paid To / Vendor Name"><input value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
-          <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
+          <Field label="Reference number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
+          <Field label="Paid to"><input placeholder="Person or shop" value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
         </div>
+        <Field label="Notes"><textarea rows={2} value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         <div className="button-row">
-          <button className="primary-button" disabled={expenseSaving} onClick={saveExpense}>{expenseSaving ? "Saving…" : editingId ? "Update Expense" : "Save Expense"}</button>
-          {editingId && <button className="secondary-button" onClick={() => { setEditingId(null); setDraft(emptyExpense); }}>Cancel Edit</button>}
+          <button className="primary-button" disabled={expenseSaving} onClick={saveExpense}>{expenseSaving ? "Saving…" : editingId ? "Save changes" : "Save expense"}</button>
+          {editingId && <button className="secondary-button" onClick={() => { setEditingId(null); setDraft(emptyExpense); clearExpenseNotice(); }}>Cancel edit</button>}
         </div>
+        <SaveNotice notice={expenseNotice} />
       </ModuleCard>
-      <ModuleCard eyebrow="Expense Register" title="Recent Expenses" subtitle="Expense rows remain available for reporting and review.">
-        <div className="ledger-toolbar">
-          <Field label="Search"><input placeholder="Search category, paid to, reference" value={filters.search} onChange={(event) => setFilters({ ...filters, search: event.target.value })} /></Field>
+      <ModuleCard eyebrow="Register" title="Recent expenses" subtitle="Every expense stays here for the reports, cancelled ones included.">
+        <div className="ledger-toolbar expense-toolbar">
+          <Field label="Search"><input placeholder="Category, paid to or reference" value={filters.search} onChange={(event) => setFilters({ ...filters, search: event.target.value })} /></Field>
           <Field label="Category">
             <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
               <option value="">All categories</option>
               {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
             </select>
           </Field>
-          <Field label="Payment Mode">
+          <Field label="Payment mode">
             <select value={filters.payment_mode} onChange={(event) => setFilters({ ...filters, payment_mode: event.target.value })}>
               <option value="">All modes</option>
-              <option value="CASH">Cash</option>
-              <option value="UPI">UPI</option>
-              <option value="BANK_TRANSFER">Bank</option>
+              {EXPENSE_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{labelFor("paymentMode", mode)}</option>)}
             </select>
           </Field>
           <Field label="Status">
@@ -22454,25 +22865,30 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
             <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Try again</button>
           </div>
         )}
+        <SaveNotice notice={registerNotice} />
         {/* Both tiles count the rows the table below shows, so the summary and the list cannot
             disagree about which expenses are in view. */}
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Total (excluding cancelled)" value={loadFailed ? MISSING_VALUE : currency.format(totalActiveExpenses)} featured />
           <SummaryMetric label="Entries shown" value={loadFailed ? MISSING_VALUE : filteredExpenses.length} />
         </div>
-        <DataTable headers={markNumericColumns(["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""])}>
+        <DataTable className="expense-register" headers={markNumericColumns(["Date", "Category", "Paid to", "Mode", "Amount", "Status", "Notes", "Actions"])}>
           {filteredExpenses.map((expense) => {
             const status = expenseRecordStatus(expense);
+            const notes = expense.remarks || expense.cancellation_reason || "";
             return (
             <tr className={status === "CANCELLED" ? "muted-row" : ""} key={expense.id}>
-              <td>{expense.expense_date}</td>
+              <td>{formatDisplayDate(expense.expense_date)}</td>
               <td className="primary-cell">{expense.category}</td>
               <td>{expense.paid_to || expense.vendor_name || MISSING_VALUE}</td>
               <td><span className="tag">{labelFor("paymentMode", expense.payment_mode)}</span></td>
               <td>{currency.format(Number(expense.amount || 0))}</td>
               <td><span className={statusClass("recordStatus", status)}>{labelFor("recordStatus", status)}</span></td>
-              <td>{expense.reference_number || MISSING_VALUE}</td>
-              <td>{expense.remarks || expense.cancellation_reason || MISSING_VALUE}</td>
+              {/* The reference rides with the notes, so the register fits a 1366 screen. */}
+              <td className="expense-notes-cell" title={[notes, expense.reference_number ? `Ref. ${expense.reference_number}` : ""].filter(Boolean).join(" · ") || undefined}>
+                {notes || (expense.reference_number ? "" : MISSING_VALUE)}
+                {expense.reference_number && <small className="cell-note">{`Ref. ${expense.reference_number}`}</small>}
+              </td>
               <td>
                 <div className="button-row table-actions-row">
                   {expense.packing_purchase === true ? (
@@ -22488,7 +22904,7 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
             </tr>
           );})}
         </DataTable>
-        {filteredExpenses.length === 0 && !loadFailed && <div className="cart-empty">No records found for selected filters.</div>}
+        {filteredExpenses.length === 0 && !loadFailed && <div className="cart-empty">{expenses.length ? "No expenses match these filters." : "No expenses yet. Record one above."}</div>}
       </ModuleCard>
     </section>
   );
@@ -31114,27 +31530,32 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
 }
 
 function PurchaseSummary({ summary }) {
+  // A bill whose items come from different origins is taxed per item ("Mixed"), not at one rate.
+  const mixedTax = summary.mandiTaxPercent === "Mixed";
+  const taxWords = mixedTax ? "by origin" : `${summary.mandiTaxPercent}%`;
+  const costPerUnit = summary.costPerUnit || { known: false, label: "Cost per unit" };
   return (
     <section className="purchase-summary">
       <div className="purchase-summary-heading">
         <div>
-          <span className="eyebrow">Landed Cost Preview</span>
-          <h3>Purchase Calculation</h3>
+          <span className="eyebrow">Landed cost preview</span>
+          <h3>Purchase calculation</h3>
         </div>
-        <span className="origin-rate">Mandi Tax {summary.mandiTaxPercent}%</span>
+        <span className="origin-rate">{mixedTax ? "Mandi tax by origin" : `Mandi tax ${summary.mandiTaxPercent}%`}</span>
       </div>
       <div className="purchase-summary-grid">
-        <SummaryMetric label="Basic Amount" value={currency.format(summary.basicAmount)} />
-        <SummaryMetric label={`Mandi Tax (${summary.mandiTaxPercent}%)`} value={currency.format(summary.mandiTaxAmount)} />
-        <SummaryMetric label="Freight Charges" value={currency.format(summary.freightCharges)} />
-        <SummaryMetric label="Labour Charges" value={currency.format(summary.labourCharges)} />
-        <SummaryMetric label="Other Charges" value={currency.format(summary.otherCharges)} />
-        <SummaryMetric label="Gross Amount" value={currency.format(summary.grossAmount)} />
-        <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={Number(summary.rebateAmount) > 0 ? `-${currency.format(summary.rebateAmount)}` : currency.format(0)} positive />
-        <SummaryMetric label="Net Payable" value={currency.format(summary.netPayable)} featured />
-        <SummaryMetric label="Pending Balance" value={currency.format(summary.balanceAmount)} />
-        <SummaryMetric label="Payment Status" value={summary.paymentStatus} />
-        <SummaryMetric label="Effective Cost / Unit" value={currency.format(summary.effectiveCostPerUnit)} featured />
+        <SummaryMetric label="Basic amount" value={currency.format(summary.basicAmount)} />
+        <SummaryMetric label={`Mandi tax (${taxWords})`} value={currency.format(summary.mandiTaxAmount)} />
+        <SummaryMetric label="Freight charges" value={currency.format(summary.freightCharges)} />
+        <SummaryMetric label="Labour charges" value={currency.format(summary.labourCharges)} />
+        <SummaryMetric label="Other charges" value={currency.format(summary.otherCharges)} />
+        <SummaryMetric label="Gross amount" value={currency.format(summary.grossAmount)} />
+        <SummaryMetric label={`Supplier rebate (${summary.rebatePercent}%)`} value={Number(summary.rebateAmount) > 0 ? `-${currency.format(summary.rebateAmount)}` : currency.format(0)} />
+        <SummaryMetric label="Net payable" value={currency.format(summary.netPayable)} featured />
+        <SummaryMetric label="Pending balance" value={currency.format(summary.balanceAmount)} />
+        <SummaryMetric label="Payment status" value={summary.paymentStatus} />
+        {/* Only for items in one unit: 10 kg and 4 boxes are not "14 units" (local/stockScreens.js). */}
+        <SummaryMetric label={costPerUnit.label} value={costPerUnit.known ? currency.format(costPerUnit.value) : MISSING_VALUE} featured />
       </div>
     </section>
   );
@@ -31892,14 +32313,16 @@ function RequiredLabel({ children }) {
   return <>{children}<span aria-hidden="true" className="pm-required"> *</span><span className="pm-sr-only"> (required)</span></>;
 }
 
-function ModuleCard({ actions = null, children, eyebrow, id, subtitle, title }) {
+// `onChange` hears every edit inside the card (React's change events bubble), so a card clears its
+// save notice on the next edit without each input having to.
+function ModuleCard({ actions = null, children, eyebrow, id, onChange, subtitle, title }) {
   return (
-    <section className="content-card" id={id}>
+    <section className="content-card" id={id} onChange={onChange}>
       <div className="card-heading">
         <div>
-          <span className="eyebrow">{eyebrow}</span>
+          {eyebrow && <span className="eyebrow">{eyebrow}</span>}
           <h2>{title}</h2>
-          <p>{subtitle}</p>
+          {subtitle && <p>{subtitle}</p>}
         </div>
         {actions && <div className="card-heading-actions">{actions}</div>}
       </div>

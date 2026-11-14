@@ -180,6 +180,7 @@ test("units read Kg, Box, Piece, Dozen", () => {
     ["Kg", "Box", "Piece", "Dozen"],
   );
   assert.equal(labelFor("unit", "kg"), "Kg");
+  assert.equal(labelFor("unit", "PCS"), "Piece", "another spelling of the same unit");
 });
 
 test("each family turns its codes into plain words", () => {

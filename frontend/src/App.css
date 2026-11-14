@@ -11528,3 +11528,220 @@ button.shortcut-sheet-row:focus-visible {
   z-index: 3;
   background: linear-gradient(180deg, var(--card-veil-solid), var(--veil-solid));
 }
+
+/* --- Stock screens (whole-app polish, phase 2) -------------------------------------------------
+   Purchase Entry, Pending Bills, Waste, Expenses, Stock Distribution and Sale Rate Update at
+   1366 x 768: tables that fit without scrolling sideways, figures on one line, and the boxes a
+   screen stacks spaced by the shared --module-gap. */
+
+/* Quantities and money never break across lines ("71.500 Kg", "₹273.73"). */
+.purchase-cart-table td,
+.purchase-amendment-table td,
+.pending-bills-table td {
+  vertical-align: top;
+}
+
+.purchase-amendment-table td.primary-cell,
+.pending-bills-table td.primary-cell {
+  white-space: normal;
+}
+
+/* A bill's items wrap inside the cell instead of widening the table. */
+.pending-bills-table td.purchase-items-cell {
+  max-width: 420px;
+  min-width: 220px;
+}
+
+.pending-bills-table td.purchase-items-cell span {
+  max-width: none;
+}
+
+/* The receipt form opens under the list; land its top below the sticky bar. */
+#customer-payment-amount,
+#expense-form,
+#product-name-input {
+  scroll-margin-top: 96px;
+}
+
+/* Expenses: seven filters on one tidy grid that wraps, Search a little wider, Refresh as wide as
+   its label. The shared toolbar is a three-track grid built for three controls. */
+.ledger-toolbar.expense-toolbar {
+  grid-template-columns: minmax(200px, 1.6fr) repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.expense-register td.expense-notes-cell {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.expense-register td:nth-child(3) {
+  max-width: 150px;
+  white-space: normal;
+}
+
+/* Two or three small buttons in a row need their own width, not the shared 250px floor. */
+:is(.expense-register, .pending-bills-table, .purchase-cart-table, .purchase-amendment-table) .table-actions-row {
+  min-width: 0;
+}
+
+/* A notes box straight under a form grid, then the buttons: the same gap as between fields. */
+.content-card > label + .button-row {
+  margin-top: var(--space-4);
+}
+
+/* Stock Distribution. */
+.distribution-board td.distribution-number {
+  white-space: nowrap;
+}
+
+.distribution-board td:nth-child(2),
+.distribution-board td:nth-child(3) {
+  white-space: normal;
+}
+
+.distribution-board td:nth-child(2),
+.distribution-board td:nth-child(3) {
+  min-width: 160px;
+}
+
+.distribution-board .table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* A long note under the buttons wraps inside the cell instead of pushing the board sideways. */
+.distribution-board td:last-child,
+.distribution-board .table-actions .cell-note {
+  white-space: normal;
+}
+
+.distribution-board .table-actions .cell-note {
+  flex-basis: 100%;
+  max-width: 420px;
+}
+
+.distribution-allocation-row > td {
+  white-space: normal;
+  background: var(--fill);
+}
+
+.distribution-allocation {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 760px;
+}
+
+.distribution-allocation-line {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.distribution-allocation-line .muted-note {
+  margin: 0;
+}
+
+/* One line of a consignment: the lot (or product) picker, its quantity and Remove, labelled and
+   sized to what they hold rather than stretched across the card. */
+.distribution-line {
+  display: grid;
+  grid-template-columns: minmax(240px, 520px) minmax(110px, 160px) auto;
+  gap: var(--space-3);
+  align-items: end;
+  margin-bottom: var(--space-3);
+}
+
+.distribution-allocation .distribution-line {
+  grid-template-columns: minmax(220px, 440px) minmax(110px, 160px);
+  margin-bottom: 0;
+}
+
+.distribution-line > .danger-text-button {
+  justify-self: start;
+  min-height: var(--control-height);
+}
+
+/* Send / Ask tabs sit above the form with the usual gap, and "Send to" is as wide as a shop's
+   name, matching the lot picker under it. */
+.distribution-page .account-tabs {
+  margin-bottom: var(--space-4);
+}
+
+.distribution-page .supplier-form-grid {
+  grid-template-columns: minmax(240px, 520px);
+}
+
+@media (max-width: 760px) {
+  .distribution-line,
+  .distribution-allocation .distribution-line,
+  .distribution-page .supplier-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Sale Rate Update's combo prices: its own six columns (it borrowed PEP Menu's five-column
+   widths, which clipped "Cost today" and "New price" and wrapped "₹273.73"). */
+.sale-rate-combo-table table {
+  table-layout: auto;
+}
+
+.sale-rate-combo-table td {
+  white-space: nowrap;
+}
+
+.sale-rate-combo-table td.primary-cell {
+  min-width: 180px;
+  white-space: normal;
+}
+
+.sale-rate-combo-table td input {
+  width: calc(110px * var(--font-scale, 1));
+  min-width: 0;
+}
+
+/* Products: the extra columns and a product's stock lots fit the card at 1366. Headings may wrap
+   onto two lines, and a row's buttons wrap instead of setting the column's width. */
+:is(.product-entry-item-table, .pm-lot-table) th,
+:is(.product-entry-item-table, .pm-lot-table) th .pm-num-head {
+  white-space: normal;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+:is(.product-entry-item-table, .pm-lot-table) .pm-row-actions {
+  flex-wrap: wrap;
+}
+
+.product-entry-item-table .pm-row-actions {
+  max-width: 190px;
+}
+
+.pm-lot-table .pm-row-actions {
+  max-width: 216px;
+}
+
+.pm-lot-table table {
+  min-width: 0;
+}
+
+.pm-lot-table td:nth-child(2) {
+  max-width: 160px;
+  white-space: normal;
+}
+
+/* With the four extra columns on, the cells sit a little closer so the ten still fit. */
+.product-entry-item-table:has(th:nth-child(10)) :is(th, td) {
+  padding-inline: 10px;
+}
+
+/* Stock Inventory's product table: its nine headings may take two lines, so Status is not pushed
+   off the card's right edge at 1366. */
+/* Specific enough to win over the num-col-N rule that keeps figure cells on one line. */
+.stock-inventory-products table thead tr th:nth-child(n):not(.empty-cell):not([colspan]),
+.stock-inventory-products th * {
+  white-space: normal;
+  overflow-wrap: normal;
+  word-break: normal;
+}
