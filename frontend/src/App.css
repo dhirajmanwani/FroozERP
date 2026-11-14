@@ -257,7 +257,7 @@ input[type="number"] {
 
 .brand-copy strong {
   color: var(--ink);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   font-weight: 850;
   letter-spacing: 0.8px;
   line-height: 1.18;
@@ -393,7 +393,7 @@ input[type="number"] {
 
 .sidebar-profile strong {
   color: var(--ink-strong);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
 }
 
 .sidebar-profile small {
@@ -473,6 +473,7 @@ input[type="number"] {
 .branch-pill {
   gap: 7px;
   padding: 7px 11px;
+  font-size: var(--font-size-sm);
   color: var(--ink-body);
   background: var(--card);
 }
@@ -486,7 +487,7 @@ input[type="number"] {
   border-radius: var(--radius-pill);
   background: var(--attention-soft);
   color: var(--attention-ink);
-  font-size: 11px;
+  font-size: var(--font-size-sm);
   font-weight: 700;
 }
 
@@ -530,7 +531,7 @@ input[type="number"] {
 
 .global-clock {
   color: var(--ink-strong);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   font-variant-numeric: tabular-nums;
   font-weight: 750;
   line-height: 1.2;
@@ -563,6 +564,19 @@ input[type="number"] {
 
 .local-only-banner strong {
   color: var(--ink-strong-warm);
+}
+
+/* One line: headline and sentence side by side, wrapping only when the window is too narrow. */
+.local-only-banner-compact {
+  padding: 6px 14px;
+}
+
+.local-only-banner-compact div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: var(--space-2);
+  row-gap: 2px;
 }
 
 /* `--ink-muted-warm`, not `--ink-muted`: on the gold fill the plainer muted ink measured 4.44:1 in
@@ -612,9 +626,26 @@ input[type="number"] {
   color: var(--ink-muted);
 }
 
-.login-close-exit-button {
+/* Retry Online, Continue Offline and Close & Exit: one row, equal widths. */
+.login-secondary-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
   width: 100%;
   margin-top: 2px;
+}
+
+.login-secondary-actions > button {
+  width: 100%;
+  min-height: var(--control-height);
+}
+
+.login-form {
+  display: grid;
+}
+
+.login-close-exit-button {
+  width: 100%;
   border-color: var(--line-strong);
   color: var(--ink-body);
   background: var(--veil-strong);
@@ -679,6 +710,17 @@ input[type="number"] {
   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.12);
 }
 
+/* Offline or waiting is the notice amber; a fault is the danger red. Never green while offline. */
+.status-dot[data-tone="notice"] {
+  background: var(--attention-strong);
+  box-shadow: 0 0 0 3px var(--attention-soft);
+}
+
+.status-dot[data-tone="problem"] {
+  background: var(--danger-strong);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
 .content-area {
   padding: 28px 32px;
 }
@@ -740,6 +782,61 @@ input[type="number"] {
   border-color: transparent;
   border-left-color: var(--danger);
   background: var(--danger-soft);
+}
+
+/* Fatal start-up screen: the brand ground with a danger edge, not a hard-coded red page. */
+.fatal-startup-page {
+  background: radial-gradient(circle at top left, var(--danger-soft), transparent 40%), var(--ground);
+}
+
+.login-panel.fatal-startup-panel {
+  display: grid;
+  gap: 10px;
+  border-left: 4px solid var(--danger);
+  max-width: min(640px, 100%);
+}
+
+.fatal-startup-panel h1,
+.fatal-startup-panel p {
+  margin: 0;
+}
+
+.fatal-startup-panel h1 {
+  color: var(--danger-ink);
+}
+
+.fatal-startup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.fatal-startup-actions > button {
+  width: auto;
+  min-width: 150px;
+  min-height: var(--control-height);
+}
+
+.fatal-startup-details summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+}
+
+.fatal-startup-message {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--shadow-faint);
+  color: var(--ink-body);
+  font-size: var(--font-size-sm);
 }
 
 .startup-api-panel {
@@ -813,7 +910,7 @@ input[type="number"] {
 }
 
 .startup-details-toggle:hover {
-  color: #fbdda4;
+  color: var(--accent);
   transform: none;
   box-shadow: none;
 }
@@ -885,7 +982,7 @@ input[type="number"] {
 }
 
 .welcome-banner .brand-copy strong {
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   letter-spacing: 1.05px;
 }
 
@@ -1060,7 +1157,7 @@ input[type="number"] {
   border-radius: 999px;
   color: var(--accent-bright);
   background: var(--accent-soft);
-  font-size: 11px;
+  font-size: var(--font-size-sm);
   font-style: normal;
   font-weight: 800;
 }
@@ -1447,7 +1544,7 @@ input[type="number"] {
 .top-product-row strong,
 .low-stock-row strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .top-product-row span,
@@ -1578,9 +1675,23 @@ button:disabled {
 
 /* One focus ring for every button, drawn outside the edge so it never changes the size. */
 :is(.primary-button, .secondary-button, .table-action, .remove-button, .danger-text-button,
-  .whatsapp-button, .compact-button, .quick-action, .range-button, .account-tab, .settings-tabs > button):focus-visible {
+  .whatsapp-button, .compact-button, .quick-action, .range-button, .account-tab, .settings-tabs > button,
+  .nav-item, .report-category-card, .report-menu-card, .startup-details-toggle, .recovery-link-button,
+  .sidebar-profile, input[type="checkbox"], input[type="radio"]):focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* A clickable report row is reached with Tab and opened with Enter; the ring sits inside the row. */
+tr.report-row-clickable:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* Every checkbox and radio in the brand accent, not the browser's blue. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
 }
 
 textarea {
@@ -1736,6 +1847,29 @@ tbody tr:last-child td {
 .profit-cell {
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* A DataTable column declared `{ label, numeric: true }`: money and quantities right-aligned,
+   heading included, so a column of figures lines up on its last digit. */
+table.num-col-1 :is(th, td):nth-child(1):not(.empty-cell):not([colspan]),
+table.num-col-2 :is(th, td):nth-child(2):not(.empty-cell):not([colspan]),
+table.num-col-3 :is(th, td):nth-child(3):not(.empty-cell):not([colspan]),
+table.num-col-4 :is(th, td):nth-child(4):not(.empty-cell):not([colspan]),
+table.num-col-5 :is(th, td):nth-child(5):not(.empty-cell):not([colspan]),
+table.num-col-6 :is(th, td):nth-child(6):not(.empty-cell):not([colspan]),
+table.num-col-7 :is(th, td):nth-child(7):not(.empty-cell):not([colspan]),
+table.num-col-8 :is(th, td):nth-child(8):not(.empty-cell):not([colspan]),
+table.num-col-9 :is(th, td):nth-child(9):not(.empty-cell):not([colspan]),
+table.num-col-10 :is(th, td):nth-child(10):not(.empty-cell):not([colspan]),
+table.num-col-11 :is(th, td):nth-child(11):not(.empty-cell):not([colspan]),
+table.num-col-12 :is(th, td):nth-child(12):not(.empty-cell):not([colspan]),
+table.num-col-13 :is(th, td):nth-child(13):not(.empty-cell):not([colspan]),
+table.num-col-14 :is(th, td):nth-child(14):not(.empty-cell):not([colspan]),
+table.num-col-15 :is(th, td):nth-child(15):not(.empty-cell):not([colspan]),
+table.num-col-16 :is(th, td):nth-child(16):not(.empty-cell):not([colspan]) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .date-cell,
@@ -2164,6 +2298,11 @@ td.origin-rate {
   font-weight: 800;
 }
 
+/* A loss in a profit column: the loss colour, never the profit green. */
+.profit-cell.loss-cell {
+  color: var(--danger-ink);
+}
+
 .purchase-summary {
   margin: 4px 0 18px;
   padding: 16px;
@@ -2213,7 +2352,7 @@ td.origin-rate {
 .summary-metric strong {
   margin-top: 4px;
   color: var(--ink-strong);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 .summary-metric-featured {
@@ -2265,7 +2404,7 @@ td.origin-rate {
 
 .sync-owner-row strong {
   color: var(--ink-strong);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-weight: 800;
   overflow-wrap: anywhere;
 }
@@ -2462,6 +2601,21 @@ td.origin-rate {
   margin-bottom: 16px;
 }
 
+/* A button in a toolbar or a button row is as wide as its label, at the inputs' height, at the
+   start of its cell. In the toolbar's grid it used to fill a whole track: "Refresh Payment History"
+   and "PDF Export" became 500px slabs that read as fields. */
+.ledger-toolbar > :is(button, .primary-button, .secondary-button, .whatsapp-button),
+.button-row > :is(.primary-button, .secondary-button, .whatsapp-button) {
+  justify-self: start;
+  width: auto;
+  max-width: 100%;
+  min-height: var(--control-height);
+}
+
+.ledger-toolbar > :is(button, .primary-button, .secondary-button, .whatsapp-button) {
+  align-self: end;
+}
+
 .supplier-detail {
   display: grid;
   gap: 18px;
@@ -2496,7 +2650,7 @@ td.origin-rate {
 .detail-item strong {
   margin-top: 5px;
   color: var(--ink-strong);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .supplier-payment-preview {
@@ -2579,7 +2733,7 @@ td.origin-rate {
 
 .permission-card strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .permission-card span {
@@ -2746,7 +2900,7 @@ td.origin-rate {
 .product-result strong {
   min-width: 0;
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   line-height: 1.25;
   overflow: hidden;
   display: -webkit-box;
@@ -3256,7 +3410,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .discount-preview strong {
   color: var(--accent);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   white-space: nowrap;
 }
 
@@ -3465,7 +3619,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .total-line-main strong {
   color: var(--accent);
-  font-size: 18px;
+  font-size: calc(18px * var(--font-scale));
 }
 
 .checkout-button {
@@ -3607,7 +3761,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .customer-sales-group-summary strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 .customer-sales-group-summary span {
@@ -3791,7 +3945,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .sale-change-approval > strong {
   color: var(--ink-strong);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .sale-change-approval .form-grid,
@@ -3888,7 +4042,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .report-toolbar strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 /* minmax(0, 1fr): a grid item's own minimum is its content's, so a wide tile row or table pushed
@@ -4000,7 +4154,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .pl-line strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-weight: 850;
   white-space: nowrap;
 }
@@ -4198,7 +4352,7 @@ tbody tr:has(> .empty-cell):hover {
   display: block;
   margin-top: 5px;
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-weight: 900;
 }
 
@@ -4571,7 +4725,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .pos-paid-qr strong {
   color: var(--ink-strong);
-  font-size: 24px;
+  font-size: calc(24px * var(--font-scale));
   font-variant-numeric: tabular-nums;
 }
 
@@ -5247,7 +5401,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .login-brand .brand-copy strong {
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
   letter-spacing: 1.2px;
 }
 
@@ -5315,7 +5469,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .recovery-link-button:hover {
-  color: #fbdda4;
+  color: var(--accent);
   transform: none;
   box-shadow: none;
 }
@@ -5410,7 +5564,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .device-activation-panel strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 .device-activation-panel small,
@@ -7575,6 +7729,19 @@ tbody tr:has(> .empty-cell):hover {
   scrollbar-color: var(--accent-line-strong) var(--veil-subtle);
 }
 
+/* More modules below the fold: the last row fades out and the scrollbar shows, so the list is
+   plainly a list that scrolls (App sets data-more-below as it scrolls). */
+.sidebar-nav[data-more-below="true"] {
+  -webkit-mask-image: linear-gradient(to bottom, #000000 calc(100% - 36px), transparent);
+  mask-image: linear-gradient(to bottom, #000000 calc(100% - 36px), transparent);
+  scrollbar-color: var(--accent-line-strong) var(--veil-subtle);
+}
+
+/* The active module is scrolled into view clear of that fade, not left half-hidden under it. */
+.sidebar-nav .nav-item {
+  scroll-margin-block: 40px;
+}
+
 .sidebar-nav::-webkit-scrollbar,
 .frost-drawer-body::-webkit-scrollbar,
 .command-list::-webkit-scrollbar {
@@ -7586,6 +7753,23 @@ tbody tr:has(> .empty-cell):hover {
 .command-list::-webkit-scrollbar-thumb {
   border-radius: 999px;
   background: var(--accent-line);
+}
+
+.sidebar-nav::-webkit-scrollbar-thumb {
+  background: var(--accent-line-strong);
+}
+
+/* Read on the sidebar panel: the faint ink measured 3.3:1 there, under the 4.5:1 small text needs. */
+.sidebar-shop-picker .sidebar-section,
+.sidebar-profile small {
+  color: var(--ink-muted);
+}
+
+/* The content area leaves room at its foot for the FROST launcher fixed in the bottom-right
+   corner, so the last row of a table, a Save button or a total is never left under it. Two classes
+   so the narrow-window rules, which reset `padding`, keep this. */
+.erp-shell .content-area {
+  padding-bottom: calc(62px + 2 * 22px);
 }
 
 .nav-item {
@@ -7950,9 +8134,10 @@ tbody tr:has(> .empty-cell):hover {
   height: 18px;
   padding: 0 5px;
   border-radius: 999px;
-  background: #ef4444;
+  /* White on the bright error red measured 3.76:1; the deep error red keeps the alarm and reads. */
+  background: #7f1d1d;
   color: #fff;
-  font-size: 10px;
+  font-size: calc(10px * var(--font-scale, 1));
   font-weight: 800;
   line-height: 18px;
   text-align: center;
@@ -8268,7 +8453,7 @@ tbody tr:has(> .empty-cell):hover {
   border-radius: 5px;
   border: 1px solid var(--line-strong);
   font-family: inherit;
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.04em;
@@ -9722,7 +9907,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .discount-confirm strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   white-space: normal;
 }
 
@@ -9799,7 +9984,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .discount-lot strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .discount-lot small {
@@ -10015,7 +10200,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .slab-text strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-variant-numeric: tabular-nums;
 }
 
@@ -10649,6 +10834,76 @@ button.shortcut-sheet-row:focus-visible {
   width: min(420px, calc(100vw - 32px));
 }
 
+/* The in-app confirm and reason boxes (feedbackDialogs.jsx), in place of the browser's own popups.
+   Above every other modal: one of them may be asked for from inside another. */
+.feedback-dialog-backdrop {
+  z-index: 140;
+}
+
+.feedback-dialog {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.feedback-dialog-body {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-5);
+}
+
+.feedback-dialog-title {
+  color: var(--ink-strong);
+  font-size: var(--font-size-lg);
+  font-weight: 750;
+  line-height: 1.3;
+}
+
+.feedback-dialog-body p {
+  margin: 0;
+  color: var(--ink-body);
+  line-height: 1.5;
+}
+
+.feedback-dialog-field {
+  display: grid;
+  gap: var(--space-2);
+  color: var(--ink-muted);
+  font-weight: 700;
+}
+
+.feedback-dialog-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.feedback-dialog-actions {
+  justify-content: flex-end;
+  margin-top: var(--space-2);
+}
+
+.feedback-dialog-actions > button {
+  min-height: var(--control-height);
+}
+
+.feedback-dialog-danger {
+  border-top: 3px solid var(--danger);
+}
+
+.primary-button.primary-button-danger {
+  border: 1px solid var(--danger);
+  color: var(--card);
+  background: var(--danger);
+}
+
+.primary-button.primary-button-danger:hover {
+  color: var(--card);
+  background: var(--danger-ink);
+}
+
+/* The line under a Save button. Spaced from the button it reports on, never jammed against it. */
+.save-notice {
+  margin: var(--space-3) 0 0;
+}
+
 .pos-combo-ask-body {
   display: grid;
   gap: 12px;
@@ -11078,7 +11333,7 @@ button.shortcut-sheet-row:focus-visible {
 .packing-purchase-total strong {
   margin-left: auto;
   color: var(--ink);
-  font-size: 16px;
+  font-size: calc(16px * var(--font-scale));
   font-variant-numeric: tabular-nums;
 }
 
@@ -11104,7 +11359,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .packing-count-after strong {
   color: var(--ink);
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
 }
 
 /* A size's count stays near its name on a wide screen, and Edit / Correct count sit in the same
@@ -11194,7 +11449,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .combo-example strong {
   color: var(--ink);
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
 }
 
 #combo-form,

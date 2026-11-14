@@ -174,3 +174,16 @@ export const lotLeftAfterCart = ({ available, inOtherLines = 0, quantity = 0 } =
   const left = balance - Number(inOtherLines || 0) - (Number(quantity) || 0);
   return Math.max(Math.round(left * 1000) / 1000, 0);
 };
+
+/**
+ * How much one tap on a fruit adds from a lot: one unit, or what is left of the lot when that is
+ * less than one. A lot holding 0.75 kg could not be sold at all, because the tap asked for a whole
+ * kilo and was refused ("Only 0.75 more units are available") before any line existed to type 0.75
+ * into. When nothing is left (or the lot's balance is unknown) it still asks for one unit, so the
+ * stock check that follows refuses with its usual message rather than adding an empty line.
+ */
+export const lotTapQuantity = ({ available, inCart = 0 } = {}) => {
+  const left = lotLeftAfterCart({ available, inOtherLines: inCart });
+  if (left === null || left <= 0) return 1;
+  return Math.min(1, left);
+};

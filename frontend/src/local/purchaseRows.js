@@ -182,3 +182,18 @@ export const purchaseHistoryAmounts = (row, itemCount) => {
     balance: amount(row?.balance_amount) * share,
   };
 };
+
+/**
+ * What Purchase Entry does with its form after a save went through.
+ *
+ * - `RESET_FORM`: the whole form goes back to a new, empty bill. Always after an edit or a pending
+ *   bill's completion: the purchase being edited is finished with. Keeping its id made the next
+ *   "Save" quietly send a PUT to the same old purchase instead of creating a new one.
+ * - `CLEAR_ITEMS`: a forgotten item was added in amendment mode (a new bill for the chosen date and
+ *   supplier); the date and supplier stay picked so another forgotten item can follow.
+ */
+export const PURCHASE_FORM_AFTER_SAVE = Object.freeze({ RESET_FORM: "RESET_FORM", CLEAR_ITEMS: "CLEAR_ITEMS" });
+
+export const purchaseFormAfterSave = ({ wasEditing = false, amendmentMode = false } = {}) => (
+  amendmentMode && !wasEditing ? PURCHASE_FORM_AFTER_SAVE.CLEAR_ITEMS : PURCHASE_FORM_AFTER_SAVE.RESET_FORM
+);

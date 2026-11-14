@@ -13,7 +13,7 @@ process.env.TZ = "Asia/Kolkata";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./reportRefresh.js";
+import { buildReportRefreshParams, describeReportRefreshFailures, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./reportRefresh.js";
 
 test("custom report dates remain canonical and reject reversed ranges", () => {
   assert.deepEqual(resolveReportDateRange({ range: "custom", date_from: "2026-07-01", date_to: "2026-07-21" }), { range: "custom", date_from: "2026-07-01", date_to: "2026-07-21" });
@@ -58,4 +58,17 @@ test("App remembers the chosen range and rebuilds POS after a sync", () => {
   assert.match(app, /currentReportParams = \(\) => range === "custom" \? \{ range: "custom", \.\.\.customRange \}/);
   const refresh = app.slice(app.indexOf("const refreshBusinessDataAfterSync = async"), app.indexOf("const applyCanonicalIdentityFromSync"));
   assert.match(refresh, /activeViewRef\.current === "sales"[\s\S]*refreshPosInventoryFromSQLite\("post-sync"\)/);
+});
+
+test("a report refresh failure names the report in words, never its request key", () => {
+  assert.equal(
+    describeReportRefreshFailures([{ key: "cashBook", message: "Network Error" }, { key: "summary", message: "" }]),
+    "Cash book could not be loaded (Network Error). Report figures could not be loaded.",
+  );
+  assert.equal(describeReportRefreshFailures([{ key: "inventory", message: "timeout" }]), "Stock inventory could not be loaded (timeout).");
+  assert.equal(describeReportRefreshFailures([{ key: "somethingNew" }]), "A report could not be loaded.");
+  assert.equal(describeReportRefreshFailures([]), "");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.doesNotMatch(app, /`\$\{failure\.key\}: \$\{failure\.message\}`/);
+  assert.match(app, /throw new Error\(describeReportRefreshFailures\(result\.failures\)\)/);
 });

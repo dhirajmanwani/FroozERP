@@ -28,6 +28,7 @@
 import { counterMaySell, resolveScopedLots } from "./locationScope.js";
 import { isSellableLot, resolveSellableProducts } from "./posInventory.js";
 import { photoForProduct } from "./productPhotos.js";
+import { DEFAULT_BRAND_TITLE, LEGACY_DEFAULT_BRAND_NAME, LEGACY_DEFAULT_BUSINESS_NAME, displaySetting, isLegacyDefault } from "./brandIdentity.js";
 import { tintFor, shopDateString } from "./catalogueExport.js";
 import { finiteOrNull, unitDisplayName, MISSING_VALUE } from "./productMaster.js";
 import { canonicalInventoryId } from "./stockInventory.js";
@@ -231,8 +232,13 @@ const text = (value) => (typeof value === "string" ? value.trim() : "");
 export const buildPriceListHeader = ({ businessSettings = {}, branchName = "", now = new Date() } = {}) => {
   const settings = businessSettings && typeof businessSettings === "object" ? businessSettings : {};
   const branch = text(branchName);
+  // A row still holding the old seeded name is an untouched default: it is THE PEP's list.
+  const seededRow = isLegacyDefault(settings.business_name, LEGACY_DEFAULT_BUSINESS_NAME);
+  const typedName = seededRow
+    ? displaySetting(settings.brand_name, LEGACY_DEFAULT_BRAND_NAME)
+    : text(settings.business_name) || text(settings.brand_name) || text(settings.company_name);
   return {
-    title: text(settings.business_name) || text(settings.brand_name) || text(settings.company_name) || "THE PEP",
+    title: typedName || DEFAULT_BRAND_TITLE,
     subtitle: branch ? `Today's prices · ${branch}` : "Today's prices",
     phone: text(settings.phone_number) || text(settings.phone),
     address: text(settings.address),

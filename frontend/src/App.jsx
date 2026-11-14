@@ -72,7 +72,7 @@ import { buildCommandIndex, highlightSegments, searchCommands } from "./local/co
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
 import { WHATSAPP_OPENED, describeChatHandoff, initialWhatsappSelection } from "./local/whatsappHandoff";
 import { RETURN_INVOICE_DEFAULT_DAYS, buildSaleReturnDraft, filterReturnInvoices, refundPerUnit, returnInvoiceListParams, saleReturnFingerprint, saleReturnPayload } from "./local/saleReturnDraft";
-import { cartEntryFits, cartLineProblem, chargeRefusalProblem, describeMandiTaxPanel, describeSavedBillRefreshFailure, editLineAmount, editedBillDateTime, lotLeftAfterCart, resolvePosBillDateTime, saleEditTotals } from "./local/posCheckout";
+import { cartEntryFits, cartLineProblem, chargeRefusalProblem, describeMandiTaxPanel, describeSavedBillRefreshFailure, editLineAmount, editedBillDateTime, lotLeftAfterCart, lotTapQuantity, resolvePosBillDateTime, saleEditTotals } from "./local/posCheckout";
 import { POS_LEAVE_PROMPT, shouldConfirmLeavingPos } from "./local/posLeaveGuard";
 import { canRetireDeviceId, normalizeMachineFingerprint, previousIdsNote, retireDeviceConfirmText, waitingIdsNote } from "./local/deviceBoxes";
 import { DASHBOARD_BLOCKS, DEFAULT_DASHBOARD_ORDER, dashboardDropIndex, isDefaultDashboardOrder, moveDashboardBlock, nudgeDashboardBlock, readDashboardOrder, writeDashboardOrder } from "./local/dashboardLayout";
@@ -107,7 +107,7 @@ import {
 } from "./local/notificationCenter";
 import { sameIdentityRecord, buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot, localSalesWindow } from "./local/dashboardSnapshot";
-import { INCLUDED_IN_COST_HEADING, balanceSheetAsAtInput, ledgerWithRunningBalance, profitLossCostOfGoods, supplierLedgerOpening } from "./local/financialStatements";
+import { INCLUDED_IN_COST_HEADING, balanceSheetAsAtInput, ledgerStatementBounds, ledgerWithRunningBalance, profitLossCostOfGoods, supplierLedgerOpening } from "./local/financialStatements";
 import { DASHBOARD_FILL, NULL_DASHBOARD_METRICS, fillUncomputedMetrics, shouldFetchCloudDashboardMetrics, unknownMetricNote } from "./local/dashboardCloudFill";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
@@ -115,6 +115,7 @@ import { resolveShellStatus } from "./local/shellStatus";
 import { plainServerMessage } from "./local/plainServerMessage";
 import { describeReport } from "./local/reportDescriptions";
 import { labelFor, toneFor } from "./local/displayLabels";
+import { markNumericColumns } from "./local/tableColumns";
 import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, MANUAL_BILL_DISCOUNT_MODE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, billDiscountRuleName, describeBillApprovalLine, lineGross, describePosDiscountApprovalReason, posDiscountApproval, readBillDiscountTooLarge, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, slabBase, resolveDiscountApprovalRoute, resolveDiscountAvailability, resolveManualBillDiscount, roundMoney as roundDiscountMoney, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
 import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, describeSaveResult, filterSaleRateRows, marginOnCost, parseTargetMargin, rateTone, resolveSaleRateAvailability, suggestedDrafts } from "./local/saleRateUpdate";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
@@ -130,6 +131,7 @@ import {
   DISTRIBUTION_BOARD_STATUS,
   pendingAllocationLines,
   resolveDistributionBoard,
+  transferActionFailureMessage,
   transferQuantity,
   validateAllocation,
   validateDistributionDraft,
@@ -177,6 +179,9 @@ import {
 import { deviceKind, deviceSeenParts, formatDeviceDate, shortDeviceId } from "./local/deviceDisplay";
 import { billNoFloorKey, billNumbersOf, displayBillNo, nextBillNo, parseBillNo } from "./local/billNumber";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
+import { FeedbackDialogHost, SaveNotice } from "./feedbackDialogs";
+import { appDialogQueue, useSaveInFlight, useSaveNotice } from "./feedbackContext";
+import { errorNotice, successNotice } from "./local/feedback";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
@@ -189,7 +194,7 @@ import { COMBO_EDIT_REFUSAL, COMBO_IN_USE_NOTE, COMBO_KINDS, COMBO_KIND_LABELS, 
 import { PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, checkPackingNodeForm, newPackingPurchaseClientRef, packingSetupStart, startPackingNodeForm, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, PACKING_STATE_WORDS, packingAddHereLabel, packingCountAfter, packingHasPickableSize, applyPackingToTransferLine, buildPackingTransferPayload, changePackingTransferFrom, createPackingTransferDraft, createPackingTransferLine, packingCatalogueAtShop, packingMovementText, packingShopName, packingShopPlace, packingTransferDestinations, packingTransferDoneText, packingTransferLineView, packingTransferOffered, packingTransferSummary, PACKING_TRANSFER_NOTE_MAX, readPackingShops } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
-import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
+import { buildReportRefreshParams, describeReportRefreshFailures, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { NAME_TITLES, getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel, joinPersonName, splitPersonName } from "./local/userPresentation";
 import { FROST_GREETING_PROMPT, resolveFrostGreeting } from "./local/frostGreeting";
@@ -208,7 +213,7 @@ import {
   preserveVerifiedLocalCollection,
   preserveVerifiedLocalValue,
 } from "./local/cloudAvailability";
-import { completionLinesPayload, completionLinesProblem, groupPurchaseBills, pendingCompletionLines, pendingItemRate, purchaseChangeBlock, purchaseHistoryAmounts, purchaseItemCounts, purchaseRowNet } from "./local/purchaseRows";
+import { PURCHASE_FORM_AFTER_SAVE, completionLinesPayload, completionLinesProblem, groupPurchaseBills, pendingCompletionLines, pendingItemRate, purchaseChangeBlock, purchaseHistoryAmounts, purchaseFormAfterSave, purchaseItemCounts, purchaseRowNet } from "./local/purchaseRows";
 import {
   describeFrostTransportFailure,
   hasCloudSession,
@@ -957,7 +962,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     syncSummary = "Selected backend reachable";
   }
 
-  let banner = "Checking FroozERP backend status...";
+  let banner = "Checking FroozERP backend status…";
   if (localStarting) {
     banner = "Starting local service...";
   } else if (cloudPaused) {
@@ -1456,7 +1461,7 @@ const toDateKey = (date) =>
   typeof date === "string" ? date.slice(0, 10) : date.toLocaleDateString("en-CA");
 const formatDisplayDate = (dateValue) => {
   const key = toDateKey(dateValue || "");
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return key || "-";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return key || MISSING_VALUE;
   const [year, month, day] = key.split("-");
   return `${day}/${month}/${year}`;
 };
@@ -1632,7 +1637,7 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
   if (!element) throw new Error("Nothing to export");
   const isThermal = mode === "THERMAL";
   const resolvedProfile = isThermal ? (receiptWidth === "58MM" ? "THERMAL_58" : "THERMAL_80") : (printProfile || "A4_PORTRAIT");
-  const hidePdfExportOverlay = showPdfExportOverlay(isThermal ? "Preparing receipt..." : "Preparing PDF...");
+  const hidePdfExportOverlay = showPdfExportOverlay(isThermal ? "Preparing receipt…" : "Preparing PDF…");
   element.dataset.printProfile = resolvedProfile;
   element.classList.add("pdf-export-mode", isThermal ? "pdf-export-thermal" : "pdf-export-a4");
   if (!isThermal) {
@@ -1690,7 +1695,7 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
   }
 };
 
-// The filter line printed above a report ("Range: ... Status: ..."). The PDF and the Excel file
+// The filter line printed above a report ("Range: ... Status: …"). The PDF and the Excel file
 // both carry it, so neither can show numbers without saying which slice of the books they are.
 // Each filter is its own line: the spans have no separator between them in textContent.
 const reportMetaLines = (element) => Array.from(element?.querySelectorAll?.(".report-filter-summary > span") || [])
@@ -1710,7 +1715,7 @@ const exportReportTextPdf = async ({ element, fileName, title, printProfile = ""
     model,
     jsPDF,
     orientation: printProfile === "A4_LANDSCAPE" ? "landscape" : "portrait",
-    generatedAt: new Date().toLocaleString("en-IN"),
+    generatedAt: formatKolkataDateTime(new Date()),
   });
   const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
   const blob = ensurePdfBlob(pdf.output("blob"));
@@ -1725,7 +1730,7 @@ const exportReportExcel = ({ element, fileName, title }) => {
   if (!element) return null;
   const model = buildReportPdfModel(element, { title, meta: reportMetaLines(element) });
   if (!reportWorkbookHasContent(model)) return null;
-  const bytes = renderXlsx(buildReportWorkbook(model, { generatedAt: new Date().toLocaleString("en-IN") }));
+  const bytes = renderXlsx(buildReportWorkbook(model, { generatedAt: formatKolkataDateTime(new Date()) }));
   const finalFileName = reportXlsxFileName(safeFileName(fileName || title), title);
   const url = URL.createObjectURL(new Blob([bytes], { type: XLSX_MIME }));
   const link = document.createElement("a");
@@ -1924,15 +1929,16 @@ const roundingRules = [
 ];
 
 const defaultBusinessSettings = {
-  business_name: "FroozERP Retail",
-  brand_name: "FEEL THE FREAKIN' FROOZ",
+  // Shown only until the real settings load; matches the identity in local/brandIdentity.js.
+  business_name: "THE PEP",
+  brand_name: "Pulp Eat Up.",
   company_name: "SRT Company",
   address: "",
   phone_number: "",
   gst_number: "",
   logo_url: "",
-  compact_logo_text: "FTF",
-  invoice_footer_text: "Thank you for shopping with FEEL THE FREAKIN' FROOZ.",
+  compact_logo_text: "PEP",
+  invoice_footer_text: "Thank you for shopping with THE PEP.",
   default_printer_type: "THERMAL",
   receipt_width: "80MM",
   auto_print_after_billing: false,
@@ -2256,21 +2262,35 @@ const NeutralStartupScreen = ({ state = "checking" }) => (
     <section className="login-panel" style={{ minHeight: 280, display: "grid", placeItems: "center", textAlign: "center" }}>
       <div>
         <BrandLogo />
-        <h1>Starting local services</h1>
-        <p>Preparing the local database and application shell.</p>
+        <h1>Starting FroozERP</h1>
+        <p>Opening this computer's shop data. This takes a few seconds.</p>
       </div>
     </section>
   </main>
 );
 
-const ConfirmedLocalRuntimeFailure = ({ message }) => (
-  <main className="login-page" data-startup-state="fatal-local-runtime" data-fatal-startup="true" style={{ background: "#7f0000" }}>
-    <section className="login-panel startup-status-panel startup-status-error">
-      <span className="eyebrow">Local Runtime Failure</span>
-      <h1>FroozERP could not start</h1>
-      <p>The local SQLite database or runtime could not be initialized after bounded recovery attempts.</p>
-      <pre>{message || "Local runtime initialization failed."}</pre>
+// Shown only when the local database could not be opened after every retry. It has to give the
+// person a way out: Try Again reloads the window (the start-up checks run again from the top), and
+// Close goes through the same controlled exit as the sign-in page, so a counter in screen-lock mode
+// still asks for the Owner exit code. The technical message stays readable and wraps.
+const ConfirmedLocalRuntimeFailure = ({ message, onExit, exitModal = null }) => (
+  <main className="login-page fatal-startup-page" data-startup-state="fatal-local-runtime" data-fatal-startup="true">
+    <section className="login-panel fatal-startup-panel" role="alert">
+      <BrandLogo />
+      <span className="eyebrow">Could not start</span>
+      <h1>FroozERP could not open its data on this computer</h1>
+      <p>The shop data on this computer could not be opened, even after several tries. Nothing has been changed or deleted.</p>
+      <p>Try again. If this keeps happening, close FroozERP, restart the computer, and call support with the details below.</p>
+      <div className="fatal-startup-actions">
+        <button type="button" className="primary-button" onClick={() => window.location.reload()}>Try Again</button>
+        {onExit && <button type="button" className="secondary-button" onClick={onExit}>Close FroozERP</button>}
+      </div>
+      <details className="fatal-startup-details" open>
+        <summary>Details for support</summary>
+        <pre className="fatal-startup-message">{message || "Local runtime initialization failed."}</pre>
+      </details>
     </section>
+    {exitModal}
   </main>
 );
 
@@ -2300,8 +2320,11 @@ function App() {
   const [notifications, setNotifications] = useState([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [startupError, setStartupError] = useState("");
+  // The last sign-in was answered and refused (wrong password, locked): a credential problem, not a
+  // connection one. Only changes what the sign-in screen shows beside the error.
+  const [loginRefused, setLoginRefused] = useState(false);
   const [startupNotice, setStartupNotice] = useState(() => (
-    isTauriRuntime() ? "Starting local FroozERP service and checking the local database..." : ""
+    isTauriRuntime() ? "Starting local FroozERP service and checking the local database…" : ""
   ));
   const [startupLogPath, setStartupLogPath] = useState("");
   const [startupTechnicalOpen, setStartupTechnicalOpen] = useState(false);
@@ -2351,6 +2374,8 @@ function App() {
   const [lastReferenceSyncAt, setLastReferenceSyncAt] = useState("");
   const [deviceGate, setDeviceGate] = useState(null);
   const [activationCode, setActivationCode] = useState("");
+  // What happened to the last activation attempt, shown in the activation panel itself.
+  const [activationNotice, setActivationNotice] = useState(null);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [activeView, setActiveView] = useState(initialView);
   const [applicationFontSize, setApplicationFontSize] = useState(getStoredApplicationFontSize);
@@ -3217,11 +3242,34 @@ function App() {
     return () => unlisten();
   }, []);
 
+  // The module list scrolls on a 768-high laptop (and at Large / Extra Large text), and Branches &
+  // Counters and Settings sat below the fold with nothing to say so. The open module is scrolled
+  // into view, and `data-more-below` fades the bottom edge while there is more list underneath.
+  const sidebarNavRef = useRef(null);
+  useEffect(() => {
+    const nav = sidebarNavRef.current;
+    if (!nav) return undefined;
+    const markMore = () => {
+      nav.dataset.moreBelow = nav.scrollHeight - nav.scrollTop - nav.clientHeight > 4 ? "true" : "false";
+    };
+    nav.querySelector(".nav-item-active")?.scrollIntoView?.({ block: "nearest" });
+    markMore();
+    nav.addEventListener("scroll", markMore, { passive: true });
+    window.addEventListener("resize", markMore);
+    return () => {
+      nav.removeEventListener("scroll", markMore);
+      window.removeEventListener("resize", markMore);
+    };
+  }, [activeView, user, sidebarCollapsed]);
+
   useEffect(() => {
     const onPopState = (event) => {
       const requestedView = new URLSearchParams(window.location.search).get("view");
       if (requestedView && navigationItems.some(([view]) => view === requestedView)) {
-        setActiveView(requestedView);
+        // Through navigate(), so the screen's loaders run exactly as they do from the sidebar.
+        // Setting the view alone left All Shops on "Loading every shop…" and Orders on an empty
+        // queue for good. The URL already names the view, so navigate pushes no history entry.
+        navigateRef.current?.(requestedView, { fromHistory: true });
       }
       // Only the index moves here. `max` is the high-water mark of this session and must survive
       // going back, or Forward would switch itself off the moment it became useful.
@@ -3773,7 +3821,7 @@ function App() {
       return status;
     }
     if (force) lastAutoSyncStartedAtRef.current = Date.now();
-    setSyncMessage("Syncing...");
+    setSyncMessage("Syncing…");
     // A forced sync that finds a cycle running gets one more cycle after it, so a purchase saved
     // mid-cycle is pushed now rather than on the next timer tick (local/syncSingleFlight.js).
     const status = await syncNow({
@@ -7136,7 +7184,7 @@ function App() {
       setPosRefreshToken((token) => token + 1);
       setSyncMessage("");
     } catch (error) {
-      setSyncMessage(getErrorMessage(error, `The consignment could not be ${action}ed`));
+      setSyncMessage(getErrorMessage(error, transferActionFailureMessage(action)));
     } finally {
       setDistributionBusy(false);
     }
@@ -7621,6 +7669,7 @@ function App() {
   const login = async () => {
     setLoginBusy(true);
     setStartupError("");
+    setLoginRefused(false);
     setStartupNotice("");
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
@@ -7747,6 +7796,7 @@ function App() {
           if (opened) return;
         }
         setDeviceGate(null);
+        setLoginRefused(true);
         setStartupError(credentialMessage);
         return;
       }
@@ -7759,6 +7809,7 @@ function App() {
         const opened = await continueOffline(latestDevice);
         if (opened) return;
       }
+      setLoginRefused(Boolean(error?.response) && !mayOpenOfflineSession(error));
       setStartupError(getAuthErrorMessage(error, `Unable to sign in through ${AUTH_API_URL}. Connect once to the FroozERP cloud backend to authorise this device.`));
     } finally {
       setLoginBusy(false);
@@ -7768,6 +7819,7 @@ function App() {
   const retryOnline = async () => {
     setLoginBusy(true);
     setStartupError("");
+    setLoginRefused(false);
     setStartupNotice(`Checking backend at ${API_URL}/api/health...`);
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
@@ -7787,7 +7839,7 @@ function App() {
         setDeviceGate(bootstrapStatus.approved ? null : bootstrapStatus);
         if (bootstrapStatus.approved) {
           if (username.trim() && password) {
-            setStartupNotice("Device approval confirmed. Completing secure provisioning...");
+            setStartupNotice("Device approval confirmed. Completing secure provisioning…");
             return await login();
           }
           setStartupNotice("Device approval confirmed. Enter credentials and click Sign In to complete secure provisioning and the initial pull.");
@@ -7914,9 +7966,10 @@ function App() {
 
   const activateDevice = async () => {
     if (!activationCode.trim()) {
-      alert("Enter activation code.");
+      setActivationNotice(errorNotice("Enter the activation code the owner gave you.", "activation_code"));
       return;
     }
+    setActivationNotice(null);
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       const response = await axios.post(`${API_URL}/devices/activate`, {
@@ -7926,9 +7979,11 @@ function App() {
       setDeviceInfo(response.data.device || latestDevice);
       setDeviceGate(null);
       setActivationCode("");
-      alert("Device activated. Please login again.");
+      // The activation panel closes with the gate, so the confirmation goes on the sign-in status line.
+      setStartupError("");
+      setStartupNotice("This computer is activated. Sign in again to start work.");
     } catch (error) {
-      alert(getErrorMessage(error, "Device activation failed"));
+      setActivationNotice(errorNotice(getErrorMessage(error, "This computer could not be activated. Check the code and try again.")));
     }
   };
 
@@ -7957,7 +8012,7 @@ function App() {
       return;
     }
     try {
-      setProductPhotoMessage("Preparing photo...");
+      setProductPhotoMessage("Preparing photo…");
       const dataUrl = await shrinkProductPhoto(file, {
         createImageBitmap: (blob) => window.createImageBitmap(blob),
         createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
@@ -8848,7 +8903,7 @@ function App() {
         );
         purchaseSubmissionRef.current.complete(aggregateOperationId);
       }
-      if (purchaseAmendmentMode) {
+      if (purchaseFormAfterSave({ wasEditing, amendmentMode: purchaseAmendmentMode }) === PURCHASE_FORM_AFTER_SAVE.CLEAR_ITEMS) {
         setPurchaseCart([]);
         resetPurchaseItemFields();
       } else {
@@ -9422,18 +9477,19 @@ function App() {
     await loadSaleForEdit(saleId);
   };
 
-  const navigate = async (view, { posLeaveConfirmed = false } = {}) => {
+  const navigate = async (view, { posLeaveConfirmed = false, fromHistory = false } = {}) => {
     // A bill on the POS counter is asked about before it is thrown away. The question is answered
-    // in the dialog, which comes back here with `posLeaveConfirmed`.
-    if (!posLeaveConfirmed && shouldConfirmLeavingPos({ activeView, nextView: view, cartLines: posWork.cartLines })) {
+    // in the dialog, which comes back here with `posLeaveConfirmed`. Back/Forward (`fromHistory`)
+    // has already moved the page: the top bar's arrows ask before moving, and asking again here
+    // would leave the address naming one screen while another is shown.
+    if (!posLeaveConfirmed && !fromHistory && shouldConfirmLeavingPos({ activeView, nextView: view, cartLines: posWork.cartLines })) {
       setCommandPaletteOpen(false);
       setPosLeavePrompt({ view });
       return;
     }
-    if (!hasModuleAccess(view)) {
-      alert("Your role does not have access to this module.");
-      return;
-    }
+    // A screen this role cannot open is not offered anywhere (sidebar, Ctrl K, Alt keys share
+    // hasModuleAccess), so a request for one is simply ignored rather than answered with a popup.
+    if (!hasModuleAccess(view)) return;
     // Newest first, deduplicated, capped. Feeds the palette's ranking so that where somebody
     // actually works outweighs how well a label happens to match their letters.
     setRecentViews((current) => [view, ...current.filter((id) => id !== view)].slice(0, 8));
@@ -9504,8 +9560,8 @@ function App() {
         await refreshPosInventoryFromSQLite("navigate-auto-pos");
         await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
       }
-      // Discounts loads itself when it opens (and on Back/Forward, which does not come through
-      // here), shows its own failure, and sends nothing in Local Only or offline.
+      // Discounts loads itself when it opens, shows its own failure, and sends nothing in Local
+      // Only or offline.
       if (["purchase", "pending-bills", "accounts"].includes(view)) {
         await loadSupplierData();
       }
@@ -9536,8 +9592,7 @@ function App() {
       // Branches & Counters shows the device list the licences are issued against and the screen
       // lock, both of which come from the settings bundle.
       if (view === "settings" || view === "branches") await loadSettingsData();
-      // Sale Rate Update loads itself when it opens (and when it is reached by Back/Forward, which
-      // does not come through here), so it is not loaded twice.
+      // Sale Rate Update loads itself when it opens, so it is not loaded here as well.
     } catch (error) {
       console.warn(`Unable to refresh ${view}`, error);
       setSyncMessage(getErrorMessage(error, `${navigationItems.find(([itemView]) => itemView === view)?.[1] || "Module"} data could not be refreshed.`));
@@ -9569,9 +9624,15 @@ function App() {
     : localServiceUnavailable
     ? "Local service could not start."
     : (startupError || startupNotice || "");
+  // A refused password is about the password, not the connection: the connection notice that
+  // happened to be on screen ("Local mode active • Cloud temporarily unavailable.") is not added
+  // under it, where it read as the reason the sign-in failed. Presentation only; the connectivity
+  // state itself is untouched.
   const startupSecondaryMessage = localServiceUnavailable
     ? "FroozERP cannot sign in on this device until the local service is running."
-    : (startupError && startupNotice ? startupNotice : "");
+    : (startupError && startupNotice && !loginRefused ? startupNotice : "");
+  // Something is wrong with the connection or the service: the technical facts are shown unasked.
+  const startupProblem = Boolean(localServiceUnavailable || (startupError && !loginRefused) || backendHealth.online === false);
   const startupConnectionLabel = localServiceUnavailable
     ? `${connectionStatus.internetStatus}, local service unavailable`
     : `${connectionStatus.internetStatus} - ${isCloudMode() ? connectionStatus.cloudBackendStatus : connectionStatus.localBackendStatus}`;
@@ -9597,7 +9658,7 @@ function App() {
 
   if (mandatoryRuntimeState === "checking") return <NeutralStartupScreen />;
   if (mandatoryRuntimeState === "fatal") {
-    return <ConfirmedLocalRuntimeFailure message={localDbStatus?.error || startupError} />;
+    return <ConfirmedLocalRuntimeFailure message={localDbStatus?.error || startupError} onExit={requestControlledExit} exitModal={exitCodeModal} />;
   }
   if (!user && isTauriRuntime() && entitlement
       && (entitlement.state === "Unprovisioned" || entitlement.bootstrap?.pending)) {
@@ -9626,107 +9687,133 @@ function App() {
           <div className="login-copy">
             <span className="eyebrow">Business Management</span>
             <h1>{APP_DISPLAY_NAME}</h1>
-            <p>Preparing FroozERP, checking the local database, device authorisation and sync readiness.</p>
+            <p>Sign in with your username and password to start work.</p>
           </div>
-          <div className="first-launch-steps">
-            <span>Checking local database</span>
-            <span>Checking device authorisation</span>
-            <span>Preparing authorised reference data</span>
-            <span>Ready for online or local-first POS</span>
-          </div>
-          <label>
-            Username
-            <input value={username} onChange={(event) => setUsername(event.target.value)} />
-          </label>
-          <label>
-            Password
-            <PasswordInput
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              onKeyDown={(event) => event.key === "Enter" && login()}
-            />
-          </label>
-          {(startupMainMessage || startupSecondaryMessage || lastReferenceSyncAt) && (
-            <div className={`startup-status-panel ${localServiceUnavailable || startupError ? "startup-status-error" : ""}`}>
-              {startupMainMessage && <p><strong>{startupMainMessage}</strong></p>}
-              {startupSecondaryMessage && <p>{startupSecondaryMessage}</p>}
-              {lastReferenceSyncAt && <small>Last successful local data sync: {new Date(lastReferenceSyncAt).toLocaleString("en-IN")}</small>}
-            </div>
-          )}
-          <div className="startup-api-panel">
-            <span>{connectionStatus.apiModeLabel}</span>
-            <code>{backendHealth.apiUrl}</code>
-            <small>{startupConnectionLabel}</small>
-            {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
-              <div className="startup-service-actions">
-                <button className="table-action" type="button" onClick={async () => {
-                  await ensureLocalBackendService({ restart: true, reason: "login-restart-service" });
-                  await performConnectivityCheck("login-restart-service", { force: true, skipServiceStart: true });
-                  setStartupTechnicalOpen(true);
-                }}>
-                  Restart Service
-                </button>
-                {SHELL_CAPABILITIES.startupLog && (
-                  <button className="secondary-button" type="button" onClick={openStartupLogFile}>
-                    Open Startup Log
+          {/* A form, so Enter in either box signs in, as on every other sign-in page. */}
+          <form
+            className="login-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!loginBusy) login();
+            }}
+          >
+            <label>
+              Username
+              <input
+                autoComplete="username"
+                autoFocus
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+              />
+            </label>
+            <label>
+              Password
+              <PasswordInput
+                value={password}
+                autoComplete="current-password"
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </label>
+            {(startupMainMessage || startupSecondaryMessage || lastReferenceSyncAt) && (
+              <div className={`startup-status-panel ${localServiceUnavailable || startupError ? "startup-status-error" : ""}`} role={startupError || localServiceUnavailable ? "alert" : "status"}>
+                {startupMainMessage && <p><strong>{startupMainMessage}</strong></p>}
+                {startupSecondaryMessage && <p>{startupSecondaryMessage}</p>}
+                {lastReferenceSyncAt && <small>Last successful local data sync: {formatKolkataDateTime(lastReferenceSyncAt)}</small>}
+              </div>
+            )}
+            {/* The connection's technical facts (mode, address, raw codes) are for whoever fixes a
+                problem, not for the cashier signing in: shown when something is wrong, otherwise
+                behind "Show technical details". */}
+            <div className="startup-api-panel">
+              {(startupTechnicalOpen || startupProblem) && (
+                <>
+                  <span>{connectionStatus.apiModeLabel}</span>
+                  <code>{backendHealth.apiUrl}</code>
+                  <small>{startupConnectionLabel}</small>
+                </>
+              )}
+              {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
+                <div className="startup-service-actions">
+                  <button className="table-action" type="button" onClick={async () => {
+                    await ensureLocalBackendService({ restart: true, reason: "login-restart-service" });
+                    await performConnectivityCheck("login-restart-service", { force: true, skipServiceStart: true });
+                    setStartupTechnicalOpen(true);
+                  }}>
+                    Restart Service
                   </button>
+                  {SHELL_CAPABILITIES.startupLog && (
+                    <button className="secondary-button" type="button" onClick={openStartupLogFile}>
+                      Open Startup Log
+                    </button>
+                  )}
+                  <button className="secondary-button" type="button" onClick={copyStartupDiagnostics}>
+                    Copy Diagnostics
+                  </button>
+                </div>
+              )}
+              {localBackendService?.message && (startupTechnicalOpen || startupProblem) && <small>{localBackendService.message}</small>}
+              <button aria-expanded={startupTechnicalOpen} className="startup-details-toggle" type="button" onClick={() => setStartupTechnicalOpen((open) => !open)}>
+                {startupTechnicalOpen ? "Hide technical details" : "Show technical details"}
+              </button>
+              {startupTechnicalOpen && (
+                <div className="startup-technical-details">
+                  {startupDetailRows.map(([label, value]) => (
+                    <div className="startup-detail-row" key={label}>
+                      <span>{label}</span>
+                      <code>{String(value)}</code>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="startup-actions">
+              <button className="primary-button login-button" disabled={loginBusy} type="submit">
+                {loginBusy ? "Signing In…" : "Sign In"}
+              </button>
+              <button className="recovery-link-button" disabled={loginBusy} type="button" onClick={() => setRecoveryOpen(true)}>
+                Forgot Username or Password?
+              </button>
+              {/* One row of equal buttons: none of the three is more important than the others. */}
+              <div className="login-secondary-actions">
+                {isTauriRuntime() && (
+                  <>
+                    <button className="secondary-button" disabled={loginBusy} type="button" onClick={retryOnline}>
+                      Retry Online
+                    </button>
+                    <button className="secondary-button" disabled={loginBusy} type="button" onClick={() => continueOffline()}>
+                      Continue Offline
+                    </button>
+                  </>
                 )}
-                <button className="secondary-button" type="button" onClick={copyStartupDiagnostics}>
-                  Copy Diagnostics
+                <button className="secondary-button login-close-exit-button" disabled={loginBusy} type="button" onClick={requestControlledExit}>
+                  Close &amp; Exit
                 </button>
               </div>
-            )}
-            {localBackendService?.message && <small>{localBackendService.message}</small>}
-            <button className="startup-details-toggle" type="button" onClick={() => setStartupTechnicalOpen((open) => !open)}>
-              {startupTechnicalOpen ? "Hide technical details" : "Show technical details"}
-            </button>
-            {startupTechnicalOpen && (
-              <div className="startup-technical-details">
-                {startupDetailRows.map(([label, value]) => (
-                  <div className="startup-detail-row" key={label}>
-                    <span>{label}</span>
-                    <code>{String(value)}</code>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-          <div className="startup-actions">
-            <button className="primary-button login-button" disabled={loginBusy} onClick={login}>
-              {loginBusy ? "Signing In..." : "Sign In"}
-            </button>
-            <button className="recovery-link-button" disabled={loginBusy} onClick={() => setRecoveryOpen(true)}>
-              Forgot Username or Password?
-            </button>
-            {isTauriRuntime() && (
-              <>
-                <button className="secondary-button" disabled={loginBusy} onClick={retryOnline}>
-                  Retry Online
-                </button>
-                <button className="secondary-button" disabled={loginBusy} onClick={() => continueOffline()}>
-                  Continue Offline
-                </button>
-              </>
-            )}
-            <button className="secondary-button login-close-exit-button" disabled={loginBusy} onClick={requestControlledExit}>
-              Close &amp; Exit
-            </button>
-            <small className="login-exit-helper">
-              {loginDeviceControlSettings.fullscreen_lock_enabled ? "Owner code required to close FroozERP" : "Close FroozERP safely"}
-            </small>
-          </div>
+              <small className="login-exit-helper">
+                {loginDeviceControlSettings.fullscreen_lock_enabled ? "Owner code required to close FroozERP" : "Close FroozERP safely"}
+              </small>
+            </div>
+          </form>
           {deviceGate && (
             <div className="device-activation-panel">
               <span className="eyebrow">Device Activation Required</span>
               <strong>{deviceGate.code === "DEVICE_PENDING_APPROVAL" ? "Device awaiting owner approval." : "This device is not approved."}</strong>
               <small>Device ID: {deviceGate.device_id || deviceInfo.device_id}</small>
               <p>Ask the owner to approve this device in Branches &amp; Counters, then sign in again. A one-time activation code may also be used.</p>
-              <input
-                placeholder="Activation code"
-                value={activationCode}
-                onChange={(event) => setActivationCode(event.target.value.toUpperCase())}
-              />
-              <button className="secondary-button" onClick={activateDevice}>Activate Device</button>
+              <label>
+                Activation code
+                <input
+                  aria-invalid={activationNotice?.field === "activation_code" ? "true" : undefined}
+                  value={activationCode}
+                  onChange={(event) => {
+                    setActivationCode(event.target.value.toUpperCase());
+                    setActivationNotice(null);
+                  }}
+                  onKeyDown={(event) => event.key === "Enter" && activateDevice()}
+                />
+              </label>
+              <button className="secondary-button" type="button" onClick={activateDevice}>Activate Device</button>
+              <SaveNotice notice={activationNotice} />
             </div>
           )}
           {recoveryOpen && (
@@ -9741,6 +9828,7 @@ function App() {
           )}
           {exitCodeModal}
         </section>
+        <FeedbackDialogHost queue={appDialogQueue} />
       </main>
     );
   }
@@ -10070,7 +10158,7 @@ function App() {
           <BrandLogo compact={sidebarCollapsed} />
         </div>
         <span className="sidebar-section">Main Menu</span>
-        <nav className="sidebar-nav">
+        <nav className="sidebar-nav" ref={sidebarNavRef}>
           {visibleNavigationItems.map(([view, label]) => {
             const shortcut = navigationRegistry.find((item) => item.id === view)?.shortcut || null;
             return (
@@ -10233,7 +10321,8 @@ function App() {
                   ? "The counter this machine is set up as. Stock and bills come from here."
                   : undefined}
               >
-                <span className="status-dot" />
+                {/* The dot follows the connection pill beside it: green only when all is well. */}
+                <span className="status-dot" data-tone={shellStatus.pill.tone} />
                 {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
               <div className="offline-pill" data-tone={shellStatus.pill.tone} title={shellStatus.pill.title || undefined}>{shellStatus.pill.label}</div>
@@ -10311,13 +10400,15 @@ function App() {
                 disabled={shopSwitchBusy || !shopView.banner.returnBranchId}
                 onClick={() => switchShopView(shopView.banner.returnBranchId)}
               >
-                {shopSwitchBusy ? "Switching..." : shopView.banner.returnLabel}
+                {shopSwitchBusy ? "Switching…" : shopView.banner.returnLabel}
               </button>
             </div>
           )}
           {connectionSentence.showsInTopBar && (
             <div
-              className="local-only-banner"
+              // Without a button to offer, the sentence is one quiet line: the top-bar pill already
+              // says "Working offline", so a 70px block repeating it pushed every screen down.
+              className={connectionSentence.tone === CONNECTION_TONE.ATTENTION ? "local-only-banner" : "local-only-banner local-only-banner-compact"}
               data-connection-state={connectionSentence.state}
               role={connectionNeedsAttention(connectionSentence) ? "alert" : "status"}
             >
@@ -10988,11 +11079,11 @@ function App() {
                       return (
                       <tr key={`${canonicalInventoryId(purchase.id)}-${purchase.inventory_batch_id ?? rowIndex}`}>
                         <td><span className="batch-id">#{purchase.id}</span>{itemCount > 1 && <small className="cell-note">{itemCount} fruits on this bill</small>}</td>
-                        <td className="primary-cell">{purchase.product_name}<small className="cell-note">{purchase.batch_no || "-"}</small></td>
+                        <td className="primary-cell">{purchase.product_name}<small className="cell-note">{purchase.batch_no || MISSING_VALUE}</small></td>
                         <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit ? labelFor("unit", purchase.unit) : ""}</td>
                         <td>{currency.format(Number(purchase.purchase_rate || purchase.expected_purchase_rate || 0))}</td>
                         <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : "Completed Bill"}</span></td>
-                        <td>{rowNet === null ? "-" : currency.format(rowNet)}</td>
+                        <td>{rowNet === null ? MISSING_VALUE : currency.format(rowNet)}</td>
                         <td>
                           {/* Edit, complete and cancel are Owner/Admin on the server (requireRateManager). */}
                           {canManagePendingPurchaseBills(user.role) ? (
@@ -11062,9 +11153,9 @@ function App() {
                     {completionLines.map((line, index) => (
                       <tr key={canonicalInventoryId(line.purchase_item_id)}>
                         <td className="primary-cell">{line.product_name}<small className="cell-note">{labelFor("origin", line.origin_type)}</small></td>
-                        <td>{line.lot_name || "-"}{line.lot_size ? ` / ${line.lot_size}` : ""}</td>
+                        <td>{line.lot_name || MISSING_VALUE}{line.lot_size ? ` / ${line.lot_size}` : ""}</td>
                         <td><input type="number" min="0" step="0.001" aria-label={`Quantity of ${line.product_name}`} value={line.quantity} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, quantity: event.target.value } : entry))} />{line.unit && <small className="cell-note">{labelFor("unit", line.unit)}</small>}</td>
-                        <td>{line.expected_rate > 0 ? currency.format(line.expected_rate) : "-"}</td>
+                        <td>{line.expected_rate > 0 ? currency.format(line.expected_rate) : MISSING_VALUE}</td>
                         <td><input type="number" min="0" step="0.01" aria-label={`Final purchase rate of ${line.product_name}`} value={line.purchase_rate} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, purchase_rate: event.target.value } : entry))} /></td>
                       </tr>
                     ))}
@@ -11104,13 +11195,13 @@ function App() {
                     {purchaseCart.map((item) => (
                       <tr key={item.line_id}>
                         <td className="primary-cell">{item.product_name}</td>
-                        <td>{item.lot_name || "-"}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
+                        <td>{item.lot_name || MISSING_VALUE}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
                         <td>{item.quantity}</td>
                         <td>{labelFor("unit", item.unit)}</td>
                         <td><span className="origin-rate">{labelFor("origin", item.origin_type)}</span></td>
                         <td>{currency.format(Number(item.purchase_rate || item.expected_purchase_rate || 0))}</td>
-                        <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : "-"}</td>
-                        <td>{item.remarks || "-"}</td>
+                        <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : MISSING_VALUE}</td>
+                        <td>{item.remarks || MISSING_VALUE}</td>
                         <td>
                           <div className="button-row table-actions-row">
                             <button className="table-action" onClick={() => editPurchaseCartItem(item.line_id)}>Edit</button>
@@ -11163,7 +11254,7 @@ function App() {
                 <div className="button-row">
                   <button className="primary-button" disabled={purchaseSaveBusy} onClick={savePurchase}>
                     {purchaseSaveBusy
-                      ? "Saving..."
+                      ? "Saving…"
                       : purchaseBillStatus === "BILL_PENDING"
                         ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival"
                         : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}
@@ -11478,7 +11569,15 @@ function App() {
                   const parts = ["settings", "purchase rules", "discount rules"];
                   const results = await Promise.allSettled([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]);
                   const failedIndex = results.findIndex((result) => result.status === "rejected");
-                  if (failedIndex >= 0) alert(refreshAfterSaveMessage(results[failedIndex].reason, parts[failedIndex]));
+                  // Saved, but the screen may be stale: the bell says so and keeps it, instead of a popup.
+                  if (failedIndex >= 0) {
+                    notify({
+                      severity: "warning",
+                      title: "Saved, but the screen did not refresh",
+                      message: refreshAfterSaveMessage(results[failedIndex].reason, parts[failedIndex]),
+                      source: "Settings",
+                    });
+                  }
                   return failedIndex < 0;
                 }}
                 onRegisterCloudDevice={registerCloudDevice}
@@ -11582,7 +11681,12 @@ function App() {
                     await loadSettingsData();
                     return true;
                   } catch (error) {
-                    alert(refreshAfterSaveMessage(error));
+                    notify({
+                      severity: "warning",
+                      title: "Saved, but the screen did not refresh",
+                      message: refreshAfterSaveMessage(error),
+                      source: "Branches & Counters",
+                    });
                     return false;
                   }
                 }}
@@ -11893,6 +11997,8 @@ function App() {
           onStay={() => setPosLeavePrompt(null)}
         />
       )}
+      {/* The app's one host for in-app confirm and reason boxes (useConfirm, useAskReason). */}
+      <FeedbackDialogHost queue={appDialogQueue} />
     </main>
   );
 }
@@ -12355,7 +12461,7 @@ function AiBusinessAssistantModule({
             <p className="ai-answer-notice">{chatSelection.message}</p>
           )}
           {chatSelection.status !== FROST_CHAT_SELECTION.UNREADABLE && chatSelection.chats.length === 0 && (
-            <p className="frost-chats-empty">{data.chatsLoading ? "Loading your chats..." : "No earlier chats yet."}</p>
+            <p className="frost-chats-empty">{data.chatsLoading ? "Loading your chats…" : "No earlier chats yet."}</p>
           )}
           {chatSelection.chats.map((chat) => (
             <button
@@ -12683,7 +12789,7 @@ function PaymentsDuePopup({ busyKey = "", collectRows = [], collectTotal = 0, fa
           <a className="table-action" href={item.whatsappLink} rel="noopener noreferrer" target="_blank">Prepare WhatsApp</a>
         )}
         <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "done")} type="button">
-          {busyKey === item.key ? "Saving..." : "Done"}
+          {busyKey === item.key ? "Saving…" : "Done"}
         </button>
         <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "tomorrow")} type="button">Remind tomorrow</button>
       </div>
@@ -12732,7 +12838,7 @@ function PaymentsDuePopup({ busyKey = "", collectRows = [], collectTotal = 0, fa
  */
 function FrostPaymentDate({ amount, canManage = false, entityId, entityName = "", kind, label, onPaymentDate, plan = null, skipped = false }) {
   if (!plan) {
-    return <small className="cell-note">{skipped ? "Payment dates need the cloud connection." : "Reading payment dates..."}</small>;
+    return <small className="cell-note">{skipped ? "Payment dates need the cloud connection." : "Reading payment dates…"}</small>;
   }
   if (plan.status !== PAYMENTS_DUE_STATUS.OK) {
     return <small className="frost-due-date-failure">Date could not be read</small>;
@@ -12761,7 +12867,7 @@ function FrostSupplierPaymentsPanel({ canManageReminders = false, onPaymentDate,
   if (!paymentPlan) {
     return (
       <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
-        <div className="cart-empty">{paymentsSkipped ? "Supplier balances need the cloud connection, which this device is not using right now." : "Reading supplier balances..."}</div>
+        <div className="cart-empty">{paymentsSkipped ? "Supplier balances need the cloud connection, which this device is not using right now." : "Reading supplier balances…"}</div>
       </ModuleCard>
     );
   }
@@ -12847,7 +12953,7 @@ function FrostReminderDueDate({ canManage = false, dueAt, label = "Reminder due 
       />
       {dirty && (
         <button className="table-action" disabled={!canManage || saving} onClick={save} type="button">
-          {saving ? "Saving..." : (draft ? "Set date" : "Clear date")}
+          {saving ? "Saving…" : (draft ? "Set date" : "Clear date")}
         </button>
       )}
       {!dirty && !saved && <small className="cell-note">No date</small>}
@@ -12954,7 +13060,7 @@ function FrostDuesPanel({
         {outreach.rows.length === 0 && <tr><td colSpan="6" className="empty-cell">Nobody has a balance outstanding.</td></tr>}
       </DataTable>
       <div className="button-row">
-        <button className="secondary-button" disabled={loading} onClick={onLoad} type="button">{loading ? "Refreshing..." : "Refresh"}</button>
+        <button className="secondary-button" disabled={loading} onClick={onLoad} type="button">{loading ? "Refreshing…" : "Refresh"}</button>
         {!canManageReminders && <small className="cell-note">You can read this list. Setting reminders needs an owner.</small>}
       </div>
     </ModuleCard>
@@ -13411,15 +13517,20 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
   // path they configured. Their values stay in the draft and are saved back unchanged, so this
   // panel never quietly rewrites settings it no longer shows. Live voice is on-device and has no
   // settings here: it is the switch in the conversation.
-  const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
-  const save = async () => {
+  const [saveNotice, showSaveNotice, clearSaveNotice] = useSaveNotice();
+  const [saving, runSave] = useSaveInFlight();
+  const update = (field, value) => {
+    clearSaveNotice();
+    setDraft((current) => ({ ...current, [field]: value }));
+  };
+  const save = () => runSave(async () => {
     try {
       await onSave(draft);
-      alert("FROST settings updated");
+      showSaveNotice(successNotice("FROST settings saved."));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update FROST settings"));
+      showSaveNotice(errorNotice(getErrorMessage(error, "The FROST settings could not be saved.")));
     }
-  };
+  });
 
   return (
     <ModuleCard eyebrow="FROST Configuration" title="AI Operating System" subtitle="Provider, engine and usage controls shared by every future AI module.">
@@ -13463,8 +13574,9 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         <span>Estimated cost {currency.format(Number(data.usage?.estimated_cost || 0))}</span>
       </div>
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage} onClick={save}><Icon name="settings" /> Save FROST Settings</button>
+        <button className="primary-button" disabled={!canManage || saving} onClick={save}><Icon name="settings" /> {saving ? "Saving…" : "Save FROST Settings"}</button>
       </div>
+      <SaveNotice notice={saveNotice} />
     </ModuleCard>
   );
 }
@@ -13596,7 +13708,7 @@ function BootstrapOwnerSetup({ deviceInfo, entitlement, onActivated }) {
           />
           {error && <small className="startup-status-error">{error}</small>}
           <button className="primary-button" disabled={busy} onClick={completePasswordChange}>
-            {busy ? "Saving..." : "Set Password & Continue"}
+            {busy ? "Saving…" : "Set Password & Continue"}
           </button>
         </>
       )}
@@ -13742,7 +13854,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
             value={enrolPassword}
           />
           <button className="secondary-button" type="button" disabled={busy} onClick={sendToShop}>
-            {busy ? "Sending..." : "Send to Shop"}
+            {busy ? "Sending…" : "Send to Shop"}
           </button>
           <span className="eyebrow">Step 2: activate</span>
           <textarea
@@ -13754,7 +13866,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
             value={pastedActivation}
           />
           <button className="primary-button" type="button" disabled={busy} onClick={activatePasted}>
-            {busy ? "Activating..." : "Activate"}
+            {busy ? "Activating…" : "Activate"}
           </button>
           <small>Or choose the .lic file instead:</small>
           <input
@@ -13770,7 +13882,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
             disabled={busy}
             onClick={() => fileInputRef.current?.click()}
           >
-            {busy ? "Activating..." : "Choose Activation File"}
+            {busy ? "Activating…" : "Choose Activation File"}
           </button>
           {notice && <small>{notice}</small>}
           {error && <small className="startup-status-error">{error}</small>}
@@ -14065,7 +14177,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
                       {row.nameDistinction?.kind === "counter"
                         ? row.nameDistinction.value
                         : row.nameDistinction?.kind === "lastSeen"
-                          ? `Last seen ${new Date(row.nameDistinction.value).toLocaleString("en-IN")}`
+                          ? `Last seen ${formatKolkataDateTime(row.nameDistinction.value)}`
                           : "Same name as another device — check the ID before issuing"}
                     </small>
                   )}
@@ -14107,7 +14219,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
                     {view.oldIds.map((row) => (
                       <li key={row.deviceId}>
                         <span className="device-id-note">{row.deviceId}</span>
-                        <small className="cell-note">{row.lastActiveAt ? `Last seen ${new Date(row.lastActiveAt).toLocaleString("en-IN")}` : "Never seen"}</small>
+                        <small className="cell-note">{row.lastActiveAt ? `Last seen ${formatKolkataDateTime(row.lastActiveAt)}` : "Never seen"}</small>
                       </li>
                     ))}
                   </ul>
@@ -14115,7 +14227,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
               </div>
               {canIssue && (
                 <button className="secondary-button" disabled={retiringOld} onClick={retireOldIds} type="button">
-                  {retiringOld ? "Retiring..." : `Retire ${view.oldIds.length} old ${view.oldIds.length === 1 ? "id" : "ids"}`}
+                  {retiringOld ? "Retiring…" : `Retire ${view.oldIds.length} old ${view.oldIds.length === 1 ? "id" : "ids"}`}
                 </button>
               )}
             </div>
@@ -14149,10 +14261,10 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
           {!validity.ok && <small className="startup-status-error">{validity.message}</small>}
           <div className="button-row">
             <button className="primary-button" disabled={issuing || !selectedRow || !validity.ok} onClick={issue} type="button">
-              <Icon name="settings" /> {issuing ? "Issuing..." : "Issue Activation Licence"}
+              <Icon name="settings" /> {issuing ? "Issuing…" : "Issue Activation Licence"}
             </button>
             <button className="secondary-button" disabled={loading || issuing} onClick={() => { loadLicences(); onReload?.(); }} type="button">
-              {loading ? "Refreshing..." : "Refresh"}
+              {loading ? "Refreshing…" : "Refresh"}
             </button>
           </div>
           {outcome && <small className={outcome.tone === "error" ? "startup-status-error" : "form-note"}>{outcome.text}</small>}
@@ -14317,7 +14429,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
   const onlineRequired = backendHealth?.online === false;
   useEffect(() => {
     let cancelled = false;
-    setStatus("Checking FroozERP service...");
+    setStatus("Checking FroozERP service…");
     Promise.resolve(onCheckOnline?.("recovery-open", { force: true, timeoutMs: 3500 })).then((health) => {
       if (cancelled) return;
       if (health?.online) {
@@ -14336,7 +14448,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
 
   useEffect(() => {
     if (backendHealth?.checking) {
-      setStatus("Checking FroozERP service...");
+      setStatus("Checking FroozERP service…");
       return;
     }
     if (backendHealth?.online) {
@@ -14530,14 +14642,14 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
                   {methods.map((entry) => <option key={entry.method} value={entry.method}>{entry.label}</option>)}
                 </select>
               </Field>
-              <button className="primary-button" disabled={busy} onClick={sendOtp}>{busy ? "Sending..." : "Send Verification Code"}</button>
+              <button className="primary-button" disabled={busy} onClick={sendOtp}>{busy ? "Sending…" : "Send Verification Code"}</button>
             </>
           )}
           {step === "otp" && (
             <>
               {developmentOtp && <div className="startup-status-panel"><p>Development test OTP: <strong>{developmentOtp}</strong></p></div>}
               <Field label="Verification Code"><input inputMode="numeric" value={otp} onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 8))} /></Field>
-              <button className="primary-button" disabled={busy} onClick={verifyOtp}>{busy ? "Verifying..." : "Verify Code"}</button>
+              <button className="primary-button" disabled={busy} onClick={verifyOtp}>{busy ? "Verifying…" : "Verify Code"}</button>
             </>
           )}
           {step === "username-result" && (
@@ -14557,7 +14669,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
               </Field>
               <label className="check-field"><input checked={showPassword} type="checkbox" onChange={(event) => setShowPassword(event.target.checked)} /><span>Show password</span></label>
               <p className="form-note">Use a password the staff member cannot guess. FroozERP stores only a secure password hash.</p>
-              <button className="primary-button" disabled={busy} onClick={resetPassword}>{busy ? "Saving..." : "Reset Password"}</button>
+              <button className="primary-button" disabled={busy} onClick={resetPassword}>{busy ? "Saving…" : "Reset Password"}</button>
             </>
           )}
           {step === "staff" && (
@@ -14717,12 +14829,12 @@ function WhatsAppSendModal({
       return;
     }
     setSending(true);
-    setStatus("Generating PDF...");
+    setStatus("Generating PDF…");
     let pdfResult = null;
     try {
       pdfResult = await generatePdf();
       const fileName = pdfResult.fileName || documentName;
-      setStatus("Sending PDF on WhatsApp...");
+      setStatus("Sending PDF on WhatsApp…");
       const pdfBase64 = await blobToBase64(pdfResult.blob);
       const response = await axios.post(`${API_URL}/api/whatsapp/send-document`, {
         phoneNumbers: normalizedNumbers,
@@ -14837,7 +14949,7 @@ function WhatsAppSendModal({
             </DataTable>
           )}
           <div className="button-row">
-            <button className="primary-button" disabled={sending || selectedRecipients.length === 0} onClick={send}>{sending ? "Sending..." : "Send PDF"}</button>
+            <button className="primary-button" disabled={sending || selectedRecipients.length === 0} onClick={send}>{sending ? "Sending…" : "Send PDF"}</button>
             <button className="secondary-button" disabled={sending} onClick={onClose}>Close</button>
           </div>
         </div>
@@ -14959,15 +15071,15 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
           <div>
             <span className="eyebrow">PDF Preview</span>
             <strong>{fileName}</strong>
-            <small>{loading ? "Loading PDF pages..." : error ? "Preview fallback available" : `${pages.length} page${pages.length === 1 ? "" : "s"} rendered inside FroozERP`}</small>
+            <small>{loading ? "Loading PDF pages…" : error ? "Preview fallback available" : `${pages.length} page${pages.length === 1 ? "" : "s"} rendered inside FroozERP`}</small>
           </div>
           <div className="invoice-actions">
             <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => setZoom((value) => Math.max(0.65, Number((value - 0.1).toFixed(2))))}>Zoom -</button>
             <span className="tag">{Math.round(zoom * 100)}%</span>
             <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => setZoom((value) => Math.min(1.8, Number((value + 0.1).toFixed(2))))}>Zoom +</button>
             <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => window.print()}><Icon name="print" /> Print</button>
-            <button className="primary-button" disabled={saving} onClick={handleSave}>{saving ? "Saving..." : "Save PDF"}</button>
-            <button className="secondary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening..." : "Open in System Viewer"}</button>
+            <button className="primary-button" disabled={saving} onClick={handleSave}>{saving ? "Saving…" : "Save PDF"}</button>
+            <button className="secondary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening…" : "Open in System Viewer"}</button>
             <button aria-label="Close PDF preview" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
@@ -14977,7 +15089,7 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
             <div className="pdf-preview-fallback">
               <strong>Unable to render PDF preview inside FroozERP.</strong>
               <p>{error}</p>
-              <button className="primary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening..." : "Open PDF in system viewer"}</button>
+              <button className="primary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening…" : "Open PDF in system viewer"}</button>
             </div>
           )}
           {!loading && !error && pages.map((page, index) => (
@@ -14995,8 +15107,8 @@ function ReportToolbar({ canWhatsappSend = false, exporting = false, onExcelExpo
       <strong>{title}</strong>
       <div className="button-row">
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
-        {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing..." : "View PDF"}</button>}
-        <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
+        {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing…" : "View PDF"}</button>}
+        <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting…" : "PDF Export"}</button>
         {onExcelExport && <button className="secondary-button" disabled={exporting} onClick={onExcelExport}>Excel</button>}
         <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
@@ -15009,6 +15121,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   // session left open on a counter cannot be used to lock its owner out.
   const [passwordDraft, setPasswordDraft] = useState({ current_password: "", password: "", confirm_password: "" });
   const [showPasswordForm, setShowPasswordForm] = useState(false);
+  const [passwordNotice, showPasswordNotice, clearPasswordNotice] = useSaveNotice();
   const [profile, setProfile] = useState(null);
   const [recoveryDraft, setRecoveryDraft] = useState({ email: "", mobile: "" });
   const [verification, setVerification] = useState({ type: "", requestId: "", otp: "", maskedContact: "" });
@@ -15044,9 +15157,9 @@ function UserProfilePanel({ onClose, onLogout, user }) {
       });
       setPasswordDraft({ current_password: "", password: "", confirm_password: "" });
       setShowPasswordForm(false);
-      alert("Password changed");
+      showPasswordNotice(successNotice("Password changed. Use the new password next time you sign in."));
     } catch (error) {
-      alert(getAuthErrorMessage(error, "Unable to change password"));
+      showPasswordNotice(errorNotice(getAuthErrorMessage(error, "The password could not be changed.")));
     }
   };
   const requestContactOtp = async (type) => {
@@ -15113,22 +15226,22 @@ function UserProfilePanel({ onClose, onLogout, user }) {
           <div className="purchase-summary-grid supplier-payment-preview">
             <SummaryMetric label="Role" value={userRoleLabel} featured />
             <SummaryMetric label="Branch" value={user.branch || "Main Branch"} />
-            <SummaryMetric label="Last Login" value={user.last_login_at ? new Date(user.last_login_at).toLocaleString("en-IN") : "Not recorded"} />
+            <SummaryMetric label="Last Login" value={user.last_login_at ? formatKolkataDateTime(user.last_login_at) || "Not recorded" : "Not recorded"} />
             <SummaryMetric label="Device" value="Local Counter" />
           </div>
           <div className="form-grid supplier-form-grid">
             <Field label="Username"><input disabled value={user.username || ""} /></Field>
             <Field label="Mobile"><input disabled value={user.mobile_number || ""} /></Field>
             <Field label="Email"><input disabled value={user.email || ""} /></Field>
-            <Field label="Joining Date"><input disabled value={user.joining_date ? toDateKey(user.joining_date) : ""} /></Field>
+            <Field label="Joining Date"><input disabled value={user.joining_date ? formatDisplayDate(user.joining_date) : ""} /></Field>
             <Field label="Notes"><textarea disabled value={user.notes || ""} /></Field>
           </div>
           <ModuleCard eyebrow="Recovery Security" title="Owner Recovery Contacts" subtitle="Recovery contacts are usable only after OTP verification. Password recovery requires backend connectivity.">
             <div className="purchase-summary-grid supplier-payment-preview">
               <SummaryMetric label="Email Status" value={profile?.recovery_email_verified ? "Verified" : profile?.pending_recovery_email ? "Pending" : "Not Verified"} featured={profile?.recovery_email_verified} />
               <SummaryMetric label="Mobile Status" value={profile?.recovery_mobile_verified ? "Verified" : profile?.pending_recovery_mobile ? "Pending" : "Not Verified"} featured={profile?.recovery_mobile_verified} />
-              <SummaryMetric label="Email Provider" value={profile?.provider_status?.email || "Checking"} />
-              <SummaryMetric label="SMS Provider" value={profile?.provider_status?.sms || "Checking"} />
+              <SummaryMetric label="Email Provider" value={profile?.provider_status?.email ? labelFor("providerStatus", profile.provider_status.email) : "Checking"} />
+              <SummaryMetric label="SMS Provider" value={profile?.provider_status?.sms ? labelFor("providerStatus", profile.provider_status.sms) : "Checking"} />
             </div>
             <div className="form-grid supplier-form-grid">
               <Field label="Recovery Email">
@@ -15148,7 +15261,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
                 <Field label={`OTP for ${verification.maskedContact || verification.type}`}>
                   <input inputMode="numeric" value={verification.otp} onChange={(event) => setVerification({ ...verification, otp: event.target.value.replace(/\D/g, "").slice(0, 8) })} />
                 </Field>
-                <button className="primary-button" disabled={busy} onClick={verifyContactOtp}>{busy ? "Verifying..." : "Confirm Verification"}</button>
+                <button className="primary-button" disabled={busy} onClick={verifyContactOtp}>{busy ? "Verifying…" : "Confirm Verification"}</button>
               </div>
             )}
             {(message || error) && (
@@ -15160,16 +15273,17 @@ function UserProfilePanel({ onClose, onLogout, user }) {
           </ModuleCard>
           {showPasswordForm && (
             <div className="form-grid settings-add-grid">
-              <Field label="Current Password"><PasswordInput autoComplete="current-password" value={passwordDraft.current_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, current_password: event.target.value })} /></Field>
-              <Field label="New Password"><PasswordInput value={passwordDraft.password} onChange={(event) => setPasswordDraft({ ...passwordDraft, password: event.target.value })} /></Field>
-              <Field label="Confirm Password"><PasswordInput value={passwordDraft.confirm_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value })} /></Field>
+              <Field label="Current Password"><PasswordInput autoComplete="current-password" value={passwordDraft.current_password} onChange={(event) => { clearPasswordNotice(); setPasswordDraft({ ...passwordDraft, current_password: event.target.value }); }} /></Field>
+              <Field label="New Password"><PasswordInput value={passwordDraft.password} onChange={(event) => { clearPasswordNotice(); setPasswordDraft({ ...passwordDraft, password: event.target.value }); }} /></Field>
+              <Field label="Confirm Password"><PasswordInput value={passwordDraft.confirm_password} onChange={(event) => { clearPasswordNotice(); setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value }); }} /></Field>
             </div>
           )}
           <div className="button-row">
-            <button className="secondary-button" onClick={() => setShowPasswordForm((visible) => !visible)}>{showPasswordForm ? "Cancel Password Change" : "Change Password"}</button>
+            <button className="secondary-button" onClick={() => { clearPasswordNotice(); setShowPasswordForm((visible) => !visible); }}>{showPasswordForm ? "Cancel Password Change" : "Change Password"}</button>
             {showPasswordForm && <button className="primary-button" onClick={savePassword}>Save Password</button>}
             <button className="remove-button" onClick={onLogout}>Logout</button>
           </div>
+          <SaveNotice notice={passwordNotice} />
         </div>
       </section>
     </div>
@@ -15280,7 +15394,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
           <BrandLogo invoice />
           <div>
             <strong>{title}</strong>
-            <span>{new Date().toLocaleString("en-IN")}</span>
+            <span>{formatKolkataDateTime(new Date())}</span>
           </div>
         </header>
         <ReportExportContext.Provider value={printTarget}>{children}</ReportExportContext.Provider>
@@ -15383,7 +15497,7 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
           <SummaryMetric label="Pending Bills" value={pendingBills.length} />
           <SummaryMetric label="Estimated Value" value={currency.format(pendingRows.reduce((sum, row) => sum + estimatedValue(row), 0))} />
         </div>
-        <DataTable headers={["Supplier Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Pending Items", "Estimated Value", "Action"]}>
+        <DataTable headers={markNumericColumns(["Supplier Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Pending Items", "Estimated Value", "Action"])}>
           {supplierSummaries.map((summary) => (
             <tr key={summary.key}>
               <td className="primary-cell">{summary.supplier_name}</td>
@@ -15401,13 +15515,13 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
 
       {selectedSupplier && (
         <ModuleCard eyebrow="Supplier Drill-Down" title={selectedSupplier.supplier_name} subtitle="Complete, edit or safely cancel pending bill entries for this supplier.">
-          <DataTable headers={["Date", "Items Narration", "Estimated Total", "Status", "Action"]}>
+          <DataTable headers={markNumericColumns(["Date", "Items Narration", "Estimated Total", "Status", "Action"])}>
             {selectedRows.map((bill) => {
               const purchase = bill.items[0];
               const itemsNarration = bill.items.map(narration).join("; ");
               const changeBlock = purchaseChangeBlock(bill.itemCount);
               return (
-              <tr className="report-row-clickable" key={bill.key} onClick={() => onOpenPurchaseAmendment(purchase)}>
+              <tr className="report-row-clickable" key={bill.key} onClick={() => onOpenPurchaseAmendment(purchase)} tabIndex={0} onKeyDown={activateOnEnter(() => onOpenPurchaseAmendment(purchase))}>
                 <td>{formatDisplayDate(purchase.purchase_date)}</td>
                 <td className="primary-cell purchase-items-cell">
                   <span title={itemsNarration}>{itemsNarration}</span>
@@ -15575,7 +15689,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
               <SummaryMetric label="Credit Amount" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
               <SummaryMetric label="Balance" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.balance || 0), 0))} />
             </div>
-            <DataTable headers={["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Returned", "Balance", "Action"]}>
+            <DataTable headers={markNumericColumns(["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Returned", "Balance", "Action"])}>
               {summaries.map((summary) => (
                 <tr key={summary.key}>
                   <td className="primary-cell">{summary.customer_name}</td>
@@ -15596,7 +15710,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
 
           {selectedCustomer && (
             <ModuleCard eyebrow="Customer Drill-Down" title={selectedCustomer.customer_name} subtitle="Receive payment, view invoices and print customer credit statement.">
-              <DataTable headers={["Bill Date", "Invoice Number", "Items / Narration", "Gross Amount", "Discount", "Net Amount", "Received", "Returned", "Balance", "Due Date", "Status", "Action"]}>
+              <DataTable headers={markNumericColumns(["Bill Date", "Invoice Number", "Items / Narration", "Gross Amount", "Discount", "Net Amount", "Received", "Returned", "Balance", "Due Date", "Status", "Action"])}>
                 {selectedCustomer.rows.map((invoice) => (
                   <tr key={invoice.id}>
                     <td>{formatDisplayDate(invoice.sale_date)}</td>
@@ -15608,7 +15722,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
                     <td>{currency.format(Number(invoice.received_amount || 0))}</td>
                     <td>{currency.format(Number(invoice.returned_amount || 0))}</td>
                     <td className="balance-cell">{currency.format(Number(invoice.balance_amount || 0))}</td>
-                    <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : "-"}</td>
+                    <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : MISSING_VALUE}</td>
                     <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{labelFor("credit_status", invoice.credit_status)}</span></td>
                     <td>
                       <div className="button-row table-actions-row">
@@ -18094,7 +18208,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     try {
       const params = currentRefreshParams();
       const result = await onReload(params);
-      if (result?.failures?.length) throw new Error(result.failures.map((failure) => `${failure.key}: ${failure.message}`).join("; "));
+      if (result?.failures?.length) throw new Error(describeReportRefreshFailures(result.failures));
       setAppliedQuery(params);
       lastSuccessfulFilters.current = { range, customRange: { ...customRange }, search, salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter };
     } catch (error) {
@@ -18193,12 +18307,12 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   /**
    * Summary tiles for one order report, or a single tile naming the reason there are none.
    *
-   * Returning `[["Orders", "-"]]` rather than `[["Orders", 0]]` is the whole point. A zero here
+   * Returning `[["Orders", "—"]]` (MISSING_VALUE) rather than `[["Orders", 0]]` is the whole point. A zero here
    * would be a confident, wrong statement about the shop's day.
    */
   const orderReportSummary = (key, build) => {
     const report = orderReportsState.reports?.[key];
-    if (!report?.ok) return [["Orders", "-", true], ["Status", orderReportsState.notice || "Unavailable"]];
+    if (!report?.ok) return [["Orders", MISSING_VALUE, true], ["Status", orderReportsState.notice || "Unavailable"]];
     return build(report.summary);
   };
   const money = (value) => currency.format(Number(value || 0));
@@ -18271,7 +18385,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       })
       .sort((left, right) => toDateKey(right.date).localeCompare(toDateKey(left.date)) || String(right.voucher_no || "").localeCompare(String(left.voucher_no || "")));
   };
-  const ledgerNarration = (row) => ledgerPrintNarration || ledgerPrintNarrationRef.current ? row.narration || row.remarks || "-" : row.remarks || row.narration || "-";
+  const ledgerNarration = (row) => ledgerPrintNarration || ledgerPrintNarrationRef.current ? row.narration || row.remarks || MISSING_VALUE : row.remarks || row.narration || MISSING_VALUE;
   const customerLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "CUSTOMER")));
   // The Supplier Ledger runs on from the balance brought forward to the range's first day (UI-10);
   // when that could not be read its balances are unknown, not counted from 0.
@@ -18495,7 +18609,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const formatSaleQuantityGroups = (groups) => {
     const entries = groups instanceof Map ? [...groups.entries()] : Object.entries(groups || {});
-    if (!entries.length) return "-";
+    if (!entries.length) return MISSING_VALUE;
     return entries
       .sort(([unitA], [unitB]) => unitA.localeCompare(unitB))
       .map(([unit, quantity]) => {
@@ -18841,8 +18955,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           <td>{money(row.value)}</td>
           <td>{number(row.orders)}</td>
           <td>{number(row.customers)}</td>
-          <td>{row.cancelledQuantity > 0 ? number(row.cancelledQuantity) : "-"}</td>
-          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+          <td>{row.cancelledQuantity > 0 ? number(row.cancelledQuantity) : MISSING_VALUE}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : MISSING_VALUE}</td>
         </tr>
       ),
     },
@@ -18864,12 +18978,12 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                 allowed without one. Saying so beats showing a name that looks like an account. */}
             {row.identified ? null : <small className="cell-note">Not a saved customer</small>}
           </td>
-          <td>{row.customerMobile || "-"}</td>
+          <td>{row.customerMobile || MISSING_VALUE}</td>
           <td>{number(row.orders)}</td>
           <td>{money(row.value)}</td>
           <td>{money(row.averageOrderValue)}</td>
-          <td>{row.cancelled > 0 ? number(row.cancelled) : "-"}</td>
-          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+          <td>{row.cancelled > 0 ? number(row.cancelled) : MISSING_VALUE}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : MISSING_VALUE}</td>
         </tr>
       ),
     },
@@ -18898,8 +19012,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             {row.warning ? <small className="cell-note">{row.warning}</small> : null}
           </td>
           <td>{row.ageHours < 24 ? `${row.ageHours} h` : `${Math.floor(row.ageHours / 24)} d`}</td>
-          <td>{row.carrier || "-"}</td>
-          <td>{row.invoiceNo || (row.billed ? "Billed" : "-")}</td>
+          <td>{row.carrier || MISSING_VALUE}</td>
+          <td>{row.invoiceNo || (row.billed ? "Billed" : MISSING_VALUE)}</td>
           <td>{money(row.value)}</td>
         </tr>
       ),
@@ -18909,21 +19023,21 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.salesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Cash", money(totalOf(rows, "cash_sales"))], ["UPI", money(totalOf(rows, "upi_sales"))], ["Profit", money(totalOf(rows, "total_profit"))]],
       headers: ["Date", "Transactions", "Sales", "Cash", "UPI", "Bank/Card", "Cost", "Profit"],
-      render: (row) => <tr key={row.sale_date}><td>{formatDisplayDate(row.sale_date)}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+      render: (row) => <tr key={row.sale_date}><td>{formatDisplayDate(row.sale_date)}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(row.total_cost)}</td><ProfitCell format={money} value={row.total_profit} /></tr>,
     },
     salesByProduct: {
       title: "Sales by Product",
       rows: filterRows(data.salesProductReport),
       summary: (rows) => [["Revenue", money(totalOf(rows, "revenue")), true], ["Quantity Sold", number(totalOf(rows, "quantity_sold"))], ["Profit", money(totalOf(rows, "profit"))]],
       headers: ["Product", "Lot", "Quantity", "Rate", "Revenue", "Cost", "Profit"],
-      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || "-"}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || MISSING_VALUE}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><ProfitCell format={money} value={row.profit} /></tr>,
     },
     salesByCustomer: {
       title: "Sales by Customer",
       rows: filterRows(data.salesCustomerReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Invoices", number(totalOf(rows, "invoice_count"))], ["Profit", money(totalOf(rows, "total_profit"))]],
       headers: ["Customer", "Mobile", "Invoices", "Sales", "Profit"],
-      render: (row) => <tr key={`${row.customer_name}-${row.customer_mobile}`}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_mobile || "-"}</td><td>{row.invoice_count}</td><td>{money(row.total_sales)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+      render: (row) => <tr key={`${row.customer_name}-${row.customer_mobile}`}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_mobile || MISSING_VALUE}</td><td>{row.invoice_count}</td><td>{money(row.total_sales)}</td><ProfitCell format={money} value={row.total_profit} /></tr>,
     },
     salesHistory: {
       title: "Sales History",
@@ -18958,7 +19072,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                   <strong>{row.customer_name}</strong>
                   <span>{row.invoice_count} invoice{row.invoice_count === 1 ? "" : "s"}</span>
                   <span>{row.item_lines} item line{row.item_lines === 1 ? "" : "s"}</span>
-                  <span>{row.quantity_summary || "-"}</span>
+                  <span>{row.quantity_summary || MISSING_VALUE}</span>
                   <span>Gross {money(row.gross_total)}</span>
                   <span>Net {money(row.net_total)}</span>
                   <span>Cash {money(row.cash_total)}</span>
@@ -18973,7 +19087,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           const expanded = Boolean(expandedSalesRows[row.display_key]);
           return (
             <React.Fragment key={row.display_key}>
-              <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} onClick={openInvoice}>
+              <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} onClick={openInvoice} tabIndex={0} onKeyDown={activateOnEnter(openInvoice)}>
                 <td className="primary-cell date-cell">
                   {formatDisplayDate(row.sale_date)}
                 </td>
@@ -18989,10 +19103,10 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                   <span>{salesNarrationDisplay(row)}</span>
                   <small className="cell-note">{row.item_rows?.length || 0} item line{(row.item_rows?.length || 0) === 1 ? "" : "s"}</small>
                 </td>
-                <td className="status-cell">{row.quantity_summary || "-"}</td>
+                <td className="status-cell">{row.quantity_summary || MISSING_VALUE}</td>
                 <td className="amount-cell">{money(row.gross_total)}</td>
-                {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
-                {salesHasBillDiscount && <td className="amount-cell">{Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
+                {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : MISSING_VALUE}</td>}
+                {salesHasBillDiscount && <td className="amount-cell">{Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : MISSING_VALUE}</td>}
                 <td className="amount-cell">{money(row.net_total)}</td>
                 <td className="status-cell">{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="status-cell">{row.status_label}</td>
@@ -19002,18 +19116,18 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                   <td colSpan={salesHistoryHeaders.length}>
                     <DataTable headers={["Item", "Lot", "Qty", "Unit", "Rate", "Gross", ...(salesHasItemDiscount ? ["Item Disc."] : []), ...(salesHasBillDiscount ? ["Bill Disc."] : []), "Net", "Cost Rate", "Profit"]}>
                       {(row.item_rows || []).map((item) => (
-                        <tr className="report-row-clickable" key={item.display_key} onClick={openInvoice}>
+                        <tr className="report-row-clickable" key={item.display_key} onClick={openInvoice} tabIndex={0} onKeyDown={activateOnEnter(openInvoice)}>
                           <td className="primary-cell">{item.item_name}</td>
                           <td>{item.lot_name || "No Lot Number"}</td>
                           <td>{number(item.quantity)}</td>
                           <td>{labelFor("unit", item.unit)}</td>
                           <td>{money(item.rate)}</td>
                           <td>{money(item.gross_total)}</td>
-                          {salesHasItemDiscount && <td>{Number(item.item_discount_total || 0) ? money(item.item_discount_total) : "-"}</td>}
-                          {salesHasBillDiscount && <td>{Number(item.bill_discount_total || 0) ? money(item.bill_discount_total) : "-"}</td>}
+                          {salesHasItemDiscount && <td>{Number(item.item_discount_total || 0) ? money(item.item_discount_total) : MISSING_VALUE}</td>}
+                          {salesHasBillDiscount && <td>{Number(item.bill_discount_total || 0) ? money(item.bill_discount_total) : MISSING_VALUE}</td>}
                           <td>{money(item.net_total)}</td>
                           <td>{money(item.cost_rate)}</td>
-                          <td className="profit-cell">{money(item.profit)}</td>
+                          <ProfitCell format={money} value={item.profit} />
                         </tr>
                       ))}
                     </DataTable>
@@ -19024,7 +19138,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           );
         }
         return (
-          <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} key={row.display_key} onClick={openInvoice}>
+          <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} key={row.display_key} onClick={openInvoice} tabIndex={0} onKeyDown={activateOnEnter(openInvoice)}>
             <td className="date-cell">{row.row_type === "CUSTOMER_ITEM" ? new Date(row.bill_datetime || row.created_at || row.sale_date).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : formatDisplayDate(row.sale_date)}</td>
             <td className="primary-cell">{row.invoice_no || `#${row.sale_id}`}{row.showing_matched_only && <small className="cell-note warning-note">Matched item</small>}</td>
             {salesFilters.viewMode !== "CUSTOMER" && <td className="primary-cell">{row.customer_name || "Walk-in Customer"}</td>}
@@ -19034,11 +19148,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             <td>{labelFor("unit", row.unit)}</td>
             <td>{money(row.rate)}</td>
             {salesFilters.viewMode !== "CUSTOMER" && <td className="amount-cell">{money(row.gross_total)}</td>}
-            {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
-            {salesHasBillDiscount && <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
-            <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : money(row.net_total)}</td>
-            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : labelFor("paymentMode", row.payment_mode)}</td>
-            <td>{row.row_type === "CUSTOMER_ITEM" ? (row.invoice_first_line ? row.status_label : "-") : (row.created_by_name || row.sold_by || "-")}</td>
+            {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : MISSING_VALUE}</td>}
+            {salesHasBillDiscount && <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? MISSING_VALUE : Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : MISSING_VALUE}</td>}
+            <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? MISSING_VALUE : money(row.net_total)}</td>
+            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? MISSING_VALUE : labelFor("paymentMode", row.payment_mode)}</td>
+            <td>{row.row_type === "CUSTOMER_ITEM" ? (row.invoice_first_line ? row.status_label : MISSING_VALUE) : (row.created_by_name || row.sold_by || MISSING_VALUE)}</td>
           </tr>
         );
       },
@@ -19048,21 +19162,21 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: editedBills,
       summary: (rows) => [["Edited Bills", rows.length, true], ["Total Amount", money(totalOf(rows, "total_amount"))]],
       headers: ["Invoice", "Date", "Amount", "Edited By", ...(editedBillsShowApprover ? ["Approved By"] : []), "Edited At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td>{editedBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td><td>{row.edit_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || MISSING_VALUE}</td>{editedBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}</td><td>{row.edit_reason || MISSING_VALUE}</td></tr>,
     },
     cancelledBills: {
       title: "Cancelled Bills",
       rows: cancelledBills,
       summary: (rows) => [["Cancelled Bills", rows.length, true], ["Cancelled Amount", money(totalOf(rows, "total_amount"))]],
       headers: ["Invoice", "Date", "Amount", "Cancelled By", ...(cancelledBillsShowApprover ? ["Approved By"] : []), "Cancelled At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td>{cancelledBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || MISSING_VALUE}</td>{cancelledBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.cancelled_at ? formatKolkataDateTime(row.cancelled_at) : MISSING_VALUE}</td><td>{row.cancellation_reason || MISSING_VALUE}</td></tr>,
     },
     provisionalProfitSales: {
       title: "Provisional Profit Sales",
       rows: filterRows(data.provisionalProfitSalesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_amount")), true], ["Provisional Profit", money(totalOf(rows, "profit"))], ["Invoices", rows.length]],
       headers: ["Invoice", "Date", "Customer", "Payment", "Products", "Amount", "Cost", "Provisional Profit"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.products || MISSING_VALUE}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><ProfitCell format={money} value={row.profit} /></tr>,
     },
     discountReport: {
       title: "Discount Report",
@@ -19079,7 +19193,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           : Number(row.bill_discount_share || 0) > 0
             ? (row.bill_discount_rule_name ? `Bill: ${row.bill_discount_rule_name}` : "Bill discount")
             : "Manual";
-        return <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{kind}</td><td>{!row.discount_type ? MISSING_VALUE : row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{known(row.item_discount_amount)}</td><td>{known(row.bill_discount_share)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>;
+        return <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || MISSING_VALUE}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{kind}</td><td>{!row.discount_type ? MISSING_VALUE : row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{known(row.item_discount_amount)}</td><td>{known(row.bill_discount_share)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>;
       },
     },
     purchasesByDate: {
@@ -19121,7 +19235,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       ],
       headers: ["Date", "Supplier", "Narration", "Gross Total", "Net Total", "Status"],
       render: (row) => (
-        <tr className="report-row-clickable" key={row.display_key} onClick={() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row)}>
+        <tr className="report-row-clickable" key={row.display_key} onClick={() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row)} tabIndex={0} onKeyDown={activateOnEnter(() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row))}>
           <td className="primary-cell date-cell">{formatDisplayDate(row.purchase_date)}</td>
           <td className="primary-cell">{row.supplier_name}{row.firm_name && <small className="cell-note">{row.firm_name}</small>}</td>
           <td className="primary-cell purchase-items-cell">
@@ -19139,14 +19253,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: purchaseChanges,
       summary: (rows) => [["Changed Purchases", rows.length, true], ["Cancelled", rows.filter((row) => row.purchase_status === "CANCELLED").length], ["Edited", rows.filter((row) => row.purchase_status === "EDITED").length]],
       headers: ["Purchase", "Date", "Supplier", "Status", "Amount", "Changed By", "Reason"],
-      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td>{row.purchase_status}</td><td>{money(row.net_payable)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancellation_reason || row.edit_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td>{row.purchase_status}</td><td>{money(row.net_payable)}</td><td>{row.changed_by_name || MISSING_VALUE}</td><td>{row.cancellation_reason || row.edit_reason || MISSING_VALUE}</td></tr>,
     },
     pendingPurchaseBills: {
       title: "Pending Purchase Bills",
       rows: filterRows(data.pendingPurchaseBillsReport),
       summary: (rows) => [["Pending Bills", purchaseItemCounts(rows).size, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
       headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Remarks"],
-      render: (row, index) => <tr key={`${row.id}-${row.batch_no || index}`}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(pendingItemRate(row))}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.id}-${row.batch_no || index}`}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(pendingItemRate(row))}</td><td>{row.remarks || MISSING_VALUE}</td></tr>,
     },
     stockWithoutBill: {
       title: "Stock Received Without Bill",
@@ -19160,7 +19274,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: customerLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || MISSING_VALUE}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     supplierLedger: {
       title: "Supplier Ledger",
@@ -19170,14 +19284,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         return [["Opening b/f", supplierOpeningTile], ["Debits", money(totalOf(periodRows, "debit")), true], ["Credits", money(totalOf(periodRows, "credit"))], ["Rows", periodRows.length]];
       },
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{row.running_balance === null ? MISSING_VALUE : `${money(Math.abs(Number(row.running_balance || 0)))} ${Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}`}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || MISSING_VALUE}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{row.running_balance === null ? MISSING_VALUE : `${money(Math.abs(Number(row.running_balance || 0)))} ${Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}`}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
       rows: accountStatementRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {labelFor("accountType", row.account_type)}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {labelFor("accountType", row.account_type)}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || MISSING_VALUE}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     paymentReport: {
       title: "Payment Report",
@@ -19188,7 +19302,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         return [["Payments", money(totals.payments), true], ["Rebates", money(totals.rebates)], ["Cancelled", money(totals.cancelled)], ["Entries", totals.entries]];
       },
       headers: ["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"],
-      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{labelFor("transactionType", row.payment_type)}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{labelFor("transactionType", row.payment_type)}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || MISSING_VALUE}</td></tr>,
     },
     paymentModeSummary: {
       title: "Payment Mode Summary",
@@ -19216,7 +19330,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.returnHistoryReport),
       summary: (rows) => [["Return Value", money(totalOf(rows, "total_return_amount")), true], ["Returns", rows.length]],
       headers: ["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"],
-      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || "-"}</td><td>{row.customer_name}</td><td>{labelFor("refundType", row.refund_type)}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || "-"}</td></tr>,
+      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || MISSING_VALUE}</td><td>{row.customer_name}</td><td>{labelFor("refundType", row.refund_type)}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || MISSING_VALUE}</td></tr>,
     },
     returnValue: {
       title: "Return Value Report",
@@ -19293,7 +19407,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.stockMovementReport),
       summary: (rows) => [["Quantity", number(totalOf(rows, "quantity")), true], ["Movements", number(totalOf(rows, "movement_count"))]],
       headers: ["Date", "Product", "Type", "Quantity", "Count", "Remarks"],
-      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{labelFor("transactionType", row.transaction_type)}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{labelFor("transactionType", row.transaction_type)}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || MISSING_VALUE}</td></tr>,
     },
     stockValuation: {
       title: "Stock Valuation",
@@ -19311,7 +19425,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         const status = String(row.batch_status || "ACTIVE").toUpperCase();
         const balance = Number(row.remaining_qty ?? row.balance_qty ?? 0);
         const statusLabel = status === "CANCELLED" ? "Cancelled" : status === "INACTIVE" ? "Inactive" : balance <= 0 ? "Sold Out" : "Active";
-        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{labelFor("stockSource", row.stock_source || "PURCHASE")}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
+        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{labelFor("stockSource", row.stock_source || "PURCHASE")}</span></td><td>{row.supplier_name || MISSING_VALUE}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
       },
     },
     profitLoss: {
@@ -19375,14 +19489,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         ["Total Closing", money(cashBookData.total_closing), true],
       ],
       headers: ["Date", "Particulars / Account", "Narration", "Receipt Cash", "Receipt Bank/UPI/Card", "Payment Cash", "Payment Bank/UPI/Card", "Cash Balance", "Bank Balance", "Total Balance", "Reference / Bill No"],
-      render: (row, index) => <tr className="report-row-clickable" onClick={() => setCashBookDetail(row)} key={`${row.date}-${row.reference_no}-${index}`}><td className="date-cell">{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.account_name || row.party_name}</td><td className="purchase-items-cell"><span title={row.narration}>{row.narration || "-"}</span></td><td className="amount-cell">{money(row.receipt_cash)}</td><td className="amount-cell">{money(row.receipt_bank)}</td><td className="amount-cell">{money(row.payment_cash)}</td><td className="amount-cell">{money(row.payment_bank)}</td><td className="amount-cell">{money(row.cash_balance)}</td><td className="amount-cell">{money(row.bank_balance)}</td><td className="profit-cell amount-cell">{money(row.total_balance)}</td><td>{row.reference_no || "-"}</td></tr>,
+      render: (row, index) => <tr className="report-row-clickable" onClick={() => setCashBookDetail(row)} tabIndex={0} onKeyDown={activateOnEnter(() => setCashBookDetail(row))} key={`${row.date}-${row.reference_no}-${index}`}><td className="date-cell">{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.account_name || row.party_name}</td><td className="purchase-items-cell"><span title={row.narration}>{row.narration || MISSING_VALUE}</span></td><td className="amount-cell">{money(row.receipt_cash)}</td><td className="amount-cell">{money(row.receipt_bank)}</td><td className="amount-cell">{money(row.payment_cash)}</td><td className="amount-cell">{money(row.payment_bank)}</td><td className="amount-cell">{money(row.cash_balance)}</td><td className="amount-cell">{money(row.bank_balance)}</td><ProfitCell className="amount-cell" format={money} value={row.total_balance} /><td>{row.reference_no || MISSING_VALUE}</td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
       rows: filterRows(data.expenseReport),
       summary: (rows) => [["Total Expenses", money(totalOf(rows.filter((row) => row.status !== "CANCELLED"), "amount")), true], ["Cash", money(totalOf(rows.filter((row) => row.payment_mode === "CASH" && row.status !== "CANCELLED"), "amount"))], ["UPI", money(totalOf(rows.filter((row) => row.payment_mode === "UPI" && row.status !== "CANCELLED"), "amount"))], ["Cancelled", money(totalOf(rows.filter((row) => row.status === "CANCELLED"), "amount"))]],
       headers: ["Date", "Category", "Paid To", "Payment Mode", "Amount", "Reference", "Remarks", "Status"],
-      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{labelFor("recordStatus", row.status || "ACTIVE")}</span></td></tr>,
+      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || MISSING_VALUE}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{money(row.amount)}</td><td>{row.reference_number || MISSING_VALUE}</td><td>{row.remarks || row.cancellation_reason || MISSING_VALUE}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{labelFor("recordStatus", row.status || "ACTIVE")}</span></td></tr>,
     },
   };
   const categories = [
@@ -19455,8 +19569,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       expenseRows.push({ category: "Other Expenses", amount: otherExpenses });
     }
     const hasTransactions = [salesRevenue, otherIncome, purchaseCost, mandiTax, freightCharges, labourCharges, otherPurchaseCharges, supplierRebateReceived, totalExpenses].some((value) => Math.abs(Number(value || 0)) > 0);
-    const periodFrom = data.dateFrom || customRange.date_from || "-";
-    const periodTo = data.dateTo || customRange.date_to || "-";
+    const periodFrom = data.dateFrom || customRange.date_from || MISSING_VALUE;
+    const periodTo = data.dateTo || customRange.date_to || MISSING_VALUE;
     return (
       <div className="profit-loss-statement">
         <div className="pl-title-block">
@@ -19498,7 +19612,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const renderFilters = () => selectedReport === "stockInventory" ? (
     <div className="ledger-toolbar">
-      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh Inventory"}</button>
+      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing…" : "Refresh Inventory"}</button>
       {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   ) : (
@@ -19801,7 +19915,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           <button className="secondary-button" onClick={() => setPurchaseFilters({ supplier: "", product: "", status: "ACTIVE", paymentType: "", date: "" })}>Clear Purchase Filters</button>
         </>
       )}
-      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh"}</button>
+      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing…" : "Refresh"}</button>
       {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   );
@@ -19841,7 +19955,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     }
     if (column === "Date") return formatDisplayDate(value);
     if (column === "Qty") return number(value);
-    return value || "-";
+    return value || MISSING_VALUE;
   };
   const renderBalanceSheetDetailModal = () => {
     if (!balanceSheetDetail && !balanceSheetDetailLoading && !balanceSheetDetailError) return null;
@@ -19854,7 +19968,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             <div>
               <span className="eyebrow">Balance Sheet Drilldown</span>
               <h2>{balanceSheetDetail?.title || "Loading Detail"}</h2>
-              <p>{balanceSheetDetail ? `${formatDisplayDate(balanceSheetDetail.dateFrom)} to ${formatDisplayDate(balanceSheetDetail.dateTo)} | Closing as at ${formatDisplayDate(balanceSheetDetail.asAtDate || balanceSheetDetail.dateTo)}` : "Fetching source transactions..."}</p>
+              <p>{balanceSheetDetail ? `${formatDisplayDate(balanceSheetDetail.dateFrom)} to ${formatDisplayDate(balanceSheetDetail.dateTo)} | Closing as at ${formatDisplayDate(balanceSheetDetail.asAtDate || balanceSheetDetail.dateTo)}` : "Fetching source transactions…"}</p>
             </div>
             <button className="secondary-button" onClick={() => { setBalanceSheetDetail(null); setBalanceSheetDetailError(""); }}>Close</button>
           </div>
@@ -19913,18 +20027,18 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             <SummaryMetric label="Payment Cash" value={money(totalPaymentCash)} />
             <SummaryMetric featured label="Payment Bank" value={money(totalPaymentBank)} />
           </div>
-          <DataTable headers={["Date & Time", "Voucher / Invoice", "Type", "Party", "Mode", "Cash", "Bank", "Remarks", "Created By", "Source"]}>
+          <DataTable headers={markNumericColumns(["Date & Time", "Voucher / Invoice", "Type", "Party", "Mode", "Cash", "Bank", "Remarks", "Created By", "Source"])}>
             {sourceRows.map((row, index) => (
               <tr key={`${row.source_type}-${row.source_id}-${index}`}>
                 <td>{formatDisplayDate(row.date)}<small className="cell-note">{row.entry_time ? new Date(row.entry_time).toLocaleTimeString("en-IN") : ""}</small></td>
-                <td className="primary-cell">{row.reference_no || "-"}</td>
+                <td className="primary-cell">{row.reference_no || MISSING_VALUE}</td>
                 <td>{labelFor("transactionType", row.source_type)}</td>
-                <td>{row.party_name || row.account_name || "-"}</td>
+                <td>{row.party_name || row.account_name || MISSING_VALUE}</td>
                 <td>{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="amount-cell">{money(Number(row.receipt_cash || 0) || Number(row.payment_cash || 0))}</td>
                 <td className="amount-cell">{money(Number(row.receipt_bank || 0) || Number(row.payment_bank || 0))}</td>
-                <td className="purchase-items-cell">{row.narration || "-"}</td>
-                <td>{row.created_by_name || "-"}</td>
+                <td className="purchase-items-cell">{row.narration || MISSING_VALUE}</td>
+                <td>{row.created_by_name || MISSING_VALUE}</td>
                 <td>{labelFor("transactionType", row.source_type)}</td>
               </tr>
             ))}
@@ -19951,7 +20065,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     };
     const groupCashBookRows = (rows) => {
       if (cashBookViewMode === "ENTRY") {
-        return rows.map((row) => ({ ...row, source_rows: [row], group_label: cashBookGroupLabel(row), ledger_folio: row.reference_no || "-" }));
+        return rows.map((row) => ({ ...row, source_rows: [row], group_label: cashBookGroupLabel(row), ledger_folio: row.reference_no || MISSING_VALUE }));
       }
       return [...rows.reduce((groups, row) => {
         const side = Number(row.receipt_cash || 0) || Number(row.receipt_bank || 0) ? "RECEIPT" : "PAYMENT";
@@ -19959,7 +20073,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         const key = [periodKey, side, row.account_type || "", row.account_name || row.party_name || "", row.mode_group || ""].join("|");
         const current = groups.get(key) || {
           date: cashBookGroupBy === "PERIOD" ? (cashBookData.dateFrom || data.dateFrom) : periodKey,
-          account_name: row.account_name || row.party_name || "-",
+          account_name: row.account_name || row.party_name || MISSING_VALUE,
           account_type: row.account_type,
           party_name: row.party_name,
           mode_group: row.mode_group,
@@ -19991,11 +20105,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     const paymentSideCashTotal = cashBookPaymentsCash + cashBookClosingCash;
     const paymentSideBankTotal = cashBookPaymentsBank + cashBookClosingBank;
     const renderBookRow = (row, side) => (
-      <tr className="report-row-clickable" key={`${side}-${row.group_label}-${row.account_name}-${row.mode_group || ""}-${row.source_id || row.reference_no}`} onClick={() => setCashBookDetail(row)}>
+      <tr className="report-row-clickable" key={`${side}-${row.group_label}-${row.account_name}-${row.mode_group || ""}-${row.source_id || row.reference_no}`} onClick={() => setCashBookDetail(row)} tabIndex={0} onKeyDown={activateOnEnter(() => setCashBookDetail(row))}>
         <td className="date-cell">{cashBookViewMode === "ENTRY" ? formatDisplayDate(row.date) : row.group_label}</td>
         <td className="primary-cell">
-          {side === "RECEIPT" ? "To " : "By "}{row.account_name || row.party_name || "-"} A/c
-          {cashBookViewMode === "ENTRY" && showCashBookRemarks && <small className="cell-note">{row.narration || "-"}</small>}
+          {side === "RECEIPT" ? "To " : "By "}{row.account_name || row.party_name || MISSING_VALUE} A/c
+          {cashBookViewMode === "ENTRY" && showCashBookRemarks && <small className="cell-note">{row.narration || MISSING_VALUE}</small>}
           {cashBookViewMode === "SUMMARY" && <small className="cell-note">{row.source_rows.length} entr{row.source_rows.length === 1 ? "y" : "ies"}</small>}
         </td>
         <td className="status-cell">{row.ledger_folio || "—"}</td>
@@ -20134,10 +20248,10 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       if (isOrderReport && orderReportsState.notice) parts.push(orderReportsState.notice);
       if (selectedReport === "salesHistory") {
         parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
-        parts.push(`Status: ${salesFilters.status}`);
-        if (salesFilters.customerMode !== "ALL") parts.push(`Customer: ${salesFilters.customerMode.replaceAll("_", " ")}`);
-        if (salesFilters.userMode !== "ALL") parts.push(`Users: ${salesFilters.userMode.replaceAll("_", " ")}`);
-        if (salesFilters.paymentMode) parts.push(`Payment: ${salesFilters.paymentMode}`);
+        parts.push(`Status: ${labelFor("status", salesFilters.status)}`);
+        if (salesFilters.customerMode !== "ALL") parts.push(`Customer: ${labelFor("filterMode", salesFilters.customerMode)}`);
+        if (salesFilters.userMode !== "ALL") parts.push(`Users: ${labelFor("filterMode", salesFilters.userMode)}`);
+        if (salesFilters.paymentMode) parts.push(`Payment: ${labelFor("paymentMode", salesFilters.paymentMode)}`);
         if (salesFilters.product) parts.push(`Product filter active`);
         if (salesFilters.lot) parts.push(`Lot filter active`);
       }
@@ -20195,7 +20309,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
               {selectedReport === "stockInventory" && loadPackingStock && <PackingStockPanel loadPacking={loadPackingStock} />}
               {selectedReport === "stockInventory" ? null : selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
                 <>
-                  <DataTable headers={currentReport.headers}>
+                  <DataTable headers={markNumericColumns(currentReport.headers, { also: ["Value"] })}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
                   </DataTable>
                   {rows.length === 0 && (
@@ -20313,7 +20427,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const formatUnitGroups = (groups) => [...groups.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([unit, value]) => `${qty(value)} ${unit}`)
-    .join(" • ") || "-";
+    .join(" • ") || MISSING_VALUE;
   const addUnitValue = (groups, unit, value) => {
     const key = normalizeUnit(unit);
     groups.set(key, (groups.get(key) || 0) + Number(value || 0));
@@ -20537,10 +20651,10 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const auditChangeSummary = (row) => {
     const oldValue = row.old_value || {};
     const newValue = row.new_value || {};
-    const beforeQty = oldValue.remaining_qty ?? oldValue.purchase_qty ?? "-";
-    const afterQty = newValue.remaining_qty ?? newValue.purchase_qty ?? "-";
-    const beforeRate = oldValue.purchase_rate ?? oldValue.effective_cost_per_unit ?? "-";
-    const afterRate = newValue.purchase_rate ?? newValue.effective_cost_per_unit ?? "-";
+    const beforeQty = oldValue.remaining_qty ?? oldValue.purchase_qty ?? MISSING_VALUE;
+    const afterQty = newValue.remaining_qty ?? newValue.purchase_qty ?? MISSING_VALUE;
+    const beforeRate = oldValue.purchase_rate ?? oldValue.effective_cost_per_unit ?? MISSING_VALUE;
+    const afterRate = newValue.purchase_rate ?? newValue.effective_cost_per_unit ?? MISSING_VALUE;
     return `Qty ${beforeQty} -> ${afterQty} | Cost ${beforeRate} -> ${afterRate}`;
   };
   const clearFilters = () => {
@@ -20590,12 +20704,12 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const renderLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
-      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
+      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)} tabIndex={0} onKeyDown={activateOnEnter(() => openLotDetail(lot))}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{labelFor("unit", lot.unit)}</small></td>
         <td>{lot.category || "Fruit"}</td>
-        <td>{lot.supplier_name || "-"}</td>
+        <td>{lot.supplier_name || MISSING_VALUE}</td>
         <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}</td>
-        <td>{lot.lot_size || "-"}</td>
+        <td>{lot.lot_size || MISSING_VALUE}</td>
         <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
         <td>{qty(lotOpening(lot))}</td>
         <td>{qty(lotUsed(lot))}</td>
@@ -20605,9 +20719,9 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         <td>{money(lotSaleRate(lot))}</td>
         {canManageStock && <td>{money(lotBalance(lot) * lotCost(lot))}</td>}
         <td><span className={statusClass(status)}>{displayStockStatus(status)}</span></td>
-        <td className="purchase-items-cell"><span title={lot.remarks || "-"}>{lot.remarks || "-"}</span></td>
-        <td>{lot.created_at ? new Date(lot.created_at).toLocaleString("en-IN") : "-"}</td>
-        <td>{lot.last_edited_at ? new Date(lot.last_edited_at).toLocaleString("en-IN") : "-"}</td>
+        <td className="purchase-items-cell"><span title={lot.remarks || MISSING_VALUE}>{lot.remarks || MISSING_VALUE}</span></td>
+        <td>{lot.created_at ? formatKolkataDateTime(lot.created_at) : MISSING_VALUE}</td>
+        <td>{lot.last_edited_at ? formatKolkataDateTime(lot.last_edited_at) : MISSING_VALUE}</td>
       </tr>
     );
   });
@@ -20615,10 +20729,10 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const renderCompactLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
-      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
+      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)} tabIndex={0} onKeyDown={activateOnEnter(() => openLotDetail(lot))}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.category || ""}</small></td>
         <td className="primary-cell">{lot.lot_name || lot.batch_no || "No Lot Number"}<small className="cell-note">{lot.lot_size || ""}</small></td>
-        <td>{lot.supplier_name || "-"}</td>
+        <td>{lot.supplier_name || MISSING_VALUE}</td>
         <td><span className={lotBalance(lot) <= 0 ? "origin-rate" : "stock-ok"}>{qty(lotBalance(lot))}</span></td>
         <td>{normalizeUnit(lot.unit)}</td>
         <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
@@ -20633,12 +20747,13 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   return (
     <section className="stock-inventory-report">
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric featured label="Total Stock Value" value={canManageStock ? money(totalStockValue) : "Restricted"} />
+        {/* A failed load is not an empty shop: every figure reads "—" beside the error, never ₹0.00 or 0. */}
+        <SummaryMetric featured label="Total Stock Value" value={!canManageStock ? "Restricted" : inventoryUnavailable ? MISSING_VALUE : money(totalStockValue)} />
         <SummaryMetric label="Products" value={inventoryPresentation.countLabel} />
-        <SummaryMetric label="Active Lots" value={filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
-        <SummaryMetric label="Stock" value={formatUnitGroups(filteredUnitGroups)} />
-        <SummaryMetric label="Out-of-Stock Lots" value={filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
-        <SummaryMetric label="Low Stock Items" value={lowStockItems} />
+        <SummaryMetric label="Active Lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
+        <SummaryMetric label="Stock" value={inventoryUnavailable ? MISSING_VALUE : formatUnitGroups(filteredUnitGroups)} />
+        <SummaryMetric label="Out-of-Stock Lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
+        <SummaryMetric label="Low Stock Items" value={inventoryUnavailable ? MISSING_VALUE : lowStockItems} />
         <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : auditError ? MISSING_VALUE : adjustmentCount} />
       </div>
       {inventoryLoading && <div className="cart-empty">{inventoryPresentation.message}</div>}
@@ -20795,7 +20910,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         )}
       </div>
       {viewMode === "PRODUCT" && (
-        <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"]}>
+        <DataTable headers={markNumericColumns(["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"])}>
           {filteredProductRows.map((product) => {
             const visibleBalance = product.visible_lots.reduce((sum, lot) => sum + lotBalance(lot), 0);
             const visibleValue = product.filtered_stock_value;
@@ -20804,7 +20919,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
             const toggleProduct = () => setExpandedProductId(expandedProductId === String(product.product_id) ? "" : String(product.product_id));
             return (
               <React.Fragment key={product.product_id}>
-                <tr className="report-row-clickable" data-inventory-product-row={String(product.product_id)} onClick={toggleProduct}>
+                <tr className="report-row-clickable" data-inventory-product-row={String(product.product_id)} onClick={toggleProduct} tabIndex={0} onKeyDown={activateOnEnter(toggleProduct)}>
                   <td className="primary-cell">{product.product_name}<small className="cell-note">Click to view lots</small></td>
                   <td>{product.category}</td>
                   <td>{product.total_stock_summary}</td>
@@ -20843,9 +20958,9 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         </p>
       )}
       {viewMode === "CATEGORY" && (
-        <DataTable headers={["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count"]}>
+        <DataTable headers={markNumericColumns(["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count"])}>
           {filteredCategoryRows.map((category) => (
-            <tr className="report-row-clickable" key={category.category} onClick={() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); }}>
+            <tr className="report-row-clickable" key={category.category} onClick={() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); }} tabIndex={0} onKeyDown={activateOnEnter(() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); })}>
               <td className="primary-cell">{category.category}</td>
               <td>{category.product_rows.length}</td>
               <td>{qty(category.product_rows.reduce((sum, product) => sum + product.total_stock, 0))}</td>
@@ -20875,12 +20990,12 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
               <DataTable headers={["Field", "Value"]}>
                 <tr><td>Product</td><td className="primary-cell">{selectedLotDetail.product_name}</td></tr>
                 <tr><td>Category</td><td>{selectedLotDetail.category || "Fruit"}</td></tr>
-                <tr><td>Supplier</td><td>{selectedLotDetail.supplier_name || "-"}</td></tr>
+                <tr><td>Supplier</td><td>{selectedLotDetail.supplier_name || MISSING_VALUE}</td></tr>
                 <tr><td>Lot / Size</td><td>{[selectedLotDetail.lot_name || selectedLotDetail.batch_no || `Lot #${selectedLotDetail.id}`, selectedLotDetail.lot_size].filter(Boolean).join(" / ")}</td></tr>
                 <tr><td>Opening / Sold / Adjusted</td><td>{qty(lotOpening(selectedLotDetail))} / {qty(lotUsed(selectedLotDetail))} / {qty(selectedLotDetail.adjusted_qty)}</td></tr>
                 <tr><td>Cost / Sale Rate</td><td>{money(lotCost(selectedLotDetail))} / {money(lotSaleRate(selectedLotDetail))}</td></tr>
                 <tr><td>Opening Date</td><td>{formatDisplayDate(selectedLotDetail.purchase_date || selectedLotDetail.created_at)}</td></tr>
-                <tr><td>Remarks</td><td>{selectedLotDetail.remarks || "-"}</td></tr>
+                <tr><td>Remarks</td><td>{selectedLotDetail.remarks || MISSING_VALUE}</td></tr>
               </DataTable>
               <div className="detail-action-bar no-print">
                 {renderLotActions(selectedLotDetail)}
@@ -20903,13 +21018,13 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
               <DataTable headers={["Date", "Product", "Lot", "Action", "Qty / Rate Change", "Reason", "Edited By"]}>
                 {focusedAuditRows.map((row) => (
                   <tr key={row.id}>
-                    <td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td>
+                    <td>{row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}</td>
                     <td className="primary-cell">{row.product_name}</td>
-                    <td>{row.lot_name || row.lot_id || "-"}</td>
+                    <td>{row.lot_name || row.lot_id || MISSING_VALUE}</td>
                     <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                     <td>{auditChangeSummary(row)}</td>
-                    <td>{row.reason || "-"}</td>
-                    <td>{row.edited_by_name || "-"}</td>
+                    <td>{row.reason || MISSING_VALUE}</td>
+                    <td>{row.edited_by_name || MISSING_VALUE}</td>
                   </tr>
                 ))}
                 {focusedAuditRows.length === 0 && <tr><td colSpan="7" className="empty-cell">No audit entries found.</td></tr>}
@@ -21087,7 +21202,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
           </Field>
           <Field label="Select Invoice">
             <select disabled={invoiceList.status !== "ready" || saving} value={invoiceId} onChange={(event) => loadReturnOptions(event.target.value)}>
-              <option value="">{invoiceList.status === "loading" ? "Loading bills..." : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : invoiceSearch.trim() ? "No bill matches" : allBills ? "No bills yet" : `No bills in the last ${RETURN_INVOICE_DEFAULT_DAYS} days`}</option>
+              <option value="">{invoiceList.status === "loading" ? "Loading bills…" : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : invoiceSearch.trim() ? "No bill matches" : allBills ? "No bills yet" : `No bills in the last ${RETURN_INVOICE_DEFAULT_DAYS} days`}</option>
               {!selectedInvoiceListed && selectedInvoice && (
                 <option value={invoiceId}>{returnInvoiceLabel(selectedInvoice)}</option>
               )}
@@ -21123,7 +21238,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
         )}
         {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items...</p>}
         {returnOptions.status === "error" && <p className="return-note return-note-error" role="alert">{returnOptions.message}</p>}
-        <DataTable headers={["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Refund per unit", "Return Value"]}>
+        <DataTable headers={markNumericColumns(["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Refund per unit", "Return Value"])}>
           {returnOptions.items.map((item, index) => {
             const key = canonicalInventoryId(item.sale_item_id);
             const line = draft.lines.find((entry) => canonicalInventoryId(entry.sale_item_id) === key);
@@ -21146,7 +21261,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
                   {lineProblem && <small className="cell-note return-line-problem">{lineProblem}</small>}
                 </td>
                 <td>{perUnit === null ? "Unknown" : currency.format(perUnit)}</td>
-                <td>{line ? (line.value === null ? "Unknown" : currency.format(line.value)) : "-"}</td>
+                <td>{line ? (line.value === null ? "Unknown" : currency.format(line.value)) : MISSING_VALUE}</td>
               </tr>
               {endsCombo && (
                 <tr className="return-combo-note">
@@ -21177,10 +21292,10 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
           </ul>
         )}
         {outcome && <p className={`return-note return-note-${outcome.tone}`} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</p>}
-        <button className="primary-button" disabled={saving || !canSave} onClick={saveReturn} type="button">{saving ? "Saving..." : "Save Return / Refund"}</button>
+        <button className="primary-button" disabled={saving || !canSave} onClick={saveReturn} type="button">{saving ? "Saving…" : "Save Return / Refund"}</button>
       </ModuleCard>
       <ModuleCard eyebrow="Return History" title="Sale Return History" subtitle="Returned goods, refund modes and reasons remain separate from original invoices.">
-        <DataTable headers={["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"]}>
+        <DataTable headers={markNumericColumns(["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"], { also: ["Value"] })}>
           {returns.map((entry) => (
             <tr key={entry.id}>
               <td><span className="batch-id">{entry.return_no}</span></td>
@@ -21240,7 +21355,9 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
     return map;
   }, new Map());
   const mostWastedProducts = [...mostWasted.values()].sort((left, right) => right.quantity - left.quantity).slice(0, 5);
-  const saveWaste = async () => {
+  // One save at a time: a double click used to record the same waste twice and take the stock twice.
+  const [wasteSaving, runWasteSave] = useSaveInFlight();
+  const saveWaste = () => runWasteSave(async () => {
     try {
       const wasteWrite = createOperationalWrite(user, {
         ...draft,
@@ -21258,7 +21375,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
     } catch (error) {
       alert(getErrorMessage(error, "Unable to save waste entry"));
     }
-  };
+  });
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Record waste" title="Fruit taken off the shelf" subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
@@ -21281,7 +21398,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
           <Field label="Date"><input type="date" value={draft.waste_date} onChange={(event) => setDraft({ ...draft, waste_date: event.target.value })} /></Field>
           <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
-        <button className="primary-button" onClick={saveWaste}>Save Waste Entry</button>
+        <button className="primary-button" disabled={wasteSaving} onClick={saveWaste}>{wasteSaving ? "Saving…" : "Save Waste Entry"}</button>
       </ModuleCard>
       <ModuleCard eyebrow="Top five" title="Most wasted products" subtitle="The products lost most, by quantity.">
         <div className="top-product-list">
@@ -21300,7 +21417,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
             <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Try again</button>
           </div>
         )}
-        <DataTable headers={["Date", "Product", "Type", "Quantity", "Cost", "Remarks"]}>
+        <DataTable headers={markNumericColumns(["Date", "Product", "Type", "Quantity", "Cost", "Remarks"])}>
           {entries.map((entry) => (
             <tr key={entry.id}>
               <td>{toDateKey(entry.waste_date)}</td>
@@ -21308,7 +21425,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
               <td><span className="tag">{labelFor("wasteType", entry.waste_type)}</span></td>
               <td>{Number(entry.quantity || 0).toLocaleString("en-IN")}</td>
               <td>{currency.format(Number(entry.cost_amount || 0))}</td>
-              <td>{entry.remarks || "-"}</td>
+              <td>{entry.remarks || MISSING_VALUE}</td>
             </tr>
           ))}
           {entries.length === 0 && !loadFailed && <tr><td className="empty-cell" colSpan={6}>No waste entries yet.</td></tr>}
@@ -21588,7 +21705,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
           <div className="button-row">
             <button className="secondary-button" onClick={addLine}>Add a product</button>
             <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={submitDraft}>
-              {busy ? "Sending..." : (asking ? "Send request" : "Create consignment")}
+              {busy ? "Sending…" : (asking ? "Send request" : "Create consignment")}
             </button>
           </div>
 
@@ -21860,7 +21977,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                         disabled={routingBusy || !assignDraft[order.id]}
                         onClick={() => handOver(order.id)}
                       >
-                        {routingBusy ? "Sending..." : "Hand over"}
+                        {routingBusy ? "Sending…" : "Hand over"}
                       </button>
                     </div>
                   </td>
@@ -22094,7 +22211,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                 <td>{order.orderNo}</td>
                 <td>{order.customerName}</td>
                 <td>{labelFor("orderStatus", order.status)}</td>
-                <td>{order.carrier || "-"}</td>
+                <td>{order.carrier || MISSING_VALUE}</td>
                 <td>{money(order.value)}</td>
               </tr>
             ))}
@@ -22120,7 +22237,7 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
     <ModuleCard
       eyebrow="Owner View"
       title="Company position"
-      subtitle={asAt ? `Company position as at ${asAt}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
+      subtitle={asAt ? `Company position as at ${formatDisplayDate(asAt)}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
     >
       <p className="form-row">
         <label>
@@ -22128,7 +22245,8 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
           <input
             max={toDateKey(new Date())}
             type="date"
-            value={state.dateTo || ""}
+            // The date in force: the one picked, or the one the server answered for (today).
+            value={state.dateTo || asAt || ""}
             onChange={(event) => onReload(event.target.value)}
           />
         </label>{" "}
@@ -22163,7 +22281,7 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
       )}
 
       {presentation.shops.length > 0 && (
-        <DataTable headers={["Shop", "Cash", "Bank", "Stock Value", "Customers Owe", "We Owe", "Net Profit"]}>
+        <DataTable headers={markNumericColumns(["Shop", "Cash", "Bank", "Stock Value", "Customers Owe", "We Owe", "Net Profit"])}>
           {presentation.shops.map((shop) => (
             <tr key={shop.branchId ?? shop.branchName}>
               <td>{shop.branchName}</td>
@@ -22174,7 +22292,7 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
                   <td>{money(shop.inventory)}</td>
                   <td>{money(shop.customerReceivable)}</td>
                   <td>{money(shop.supplierPayable)}</td>
-                  <td className="profit-cell">{money(shop.netProfit)}</td>
+                  <ProfitCell format={money} value={shop.netProfit} />
                 </>
               ) : (
                 // Deliberately one spanning cell rather than six blanks or six zeros: a row of
@@ -22225,7 +22343,9 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
   });
   const totalActiveExpenses = expenseTotalExcludingCancelled(filteredExpenses);
 
-  const saveExpense = async () => {
+  // One save at a time: a double click used to record the same expense twice.
+  const [expenseSaving, runExpenseSave] = useSaveInFlight();
+  const saveExpense = () => runExpenseSave(async () => {
     try {
       const payload = {
         ...draft,
@@ -22248,7 +22368,7 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
     } catch (error) {
       alert(getErrorMessage(error, "Unable to save expense"));
     }
-  };
+  });
   const editExpense = (expense) => {
     setEditingId(expense.id);
     setDraft({
@@ -22296,7 +22416,7 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
           <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
         <div className="button-row">
-          <button className="primary-button" onClick={saveExpense}>{editingId ? "Update Expense" : "Save Expense"}</button>
+          <button className="primary-button" disabled={expenseSaving} onClick={saveExpense}>{expenseSaving ? "Saving…" : editingId ? "Update Expense" : "Save Expense"}</button>
           {editingId && <button className="secondary-button" onClick={() => { setEditingId(null); setDraft(emptyExpense); }}>Cancel Edit</button>}
         </div>
       </ModuleCard>
@@ -22340,19 +22460,19 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
           <SummaryMetric label="Total (excluding cancelled)" value={loadFailed ? MISSING_VALUE : currency.format(totalActiveExpenses)} featured />
           <SummaryMetric label="Entries shown" value={loadFailed ? MISSING_VALUE : filteredExpenses.length} />
         </div>
-        <DataTable headers={["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""]}>
+        <DataTable headers={markNumericColumns(["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""])}>
           {filteredExpenses.map((expense) => {
             const status = expenseRecordStatus(expense);
             return (
             <tr className={status === "CANCELLED" ? "muted-row" : ""} key={expense.id}>
               <td>{expense.expense_date}</td>
               <td className="primary-cell">{expense.category}</td>
-              <td>{expense.paid_to || expense.vendor_name || "-"}</td>
+              <td>{expense.paid_to || expense.vendor_name || MISSING_VALUE}</td>
               <td><span className="tag">{labelFor("paymentMode", expense.payment_mode)}</span></td>
               <td>{currency.format(Number(expense.amount || 0))}</td>
               <td><span className={statusClass("recordStatus", status)}>{labelFor("recordStatus", status)}</span></td>
-              <td>{expense.reference_number || "-"}</td>
-              <td>{expense.remarks || expense.cancellation_reason || "-"}</td>
+              <td>{expense.reference_number || MISSING_VALUE}</td>
+              <td>{expense.remarks || expense.cancellation_reason || MISSING_VALUE}</td>
               <td>
                 <div className="button-row table-actions-row">
                   {expense.packing_purchase === true ? (
@@ -22483,6 +22603,14 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     (!ledgerDateRange.date_from || toDateKey(row.date) >= ledgerDateRange.date_from) &&
     (!ledgerDateRange.date_to || toDateKey(row.date) <= ledgerDateRange.date_to)
   );
+  // "—" with no account chosen, and the balance carried in when the range has no entries
+  // (local/financialStatements.js); both used to print ₹0.00.
+  const ledgerBounds = ledgerStatementBounds(accountLedger.ledger || [], {
+    dateFrom: ledgerDateRange.date_from,
+    dateTo: ledgerDateRange.date_to,
+    hasAccount: Boolean(accountLedger.account),
+    dateKey: toDateKey,
+  });
   const ledgerDocumentTitle = `${accountLedger.account?.account_name || accountLedger.account?.customer_name || accountLedger.account?.supplier_name || "Account"} - Ledger Statement`;
   const exportLedgerPdf = async () => {
     if (!ledgerPrintRef.current) return;
@@ -22735,7 +22863,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               <Field label="Search"><input placeholder="Search account or mobile" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
               <button className="secondary-button" onClick={onReload}>Refresh</button>
             </div>
-            <DataTable headers={["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", "Actions"]}>
+            <DataTable headers={markNumericColumns(["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", "Actions"])}>
               {filteredAccounts.map((account) => (
                 <tr key={account.account_key}>
                   <td className="primary-cell">
@@ -22743,7 +22871,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                     {(account.system_account || account.firm_name || account.city || account.address) && <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address}</small>}
                   </td>
                   <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
-                  <td>{account.mobile_number || "-"}</td>
+                  <td>{account.mobile_number || MISSING_VALUE}</td>
                   <td>{currency.format(Number(account.opening_balance || 0))}</td>
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                   <td>{currency.format(Number(account.payable_balance || 0))}</td>
@@ -22776,7 +22904,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
             <Field label="Statement From"><input type="date" value={ledgerDateRange.date_from} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_from: event.target.value })} /></Field>
             <Field label="Statement To"><input type="date" value={ledgerDateRange.date_to} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_to: event.target.value })} /></Field>
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Statement</button>
-            <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting..." : "PDF Export"}</button>
+            <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting…" : "PDF Export"}</button>
             <button className="whatsapp-button" disabled={!accountLedger.account || ledgerExporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setLedgerWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
           </div>
           <div ref={ledgerPrintRef} className="print-area report-paper">
@@ -22788,23 +22916,26 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               </div>
             </header>
             <div className="purchase-summary-grid supplier-payment-preview">
-              <SummaryMetric label="Opening Balance" value={currency.format(Number(printableLedgerRows[0]?.balance || 0) - Number(printableLedgerRows[0]?.debit || 0) + Number(printableLedgerRows[0]?.credit || 0))} />
-              <SummaryMetric label="Closing Balance" value={currency.format(Number(printableLedgerRows.at(-1)?.balance || 0))} featured />
+              <SummaryMetric label="Opening Balance" value={formatKnownFigure(ledgerBounds.opening, (value) => currency.format(value))} />
+              <SummaryMetric label="Closing Balance" value={formatKnownFigure(ledgerBounds.closing, (value) => currency.format(value))} featured />
             </div>
-            <DataTable headers={["Date", "Invoice Number", "Transaction Type", "Sale Amount", "Payment Mode", "Debit", "Credit", "Balance", "Narration"]}>
+            <DataTable headers={markNumericColumns(["Date", "Invoice Number", "Transaction Type", "Sale Amount", "Payment Mode", "Debit", "Credit", "Balance", "Narration"])}>
               {printableLedgerRows.map((row, index) => (
                 <tr key={`${row.date}-${row.transaction_type}-${index}`}>
-                  <td>{row.date}</td>
-                  <td>{row.invoice_no || "-"}</td>
+                  <td>{formatDisplayDate(row.date)}</td>
+                  <td>{row.invoice_no || MISSING_VALUE}</td>
                   <td><span className="tag">{labelFor("transactionType", row.transaction_type)}</span></td>
-                  <td>{row.sale_amount ? currency.format(Number(row.sale_amount || 0)) : "-"}</td>
+                  <td>{row.sale_amount ? currency.format(Number(row.sale_amount || 0)) : MISSING_VALUE}</td>
                   <td>{labelFor("paymentMode", row.payment_mode)}</td>
                   <td>{currency.format(Number(row.debit || 0))}</td>
                   <td>{currency.format(Number(row.credit || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
-                  <td>{row.remarks || "-"}</td>
+                  <td>{row.remarks || MISSING_VALUE}</td>
                 </tr>
               ))}
+              {printableLedgerRows.length === 0 && (
+                <tr><td className="empty-cell" colSpan={9}>{accountLedger.account ? "No entries for this account in these dates." : "Choose an account above to see its ledger."}</td></tr>
+              )}
             </DataTable>
           </div>
           {ledgerWhatsappOpen && (
@@ -22842,10 +22973,11 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               </>
             ) : (
               <>
+                {/* Nothing is outstanding "before" or "after" an account nobody has chosen. */}
                 <SummaryMetric label="Selected Account" value="None" />
-                <SummaryMetric label="Outstanding Before" value={currency.format(0)} />
-                <SummaryMetric label="Payment Impact" value={currency.format(0)} />
-                <SummaryMetric label="Outstanding After" value={currency.format(0)} featured />
+                <SummaryMetric label="Outstanding Before" value={MISSING_VALUE} />
+                <SummaryMetric label="Payment Impact" value={MISSING_VALUE} />
+                <SummaryMetric label="Outstanding After" value={MISSING_VALUE} featured />
               </>
             )}
           </div>
@@ -22873,10 +23005,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
             <Field label="Remarks"><textarea value={payment.remarks} onChange={(event) => setPayment({ ...payment, remarks: event.target.value })} /></Field>
           </div>
           <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label={isSupplierPayment ? "Outstanding Payable Before" : "Outstanding Receivable Before"} value={currency.format(outstandingBefore)} />
+            <SummaryMetric label={isSupplierPayment ? "Outstanding Payable Before" : "Outstanding Receivable Before"} value={payment.account_key ? currency.format(outstandingBefore) : MISSING_VALUE} />
             <SummaryMetric label="Payment Amount" value={currency.format(paymentAmount)} />
             {isSupplierPayment && <SummaryMetric label="Rebate Received" value={currency.format(rebateAmount)} positive />}
-            <SummaryMetric label={balancePreview.overpaid ? "Balance After Payment (advance)" : "Balance After Payment"} value={currency.format(outstandingAfter)} featured />
+            <SummaryMetric label={balancePreview.overpaid ? "Balance After Payment (advance)" : "Balance After Payment"} value={payment.account_key ? currency.format(outstandingAfter) : MISSING_VALUE} featured />
           </div>
           {overpaymentNote && <div className="warning-note" role="status">{overpaymentNote}</div>}
           <div className="button-row">
@@ -22887,18 +23019,18 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
             <button className="secondary-button" onClick={() => onPaymentsLoad(payment.account_key)}>Refresh Payment History</button>
             <button className="secondary-button" onClick={() => onPaymentsLoad()}>Show All Payments</button>
           </div>
-          <DataTable headers={["Date", "Party", "Type", "Payment", "Rebate", "Mode", "Status", "Reference", "Remarks", "Actions"]}>
+          <DataTable headers={markNumericColumns(["Date", "Party", "Type", "Payment", "Rebate", "Mode", "Status", "Reference", "Remarks", "Actions"], { also: ["Payment"] })}>
             {(accountPayments || []).map((row) => (
               <tr key={row.payment_key}>
-                <td>{toDateKey(row.payment_date)}</td>
+                <td>{formatDisplayDate(row.payment_date)}</td>
                 <td className="primary-cell">{row.account_name}</td>
                 <td><span className="tag">{labelFor("payment_source", row.payment_source)}</span></td>
                 <td>{currency.format(Number(row.payment_amount || 0))}</td>
-                <td>{Number(row.rebate_amount || 0) ? currency.format(Number(row.rebate_amount || 0)) : "-"}</td>
+                <td>{Number(row.rebate_amount || 0) ? currency.format(Number(row.rebate_amount || 0)) : MISSING_VALUE}</td>
                 <td><span className="tag">{labelFor("paymentMode", row.payment_mode)}</span></td>
                 <td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td>
-                <td>{row.reference_number || "-"}</td>
-                <td>{row.cancellation_reason || row.edit_reason || row.remarks || "-"}</td>
+                <td>{row.reference_number || MISSING_VALUE}</td>
+                <td>{row.cancellation_reason || row.edit_reason || row.remarks || MISSING_VALUE}</td>
                 <td className="table-actions-row">
                   <button className="table-action" disabled={row.cancelled} onClick={() => editPayment(row)}>Edit</button>
                   <button className="remove-button" disabled={row.cancelled || !canCancel} title={canCancel ? undefined : "Cancelling a payment needs Invoice Cancellation permission."} onClick={() => cancelPayment(row)}>Cancel</button>
@@ -22907,6 +23039,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                 </td>
               </tr>
             ))}
+            {(accountPayments || []).length === 0 && (
+              <tr><td className="empty-cell" colSpan={10}>{payment.account_key ? "No payments recorded for this account yet." : "No payments to show. Choose an account, or press Show All Payments."}</td></tr>
+            )}
           </DataTable>
         </ModuleCard>
       )}
@@ -22923,7 +23058,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                 <SummaryMetric label="Customer Accounts" value={outstandingView.customerOutstanding.length} />
                 <SummaryMetric label="Supplier Accounts" value={outstandingView.supplierOutstanding.length} />
               </div>
-              <DataTable headers={["Account", "Type", "Receivable", "Payable", "Status"]}>
+              <DataTable headers={markNumericColumns(["Account", "Type", "Receivable", "Payable", "Status"])}>
                 {[...outstandingView.customerOutstanding, ...outstandingView.supplierOutstanding].map((account) => (
                   <tr key={account.account_key}>
                     <td className="primary-cell">{account.account_name}</td>
@@ -23284,7 +23419,7 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
       return;
     }
     try {
-      setLogoMessage("Preparing logo...");
+      setLogoMessage("Preparing logo…");
       const dataUrl = await shrinkBrandLogo(file, {
         createImageBitmap: (blob) => window.createImageBitmap(blob),
         createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
@@ -23588,7 +23723,9 @@ function ScaleConnectionPanel() {
           </select>
         </Field>
       </div>
-      {ports.status === "ready" && ports.rows.length === 0 && <p className="form-note">No ports on this computer yet. Pair the scale first (below).</p>}
+      {/* When the list itself could not be read, the error below says so; "No ports" beside it would
+          claim the computer has none. */}
+      {ports.status === "ready" && ports.rows.length === 0 && !ports.message && <p className="form-note">No ports on this computer yet. Pair the scale first (below).</p>}
       {ports.message && <div className="inline-error" role="alert">{ports.message}</div>}
       <div className="button-row">
         <button className="primary-button" disabled={work.busy} type="button" onClick={find}>{work.busy ? "Working…" : "Find scale"}</button>
@@ -24475,11 +24612,11 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
       <DataTable headers={["Attempted At", "User", "Device", "Result", "Reason"]}>
         {exitAttemptLogs.map((row) => (
           <tr key={row.id}>
-            <td>{row.attempted_at ? new Date(row.attempted_at).toLocaleString("en-IN") : "-"}</td>
-            <td>{row.user_name || row.user_id || "-"}</td>
-            <td>{row.device_id || "-"}</td>
+            <td>{row.attempted_at ? formatKolkataDateTime(row.attempted_at) : MISSING_VALUE}</td>
+            <td>{row.user_name || row.user_id || MISSING_VALUE}</td>
+            <td>{row.device_id || MISSING_VALUE}</td>
             <td><span className={row.success ? "stock-ok" : "stock-low"}>{row.success ? "Allowed" : "Blocked"}</span></td>
-            <td>{row.failure_reason || "-"}</td>
+            <td>{row.failure_reason || MISSING_VALUE}</td>
           </tr>
         ))}
         {exitAttemptLogs.length === 0 && <tr><td colSpan="5" className="empty-cell">No exit attempts logged yet.</td></tr>}
@@ -24681,8 +24818,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
             </td>
             <td>{item.username}</td>
             <td><span className="tag">{item.role}</span></td>
-            <td>{item.mobile_number || "-"}</td>
-            <td>{item.last_login_at ? new Date(item.last_login_at).toLocaleString("en-IN") : "Not recorded"}</td>
+            <td>{item.mobile_number || MISSING_VALUE}</td>
+            <td>{item.last_login_at ? formatKolkataDateTime(item.last_login_at) : "Not recorded"}</td>
             <td><span className={item.active ? "stock-ok" : "stock-low"}>{item.active ? "Active" : "Inactive"}</span></td>
             <td>
               <div className="button-row table-actions-row">
@@ -24981,15 +25118,15 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, holdbackDays = 0,
         <strong>FroozERP update</strong>
         <span>{notice.text}</span>
         {notice.nextWindowAt && (
-          <span>Next update time: {new Date(notice.nextWindowAt).toLocaleString("en-IN")}</span>
+          <span>Next update time: {formatKolkataDateTime(notice.nextWindowAt)}</span>
         )}
         {notice.releasesAt && (
-          <span>This counter takes it after {new Date(notice.releasesAt).toLocaleString("en-IN")}</span>
+          <span>This counter takes it after {formatKolkataDateTime(notice.releasesAt)}</span>
         )}
       </div>
       {notice.actionLabel === "Install now" && (
         <button className="primary-button" disabled={state.phase === "installing"} onClick={() => install(true)}>
-          {state.phase === "installing" ? "Installing..." : "Install now"}
+          {state.phase === "installing" ? "Installing…" : "Install now"}
         </button>
       )}
     </div>
@@ -25481,10 +25618,10 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
           <SummaryMetric label="Latest Available Version" value={displayLatestVersion} />
           <SummaryMetric label="Compatibility" value={compatibilityStatus} />
           <SummaryMetric label="Status" value={updateStatusText} />
-          <SummaryMetric label="Published" value={updaterState.publishedAt ? new Date(updaterState.publishedAt).toLocaleString("en-IN") : "Not available"} />
+          <SummaryMetric label="Published" value={updaterState.publishedAt ? formatKolkataDateTime(updaterState.publishedAt) : "Not available"} />
           <SummaryMetric label="Download Status" value={downloadStatus} />
           <SummaryMetric label="Signature Status" value={signatureStatus} />
-          <SummaryMetric label="Last Checked" value={updaterState.lastCheckedAt ? new Date(updaterState.lastCheckedAt).toLocaleString("en-IN") : "Not checked"} />
+          <SummaryMetric label="Last Checked" value={updaterState.lastCheckedAt ? formatKolkataDateTime(updaterState.lastCheckedAt) : "Not checked"} />
           <SummaryMetric label="Download Size" value={formatBytes(updaterState.downloadProgress.total)} />
           <SummaryMetric label="Current Executable" value={installDiagnostics?.current_executable || "Desktop diagnostic pending"} />
           <SummaryMetric label="Backend PID" value={backendVersionDiagnostics?.pid || "Unknown"} />
@@ -25548,7 +25685,7 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
         <small>Zero means this counter takes a release as soon as it is published, at the hours above. Set it to one or two and this counter waits while the Owner&apos;s own machine runs the release first. A machine the Owner is signed in on never waits.</small>
         {scheduleMessage && <small>{scheduleMessage}</small>}
         <div className="button-row">
-          <button className="primary-button" disabled={!canManage || scheduleBusy} onClick={saveSchedule}>{scheduleBusy ? "Saving..." : "Save Update Hours"}</button>
+          <button className="primary-button" disabled={!canManage || scheduleBusy} onClick={saveSchedule}>{scheduleBusy ? "Saving…" : "Save Update Hours"}</button>
         </div>
       </div>
       )}
@@ -25745,7 +25882,7 @@ function SyncSettingsSection({
   const runRegisterDevice = async () => {
     if (!onRegisterCloudDevice) return;
     setCloudActionBusy("register");
-    setConfigMessage("Registering this device with FroozERP cloud...");
+    setConfigMessage("Registering this device with FroozERP cloud…");
     try {
       const result = await onRegisterCloudDevice(user, localDbStatus?.deviceIdentity || {
         device_id: localStorage.getItem("froozerp_device_id"),
@@ -25759,7 +25896,7 @@ function SyncSettingsSection({
   const runApproveDevice = async () => {
     if (!onApproveCloudDevice) return;
     setCloudActionBusy("approve");
-    setConfigMessage("Approving this device for FroozERP cloud sync...");
+    setConfigMessage("Approving this device for FroozERP cloud sync…");
     try {
       const result = await onApproveCloudDevice(user, localDbStatus?.deviceIdentity || {
         device_id: localStorage.getItem("froozerp_device_id"),
@@ -25873,8 +26010,8 @@ function SyncSettingsSection({
           </div>
           <div className="toolbar-actions">
             <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Run Cloud Diagnostics</button>
-            <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering..." : "Register This Device"}</button>
-            <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving..." : "Approve This Device"}</button>
+            <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering…" : "Register This Device"}</button>
+            <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving…" : "Approve This Device"}</button>
             <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
             <button className="secondary-button" onClick={copySafeDiagnostics}>Copy Safe Diagnostics</button>
           </div>
@@ -25962,7 +26099,7 @@ function SyncSettingsSection({
                 names the one address there is instead of whichever box was on screen. */}
             <button className="secondary-button" disabled={!canManage} onClick={() => testApiUrl(API_CONFIG.apiUrl, "This app's server")}>Test Connection</button>
             <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
-            <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
+            <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud…" : "Cloud Readiness Check"}</button>
           </div>
           {cloudDiagnostics?.results?.length > 0 && (
             <DataTable headers={["Check", "Result", "URL", "HTTP", "Message"]}>
@@ -25971,7 +26108,7 @@ function SyncSettingsSection({
                   <td>{row.label}</td>
                   <td><span className={row.ok ? "stock-ok" : "stock-low"}>{row.ok ? "Passed" : "Failed"}</span></td>
                   <td><small>{row.url}</small></td>
-                  <td>{row.httpStatus || "-"}</td>
+                  <td>{row.httpStatus || MISSING_VALUE}</td>
                   <td>{row.message}</td>
                 </tr>
               ))}
@@ -26281,7 +26418,7 @@ function OperationalScopeManagement({
         </div>
         {stepMessage("branches")}
         <DataTable headers={["Branch", "Address", "Counters", "Status", "Actions"]}>
-          {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || "-"}</td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id) && location.active !== false).length}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Close branch</button>}</div></td></tr>)}
+          {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || MISSING_VALUE}</td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id) && location.active !== false).length}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Close branch</button>}</div></td></tr>)}
         </DataTable>
       </ModuleCard>
 
@@ -26312,7 +26449,7 @@ function OperationalScopeManagement({
         </div>
         {stepMessage("staff")}
         <DataTable headers={["Person", "Role", "Branch", "Counter", "Main counter", "Status", "Actions"]}>
-          {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || "-"}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Can sign in" : "Removed"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Remove</button>}</td></tr>)}
+          {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || MISSING_VALUE}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Can sign in" : "Removed"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Remove</button>}</td></tr>)}
         </DataTable>
       </ModuleCard>
 
@@ -26452,8 +26589,8 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
             <td>{labelFor("deviceType", device.device_type || "Browser")}</td>
             <td>{device.branch_name || "Branch not known"}<small className="cell-note">{device.counter_name || "Counter: see Branches & Counters"}</small></td>
             <td><span className={statusClass("deviceStatus", device.status)}>{labelFor("deviceStatus", device.status)}</span></td>
-            <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
-            <td>{device.last_sync_at ? new Date(device.last_sync_at).toLocaleString("en-IN") : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
+            <td>{device.last_active_at ? formatKolkataDateTime(device.last_active_at) : "Not active yet"}</td>
+            <td>{device.last_sync_at ? formatKolkataDateTime(device.last_sync_at) : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
             <td>
               <div className="button-row table-actions-row">
                 <button className="table-action" disabled={!canManage || device.status === "APPROVED"} onClick={() => deviceAction(device, "APPROVE")}>Approve</button>
@@ -26490,9 +26627,9 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
             <td className="primary-cell">{code.code_label || "Activation Code"}</td>
             <td>{code.branch_name || "Any"}</td>
             <td>{code.counter_name || "Any"}</td>
-            <td>{code.expires_at ? new Date(code.expires_at).toLocaleString("en-IN") : "-"}</td>
+            <td>{code.expires_at ? formatKolkataDateTime(code.expires_at) : MISSING_VALUE}</td>
             <td><span className={statusClass("activationCodeStatus", code.status)}>{labelFor("activationCodeStatus", code.status)}</span></td>
-            <td>{code.used_by_device_id || "-"}</td>
+            <td>{code.used_by_device_id || MISSING_VALUE}</td>
             <td><button className="remove-button" disabled={!canManage || code.status !== "ACTIVE"} onClick={() => revokeCode(code)}>Revoke</button></td>
           </tr>
         ))}
@@ -26536,7 +26673,7 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
         <button className="primary-button" disabled={!canManage || !branchDraft.branch_name.trim()} onClick={addBranch}>Add Branch</button>
       </div>
       <DataTable headers={["Branch", "Address", "Phone", "GST", "Status"]}>
-        {branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || branch.location || "-"}</td><td>{branch.phone_number || "-"}</td><td>{branch.gst_number || "-"}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+        {branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || branch.location || MISSING_VALUE}</td><td>{branch.phone_number || MISSING_VALUE}</td><td>{branch.gst_number || MISSING_VALUE}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
       </DataTable>
       <div className="form-grid supplier-form-grid">
         <Field label="Branch">
@@ -26555,7 +26692,7 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
         <button className="primary-button" disabled={!canManage || !counterDraft.counter_name.trim()} onClick={addCounter}>Add Counter</button>
       </div>
       <DataTable headers={["Counter", "Branch", "Type", "Status"]}>
-        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || "-"}</td><td>{labelFor("counterType", counter.counter_type)}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || MISSING_VALUE}</td><td>{labelFor("counterType", counter.counter_type)}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
       </DataTable>
     </ModuleCard>
   );
@@ -26633,13 +26770,13 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
       <DataTable headers={["File", "Type", "Size", "Started", "Completed", "Status", "Error"]}>
         {backupLogs.map((log) => (
           <tr key={log.id}>
-            <td className="primary-cell">{log.backup_file_name || "-"}<small className="cell-note">{log.backup_path || "-"}</small></td>
+            <td className="primary-cell">{log.backup_file_name || MISSING_VALUE}<small className="cell-note">{log.backup_path || MISSING_VALUE}</small></td>
             <td>{labelFor("backupType", log.backup_type)}</td>
             <td>{Number(log.backup_size || 0).toLocaleString("en-IN")} bytes</td>
-            <td>{log.started_at ? new Date(log.started_at).toLocaleString("en-IN") : "-"}</td>
-            <td>{log.completed_at ? new Date(log.completed_at).toLocaleString("en-IN") : "-"}</td>
+            <td>{log.started_at ? formatKolkataDateTime(log.started_at) : MISSING_VALUE}</td>
+            <td>{log.completed_at ? formatKolkataDateTime(log.completed_at) : MISSING_VALUE}</td>
             <td><span className={statusClass("backupStatus", log.status)}>{labelFor("backupStatus", log.status)}</span></td>
-            <td>{log.error_message || "-"}</td>
+            <td>{log.error_message || MISSING_VALUE}</td>
           </tr>
         ))}
         {backupLogs.length === 0 && <tr><td className="empty-cell" colSpan={7}>No backups recorded yet. Backup Now makes the first one.</td></tr>}
@@ -26652,7 +26789,7 @@ function SystemInfoSection({ systemInfo }) {
   const device = systemInfo.currentDevice || {};
   const branch = systemInfo.currentBranch || {};
   const backup = systemInfo.lastBackup || {};
-  const androidUrl = systemInfo.lanFrontendUrl || (systemInfo.serverIp ? `http://${systemInfo.serverIp}:5173` : "-");
+  const androidUrl = systemInfo.lanFrontendUrl || (systemInfo.serverIp ? `http://${systemInfo.serverIp}:5173` : MISSING_VALUE);
   return (
     <ModuleCard eyebrow="System Info" title="Server, Network and Device Status" subtitle="Use the LAN URL from another device on the same shop network.">
       <section className="about-frooz-panel">
@@ -26667,24 +26804,24 @@ function SystemInfoSection({ systemInfo }) {
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric featured label="Server" value={systemInfo.backendStatus || "Unknown"} />
         <SummaryMetric label="Database" value={systemInfo.databaseStatus || "Unknown"} />
-        <SummaryMetric label="Server IP" value={systemInfo.serverIp || "-"} />
+        <SummaryMetric label="Server IP" value={systemInfo.serverIp || MISSING_VALUE} />
         <SummaryMetric label="Device Status" value={device.status ? labelFor("deviceStatus", device.status) : "Not registered"} />
       </div>
       <DataTable headers={["Item", "Value"]}>
         <tr><td>Software Version</td><td>{systemInfo.softwareVersion || APP_VERSION}</td></tr>
         <tr><td>Display Branding</td><td>{APP_DISPLAY_NAME}</td></tr>
         <tr><td>Company</td><td>{APP_COMPANY}</td></tr>
-        <tr><td>LAN API URL</td><td>{systemInfo.lanApiUrl || "-"}</td></tr>
-        <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || "-"}</td></tr>
+        <tr><td>LAN API URL</td><td>{systemInfo.lanApiUrl || MISSING_VALUE}</td></tr>
+        <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || MISSING_VALUE}</td></tr>
         <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>
-        <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
+        <tr><td>Current Device</td><td>{device.device_name || MISSING_VALUE} ({device.device_id || MISSING_VALUE})</td></tr>
         <tr><td>Current Device Type</td><td>{labelFor("deviceType", device.device_type || "Browser")}</td></tr>
         {/* This reads the older device record, which a computer approved in Branches & Counters
             (Step 4) leaves empty: say where to look rather than "Not assigned" or a made-up branch. */}
         <tr><td>Current Branch</td><td>{branch.branch_name || "Not known here"}</td></tr>
         <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "See Branches & Counters, Step 4"}</td></tr>
-        <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
-        <tr><td>Backup Location</td><td>{systemInfo.backupLocation || "-"}</td></tr>
+        <tr><td>Last Backup</td><td>{backup.completed_at ? formatKolkataDateTime(backup.completed_at) : "Not recorded"}</td></tr>
+        <tr><td>Backup Location</td><td>{systemInfo.backupLocation || MISSING_VALUE}</td></tr>
       </DataTable>
       <section className="android-help-card">
         <span className="eyebrow">Android Connection Guide</span>
@@ -26941,7 +27078,7 @@ function SaleRateManager({ desiredMargin, history, loadState = {}, onLoad, onSav
             {history.length === 0 && !loadState.historyMessage && <tr><td className="empty-cell" colSpan={6}>No rate changes yet.</td></tr>}
             {history.map((item) => (
               <tr key={item.id}>
-                <td>{item.changed_at ? new Date(item.changed_at).toLocaleString("en-IN") : MISSING_VALUE}</td>
+                <td>{item.changed_at ? formatKolkataDateTime(item.changed_at) : MISSING_VALUE}</td>
                 <td className="primary-cell">{item.product_name || MISSING_VALUE}</td>
                 <td className="pm-num">{formatOptionalMoney(item.old_selling_rate, currency)}</td>
                 <td className="pm-num">{formatOptionalMoney(item.new_selling_rate, currency)}</td>
@@ -27674,7 +27811,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // In scale mode a kg item takes the scale's steady weight, once; otherwise one unit as before.
     const saleUnit = lot.unit || product.unit;
     const weighed = effectiveQuantityMode === "SCALE" ? scaleQuantityFor(saleUnit, scale, takenScaleReading) : null;
-    const addQuantity = weighed ?? 1;
+    // A tap adds one unit, or the rest of a lot holding less than one (local/posCheckout.js), so the
+    // last 0.75 kg of a lot can be sold. The lot check below then sees the real quantity.
+    const addQuantity = weighed ?? lotTapQuantity({ available: availableStock, inCart: getCartQuantityForLot(lot.id) });
     const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
     // While a customer's-choice combo is open, the product joins it (local/combos.js): priced by the
@@ -29322,7 +29461,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         </div>
         <div className="button-row checkout-actions">
           <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError) || totals.chargeRefusals.length > 0} onClick={() => checkout(false)}>
-            <Icon name="receipt" /> {saving ? "Saving..." : "Checkout"}
+            <Icon name="receipt" /> {saving ? "Saving…" : "Checkout"}
           </button>
           <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
             <Icon name="print" /> Print Bill
@@ -29837,7 +29976,7 @@ function SaleCancelModal({ approvalRoute, draft, onChange, onClose, onConfirm })
             {items.map((item, index) => (
               <tr key={item.id || item.sale_item_id || `${item.product_id}-${index}`}>
                 <td className="primary-cell">{item.product_name}</td>
-                <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
+                <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || MISSING_VALUE}</td>
                 <td>{Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} {item.unit || ""}</td>
                 <td>{currency.format(Number(item.selling_rate || item.rate || 0))}</td>
                 <td>{currency.format(Number(item.net_amount || item.amount || 0))}</td>
@@ -29851,7 +29990,7 @@ function SaleCancelModal({ approvalRoute, draft, onChange, onClose, onConfirm })
           {draft.error && <div className="error-banner" role="alert">{draft.error}</div>}
           <p className="form-note stock-low">This will mark the invoice as CANCELLED, restore exact lot stock, and reverse cash/bank/customer ledger impact. The invoice will remain visible with a cancelled badge.</p>
           <div className="button-row">
-            <button className="remove-button" disabled={draft.saving || saleChangeFormProblem(draft, approvalRoute) !== ""} onClick={onConfirm}>{draft.saving ? "Cancelling..." : "Confirm Cancel Bill"}</button>
+            <button className="remove-button" disabled={draft.saving || saleChangeFormProblem(draft, approvalRoute) !== ""} onClick={onConfirm}>{draft.saving ? "Cancelling…" : "Confirm Cancel Bill"}</button>
             <button className="secondary-button" disabled={draft.saving} onClick={onClose}>Keep Bill</button>
           </div>
         </div>
@@ -30269,7 +30408,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
             <strong>{invoice.invoice_no}</strong>
           </div>
           <div className="invoice-actions">
-            <button className="primary-button" disabled={saving || hasInvalidMixedPayment || !isMixedPaymentBalanced || changeProblem !== ""} onClick={save}>{saving ? "Saving..." : "Save Edit"}</button>
+            <button className="primary-button" disabled={saving || hasInvalidMixedPayment || !isMixedPaymentBalanced || changeProblem !== ""} onClick={save}>{saving ? "Saving…" : "Save Edit"}</button>
             <button aria-label="Close editor" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
@@ -30413,9 +30552,9 @@ const formatSaleAuditLines = (row) => {
   if (row.action === "CANCEL") {
     return [
       "Invoice Cancelled",
-      `Reason: ${row.reason || "-"}`,
-      `Cancelled By: ${row.edited_by_name || "-"}`,
-      `Cancelled At: ${row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}`,
+      `Reason: ${row.reason || MISSING_VALUE}`,
+      `Cancelled By: ${row.edited_by_name || MISSING_VALUE}`,
+      `Cancelled At: ${row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}`,
     ];
   }
   const oldValue = row.old_value || {};
@@ -30430,7 +30569,7 @@ const formatSaleAuditLines = (row) => {
   };
   if ((oldSale.customer_name || "") !== (newSale.customer_name || "")) lines.push(`Customer: ${oldSale.customer_name || "Walk-in"} -> ${newSale.customer_name || "Walk-in"}`);
   if (toDateKey(oldSale.sale_date || "") !== toDateKey(newSale.sale_date || "")) lines.push(`Bill Date: ${formatDisplayDate(oldSale.sale_date)} -> ${formatDisplayDate(newSale.sale_date)}`);
-  if ((oldSale.payment_mode || "") !== (newSale.payment_mode || "")) lines.push(`Payment Mode: ${oldSale.payment_mode || "-"} -> ${newSale.payment_mode || "-"}`);
+  if ((oldSale.payment_mode || "") !== (newSale.payment_mode || "")) lines.push(`Payment Mode: ${oldSale.payment_mode || MISSING_VALUE} -> ${newSale.payment_mode || MISSING_VALUE}`);
   addMoneyChange("Gross Total", "gross_amount");
   addMoneyChange("Discount", "invoice_discount_amount");
   addMoneyChange("Net Amount", "total_amount");
@@ -30476,8 +30615,8 @@ function ChangeHistoryModal({ history, onClose }) {
             {history.rows.map((row) => (
               <tr key={row.id}>
                 <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
-                <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
-                <td>{row.edited_by_name || "-"}</td>
+                <td>{formatKolkataDateTime(row.edited_at)}</td>
+                <td>{row.edited_by_name || MISSING_VALUE}</td>
                 <td>{row.reason}</td>
                 <td><div className="audit-readable">{formatSaleAuditLines(row).map((line) => <span key={line}>{line}</span>)}</div></td>
               </tr>
@@ -30496,18 +30635,18 @@ const formatPaymentAuditLines = (row) => {
   if (row.action === "CANCEL") {
     return [
       "Payment Cancelled",
-      `Reason: ${row.reason || "-"}`,
-      `Cancelled By: ${row.edited_by_name || "-"}`,
-      `Cancelled At: ${row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}`,
+      `Reason: ${row.reason || MISSING_VALUE}`,
+      `Cancelled By: ${row.edited_by_name || MISSING_VALUE}`,
+      `Cancelled At: ${row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}`,
     ];
   }
   const fields = [
     ["payment_date", "Date", (value) => toDateKey(value || "")],
     ["payment_amount", "Payment Amount", (value) => currency.format(Number(value || 0))],
     ["rebate_amount", "Rebate Amount", (value) => currency.format(Number(value || 0))],
-    ["payment_mode", "Payment Mode", (value) => value || "-"],
-    ["reference_number", "Reference", (value) => value || "-"],
-    ["remarks", "Remarks", (value) => value || "-"],
+    ["payment_mode", "Payment Mode", (value) => value || MISSING_VALUE],
+    ["reference_number", "Reference", (value) => value || MISSING_VALUE],
+    ["remarks", "Remarks", (value) => value || MISSING_VALUE],
   ];
   const lines = fields
     .filter(([key]) => String(oldValue[key] ?? "") !== String(newValue[key] ?? ""))
@@ -30531,8 +30670,8 @@ function PaymentAuditModal({ audit, onClose }) {
             {audit.rows.map((row) => (
               <tr key={row.id}>
                 <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
-                <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
-                <td>{row.edited_by_name || "-"}</td>
+                <td>{formatKolkataDateTime(row.edited_at)}</td>
+                <td>{row.edited_by_name || MISSING_VALUE}</td>
                 <td>{row.reason}</td>
                 <td><div className="audit-readable">{formatPaymentAuditLines(row).map((line) => <span key={line}>{line}</span>)}</div></td>
               </tr>
@@ -30589,7 +30728,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
           </div>
           <div className="invoice-actions">
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Receipt</button>
-            <button className="secondary-button" disabled={exporting} onClick={exportReceiptPdf}>{exporting ? "Exporting..." : "Save PDF"}</button>
+            <button className="secondary-button" disabled={exporting} onClick={exportReceiptPdf}>{exporting ? "Exporting…" : "Save PDF"}</button>
             <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
             <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
@@ -30604,7 +30743,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
             </div>
           </header>
           <section className="invoice-customer">
-            <div><small>Party Name</small><strong>{payment.account_name || "-"}</strong><span>{payment.account_type || payment.payment_source || "-"}</span></div>
+            <div><small>Party Name</small><strong>{payment.account_name || MISSING_VALUE}</strong><span>{payment.account_type || payment.payment_source || MISSING_VALUE}</span></div>
             <div><small>Payment Mode</small><strong>{labelFor("paymentMode", payment.payment_mode)}</strong><span>{payment.reference_number || "No reference"}</span></div>
           </section>
           <section className="receipt-summary">
@@ -30918,8 +31057,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             {!canEdit && editRefusal && <span className="form-note invoice-edit-refusal" role="note">{editRefusal}</span>}
             <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
-            <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing..." : "View PDF"}</button>
-            <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "Save PDF"}</button>
+            <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing…" : "View PDF"}</button>
+            <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting…" : "Save PDF"}</button>
             <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
             {canCancel && <button className="remove-button invoice-cancel-bill" onClick={onCancel}>Cancel Bill</button>}
           </div>
@@ -31277,7 +31416,7 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
         <div className="button-row price-list-actions">
           {/* The device share sheet, not the server send route, so it needs no WhatsApp-send permission. */}
           <button className="whatsapp-button price-list-share" disabled={busy || list.rows.length === 0} onClick={share} type="button">
-            <Icon name="message" /> {busy ? "Preparing..." : "Share on WhatsApp"}
+            <Icon name="message" /> {busy ? "Preparing…" : "Share on WhatsApp"}
           </button>
           <button className="secondary-button" disabled={list.rows.length === 0} onClick={copyText} type="button">Copy as text</button>
         </div>
@@ -31367,7 +31506,7 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
                   setGroupDraft(event.target.value);
                   setGroupNote(null);
                 }}
-                placeholder="https://chat.whatsapp.com/..."
+                placeholder="https://chat.whatsapp.com/…"
                 value={groupDraft}
               />
             </label>
@@ -31688,15 +31827,25 @@ function DashboardHighlights({ insights, lowStockItems, onNavigate, topProducts 
 }
 
 function SummaryMetric({ featured = false, label, positive = false, value }) {
-  const displayValue = value ?? "-";
-  // A negative amount stays on one line, with a true minus, in the loss colour.
+  const displayValue = value ?? MISSING_VALUE;
+  // A negative amount stays on one line, with a true minus, in the loss colour -- even on a tile
+  // marked `positive`, which only means "green when this is good". A loss is never painted green.
   const signed = presentSignedFigure(displayValue);
   return (
     <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"} title={`${label}: ${displayValue}`}>
       <span>{label}</span>
-      <strong className={positive ? "metric-value profit-cell" : signed.negative ? "metric-value metric-negative" : "metric-value"}>{signed.text}</strong>
+      <strong className={signed.negative ? "metric-value metric-negative" : positive ? "metric-value profit-cell" : "metric-value"}>{signed.text}</strong>
     </div>
   );
+}
+
+// A profit figure in a table: green when it is a profit, the loss colour with a true minus when it
+// is a loss. `profit-cell` alone painted "-₹1,900.00" green and bold, which reads as a gain.
+function ProfitCell({ className = "", format = (number) => currency.format(number), value }) {
+  const number = Number(value);
+  const loss = Number.isFinite(number) && number < 0;
+  const signed = presentSignedFigure(format(value));
+  return <td className={`profit-cell ${loss || signed.negative ? "loss-cell" : ""} ${className}`.replace(/\s+/g, " ").trim()}>{signed.text}</td>;
 }
 
 // A password box with its own show/hide eye (4 Oct 2026). The eye Windows' WebView draws by itself
@@ -31780,14 +31929,38 @@ function DeviceIdentity({ children, deviceId, kind, name }) {
 
 // Branch on top, counter under it, for every device table.
 function DevicePlace({ branch, counter }) {
-  return <><span className="device-place">{branch || "-"}</span><small className="cell-note">{counter || "-"}</small></>;
+  return <><span className="device-place">{branch || MISSING_VALUE}</span><small className="cell-note">{counter || MISSING_VALUE}</small></>;
 }
 
+// A clickable table row opens with Enter as well as a click, so Tab and Enter reach every report
+// detail. Only the row itself: Enter on a button inside it keeps doing that button's job.
+const activateOnEnter = (handler) => (event) => {
+  if (event.key !== "Enter" || event.target !== event.currentTarget) return;
+  event.preventDefault();
+  handler(event);
+};
+
+// A header is a string, a node, or `{ label, numeric: true }` for a money or quantity column. A
+// numeric column is right-aligned, heading and cells alike, through a `num-col-N` class on the
+// table (App.css), so every row lines its figures up without each cell having to ask.
+const isColumnSpec = (header) => Boolean(header) && typeof header === "object" && !React.isValidElement(header) && "label" in header;
+
 function DataTable({ children, className = "", headers }) {
+  const numericColumns = headers
+    .map((header, index) => (isColumnSpec(header) && header.numeric ? index + 1 : 0))
+    .filter((column) => column > 0 && column <= 16);
+  const tableClass = numericColumns.map((column) => `num-col-${column}`).join(" ");
   return (
     <div className={`table-wrap ${className}`.trim()}>
-      <table>
-        <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? `${index}:${header}` : index}>{header}</th>)}</tr></thead>
+      <table className={tableClass || undefined}>
+        <thead>
+          <tr>
+            {headers.map((header, index) => {
+              const label = isColumnSpec(header) ? header.label : header;
+              return <th key={typeof label === "string" ? `${index}:${label}` : index}>{label}</th>;
+            })}
+          </tr>
+        </thead>
         <tbody>{children}</tbody>
       </table>
     </div>

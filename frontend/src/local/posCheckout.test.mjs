@@ -11,6 +11,7 @@ import {
   editedBillDateTime,
   localDateTimeText,
   lotLeftAfterCart,
+  lotTapQuantity,
   posLineProblem,
   resolvePosBillDateTime,
   saleEditTotals,
@@ -115,4 +116,13 @@ test("what is left in a lot counts the whole cart, to 3 decimals", () => {
   assert.equal(lotLeftAfterCart({ available: 5, inOtherLines: 2, quantity: "1.5" }), 1.5);
   assert.equal(lotLeftAfterCart({ available: 1, inOtherLines: 1, quantity: 1 }), 0, "never below zero");
   assert.equal(lotLeftAfterCart({ available: undefined }), null, "unknown is not 0");
+});
+
+test("a tap adds one unit, or what is left of a lot holding less than one", () => {
+  assert.equal(lotTapQuantity({ available: 5, inCart: 0 }), 1);
+  assert.equal(lotTapQuantity({ available: 0.75, inCart: 0 }), 0.75, "a 0.75 kg lot can be sold");
+  assert.equal(lotTapQuantity({ available: 5.5, inCart: 5 }), 0.5, "the last half kilo of a lot");
+  assert.equal(lotTapQuantity({ available: 3.6, inCart: 3.2 }), 0.4, "3 decimals, no float tail");
+  assert.equal(lotTapQuantity({ available: 2, inCart: 2 }), 1, "nothing left: the stock check refuses as before");
+  assert.equal(lotTapQuantity({ available: undefined }), 1, "unknown balance: unchanged behaviour");
 });

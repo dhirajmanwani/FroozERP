@@ -31,9 +31,12 @@
  */
 
 import { EMPTY_LABEL, labelFor } from "./displayLabels.js";
+import { DEFAULT_BRAND_TITLE, DEFAULT_INVOICE_FOOTER, displayBusinessName, displayInvoiceFooter } from "./brandIdentity.js";
 
-export const INVOICE_FALLBACK_SHOP_NAME = "FroozERP Retail";
-export const INVOICE_FALLBACK_FOOTER = "Thank you for shopping with FEEL THE FREAKIN' FROOZ.";
+// A settings row that is blank, or still holds the old seeded defaults, prints as THE PEP
+// (see displayBusinessName in brandIdentity.js). The stored settings are never changed.
+export const INVOICE_FALLBACK_SHOP_NAME = DEFAULT_BRAND_TITLE;
+export const INVOICE_FALLBACK_FOOTER = DEFAULT_INVOICE_FOOTER;
 export const INVOICE_FALLBACK_COMPANY = "SRT Company";
 export const INVOICE_WALK_IN_CUSTOMER = "Walk-in Customer";
 export const INVOICE_COLUMNS = Object.freeze(["Product", "Qty", "Unit", "Rate", "Amount"]);
@@ -535,7 +538,7 @@ export const buildInvoiceLayout = (sale = {}, settings = {}, options = {}) => {
 
   return {
     header: {
-      shopName: text(safeSettings.business_name) || INVOICE_FALLBACK_SHOP_NAME,
+      shopName: displayBusinessName(safeSettings),
       addressLines,
       phone,
       phoneText: phone ? `Ph. ${phone}` : "",
@@ -562,7 +565,7 @@ export const buildInvoiceLayout = (sale = {}, settings = {}, options = {}) => {
     payment,
     savings,
     footer: {
-      message: text(safeSettings.invoice_footer_text) || INVOICE_FALLBACK_FOOTER,
+      message: displayInvoiceFooter(safeSettings),
       poweredBy: `Powered by ${text(safeSettings.company_name) || INVOICE_FALLBACK_COMPANY}`,
     },
     // For the screen only. A customer's copy is not the place to explain a data problem.

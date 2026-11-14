@@ -5,8 +5,14 @@ import {
   BRAND_IDENTITY_STORAGE_KEY,
   BRAND_LOGO_EDGE,
   DEFAULT_BRAND_IDENTITY,
+  DEFAULT_INVOICE_FOOTER,
+  LEGACY_DEFAULT_BRAND_NAME,
+  LEGACY_DEFAULT_BUSINESS_NAME,
+  LEGACY_DEFAULT_INVOICE_FOOTER,
   checkBrandLogo,
   createBrandIdentityStore,
+  displayBusinessName,
+  displayInvoiceFooter,
   hasUnusableLogo,
   readCachedBrandIdentity,
   resolveBrandIdentity,
@@ -147,4 +153,36 @@ test("checkBrandLogo mirrors the server's 200 KB limit", () => {
   assert.equal(checkBrandLogo("https://x/y.png").ok, false);
   const big = `data:image/png;base64,${"A".repeat(Math.ceil((201 * 1024) / 3) * 4)}`;
   assert.match(checkBrandLogo(big).message, /200 KB/);
+});
+
+test("an untouched seeded settings row is shown as THE PEP, never the old default name", () => {
+  const seeded = {
+    business_name: LEGACY_DEFAULT_BUSINESS_NAME,
+    brand_name: LEGACY_DEFAULT_BRAND_NAME,
+    company_name: "SRT Company",
+    invoice_footer_text: LEGACY_DEFAULT_INVOICE_FOOTER,
+  };
+  assert.deepEqual(resolveBrandIdentity(seeded), { title: "THE PEP", tagline: "Pulp Eat Up. - by SRT Company", logo: null });
+  assert.equal(displayBusinessName(seeded), "THE PEP");
+  assert.equal(displayInvoiceFooter(seeded), DEFAULT_INVOICE_FOOTER);
+  // The settings themselves are only read, never rewritten.
+  assert.equal(seeded.business_name, "FroozERP Retail");
+});
+
+test("whatever the owner typed is shown as typed", () => {
+  const typed = { business_name: "Sardar Fruits", brand_name: LEGACY_DEFAULT_BRAND_NAME, invoice_footer_text: "Visit again" };
+  assert.equal(resolveBrandIdentity(typed).title, "Sardar Fruits");
+  assert.equal(resolveBrandIdentity(typed).tagline, LEGACY_DEFAULT_BRAND_NAME);
+  assert.equal(displayBusinessName(typed), "Sardar Fruits");
+  assert.equal(displayInvoiceFooter(typed), "Visit again");
+  assert.equal(displayBusinessName({ business_name: "  " }), "THE PEP");
+});
+
+test("the App's pre-load defaults carry THE PEP identity, not the old seeded words", async () => {
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const defaults = app.slice(app.indexOf("const defaultBusinessSettings = {"), app.indexOf("const defaultSaleRateSettings"));
+  assert.match(defaults, /business_name: "THE PEP"/);
+  assert.match(defaults, /brand_name: "Pulp Eat Up\."/);
+  assert.doesNotMatch(defaults, /FroozERP Retail|FREAKIN/);
 });
