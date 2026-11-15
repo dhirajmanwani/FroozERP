@@ -2781,9 +2781,11 @@ td.origin-rate {
   background: var(--hover);
 }
 
+/* The shelf and cart take what the checkout panel leaves. A 690px floor for them made the page
+   scroll sideways at 1366 with Large or Extra Large text (1370 > 1366). */
 .pos-layout {
   display: grid;
-  grid-template-columns: minmax(690px, 1fr) minmax(320px, 380px);
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
   gap: var(--module-gap);
   align-items: start;
   min-height: 0;
@@ -2854,12 +2856,23 @@ td.origin-rate {
   padding-left: 38px;
 }
 
+/* auto-fill: one combo on a tab keeps a tile's width instead of stretching across the card. */
 .product-results {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(245px, 1fr));
   gap: 10px;
   margin-top: 13px;
   align-items: stretch;
+}
+
+/* The shelf scrolls inside its card, so the cart under it stays on screen while items are added
+   (each tap used to push the cart ~1500px further down at 1366). */
+.pos-search-card .product-results {
+  max-height: clamp(220px, calc(100vh - 480px), 640px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 4px 2px 2px;
+  scrollbar-width: thin;
 }
 
 .product-result {
@@ -3013,7 +3026,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .cart-table table {
-  min-width: 710px;
+  min-width: 0;
   width: 100%;
   table-layout: fixed;
   border-collapse: separate;
@@ -3029,31 +3042,33 @@ tbody tr:has(> .empty-cell):hover {
   text-overflow: ellipsis;
 }
 
+/* Sized to fit the cart card at 1366 with every column, the remove button included: the product
+   takes what is left, the figures keep fixed widths so they line up. */
 .cart-table th:nth-child(1),
 .cart-table td:nth-child(1) {
-  width: 23%;
+  width: auto;
 }
 
 .cart-table th:nth-child(2),
 .cart-table td:nth-child(2) {
-  width: 18%;
+  width: 16%;
 }
 
 .cart-table th:nth-child(3),
 .cart-table th:nth-child(4),
 .cart-table td:nth-child(3),
 .cart-table td:nth-child(4) {
-  width: 82px;
+  width: 76px;
 }
 
 .cart-table th:nth-last-child(3),
 .cart-table td:nth-last-child(3) {
-  width: 104px;
+  width: 96px;
 }
 
 .cart-table th:nth-last-child(2),
 .cart-table td:nth-last-child(2) {
-  width: 104px;
+  width: 94px;
 }
 
 .cart-table th:last-child,
@@ -3085,10 +3100,16 @@ tbody tr:has(> .empty-cell):hover {
   white-space: nowrap;
 }
 
+/* The lot on one line, cut with "…" (its full name is the tooltip): in a narrow column it used to
+   break one letter per line. */
 .cart-table .batch-id {
   display: block;
+  max-width: 100%;
+  overflow: hidden;
   color: var(--ink-body);
   line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cart-table .amount-cell {
@@ -3102,9 +3123,10 @@ tbody tr:has(> .empty-cell):hover {
 
 .cart-table .table-input {
   width: 100%;
-  min-width: 72px;
+  min-width: 0;
   max-width: 108px;
   padding-inline: 6px;
+  text-align: right;
   white-space: nowrap;
 }
 
@@ -3189,7 +3211,7 @@ tbody tr:has(> .empty-cell):hover {
   top: 78px;
   z-index: 2;
   display: grid;
-  grid-template-columns: minmax(260px, 1.6fr) repeat(5, minmax(118px, 0.7fr)) minmax(150px, auto);
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
   align-items: end;
   padding: 14px 16px;
@@ -3202,6 +3224,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .lot-selector-search {
+  grid-column: span 2;
   min-width: 0;
 }
 
@@ -3247,7 +3270,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .lot-selector-table {
   width: 100%;
-  min-width: 920px;
+  min-width: 0;
   border-collapse: separate;
   border-spacing: 0;
 }
@@ -3353,10 +3376,13 @@ tbody tr:has(> .empty-cell):hover {
   background: var(--danger-soft);
 }
 
+/* Docked above the FROST launcher: the panel ends before the launcher's corner, so Checkout &
+   Print and the Mandi Tax badge are never under it. */
 .checkout-card {
   position: sticky;
   top: calc(var(--topbar-height, 0px) + 18px);
-  max-height: calc(100vh - 104px - var(--topbar-height, 0px));
+  /* 106px = the FROST launcher (62px) and its 22px gap above and below it. */
+  max-height: calc(100vh - 18px - 106px - var(--topbar-height, 0px));
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -3604,6 +3630,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .total-line strong {
   color: var(--ink-body);
+  font-size: var(--font-size-base);
 }
 
 .total-line-muted {
@@ -10362,15 +10389,17 @@ button.shortcut-sheet-row:focus-visible {
 
 /* A small chip on the box's corner, half outside it, so it never covers a box's own title or
    buttons: a box made of several cards (today's figures, the graphs) has no padding of its own. */
+/* Inside the box's top-right corner, small, so it reads as part of the box (half outside it, it
+   looked misplaced) and still clears a box's own title and buttons. */
 .dash-handle {
   position: absolute;
-  top: -9px;
-  right: -9px;
+  top: 6px;
+  right: 6px;
   z-index: 5;
   display: inline-grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 1px solid var(--line-soft);
   border-radius: var(--radius-pill);
@@ -11744,4 +11773,326 @@ button.shortcut-sheet-row:focus-visible {
   white-space: normal;
   overflow-wrap: normal;
   word-break: normal;
+}
+
+/* ------------------------------------------------------------------------------------------------
+   Phase 3 polish: the counter screens (POS, Sale Returns, Orders, Discounts, Dashboard).
+   ------------------------------------------------------------------------------------------------ */
+
+/* The FROST launcher is fixed over the bottom-right corner. On these screens the cards stop short of
+   it, so a figure or a button at the right edge is never under it while the page scrolls. POS docks
+   its checkout panel above the launcher instead (the max-height on .checkout-card). */
+@media (min-width: 821px) {
+  .erp-shell .content-area:is([data-view="dashboard"], [data-view="returns"], [data-view="orders"], [data-view="discounts"]) {
+    padding-right: calc(62px + 22px + 10px);
+  }
+}
+
+@media (max-width: 820px) {
+  /* A phone has one scroll box, the page: the shelf is not boxed in there. */
+  .pos-search-card .product-results {
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+/* A tile's stock, once, with its unit and lots: "68 Kg · 4 lots". */
+.product-result-stock {
+  justify-self: start;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  color: var(--ink-body);
+  background: var(--veil);
+  font-weight: 800;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.product-result-stock.stock-low {
+  border-color: transparent;
+}
+
+.product-result em {
+  font-size: var(--font-size-sm);
+}
+
+/* Notices that replaced POS's browser boxes, right where the cashier is looking. */
+.pos-add-notice,
+.pos-cart-notice {
+  margin: var(--space-3) 0 0;
+}
+
+.pos-cart-notice {
+  margin: 0 0 var(--space-3);
+}
+
+/* The cart's figure columns: headings over their numbers, inputs typed from the right. */
+.cart-table th.amount-cell {
+  text-align: right;
+}
+
+.cart-table th.cart-discount-head {
+  white-space: normal;
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+}
+
+.cart-table th.cart-discount-head .pos-discount-limit-note {
+  display: block;
+  margin-top: 2px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.cart-table .pos-discount-over-note {
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.mixed-payment-panel input,
+#pos-bill-discount-input,
+.lot-selector-controls .numeric-input {
+  text-align: right;
+}
+
+/* The foot of the checkout panel: Net Payable, why checkout stopped, and the buttons, pinned in
+   sight while the customer fields above it scroll. */
+.checkout-card {
+  box-sizing: border-box;
+}
+
+/* Widths include the cell padding, so the fixed figure columns leave the product its share. */
+.cart-table th,
+.cart-table td {
+  box-sizing: border-box;
+  padding-inline: 8px;
+}
+
+.checkout-footer {
+  position: sticky;
+  bottom: calc(-1 * var(--space-6));
+  z-index: 3;
+  display: grid;
+  gap: var(--space-2);
+  margin: 0 calc(-1 * var(--space-6)) calc(-1 * var(--space-6));
+  padding: var(--space-3) var(--space-6) var(--space-5);
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 var(--radius-card) var(--radius-card);
+  background: var(--card);
+  box-shadow: 0 -12px 18px -16px var(--shadow-soft);
+}
+
+.checkout-footer .total-line-main {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.checkout-footer .pos-discount-notice,
+.checkout-footer .save-notice {
+  margin: 0;
+}
+
+.checkout-footer .checkout-actions {
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  margin-top: 0;
+}
+
+.checkout-footer .checkout-actions > button {
+  width: 100%;
+  white-space: nowrap;
+}
+
+.pos-bill-date-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+@media (max-width: 820px) {
+  .checkout-footer {
+    position: static;
+    margin: 0;
+    padding: var(--space-3) 0 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+}
+
+/* The lot picker with one size and one unit: the search and "Show" only. */
+.lot-selector-controls.lot-selector-controls-simple {
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 210px);
+}
+
+.lot-selector-controls.lot-selector-controls-simple .lot-selector-search {
+  grid-column: auto;
+}
+
+@media (max-width: 820px) {
+  .lot-selector-controls.lot-selector-controls-simple {
+    grid-template-columns: 1fr;
+  }
+}
+
+.lot-selector-table td small {
+  display: block;
+  color: var(--ink-faint);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.lot-selector-table th.amount-cell,
+.lot-selector-table td.amount-cell {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.lot-selector-notice {
+  margin: var(--space-3) 16px 0;
+}
+
+.lot-selector-foot {
+  margin: 0;
+  padding: 0 16px 16px;
+}
+
+/* Sale Returns (Phase 3). Each field keeps its own height: the reason box beside Refund Option used
+   to stretch the select to its 68px. The history's long return numbers and free-text reasons wrap
+   inside their cells, so the table fits its card at 1366 instead of scrolling the Items off it. */
+.return-entry-grid > label {
+  align-content: start;
+}
+
+.return-entry-grid textarea {
+  min-height: 42px;
+  resize: vertical;
+}
+
+.return-history-table table,
+.return-items-table table {
+  min-width: 0;
+}
+
+/* The return number as plain small text that may break, not a pill: wrapped, a pill became a
+   rounded blob three lines tall. The number itself is the server's and is shown as it is. */
+.return-history-table .batch-id {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-sm);
+}
+
+.return-history-table td.return-wrap-cell {
+  min-width: 120px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.return-outcome {
+  margin-top: var(--space-3);
+}
+
+.return-outcome + .button-row,
+.return-blockers + .button-row {
+  margin-top: var(--space-3);
+}
+
+/* The saved bill's way out sits at the end of its actions; a PDF that failed is said under them. */
+.invoice-actions-bill .invoice-done-button {
+  margin-left: auto;
+}
+
+.invoice-pdf-error {
+  margin-top: var(--space-3);
+}
+
+.pdf-preview-notice {
+  margin: var(--space-3) var(--space-4) 0;
+}
+
+/* Orders (Phase 3). The order's number and its value sit at either end of the card's top line
+   ("ORD-… · Sunita Sharma" … "₹540.00"), never run together; buttons sit in rows with a gap. */
+.order-card .carrier-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-2);
+}
+
+.order-card .carrier-top > span {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.order-card + .order-card {
+  margin-top: var(--space-4);
+}
+
+.order-card .order-actions,
+.orders-form-actions {
+  margin-top: var(--space-3);
+}
+
+.orders-toolbar {
+  align-items: center;
+  margin-bottom: var(--space-3);
+}
+
+.orders-saved-notice {
+  margin: 0 0 var(--space-3);
+}
+
+.order-draft-table .numeric-input {
+  text-align: right;
+}
+
+/* Dashboard (Phase 3): the price list's reminder and group settings fold under one line. */
+.price-list-schedule-details {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--line);
+}
+
+.price-list-schedule-details > summary {
+  cursor: pointer;
+  color: var(--ink-body);
+  font-size: var(--font-size-sm);
+  font-weight: 650;
+}
+
+.price-list-schedule-state {
+  color: var(--ink-muted);
+  font-weight: 500;
+}
+
+.price-list-schedule-details[open] > summary {
+  margin-bottom: var(--space-3);
+}
+
+.price-list-schedule-details .price-list-schedule {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.insight-list .empty-inline {
+  margin: 0;
+}
+
+.return-items-table input.table-input {
+  text-align: right;
+}
+
+/* At the largest text size the print icon was squeezed to a dot beside "Checkout & Print". */
+.checkout-footer .checkout-actions > button svg {
+  flex-shrink: 0;
 }

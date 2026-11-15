@@ -1005,7 +1005,8 @@ test("Settings shows the value POS uses: no settings card keeps a copy of its se
   }
   // The checkbox and POS read the same live value.
   assert.match(functionBody("BusinessSettingsSection"), /checked=\{draft\.show_item_discount_column_pos !== false\}/);
-  assert.match(app, /\{printSettings\.show_item_discount_column_pos !== false && <th>Item Discount/);
+  // Phase 3: the cart heading is "Discount", right-aligned over its figures; still behind the switch.
+  assert.match(app, /\{printSettings\.show_item_discount_column_pos !== false && <th className="amount-cell cart-discount-head"[^>]*>Discount/);
   // A desktop counter picks up the switches after a sync, not only when Settings is opened on it.
   assert.match(app, /setSettingsData\(\(current\) => \(\{ \.\.\.current, businessSettings: \{ \.\.\.defaultBusinessSettings, \.\.\.businessBundle \} \}\)\);/);
 });

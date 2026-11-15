@@ -72,7 +72,8 @@ import { buildCommandIndex, highlightSegments, searchCommands } from "./local/co
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
 import { WHATSAPP_OPENED, describeChatHandoff, initialWhatsappSelection } from "./local/whatsappHandoff";
 import { RETURN_INVOICE_DEFAULT_DAYS, buildSaleReturnDraft, filterReturnInvoices, refundPerUnit, returnInvoiceListParams, saleReturnFingerprint, saleReturnPayload } from "./local/saleReturnDraft";
-import { cartEntryFits, cartLineProblem, chargeRefusalProblem, describeMandiTaxPanel, describeSavedBillRefreshFailure, editLineAmount, editedBillDateTime, lotLeftAfterCart, lotTapQuantity, resolvePosBillDateTime, saleEditTotals } from "./local/posCheckout";
+import { CHECKOUT_GATE, cartEntryFits, cartLineProblem, chargeRefusalProblem, checkoutDateReasonDialog, checkoutGateDialog, checkoutGateRefusal, describeMandiTaxPanel, describeSavedBillRefreshFailure, editLineAmount, editedBillDateTime, lotLeftAfterCart, lotTapQuantity, resolveDateOverrideReason, resolvePosBillDateTime, saleEditTotals } from "./local/posCheckout";
+import { billDateHint, counterQuantityWithUnit, invoiceCloseLabel, lotShortMessage, orderSavedText, ordersNeedCheckingText, posRateLabel, posTileStockLine, returnInvoiceOptionLabel, returnItemsText, shouldShowLotFilters } from "./local/counterScreens";
 import { POS_LEAVE_PROMPT, shouldConfirmLeavingPos } from "./local/posLeaveGuard";
 import { canRetireDeviceId, normalizeMachineFingerprint, previousIdsNote, retireDeviceConfirmText, waitingIdsNote } from "./local/deviceBoxes";
 import { DASHBOARD_BLOCKS, DEFAULT_DASHBOARD_ORDER, dashboardDropIndex, isDefaultDashboardOrder, moveDashboardBlock, nudgeDashboardBlock, readDashboardOrder, writeDashboardOrder } from "./local/dashboardLayout";
@@ -2944,6 +2945,9 @@ function App() {
   const [editingSale, setEditingSale] = useState(null);
   const [saleEditLoading, setSaleEditLoading] = useState(false);
   const [saleEditError, setSaleEditError] = useState("");
+  // A bill that could not be opened, printed or cancelled, said in a window like the edit refusal
+  // below instead of a browser alert: { title, message }.
+  const [saleActionProblem, setSaleActionProblem] = useState(null);
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [exitCodeModalOpen, setExitCodeModalOpen] = useState(false);
@@ -3183,7 +3187,9 @@ function App() {
       // would be a defect, not a nuisance. The guard lives in the module because that is where it
       // can be tested; removing it fails three tests.
       const shortcutTarget = resolveShortcutTarget(event);
-      if (shortcutTarget && user) {
+      // Not while an in-app question is open (a checkout gate, a reason box): the browser's own boxes
+      // froze the page, and an Alt key must not take the screen away from under the question either.
+      if (shortcutTarget && user && !appDialogQueue.current()) {
         event.preventDefault();
         setCommandPaletteOpen(false);
         setShortcutSheetOpen(false);
@@ -7428,8 +7434,8 @@ function App() {
         return { ok: false, message: "Orders are stored on this device and need the desktop app. This looks like a browser." };
       }
       await loadOrders();
-      setSyncMessage(`Order ${saved.order_no} saved. Stock is set aside.`);
-      return { ok: true, message: "" };
+      // Said on the Orders screen itself, beside the form that was just cleared (orderSavedText).
+      return { ok: true, message: "", orderNo: saved.order_no || "" };
     } catch (error) {
       // The reason travels back to the form. It used to go only to the sync banner while the form
       // said "that order was not saved" — which names no cause, so the operator has nothing to try
@@ -9122,14 +9128,14 @@ function App() {
       setSelectedInvoice(response.data);
       setSelectedInvoicePrintMode(options.print ? (options.printMode || "THERMAL") : null);
     } catch (error) {
-      alert(getErrorMessage(error, "Error Loading Invoice"));
+      setSaleActionProblem({ title: "This bill could not be opened", message: getErrorMessage(error, "The bill could not be loaded. Nothing was changed; try again.") });
     }
   };
 
   const printSaleInvoice = async (saleId, printMode = "THERMAL") => {
     const invoiceId = saleId || "";
     if (!invoiceId) {
-      alert("Unable to print invoice. Invoice ID is missing.");
+      setSaleActionProblem({ title: "This bill could not be printed", message: "The bill has no number to print it by. Open it from the sales list and print it from there." });
       return;
     }
     await loadInvoice(invoiceId, { print: true, printMode });
@@ -9157,9 +9163,8 @@ function App() {
       }
       setEditingSale(response.data);
     } catch (error) {
-      const message = getErrorMessage(error, "Error Loading Invoice");
-      setSaleEditError(message);
-      alert(message);
+      // Said once, in the edit window below; the alert that repeated it is gone.
+      setSaleEditError(getErrorMessage(error, "Error Loading Invoice"));
     } finally {
       setSaleEditLoading(false);
     }
@@ -9170,7 +9175,7 @@ function App() {
       const response = await axios.get(`${API_URL}/sales/${saleId}/audit`);
       setChangeHistory({ saleId, rows: response.data });
     } catch (error) {
-      alert(getErrorMessage(error, "Error Loading Change History"));
+      setSaleActionProblem({ title: "The change history could not be opened", message: getErrorMessage(error, "The change history could not be loaded. Try again.") });
     }
   };
 
@@ -9245,13 +9250,13 @@ function App() {
     try {
       const fullSale = await getSaleDetailsForAction(sale);
       if (fullSale.sale_status === "CANCELLED") {
-        alert("Invoice is already cancelled.");
+        setSaleActionProblem({ title: "This bill is already cancelled", message: `${fullSale.invoice_no || "This bill"} was cancelled earlier. Nothing more needs doing.` });
         return false;
       }
       setCancelDraft({ sale: fullSale, ...EMPTY_SALE_CHANGE_FORM, error: "", saving: false });
       return false;
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to open cancellation confirmation"));
+      setSaleActionProblem({ title: "This bill could not be cancelled", message: getErrorMessage(error, "The bill could not be loaded to cancel it. Nothing was changed; try again.") });
       return false;
     }
   };
@@ -9320,14 +9325,18 @@ function App() {
         cancellationWrite.config
       );
       await refreshAfterSaleCancellation();
-      alert("Invoice cancelled");
+      notify({
+        severity: NOTIFICATION_SEVERITY.SUCCESS,
+        title: `${sale.invoice_no || "The bill"} is cancelled`,
+        message: "The sales list now shows it as cancelled.",
+        source: "Sales",
+      });
       setCancelDraft(null);
       return true;
     } catch (error) {
       if (approvalErrorCode(error) === "SALE_CHANGE_APPROVAL_REQUIRED") return stop(describeApprovalError(error));
-      stop("");
-      alert(getErrorMessage(error, "Unable to cancel invoice"));
-      return false;
+      // Said in the cancel window itself, which stays open so the reason is not typed again.
+      return stop(plainRefusalMessage(error) || getErrorMessage(error, "The bill was not cancelled. Nothing was changed; try again."));
     } finally {
       setCancelDraft((current) => current ? { ...current, approverPassword: "", saving: false } : current);
     }
@@ -9655,12 +9664,12 @@ function App() {
 
   const openSaleForEditFromReport = async (sale) => {
     if (!canEditSales) {
-      alert("Your role cannot edit completed sales.");
+      setSaleActionProblem({ title: "This bill can't be edited", message: "Your role cannot edit completed bills. Ask the Owner or an Admin." });
       return;
     }
     const saleId = String(sale.sale_id || sale.id || "");
     if (!saleId) {
-      alert("Sale invoice not found.");
+      setSaleActionProblem({ title: "This bill can't be edited", message: "The bill has no number to open it by. Open it again from the sales list." });
       return;
     }
     const localEligible = isTauriRuntime() && (
@@ -10609,7 +10618,7 @@ function App() {
           </div>
         </header>
 
-        <div className="content-area">
+        <div className="content-area" data-view={activeView}>
           {shopView.banner && (
             // Above the connectivity notice on purpose. Local Only changes where the numbers come
             // from; this changes whose they are, and that is the more surprising of the two.
@@ -11996,6 +12005,7 @@ function App() {
           canEdit={canEditSales && selectedInvoice.sale_status !== "CANCELLED" && !saleHasCombos(selectedInvoice)}
           editRefusal={canEditSales && selectedInvoice.sale_status !== "CANCELLED" && saleHasCombos(selectedInvoice) ? COMBO_EDIT_REFUSAL : null}
           canWhatsappSend={canWhatsappSend}
+          closeLabel={invoiceCloseLabel({ fromPos: activeView === "sales" })}
           invoice={selectedInvoice}
           onCancel={async () => {
             const invoice = selectedInvoice;
@@ -12027,6 +12037,23 @@ function App() {
           </section>
         </div>
       )}
+      {saleActionProblem && (
+        <div className="modal-backdrop">
+          <section aria-label={saleActionProblem.title} aria-modal="true" className="invoice-modal change-history-modal" role="dialog">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Bill</span>
+                <strong>{saleActionProblem.title}</strong>
+              </div>
+              <button aria-label="Close" className="remove-button" type="button" onClick={() => setSaleActionProblem(null)}><Icon name="close" /></button>
+            </div>
+            <div className="error-banner" role="alert">{saleActionProblem.message}</div>
+            <div className="button-row">
+              <button autoFocus className="secondary-button" type="button" onClick={() => setSaleActionProblem(null)}>OK</button>
+            </div>
+          </section>
+        </div>
+      )}
       {saleEditError && !saleEditLoading && !editingSale && (
         <div className="modal-backdrop">
           <section className="invoice-modal change-history-modal">
@@ -12050,6 +12077,7 @@ function App() {
             invoice={editingSale}
             offlineMode={offlineMode}
             onClose={() => setEditingSale(null)}
+            onNotify={notify}
             onAddCustomer={() => {
               setEditingSale(null);
               navigate("accounts");
@@ -15291,6 +15319,8 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   const [zoom, setZoom] = useState(1);
   const [opening, setOpening] = useState(false);
   const [saving, setSaving] = useState(false);
+  // What happened to the last Save or Open, said in this window instead of a browser alert.
+  const [actionNotice, showActionNotice, clearActionNotice] = useSaveNotice();
   useEffect(() => {
     let cancelled = false;
     let loadingTask = null;
@@ -15328,23 +15358,25 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   }, [blob]);
   const openFallback = async () => {
     setOpening(true);
+    clearActionNotice();
     try {
       await openPdfInSystemViewer({ blob, fileName });
     } catch (openError) {
       console.error("FroozERP PDF system viewer failed", openError);
-      alert("Unable to open PDF in system viewer. Please save the PDF and open it manually.");
+      showActionNotice(errorNotice("The PDF could not be opened in the system viewer. Save it, then open the saved file."));
     } finally {
       setOpening(false);
     }
   };
   const handleSave = async () => {
     setSaving(true);
+    clearActionNotice();
     try {
       const result = await onSave?.();
       if (result?.canceled) return;
-      if (result?.path) alert(`PDF saved successfully:\n${result.path}`);
+      if (result?.path) showActionNotice(successNotice(`The PDF is saved: ${result.path}`));
     } catch (saveError) {
-      alert(`Unable to save PDF: ${saveError.message || saveError}`);
+      showActionNotice(errorNotice(`The PDF could not be saved: ${saveError?.message || saveError}`));
     } finally {
       setSaving(false);
     }
@@ -15368,6 +15400,7 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
             <button aria-label="Close PDF preview" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
+        <SaveNotice className="pdf-preview-notice" notice={actionNotice} />
         <div className="pdf-preview-pages">
           {loading && <div className="cart-empty">Rendering PDF preview inside FroozERP...</div>}
           {error && (
@@ -21473,7 +21506,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
         });
       } catch (error) {
         setSaving(false);
-        setOutcome({ tone: "error", text: describeApprovalError(error) });
+        setOutcome(errorNotice(describeApprovalError(error)));
         return;
       }
     }
@@ -21491,7 +21524,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
       // A refused or spent approval cannot be reused; the next try asks again.
       if (String(error?.response?.data?.code || "").includes("APPROVAL")) pendingWrite.current.approvalId = "";
       setSaving(false);
-      setOutcome({ tone: "error", text: getErrorMessage(error, "The return was not saved.") });
+      setOutcome(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The return was not saved.")));
       return;
     }
     pendingWrite.current = { fingerprint: "", operationId: "", approvalId: "" };
@@ -21513,13 +21546,14 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
       refreshNote = `The lists on this screen could not refresh (${getErrorMessage(error, "unknown error")}). Reopen Sale Returns to see it.`;
     }
     setSaving(false);
-    setOutcome({ tone: refreshNote ? "warning" : "ok", text: refreshNote ? `${savedText} ${refreshNote}` : savedText });
+    // Said as a banner, green when all went through: the cashier looks up from the customer to it.
+    setOutcome(refreshNote ? warningNotice(`${savedText} ${refreshNote}`) : successNotice(savedText));
   };
 
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Sale Return / Refund" title="Return Entry" subtitle="Create a separate return record without editing the original invoice.">
-        <div className="form-grid supplier-form-grid">
+        <div className="form-grid supplier-form-grid return-entry-grid">
           <Field label="Find Invoice">
             <input
               placeholder="Invoice no, customer or mobile"
@@ -21564,9 +21598,9 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
             <button className="table-action" disabled={saving} onClick={() => { setAllBills(true); loadInvoices({ older: true }); }} type="button">Load older bills</button>
           </p>
         )}
-        {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items...</p>}
+        {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items…</p>}
         {returnOptions.status === "error" && <p className="return-note return-note-error" role="alert">{returnOptions.message}</p>}
-        <DataTable headers={markNumericColumns(["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Refund per unit", "Return Value"])}>
+        <DataTable className="return-items-table" headers={markNumericColumns(["Product", "Sold", "Returned", "Returnable", "Return Qty", "Refund / unit", "Return Value"], { also: ["Return Qty", "Refund / unit"] })}>
           {returnOptions.items.map((item, index) => {
             const key = canonicalInventoryId(item.sale_item_id);
             const line = draft.lines.find((entry) => canonicalInventoryId(entry.sale_item_id) === key);
@@ -21602,6 +21636,9 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
           {returnOptions.status === "ready" && returnOptions.items.length === 0 && (
             <tr><td className="empty-cell" colSpan="7">This invoice has no items left to return.</td></tr>
           )}
+          {returnOptions.status === "idle" && (
+            <tr><td className="empty-cell" colSpan="7">Pick an invoice above to see what can be returned.</td></tr>
+          )}
         </DataTable>
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Selected Items" value={draft.lines.length} />
@@ -21619,21 +21656,23 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
             {blockers.map((problem) => <li key={problem}>{problem}</li>)}
           </ul>
         )}
-        {outcome && <p className={`return-note return-note-${outcome.tone}`} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</p>}
-        <button className="primary-button" disabled={saving || !canSave} onClick={saveReturn} type="button">{saving ? "Saving…" : "Save Return / Refund"}</button>
+        <SaveNotice className="return-outcome" notice={outcome} />
+        <div className="button-row">
+          <button className="primary-button" disabled={saving || !canSave} onClick={saveReturn} type="button">{saving ? "Saving…" : "Save Return / Refund"}</button>
+        </div>
       </ModuleCard>
       <ModuleCard eyebrow="Return History" title="Sale Return History" subtitle="Returned goods, refund modes and reasons remain separate from original invoices.">
-        <DataTable headers={markNumericColumns(["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"], { also: ["Value"] })}>
+        <DataTable className="return-history-table" headers={markNumericColumns(["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"], { also: ["Value"] })}>
           {returns.map((entry) => (
             <tr key={entry.id}>
               <td><span className="batch-id">{entry.return_no}</span></td>
-              <td>{toDateKey(entry.return_date)}</td>
+              <td>{formatDisplayDate(entry.return_date)}</td>
               <td>{entry.invoice_no}</td>
               <td className="primary-cell">{entry.customer_name || "Walk-in"}</td>
               <td><span className="tag">{labelFor("refundType", entry.refund_type)}</span></td>
               <td>{currency.format(Number(entry.total_return_amount || 0))}</td>
-              <td>{entry.return_reason}</td>
-              <td>{(entry.items || []).map((item) => `${item.product_name} x ${Number(item.return_quantity).toLocaleString("en-IN", { maximumFractionDigits: 3 })}`).join(", ")}</td>
+              <td className="return-wrap-cell">{entry.return_reason}</td>
+              <td className="return-wrap-cell">{returnItemsText(entry.items)}</td>
             </tr>
           ))}
           {returns.length === 0 && <tr><td className="empty-cell" colSpan="8">No returns recorded yet.</td></tr>}
@@ -21643,15 +21682,11 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
   );
 }
 
-const returnInvoiceLabel = (sale) => {
-  const amount = Number(sale.amount);
-  return [
-    sale.invoice_no || `Invoice #${sale.id}`,
-    sale.sale_date ? toDateKey(sale.sale_date) : "",
-    sale.customer_name || "Walk-in",
-    Number.isFinite(amount) ? currency.format(amount) : "",
-  ].filter(Boolean).join(" - ");
-};
+// One bill in the picker, its date read the Indian way: local/counterScreens.js.
+const returnInvoiceLabel = (sale) => returnInvoiceOptionLabel(sale, {
+  formatDate: formatDisplayDate,
+  formatMoney: (amount) => currency.format(amount),
+});
 
 function WasteManagementModule({ entries, inventory, loadState = { status: "idle", message: "" }, onReload, products, user }) {
   const loadFailed = loadState.status === "failed";
@@ -22223,10 +22258,14 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     permitted: canRoute,
   });
   const [carrierDraft, setCarrierDraft] = useState({});
-  const [reasonDraft, setReasonDraft] = useState({});
   const emptyLine = { product_id: "", quantity: "", agreed_rate: "" };
   const [draft, setDraft] = useState({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
   const [draftError, setDraftError] = useState("");
+  // "Order ORD-… for Sunita is saved." after Save order, which used to clear the form in silence.
+  const [orderNotice, showOrderNotice, clearOrderNotice] = useSaveNotice();
+  // Cancelling asks why in a box of its own, at the moment of cancelling, instead of a "Reason (if
+  // cancelling)" field on every open order. The reason is still required (validateOrderAction).
+  const askCancelReason = useAskReason();
 
   const setLine = (index, patch) => setDraft((current) => ({
     ...current,
@@ -22243,6 +22282,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     if (!built.ok) return setDraftError(built.message);
     const lines = built.lines;
     setDraftError("");
+    clearOrderNotice();
     // Only clear the form once the order is actually saved. It used to reset unconditionally while
     // `takeOrder` swallowed the failure into a toast, so a rejected order wiped the customer, the
     // address and every line the operator had just taken down the phone.
@@ -22251,13 +22291,14 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       setDraftError(`${saved?.message || "That order was not saved."} Your details are still here.`);
       return;
     }
+    showOrderNotice(successNotice(orderSavedText({ orderNo: saved.orderNo, customerName: draft.customer_name })));
     setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
   };
 
   if (state.loadState === "loading") {
     return (
       <ModuleCard eyebrow="Open orders" title="Loading orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
-        <p className="form-note">Reading orders from this device...</p>
+        <p className="form-note">Reading orders from this device…</p>
       </ModuleCard>
     );
   }
@@ -22269,7 +22310,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     return (
       <ModuleCard eyebrow="Open orders" title="Orders not loaded yet" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <div className="cart-empty">Orders have not been loaded yet.</div>
-        <p><button className="table-action" type="button" onClick={onReload}>Load orders</button></p>
+        <div className="button-row"><button className="table-action" type="button" onClick={onReload}>Load orders</button></div>
       </ModuleCard>
     );
   }
@@ -22279,12 +22320,35 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     return (
       <ModuleCard eyebrow="Open orders" title="Orders could not be loaded" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <div className="error-banner" role="alert">{state.loadError}</div>
-        <p><button className="table-action" type="button" onClick={onReload}>Try again</button></p>
+        <div className="button-row"><button className="table-action" type="button" onClick={onReload}>Try again</button></div>
       </ModuleCard>
     );
   }
 
   const board = buildOrdersBoard(state.orders);
+
+  /** Cancel asks why first; closing the box leaves the order as it is. */
+  const runOrderAction = async (order, action) => {
+    let cancellationReason = "";
+    if (action.needsReason) {
+      const reason = await askCancelReason({
+        title: `Cancel ${order.orderNo || "this order"}?`,
+        message: `${order.customerName || "The customer"} will need to be told why. The stock set aside for it is released.`,
+        label: "Why is it being cancelled?",
+        placeholder: "Customer changed their mind, stock finished…",
+        confirmLabel: "Cancel order",
+        cancelLabel: "Keep order",
+        tone: "danger",
+      });
+      if (reason === null) return;
+      cancellationReason = reason;
+    }
+    onAdvance(order, action.to, {
+      carrier: carrierDraft[order.id] || "",
+      cancellation_reason: cancellationReason,
+      created_by: user?.full_name || "",
+    });
+  };
 
   /** Hand one waiting order to a shop. */
   const handOver = async (orderId) => {
@@ -22311,10 +22375,10 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
           title="Unassigned orders"
           subtitle="These arrived without a shop. Until one is chosen, no counter can see them and no stock is set aside."
         >
-          <p className="button-row">
+          <div className="button-row orders-toolbar">
             <span className="pill">{waiting.countLabel}</span>
             <button className="table-action" type="button" onClick={onReload}>Refresh</button>
-          </p>
+          </div>
 
           {/* Never a bare empty list: "none waiting", "could not load" and "not allowed" look the
               same as rows, and only one of them means a customer is not waiting. */}
@@ -22374,13 +22438,13 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
         title="Open orders"
         subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Kept on this computer, so it works without internet."
       >
-        <p><button className="table-action" type="button" onClick={onReload}>Refresh</button></p>
+        <div className="button-row orders-toolbar"><button className="table-action" type="button" onClick={onReload}>Refresh</button></div>
 
         {board.needsAttention.length > 0 && (
           // Above the board, not a badge on a card. A lapsed order looks exactly like a healthy one
           // and the difference is that its fruit may already have been sold to somebody else.
           <div className="warning-note" role="alert">
-            <strong>{board.needsAttention.length} order{board.needsAttention.length === 1 ? "" : "s"} need checking.</strong>{" "}
+            <strong>{ordersNeedCheckingText(board.needsAttention.length)}</strong>{" "}
             {board.needsAttention.map((order) => `${order.orderNo || "Order"} (${order.customerName})`).join(", ")}
             {" — "}the stock held for these went back on the shelf after six hours. Check it is still in the shop before packing.
           </div>
@@ -22396,6 +22460,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
 
       <ModuleCard eyebrow="New" title="Take an order" subtitle="Rings the phone? Write it here. Stock is set aside the moment you save.">
         {draftError && <div className="error-banner" role="alert">{draftError}</div>}
+        <SaveNotice className="orders-saved-notice" notice={orderNotice} />
         {products.length === 0 && (
           // An empty dropdown with no explanation reads as a broken screen. This says which of the
           // two it is: nothing to sell yet, or a list that did not arrive.
@@ -22425,7 +22490,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
           <input onChange={(event) => setDraft({ ...draft, delivery_address: event.target.value })} placeholder="Where it is going" value={draft.delivery_address} />
         </Field>
 
-        <DataTable headers={["Item", "Quantity", "Rate agreed", ""]}>
+        <DataTable className="order-draft-table" headers={markNumericColumns(["Item", "Quantity", "Rate agreed", { label: <span className="pm-sr-only">Remove</span> }])}>
           {draft.items.map((line, index) => (
             <tr key={index}>
               <td>
@@ -22448,10 +22513,10 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                   ))}
                 </select>
               </td>
-              <td><input onChange={(event) => setLine(index, { quantity: event.target.value })} placeholder="0.000" step="0.001" type="number" value={line.quantity} /></td>
+              <td><input aria-label="Quantity" className="numeric-input" onChange={(event) => setLine(index, { quantity: event.target.value })} placeholder="0.000" step="0.001" type="number" value={line.quantity} /></td>
               {/* The rate the customer is quoted today, kept for when the order ships. Produce
                   rates move daily and a customer quoted 80 on Monday is owed 80 on Thursday. */}
-              <td><input onChange={(event) => setLine(index, { agreed_rate: event.target.value })} placeholder="0.00" step="0.01" type="number" value={line.agreed_rate} /></td>
+              <td><input aria-label="Rate agreed" className="numeric-input" onChange={(event) => setLine(index, { agreed_rate: event.target.value })} placeholder="0.00" step="0.01" type="number" value={line.agreed_rate} /></td>
               <td>
                 <button
                   className="table-action"
@@ -22465,17 +22530,17 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
             </tr>
           ))}
         </DataTable>
-        <p>
+        <div className="button-row orders-form-actions">
           <button className="table-action" type="button" onClick={() => setDraft({ ...draft, items: [...draft.items, { ...emptyLine }] })}>Add item</button>
-          <button className="primary-button" disabled={busy} type="button" onClick={submitOrder}>Save order</button>
-        </p>
+          <button className="primary-button" disabled={busy} type="button" onClick={submitOrder}>{busy ? "Saving…" : "Save order"}</button>
+        </div>
       </ModuleCard>
 
       {board.columns.map((column) => (
         <ModuleCard eyebrow={column.hint} key={column.key} title={`${column.label} (${column.orders.length})`}>
           {column.orders.length === 0 && <p className="form-note">Nothing here right now.</p>}
           {column.orders.map((order) => (
-            <div className="content-card" key={order.id}>
+            <div className="content-card order-card" key={order.id}>
               <div className="carrier-top">
                 <strong>{order.orderNo} · {order.customerName}</strong>
                 <span>{money(order.value)}</span>
@@ -22520,14 +22585,14 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                 )}
               </div>
 
-              <DataTable headers={["Item", "Quantity", "Rate agreed", "Amount"]}>
+              <DataTable headers={markNumericColumns(["Item", "Quantity", "Rate agreed", "Amount"])}>
                 {order.items.map((line) => (
                   <tr key={line.id || `${order.id}-${line.line_index}`}>
                     <td>{line.product_name}</td>
                     {/* Quantities carry three decimals and rates always carry their unit: a produce
                         price with no unit beside it is the commonest confusion in this trade. */}
-                    <td>{Number(line.quantity || 0).toFixed(3)} {line.unit || ""}</td>
-                    <td>{money(line.agreed_rate)} / {line.unit || "unit"}</td>
+                    <td>{counterQuantityWithUnit(line.quantity, line.unit)}</td>
+                    <td>{money(line.agreed_rate)} / {unitDisplayName(line.unit) === MISSING_VALUE ? "unit" : unitDisplayName(line.unit)}</td>
                     <td>{money(Number(line.quantity || 0) * Number(line.agreed_rate || 0))}</td>
                   </tr>
                 ))}
@@ -22552,33 +22617,19 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                   />
                 </Field>
               )}
-              {order.actions.some((action) => action.needsReason) && (
-                <Field label="Reason (if cancelling)">
-                  <input
-                    onChange={(event) => setReasonDraft({ ...reasonDraft, [order.id]: event.target.value })}
-                    placeholder="Customer changed their mind, stock finished..."
-                    value={reasonDraft[order.id] || ""}
-                  />
-                </Field>
-              )}
-
-              <p>
+              <div className="button-row order-actions">
                 {order.actions.map((action) => (
                   <button
-                    className={action.tone === "primary" ? "primary-button" : "table-action"}
+                    className={action.tone === "primary" ? "primary-button" : action.tone === "danger" ? "danger-text-button" : "table-action"}
                     disabled={busy}
                     key={action.to}
                     type="button"
-                    onClick={() => onAdvance(order, action.to, {
-                      carrier: carrierDraft[order.id] || "",
-                      cancellation_reason: reasonDraft[order.id] || "",
-                      created_by: user?.full_name || "",
-                    })}
+                    onClick={() => runOrderAction(order, action)}
                   >
                     {action.label}
                   </button>
                 ))}
-              </p>
+              </div>
             </div>
           ))}
         </ModuleCard>
@@ -22586,7 +22637,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
 
       {board.finished.length > 0 && (
         <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Delivered, returned and cancelled orders, so you can check what went out.">
-          <DataTable headers={["Order", "Customer", "Status", "Carrier", "Value"]}>
+          <DataTable headers={markNumericColumns(["Order", "Customer", "Status", "Carrier", "Value"], { also: ["Value"] })}>
             {board.finished.map((order) => (
               <tr key={order.id}>
                 <td>{order.orderNo}</td>
@@ -27687,6 +27738,25 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    */
   const [chargeSelections, setChargeSelections] = useState([]);
   const [search, setSearch] = useState("");
+  // The app's own question boxes (feedbackDialogs.jsx) for checkout's gates, and the notices that
+  // replaced the browser's alert boxes: one where items are added (the search card, or the lot
+  // picker while it is open), one on the cart, and one beside the checkout buttons.
+  const confirmGate = useConfirm();
+  const askGateReason = useAskReason();
+  const [addNotice, showAddNotice, clearAddNotice] = useSaveNotice();
+  const [cartNotice, showCartNotice, clearCartNotice] = useSaveNotice();
+  const [checkoutNotice, showCheckoutNotice, clearCheckoutNotice] = useSaveNotice();
+  // True while checkout waits on one of its questions. The in-app box does not freeze the page the
+  // way the browser's did, so a second F4 or click must not start a second checkout behind it.
+  const checkoutAskingRef = useRef(false);
+  const askCheckout = async (ask) => {
+    checkoutAskingRef.current = true;
+    try {
+      return await ask();
+    } finally {
+      checkoutAskingRef.current = false;
+    }
+  };
   // Combos are sold where the app hands POS a combo list (the counter app); `null` is the browser,
   // which shows no combo tabs at all (v1).
   const combosEnabled = combos !== null && combos !== undefined;
@@ -28191,9 +28261,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return isSelectableLot(lot);
     });
     if (productLots.length === 0) {
-      alert(`No available stock lots found for ${product.product_name}.`);
+      showAddNotice(warningNotice(`${product.product_name} has no lot with stock to sell right now.`));
       return;
     }
+    clearAddNotice();
     setLotSelectorProduct(product);
     setLotSelectorSearch("");
     setLotFilter("AVAILABLE");
@@ -28220,7 +28291,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }
     const lot = selectedLot;
     if (!lot || !isSelectableLot(lot)) {
-      alert("Please select an active lot with available stock.");
+      showAddNotice(warningNotice("Choose a lot that is active and has stock."));
       return;
     }
     const availableStock = lotBalance(lot);
@@ -28259,15 +28330,16 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       unit: lot.unit || product.unit || "",
     });
     if (counterStock.status !== COUNTER_STOCK.FREE) {
-      alert(counterStock.message);
+      showAddNotice(warningNotice(counterStock.message));
       return;
     }
     const nextLotQuantity = getCartQuantityForLot(lot.id) + quantityChange;
     if (availableStock < nextLotQuantity) {
       const moreAvailable = Math.max(availableStock - getCartQuantityForLot(lot.id), 0);
-      alert(`Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${lotStableName(lot) || lot.id}.`);
+      showAddNotice(warningNotice(lotShortMessage({ more: moreAvailable, unit: lot.unit || product.unit, lotName: lotStableName(lot) || lot.id })));
       return;
     }
+    clearAddNotice();
     const lineId = currentItem?.line_id || newCartLineId();
     const nextDiscounted = applyLotDiscount(defaultRate, nextQuantity, lotDiscount);
 
@@ -28327,7 +28399,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // Quantities carry 3 decimals and money 2: a fourth decimal is not taken (local/posCheckout.js).
     if (!cartEntryFits(field, value)) return false;
     if (field === "selling_rate" && !canManualRateOverride) {
-      alert("You do not have permission to change sale rate.");
+      showCartNotice(warningNotice("You do not have permission to change the sale rate."));
       return false;
     }
     const currentItem = cart.find((item) => item.line_id === lineId);
@@ -28342,15 +28414,18 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         unit: currentItem.unit || "",
       });
       if (counterStock.status !== COUNTER_STOCK.FREE) {
-        alert(counterStock.message);
+        showCartNotice(warningNotice(counterStock.message));
         return false;
       }
     }
     if (field === "quantity" && currentItem && number + getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id) > Number(currentItem.available_qty || 0)) {
       const moreAvailable = Math.max(Number(currentItem.available_qty || 0) - getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id), 0);
-      alert(currentItem.inventory_batch_id ? `Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${currentItem.lot_name || currentItem.inventory_batch_id}.` : `Only ${currentItem.available_qty || 0} units are available.`);
+      showCartNotice(warningNotice(currentItem.inventory_batch_id
+        ? lotShortMessage({ more: moreAvailable, unit: currentItem.unit, lotName: currentItem.lot_name || currentItem.inventory_batch_id })
+        : `Only ${counterQuantityWithUnit(currentItem.available_qty || 0, currentItem.unit)} is available.`));
       return false;
     }
+    clearCartNotice();
     const repriceAfter = (items) => (isComboLine(comboLine) ? repriceCustomCombo(items, comboLine.combo_line_key) : items);
     setCart((items) => repriceAfter(items.map((item) => {
       if (item.line_id !== lineId) return item;
@@ -28472,7 +28547,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // two, because nobody reads a barcode before it beeps.
     const product = filterSellableProducts(products, inventory, new Date(), counterScope).find((item) => item.barcode === code);
     if (!product) {
-      alert(`No sellable stock is available for barcode ${code}`);
+      showAddNotice(warningNotice(`No product with stock to sell has barcode ${code}.`));
       barcodeRef.current?.focus();
     } else {
       openLotSelector(product);
@@ -28801,10 +28876,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
 
   const checkout = async (printAfterSave = false, confirmations = {}) => {
     if (saving && !confirmations.retry) return;
+    // A checkout question is on screen: its answer carries this checkout on; a second press waits.
+    if (checkoutAskingRef.current) return;
     // The approval dialog is open (F4 pressed behind it): it finishes checkout itself.
     if (discountApproval && !confirmations.discount_approval_id && !confirmations.discount_approval_not_needed) return;
+    clearCheckoutNotice();
     if (cart.length === 0) {
-      alert("Add at least one product before checkout.");
+      showCheckoutNotice(warningNotice("Add at least one product before checkout."));
       return;
     }
     const today = toDateKey(new Date());
@@ -28812,35 +28890,40 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const effectiveBillDateTime = resolvePosBillDateTime({ typed: billDateTime, edited: billDateEdited, now: currentDateTimeLocal() });
     const selectedBillDate = effectiveBillDateTime ? effectiveBillDateTime.slice(0, 10) : today;
     if (!canPosDateOverride && selectedBillDate !== today) {
-      alert("You do not have permission to change bill date.");
+      showCheckoutNotice(errorNotice("You do not have permission to change the bill date."));
       return;
     }
     const dateConfirmations = {};
     let dateOverrideReason = confirmations.date_override_reason || "";
+    // Gate 1: a back-dated bill. "Go back" stops checkout, as Cancel did; the reason after it is
+    // optional and its Skip keeps the default reason, as the old prompt's Cancel did.
     if (selectedBillDate < today && !confirmations.backdate_confirmed) {
-      if (!window.confirm(`You are creating a backdated POS bill for ${selectedBillDate}. Continue?`)) return;
-      dateOverrideReason = window.prompt("Reason for backdated bill (optional)", "Backdated POS bill created") || "Backdated POS bill created";
+      if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BACKDATE, { billDate: formatDisplayDate(selectedBillDate) }))))) return;
+      dateOverrideReason = resolveDateOverrideReason(CHECKOUT_GATE.BACKDATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.BACKDATE))));
       dateConfirmations.backdate_confirmed = true;
     }
+    // Gate 2: a future-dated bill, Owner/Admin only.
     if (selectedBillDate > today && !confirmations.future_date_confirmed) {
       if (!["Owner", "Admin"].includes(user.role)) {
-        alert("Only Owner/Admin can confirm a future bill date.");
+        showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.FUTURE_DATE)));
         return;
       }
-      if (!window.confirm(`You are creating a future-dated POS bill for ${selectedBillDate}. Continue?`)) return;
-      dateOverrideReason = window.prompt("Reason for future bill date (optional)", "Future-dated POS bill created") || "Future-dated POS bill created";
+      if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.FUTURE_DATE, { billDate: formatDisplayDate(selectedBillDate) }))))) return;
+      dateOverrideReason = resolveDateOverrideReason(CHECKOUT_GATE.FUTURE_DATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.FUTURE_DATE))));
       dateConfirmations.future_date_confirmed = true;
     }
+    // Gate 3: the customer's mobile number.
     if (customer.mobile && !/^\d{10,15}$/.test(customer.mobile)) {
-      alert("Enter a valid customer mobile number.");
+      showCheckoutNotice(errorNotice("Enter a valid customer mobile number (10 to 15 digits)."));
       return;
     }
+    // Gate 4: credit with no saved customer, Owner/Admin only, and asked.
     if (paymentMode === "CREDIT" && !customer.account_id) {
       if (!["Owner", "Admin"].includes(user.role)) {
-        alert("Select a saved customer account for credit sale.");
+        showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.WALK_IN_CREDIT)));
         return;
       }
-      if (!window.confirm("No saved customer selected. Assign this credit sale to Walk-in Customer Credit?")) return;
+      if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.WALK_IN_CREDIT))))) return;
     }
     // A customer's-choice combo still open would take the next product into it; and every combo must
     // still add up to its price.
@@ -28857,7 +28940,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // product's name, before the device refuses it in words that do not name it.
     const lineProblem = cartLineProblem(cart);
     if (lineProblem) {
-      alert(lineProblem);
+      showCheckoutNotice(errorNotice(lineProblem));
       return;
     }
     let zeroRateConfirmed = confirmations.zero_rate_confirmed === true;
@@ -28871,20 +28954,30 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       const rateChanged = roundUi(rate) !== roundUi(defaultRate);
       const discountControlledRate = item.lot_discount_type === "SPECIAL_RATE";
       if (!Number.isFinite(rate) || rate < 0) {
-        alert(`Enter a valid sale rate for ${item.product_name}.`);
+        showCheckoutNotice(errorNotice(`Enter a valid sale rate for ${item.product_name}.`));
         return;
       }
       if (rateChanged && !discountControlledRate && !canManualRateOverride) {
-        alert("You do not have permission to change sale rate.");
+        showCheckoutNotice(errorNotice("You do not have permission to change the sale rate."));
         return;
       }
+      // Gate 5: a zero rate, Owner/Admin only, and asked once per checkout.
       if (rateChanged && !discountControlledRate && rate === 0 && !zeroRateConfirmed) {
-        if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`Sale rate for ${item.product_name} is zero. Continue?`)) return;
+        if (!["Owner", "Admin"].includes(user.role)) {
+          showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.ZERO_RATE)));
+          return;
+        }
+        if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.ZERO_RATE, { productName: item.product_name }))))) return;
         zeroRateConfirmed = true;
       }
       const estimatedCost = Number(costByProduct.get(item.product_id) || 0);
+      // Gate 6: a rate below cost, Owner/Admin only, and asked once per checkout.
       if (rateChanged && !discountControlledRate && estimatedCost > 0 && rate < estimatedCost && !belowCostConfirmed) {
-        if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`This rate is below cost for ${item.product_name}. Continue?`)) return;
+        if (!["Owner", "Admin"].includes(user.role)) {
+          showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.BELOW_COST)));
+          return;
+        }
+        if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BELOW_COST, { productName: item.product_name }))))) return;
         belowCostConfirmed = true;
       }
     }
@@ -28902,17 +28995,17 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return;
     }
     if (totals.invoiceDiscount > totals.gross - totals.itemDiscount) {
-      alert("Invoice discount cannot exceed the cart subtotal.");
+      showCheckoutNotice(errorNotice("The bill discount cannot be more than the cart subtotal."));
       return;
     }
     if (hasInvalidMixedPayment) {
-      alert("Mixed payment amounts cannot be negative.");
+      showCheckoutNotice(errorNotice("Mixed payment amounts cannot be negative."));
       return;
     }
 
     const { payments, error: paymentError } = buildPosPayments({ paymentMode, mixedPayments, total: totals.total });
     if (paymentError) {
-      alert(paymentError);
+      showCheckoutNotice(errorNotice(paymentError));
       return;
     }
 
@@ -28974,12 +29067,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     try {
       if (isTauriRuntime()) {
         if (cart.some((item) => !item.inventory_batch_id)) {
-          alert("Desktop local-first POS requires a selected stock lot for every item.");
+          showCheckoutNotice(errorNotice("Every item needs its stock lot on this computer. Remove the item without a lot and add it again from its lot."));
           return;
         }
         // One computer, one device id, forever: a bill is never stamped with a made-up one.
         if (!String(deviceInfo.device_id || "").trim()) {
-          alert("This computer's device id has not loaded yet. Wait a moment and try again.");
+          showCheckoutNotice(errorNotice("This computer's device id has not loaded yet. Wait a moment and try again."));
           return;
         }
         const billNo = await nextLocalBillNo(selectedBillDate);
@@ -29189,31 +29282,33 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         });
         return;
       }
+      // The server asks for a confirmation (HTTP 409): the same four questions, in the same order,
+      // in the app's box. "Go back" falls through to the refusal below, as Cancel did.
       if (error.response?.status === 409) {
-        if (responseData.requires_below_cost_confirmation && window.confirm(responseData.message || "This rate is below cost. Continue?")) {
+        if (responseData.requires_below_cost_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BELOW_COST, { serverMessage: responseData.message || "This rate is below cost." })))) {
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, below_cost_confirmed: true, retry: true }), 0);
           return;
         }
-        if (responseData.requires_zero_rate_confirmation && window.confirm(responseData.message || "Zero sale rate requires confirmation. Continue?")) {
+        if (responseData.requires_zero_rate_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.ZERO_RATE, { serverMessage: responseData.message || "Zero sale rate requires confirmation." })))) {
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, zero_rate_confirmed: true, retry: true }), 0);
           return;
         }
-        if (responseData.requires_backdate_confirmation && window.confirm(responseData.message || "Backdated bill requires confirmation. Continue?")) {
-          const reason = window.prompt("Reason for backdated bill (optional)", "Backdated POS bill created") || "Backdated POS bill created";
+        if (responseData.requires_backdate_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BACKDATE, { serverMessage: responseData.message || "Backdated bill requires confirmation." })))) {
+          const reason = resolveDateOverrideReason(CHECKOUT_GATE.BACKDATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.BACKDATE))));
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, backdate_confirmed: true, date_override_reason: reason, retry: true }), 0);
           return;
         }
-        if (responseData.requires_future_date_confirmation && window.confirm(responseData.message || "Future bill date requires confirmation. Continue?")) {
-          const reason = window.prompt("Reason for future bill date (optional)", "Future-dated POS bill created") || "Future-dated POS bill created";
+        if (responseData.requires_future_date_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.FUTURE_DATE, { serverMessage: responseData.message || "Future bill date requires confirmation." })))) {
+          const reason = resolveDateOverrideReason(CHECKOUT_GATE.FUTURE_DATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.FUTURE_DATE))));
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, future_date_confirmed: true, date_override_reason: reason, retry: true }), 0);
           return;
         }
       }
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to complete checkout"));
+      showCheckoutNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The bill was not saved. Nothing was billed; try again.")));
     } finally {
       setSaving(false);
     }
@@ -29287,6 +29382,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     if (!lotSelectorProduct) return [];
     return [...new Set((lotsByProduct.get(lotSelectorProduct.id) || []).map((lot) => String(lot.unit || lotSelectorProduct.unit || "").trim()).filter(Boolean))].sort();
   }, [lotSelectorProduct, lotsByProduct]);
+  // Size, unit and rate filters only when there is a choice to make (local/counterScreens.js). A
+  // filter already set stays on screen so it can be cleared.
+  const showLotFilters = shouldShowLotFilters({ sizes: lotSelectorSizeOptions, units: lotSelectorUnitOptions })
+    || Boolean(lotSizeFilter || lotUnitFilter || lotRateMin || lotRateMax);
 
   const confirmPayment = () => {
     const draft = paymentConfirm;
@@ -29303,6 +29402,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    */
   const handleShortcuts = (event) => {
     if (event.defaultPrevented || shortcutsPaused) return;
+    // An in-app question (a checkout gate) is open: its keys are its own.
+    if (appDialogQueue.current()) return;
     if (paymentConfirm || discountApproval || comboAsk || lotSelectorProduct) return;
     if (event.key === "F2") {
       event.preventDefault();
@@ -29332,7 +29433,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
 
   const printLastInvoice = () => {
     if (!lastInvoice) {
-      alert("Save a bill before printing.");
+      showCheckoutNotice(warningNotice("Save a bill before printing."));
       return;
     }
     // Through the invoice's own print path: its PDF name, page profile and drawn UPI QR.
@@ -29381,6 +29482,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     );
   };
 
+  // A unit as the counter reads it ("Kg", "Piece"); a blank unit stays blank.
+  const cartUnitName = (unit) => {
+    const name = unitDisplayName(unit);
+    return name === MISSING_VALUE ? "" : name;
+  };
+
   // What is left in the line's lot once the cart has taken its share, to 3 decimals.
   const describeCartLotLeft = (item) => {
     const left = lotLeftAfterCart({
@@ -29389,7 +29496,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       quantity: item.quantity,
     });
     if (left === null) return "";
-    return `${left.toLocaleString("en-IN", { maximumFractionDigits: 3 })} ${item.unit || ""} left in this lot`.replace(/\s+/g, " ");
+    return `${counterQuantityWithUnit(left, item.unit)} left in this lot`;
   };
 
   const renderCartRow = (item) => {
@@ -29401,11 +29508,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           <small className="cell-note">{describeCartLotLeft(item)}</small>
           {/* Said before the operator tries, not only when they are refused. A
               refusal at the till happens with a customer standing there. */}
-          {reservedNote(reservedIndex, item.product_id, item.unit) && (
-            <small className="cell-note">{reservedNote(reservedIndex, item.product_id, item.unit)}</small>
+          {reservedNote(reservedIndex, item.product_id, cartUnitName(item.unit)) && (
+            <small className="cell-note">{reservedNote(reservedIndex, item.product_id, cartUnitName(item.unit))}</small>
           )}
         </td>
-        <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
+        <td><span className="batch-id" title={[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
         <td>
           <input
             className="table-input"
@@ -29425,12 +29532,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           <td>
             <input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} />
             {discountApprovalCheck.lines.some((entry) => entry.lineId === item.line_id) && (
-              <small className="cell-note stock-low pos-discount-over-note">Over 5%: needs Owner/Admin approval</small>
+              <small className="cell-note stock-low pos-discount-over-note" title="More than 5% off this item: the Owner or an Admin approves it at checkout.">Over 5%: needs approval</small>
             )}
           </td>
         )}
         {/* Line by line to the paisa, as Gross Total adds it up (`lineGross`). */}
-        <td className="primary-cell">{currency.format(lineGross(item) - Number(item.discount_amount || 0))}</td>
+        <td className="primary-cell amount-cell">{currency.format(lineGross(item) - Number(item.discount_amount || 0))}</td>
         <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
       </tr>
     );
@@ -29449,25 +29556,29 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <h2>Add items</h2>
               <p>Search for a product or scan its barcode.</p>
             </div>
-            <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout & Print{effectiveQuantityMode === "SCALE" ? " - F6 Weight" : ""}</span>
+            <span className="shortcut-hint">F2 Search · F3 Barcode · F4 Checkout & Print{effectiveQuantityMode === "SCALE" ? " · F6 Weight" : ""}</span>
           </div>
-          <div className="pos-mode-panel">
-            <Field label="Quantity Mode">
-              <select value={effectiveQuantityMode} onChange={(event) => { quantityModeChosenRef.current = true; setQuantityMode(event.target.value); }}>
-                <option value="MANUAL">Manual</option>
-                <option disabled={!posSettings.enable_weighing_scale} value="SCALE">Weighing Scale Mode</option>
-              </select>
-            </Field>
-            <button className="secondary-button" disabled={effectiveQuantityMode !== "SCALE"} onClick={readScaleWeight}>Read Weight (F6)</button>
-            {effectiveQuantityMode === "SCALE" ? (
-              <span className="scale-readout">
-                <span className={SCALE_VIEW_TONE[scale.state] || "inline-error"} role="status">{scale.message}</span>
-                {scaleMessage && <small className="cell-note">{scaleMessage}</small>}
-              </span>
-            ) : (
-              <span className="stock-ok">Manual quantity entry</span>
-            )}
-          </div>
+          {/* Only where a weighing scale is switched on in Settings. Without one there is nothing to
+              choose: quantities are typed, and a disabled Read Weight button only took a row. */}
+          {posSettings.enable_weighing_scale && (
+            <div className="pos-mode-panel">
+              <Field label="Quantity Mode">
+                <select value={effectiveQuantityMode} onChange={(event) => { quantityModeChosenRef.current = true; setQuantityMode(event.target.value); }}>
+                  <option value="MANUAL">Manual</option>
+                  <option value="SCALE">Weighing Scale Mode</option>
+                </select>
+              </Field>
+              <button className="secondary-button" disabled={effectiveQuantityMode !== "SCALE"} onClick={readScaleWeight}>Read Weight (F6)</button>
+              {effectiveQuantityMode === "SCALE" ? (
+                <span className="scale-readout">
+                  <span className={SCALE_VIEW_TONE[scale.state] || "inline-error"} role="status">{scale.message}</span>
+                  {scaleMessage && <small className="cell-note">{scaleMessage}</small>}
+                </span>
+              ) : (
+                <span className="stock-ok">Manual quantity entry</span>
+              )}
+            </div>
+          )}
           <div className="pos-inputs">
             <label className="icon-input">
               <Icon name="search" />
@@ -29490,6 +29601,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               />
             </label>
           </div>
+          {!lotSelectorProduct && <SaveNotice className="pos-add-notice" notice={addNotice} />}
           <div className="pos-sections" role="tablist" aria-label="POS sections">
             {posTabs.map((section) => (
               <button
@@ -29602,9 +29714,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               const minRate = rates.length ? Math.min(...rates) : Number(product.selling_rate || 0);
               const maxRate = rates.length ? Math.max(...rates) : minRate;
               const discountedCount = activeLots.filter((lot) => lotDiscountFor(lot.id)).length;
-              const rateLabel = minRate === maxRate
-                ? `${currency.format(minRate)}/${product.unit || "Unit"}`
-                : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
+              const rateLabel = posRateLabel({ min: minRate, max: maxRate, unit: product.unit, format: (value) => currency.format(value) });
               // The owner's photo when there is one; otherwise the product's colour and first letter.
               const photo = photoForProduct(productPhotoIndex, product);
               const badge = posTileBadge(product.product_name);
@@ -29620,15 +29730,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     : <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>}
                   <span className="product-result-main">
                     <strong>{product.product_name}</strong>
-                    <span className="product-result-meta">
-                      <span>{activeLots.length} available lot{activeLots.length === 1 ? "" : "s"}</span>
-                      <span>Stock: {stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span>
-                      <span>Unit: {product.unit || "Unit"}</span>
-                      {posSearching && posTabs.length > 1 && <span className="product-result-section">{posTabFor("retail").label}</span>}
-                    </span>
-                    <small>Rate: {rateLabel}{discountedCount ? ` - ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
+                    {/* The stock once, with its unit and the lots it sits in: "68 Kg · 4 lots". */}
+                    <span className={stock <= 5 ? "product-result-stock stock-low" : "product-result-stock"}>{posTileStockLine({ stock, unit: product.unit, lotCount: activeLots.length })}</span>
+                    {posSearching && posTabs.length > 1 && (
+                      <span className="product-result-meta"><span className="product-result-section">{posTabFor("retail").label}</span></span>
+                    )}
+                    <small>{rateLabel}{discountedCount ? ` · ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
                   </span>
-                  <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })} in stock</em>
                 </button>
               );
             })}
@@ -29667,6 +29775,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             </div>
             <span className="cart-count">{totals.itemCount === 1 ? "1 item" : `${totals.itemCount} items`}</span>
           </div>
+          <SaveNotice className="pos-cart-notice" notice={cartNotice} />
           {packingShort.length > 0 && (
             // Warning only (owner, 22 Oct 2026): the bill still goes through, and the bell is told.
             <p className="warning-note pos-packing-short" role="status">
@@ -29683,7 +29792,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           ) : (
             <div className="table-wrap cart-table">
               <table>
-                <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount{!discountExempt && <small className="cell-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}</small>}</th>}<th>Total</th><th /></tr></thead>
+                <thead><tr><th>Product</th><th>Lot</th><th className="amount-cell">Rate</th><th className="amount-cell">Qty</th>{printSettings.show_item_discount_column_pos !== false && <th className="amount-cell cart-discount-head" title="Discount in ₹ on this line">Discount{!discountExempt && <small className="cell-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}</small>}</th>}<th className="amount-cell">Total</th><th><span className="pm-sr-only">Remove</span></th></tr></thead>
                 <tbody>
                   {groupComboLines(cart).map((group) => (group.kind === "line"
                     ? renderCartRow(group.line)
@@ -29737,7 +29846,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               onChange={(event) => { setBillDateTime(event.target.value); setBillDateEdited(true); }}
             />
           </Field>
-          <p className="form-note">{canPosDateOverride ? "Owner/Admin can select a previous or custom bill date." : "Bill date is locked for your role."}</p>
+          {billDateHint({ canChange: canPosDateOverride, edited: billDateEdited }) && (
+            <p className="form-note pos-bill-date-hint">
+              {billDateHint({ canChange: canPosDateOverride, edited: billDateEdited })}
+              {canPosDateOverride && billDateEdited && (
+                <button className="table-action" type="button" onClick={resetBillDate}>Back to now</button>
+              )}
+            </p>
+          )}
           <Field label="Saved Customer Account">
             <select value={customer.account_id || ""} onChange={(event) => selectCustomer(event.target.value)}>
               <option value="">Walk-in Customer</option>
@@ -29779,12 +29895,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             <strong>{saleRateSettings.bill_level_slab_discount_enabled === false ? MISSING_VALUE : currency.format(totals.slabDiscount)}</strong>
             <small>{describeBillDiscountPreview({ enabled: saleRateSettings.bill_level_slab_discount_enabled !== false, rule: totals.discountRule })}</small>
           </div>
-          {discountNotice && (
-            <div className="warning-note pos-discount-notice" role="alert">
-              {discountNotice}
-              <button className="secondary-button compact-button" type="button" onClick={() => setDiscountNotice("")}>OK</button>
-            </div>
-          )}
           <Field label="Payment Mode">
             <select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value)}>
               <option value="CASH">Cash</option>
@@ -29870,11 +29980,21 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           {totals.mandiTaxAmount > 0 && <TotalLine label={`Mandi Tax (${totals.mandiTaxRate}%)`} value={totals.mandiTaxAmount} />}
           {totals.mandiTaxAmount === 0 && <TotalLine label="Tax" value={0} muted />}
           {totals.otherChargesAmount > 0 && <TotalLine label="Other Charges" value={totals.otherChargesAmount} />}
+          {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
+        </div>
+        {/* Pinned to the foot of the panel: the amount to collect, why checkout stopped (if it did)
+            and the buttons stay in sight however far the customer fields above are scrolled. */}
+        <div className="checkout-footer">
           {totals.manualBillError
             ? <div className="total-line total-line-main total-line-error"><span>Net Payable</span><strong>{MISSING_VALUE}</strong></div>
             : <TotalLine label="Net Payable" value={totals.total} total />}
-          {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
-        </div>
+          {discountNotice && (
+            <div className="warning-note pos-discount-notice" role="alert">
+              {discountNotice}
+              <button className="secondary-button compact-button" type="button" onClick={() => setDiscountNotice("")}>OK</button>
+            </div>
+          )}
+          <SaveNotice className="pos-checkout-notice" notice={checkoutNotice} />
         <div className="button-row checkout-actions">
           <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError) || totals.chargeRefusals.length > 0} onClick={() => checkout(false)}>
             <Icon name="receipt" /> {saving ? "Saving…" : "Checkout"}
@@ -29892,6 +30012,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             <button className="secondary-button compact-button" type="button" onClick={() => setSaveNotice("")}>OK</button>
           </div>
         )}
+        </div>
       </aside>
       {lotSelectorProduct && (
         <div className="modal-backdrop lot-selector-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeLotSelector()}>
@@ -29911,18 +30032,18 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           >
             <div className="invoice-toolbar lot-selector-toolbar">
               <div>
-                <span className="eyebrow">Lot Selection</span>
+                <span className="eyebrow">Choose a lot</span>
                 <h2>{lotSelectorProduct.product_name}</h2>
-                <p>Select the exact lot being sold. Different lots stay as separate cart rows.</p>
+                <p>Pick the lot being sold. Each lot is its own line on the bill.</p>
               </div>
               <button className="secondary-button" onClick={closeLotSelector}>Close</button>
             </div>
-            <div className="lot-selector-controls">
+            <div className={showLotFilters ? "lot-selector-controls" : "lot-selector-controls lot-selector-controls-simple"}>
               <label className="icon-input lot-selector-search">
                 <Icon name="search" />
                 <input
                   autoFocus
-                  placeholder="Search lot, size, rate or stock..."
+                  placeholder="Search lot, size, rate or stock…"
                   value={lotSelectorSearch}
                   onChange={(event) => setLotSelectorSearch(event.target.value)}
                   onKeyDown={(event) => {
@@ -29931,39 +30052,44 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 />
                 {lotSelectorSearch && <button aria-label="Clear lot search" className="clear-search-button" type="button" onClick={() => setLotSelectorSearch("")}>×</button>}
               </label>
-              <Field label="Filter">
+              <Field label="Show">
                 <select value={lotFilter} onChange={(event) => setLotFilter(event.target.value)}>
-                  <option value="AVAILABLE">All Available Lots</option>
-                  <option value="DISCOUNTED">Discounted Lots</option>
+                  <option value="AVAILABLE">All lots</option>
+                  <option value="DISCOUNTED">Discounted lots</option>
                 </select>
               </Field>
-              <Field label="Size / Grade">
-                <select value={lotSizeFilter} onChange={(event) => setLotSizeFilter(event.target.value)}>
-                  <option value="">All sizes</option>
-                  {lotSelectorSizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
-                </select>
-              </Field>
-              <Field label="Unit">
-                <select value={lotUnitFilter} onChange={(event) => setLotUnitFilter(event.target.value)}>
-                  <option value="">All units</option>
-                  {lotSelectorUnitOptions.map((unit) => <option key={unit} value={unit}>{unit}</option>)}
-                </select>
-              </Field>
-              <Field label="Min Rate"><input min="0" step="0.01" type="number" value={lotRateMin} onChange={(event) => setLotRateMin(event.target.value)} /></Field>
-              <Field label="Max Rate"><input min="0" step="0.01" type="number" value={lotRateMax} onChange={(event) => setLotRateMax(event.target.value)} /></Field>
+              {/* Only when there is something to choose between: most fruit has one size and one unit. */}
+              {showLotFilters && (
+                <>
+                  <Field label="Size / Grade">
+                    <select value={lotSizeFilter} onChange={(event) => setLotSizeFilter(event.target.value)}>
+                      <option value="">All sizes</option>
+                      {lotSelectorSizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Unit">
+                    <select value={lotUnitFilter} onChange={(event) => setLotUnitFilter(event.target.value)}>
+                      <option value="">All units</option>
+                      {lotSelectorUnitOptions.map((unit) => <option key={unit} value={unit}>{unitDisplayName(unit)}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Min rate ₹"><input className="numeric-input" min="0" step="0.01" type="number" value={lotRateMin} onChange={(event) => setLotRateMin(event.target.value)} /></Field>
+                  <Field label="Max rate ₹"><input className="numeric-input" min="0" step="0.01" type="number" value={lotRateMax} onChange={(event) => setLotRateMax(event.target.value)} /></Field>
+                </>
+              )}
             </div>
+            <SaveNotice className="lot-selector-notice" notice={addNotice} />
             <div className="lot-selector-table-wrap">
               <table className="lot-selector-table">
                 <thead>
                   <tr>
-                    <th>Lot No.</th>
+                    <th>Lot</th>
                     <th>Size / Grade</th>
-                    <th>Unit</th>
-                    <th>Available Stock</th>
-                    <th>Rate</th>
+                    <th className="amount-cell">In stock</th>
+                    <th className="amount-cell">Rate</th>
                     <th>Discount</th>
                     <th>Date</th>
-                    <th>Select</th>
+                    <th><span className="pm-sr-only">Select</span></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -29974,13 +30100,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     return (
                       <tr key={lot.id} className={selectable ? "lot-selector-row" : "lot-selector-row lot-selector-row-disabled"} onDoubleClick={() => selectable && addProduct(lotSelectorProduct, lot)}>
                         <td>
-                          <strong>{getCompactLotName(lot)}</strong>
-                          <small>{lotSelectorProduct.product_name}</small>
+                          <strong title={lotStableName(lot)}>{getCompactLotName(lot)}</strong>
                         </td>
                         <td>{lot.lot_size || lot.size_grade || "Standard"}</td>
-                        <td>{lot.unit || lotSelectorProduct.unit || "Unit"}</td>
-                        <td className={lotBalance(lot) <= 5 ? "stock-low" : "stock-ok"}>{lotBalance(lot).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                        <td>{currency.format(rate)}</td>
+                        <td className={lotBalance(lot) <= 5 ? "amount-cell stock-low" : "amount-cell stock-ok"}>{counterQuantityWithUnit(lotBalance(lot), lot.unit || lotSelectorProduct.unit)}</td>
+                        <td className="amount-cell">{currency.format(rate)}<small>{`per ${unitDisplayName(lot.unit || lotSelectorProduct.unit).toLowerCase()}`}</small></td>
                         <td>{activeDiscount ? <span className="status-badge status-active">Discounted</span> : <span className="status-badge">None</span>}</td>
                         <td>{formatDisplayDate(lotDateKey(lot))}</td>
                         <td>
@@ -29992,12 +30116,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     );
                   })}
                   {lotSelectorLots.length === 0 && (
-                    <tr><td className="empty-cell" colSpan={8}>No matching lots found.</td></tr>
+                    <tr><td className="empty-cell" colSpan={7}>No lot matches. Clear the search to see every lot.</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <p className="form-note">Only lots with stock that can be sold are shown.</p>
+            <p className="form-note lot-selector-foot">Only lots with stock that can be sold are listed. Double-click a row, or press Enter in the search box for the first one.</p>
           </section>
         </div>
       )}
@@ -30201,7 +30325,9 @@ function DiscountApprovalModal({ draft, onChange, onClose, onConfirm }) {
               {draft.bill && <li key="bill">{describeBillApprovalLine(draft.bill)}</li>}
             </ul>
           )}
+          {/* The Owner or Admin is standing at the till to type their name: start there. */}
           <SaleChangeApprovalFields
+            autoFocus
             disabled={draft.saving}
             form={draft}
             onChange={onChange}
@@ -30334,7 +30460,7 @@ function SaleChangeReasonPicker({ disabled = false, form, label, onChange }) {
  * or Admin. When approval cannot happen here (offline, Local Only), the one line that says so and
  * no password box, so nobody types a password that could not be checked.
  */
-function SaleChangeApprovalFields({ disabled = false, form, onChange, route }) {
+function SaleChangeApprovalFields({ autoFocus = false, disabled = false, form, onChange, route }) {
   if (!route || route.mode === SALE_CHANGE_APPROVAL_MODE.NONE) return null;
   if (route.mode === SALE_CHANGE_APPROVAL_MODE.REFUSED) {
     return <div className="error-banner" role="alert">{route.message}</div>;
@@ -30344,7 +30470,7 @@ function SaleChangeApprovalFields({ disabled = false, form, onChange, route }) {
       <strong>Owner or Admin approval</strong>
       <div className="form-grid">
         <Field label="Username">
-          <input autoCapitalize="none" autoComplete="off" disabled={disabled} name="sale-change-approver" spellCheck={false} value={form.approverUsername || ""} onChange={(event) => onChange({ approverUsername: event.target.value })} />
+          <input autoCapitalize="none" autoComplete="off" autoFocus={autoFocus} disabled={disabled} name="sale-change-approver" spellCheck={false} value={form.approverUsername || ""} onChange={(event) => onChange({ approverUsername: event.target.value })} />
         </Field>
         <Field label="Password">
           <PasswordInput autoComplete="new-password" disabled={disabled} name="sale-change-approver-password" value={form.approverPassword || ""} onChange={(event) => onChange({ approverPassword: event.target.value })} />
@@ -30415,7 +30541,7 @@ function SaleCancelModal({ approvalRoute, draft, onChange, onClose, onConfirm })
   );
 }
 
-function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivityMode, customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onSaved, paymentSettings = {}, products, user }) {
+function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivityMode, customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onNotify = () => {}, onSaved, paymentSettings = {}, products, user }) {
   const activeCustomers = customers.filter((entry) => entry.active !== false);
   const walkInCustomer = activeCustomers.find((entry) => entry.system_account === true && String(entry.customer_name || "").toLowerCase().includes("walk-in")) || null;
   const customerFromAccount = (account) => account ? ({
@@ -30639,19 +30765,19 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
     }
     const reason = composed.reason;
     if (items.length === 0) {
-      alert("Invoice must contain at least one item.");
+      setChangeError("A bill needs at least one item. Add an item, or cancel the bill instead.");
       return;
     }
     if (customer.mobile && !/^\d{10,15}$/.test(customer.mobile)) {
-      alert("Enter a valid customer mobile number.");
+      setChangeError("The customer's mobile number needs 10 to 15 digits.");
       return;
     }
     if (Number(invoiceDiscount || 0) > subtotalAfterItemDiscounts) {
-      alert("Bill discount cannot exceed sale value after item discounts.");
+      setChangeError("The bill discount is more than the bill after item discounts. Lower it.");
       return;
     }
     if (hasInvalidMixedPayment) {
-      alert("Mixed payment amounts cannot be negative.");
+      setChangeError("A mixed payment amount cannot be below zero.");
       return;
     }
     const payments = paymentMode === "MIXED"
@@ -30661,7 +30787,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
       : [{ mode: paymentMode, amount: netPayable }];
     const paidAmount = roundUi(payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
     if (paymentMode === "MIXED" && (!isMixedPaymentBalanced || Math.abs(paidAmount - netPayable) > 0.01)) {
-      alert("Mixed payment split must exactly match Net Payable.");
+      setChangeError("The mixed payment split must add up to exactly the Net Payable.");
       return;
     }
     // Decided before anything is written or sent. REFUSED (offline, Local Only, cloud gate closed)
@@ -30771,11 +30897,12 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
         try {
           await onSaved({ localSale: localSnapshotToInvoice(result.invoice), pendingOperations: result.pending_operations });
         } catch (refreshError) {
-          alert(describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }));
+          // The window closes; the bell keeps the warning so it is not lost with it.
+          onNotify({ severity: "warning", title: `${invoice.invoice_no || "The bill"} is updated`, message: describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }), source: "Sales" });
           onClose?.();
           return;
         }
-        alert("Invoice updated locally. Pending sync.");
+        onNotify({ severity: "success", title: `${invoice.invoice_no || "The bill"} is updated on this computer`, message: "It goes to the cloud with the next sync.", source: "Sales" });
       } else {
         const saleEditWrite = createOperationalWrite(user, {
           ...payload,
@@ -30801,15 +30928,15 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
         try {
           await onSaved();
         } catch (refreshError) {
-          alert(describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }));
+          onNotify({ severity: "warning", title: `${invoice.invoice_no || "The bill"} is updated`, message: describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }), source: "Sales" });
           onClose?.();
           return;
         }
-        alert("Invoice updated");
+        onNotify({ severity: "success", title: `${invoice.invoice_no || "The bill"} is updated`, source: "Sales" });
       }
     } catch (error) {
       if (approvalErrorCode(error) === "SALE_CHANGE_APPROVAL_REQUIRED") setChangeError(describeApprovalError(error));
-      else alert(getErrorMessage(error, "Unable to update invoice"));
+      else setChangeError(plainRefusalMessage(error) || getErrorMessage(error, "The bill was not updated. Nothing was changed; try again."));
     } finally {
       setSaving(false);
     }
@@ -31324,7 +31451,7 @@ function InvoiceBill({ layout, stacked = false, upi = null }) {
   );
 }
 
-function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, editRefusal = null, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
+function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, closeLabel = "Close", editRefusal = null, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
@@ -31334,6 +31461,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
   const [pdfPreview, setPdfPreview] = useState(null);
+  // A PDF that could not be made is said inside the bill window, not in a browser alert.
+  const [pdfError, setPdfError] = useState("");
   const invoiceRef = useRef(null);
   const invoiceSectionRef = useRef(null);
   const autoPrintedRef = useRef(false);
@@ -31384,6 +31513,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
     [invoice, printSettings, invoiceDateKey, invoiceEntryTime],
   );
   const billVariant = activePrintMode === "A4" ? "a4" : printSettings.receipt_width === "58MM" ? "thermal-58" : "thermal-80";
+  // The shop's own default print, from Settings: that button is the primary one.
+  const defaultPrintMode = printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL";
   const printWithMode = (mode) => {
     setPrintMode(mode);
     const nextProfile = mode === "A4" ? "A4_PORTRAIT" : printSettings.receipt_width === "58MM" ? "THERMAL_58" : "THERMAL_80";
@@ -31402,6 +31533,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   }, [autoPrintMode, upiPayload, upiQrSettledFor]);
   const exportInvoicePdf = async (mode = activePrintMode, save = true) => {
     setPrintMode(mode);
+    setPdfError("");
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, upiPayload && !upiQrDataUrl ? 250 : 80));
@@ -31424,7 +31556,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       const result = await exportInvoicePdf(mode, false);
       setPdfPreview({ ...result });
     } catch (error) {
-      alert(`Unable to view invoice PDF: ${error.message}`);
+      setPdfError(`The PDF could not be made: ${getErrorMessage(error, "try again")}. The bill is saved; print it instead.`);
     } finally {
       setExporting(false);
     }
@@ -31468,16 +31600,20 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             </div>
             <button aria-label="Close invoice" className="remove-button invoice-close" onClick={onClose} title="Close" type="button"><Icon name="close" /></button>
           </div>
+          {/* Printing is what a saved bill is opened for, so the print in the shop's own default
+              mode leads; editing is a correction and sits beside the other secondary actions. */}
           <div className="invoice-actions invoice-actions-bill">
-            {canEdit && <button className="primary-button" onClick={onEdit}>Edit Bill</button>}
+            <button className={defaultPrintMode === "THERMAL" ? "primary-button" : "secondary-button"} type="button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> Thermal Print</button>
+            <button className={defaultPrintMode === "A4" ? "primary-button" : "secondary-button"} type="button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
+            {canEdit && <button className="secondary-button" type="button" onClick={onEdit}>Edit Bill</button>}
             {!canEdit && editRefusal && <span className="form-note invoice-edit-refusal" role="note">{editRefusal}</span>}
-            <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
-            <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
-            <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing…" : "View PDF"}</button>
-            <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting…" : "Save PDF"}</button>
-            <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
-            {canCancel && <button className="remove-button invoice-cancel-bill" onClick={onCancel}>Cancel Bill</button>}
+            <button className="secondary-button" disabled={exporting} type="button" onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing…" : "View PDF"}</button>
+            <button className="secondary-button" disabled={exporting} type="button" onClick={() => exportInvoicePdf(activePrintMode, true).catch((error) => setPdfError(`The PDF could not be saved: ${getErrorMessage(error, "try again")}. The bill is saved; print it instead.`))}>{exporting ? "Exporting…" : "Save PDF"}</button>
+            <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} type="button" onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
+            {canCancel && <button className="remove-button invoice-cancel-bill" type="button" onClick={onCancel}>Cancel Bill</button>}
+            <button className="secondary-button invoice-done-button" type="button" onClick={onClose}>{closeLabel}</button>
           </div>
+          {pdfError && <div className="error-banner invoice-pdf-error" role="alert">{pdfError}</div>}
         </div>
         {layout.issues.length > 0 && (
           <p className="bill-issue no-print" role="status">{layout.issues.join(" ")}</p>
@@ -31707,7 +31843,9 @@ function DualLineChart({ data, firstKey, firstLabel, secondKey, secondLabel, sub
  * WhatsApp" turns the card into a picture: the system share sheet where the webview has one,
  * otherwise copied to the clipboard and saved to Downloads, ready to paste into the group.
  */
-const PRICE_LIST_PREVIEW_ROWS = 8;
+// Two rows of tiles at 1366 on the Dashboard; "Show all" and the shared picture carry every row. Eight
+// tiles and the reminder settings filled the whole first screen at 1366 before any figure showed.
+const PRICE_LIST_PREVIEW_ROWS = 6;
 
 function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedule = false, groupCode = "", inventoryLots, onGroupChange, loadError = "", loading = false, onScheduleChange, photoIndex, products, readyToday = false, schedule, scope }) {
   const built = useMemo(
@@ -31844,7 +31982,7 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
       </div>
       {/* Right under the button that caused it, so what to do next is the first thing read. */}
       {outcome && <div className={outcome.tone === "error" ? "error-banner" : "form-note price-list-outcome"} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</div>}
-      {list.status === "loading" && <div className="cart-empty" role="status">Reading today's stock on this computer...</div>}
+      {list.status === "loading" && <div className="cart-empty" role="status">Reading today's stock on this computer…</div>}
       {list.status === PRICE_LIST_STATUS.UNAVAILABLE && <div className="error-banner" role="alert">{list.message || "The price list could not be built."}</div>}
       {list.status === PRICE_LIST_STATUS.EMPTY && <div className="cart-empty">{list.message || "Nothing is in stock with a rate, so there is no price list today."}</div>}
       {list.status === PRICE_LIST_STATUS.READY && (
@@ -31885,6 +32023,12 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
         </>
       )}
       {canSchedule && (
+        // Set once and then left alone, so folded away under one line that still says the state.
+        <details className="price-list-schedule-details">
+          <summary>
+            Morning reminder and WhatsApp group
+            <span className="price-list-schedule-state">{schedule.enabled ? ` · reminder at ${schedule.time}` : " · reminder off"}{groupCode ? " · group set" : ""}</span>
+          </summary>
         <div className="price-list-schedule">
           <label className="check-field">
             <input
@@ -31935,6 +32079,7 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
           </form>
           {groupNote && <p className={groupNote.tone === "error" ? "form-note stock-low" : "form-note"} role="status">{groupNote.text}</p>}
         </div>
+        </details>
       )}
     </section>
   );
@@ -32199,7 +32344,7 @@ function DashboardHighlights({ insights, lowStockItems, onNavigate, topProducts 
           </div>
         </div>
         <div className="insight-list">
-          {insights.length ? insights.map((insight) => <p key={insight}>{insight}</p>) : <p>No insights available yet.</p>}
+          {insights.length ? insights.map((insight) => <p key={insight}>{insight}</p>) : <div className="empty-inline">No insights for this period yet.</div>}
         </div>
       </section>
 

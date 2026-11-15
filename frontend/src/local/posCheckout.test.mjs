@@ -1,9 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { readFileSync } from "node:fs";
+
 import {
+  CHECKOUT_GATE,
+  DEFAULT_DATE_OVERRIDE_REASON,
   cartEntryFits,
   cartLineProblem,
+  checkoutDateReasonDialog,
+  checkoutGateDialog,
+  checkoutGateRefusal,
   chargeRefusalProblem,
   describeMandiTaxPanel,
   describeSavedBillRefreshFailure,
@@ -13,6 +20,7 @@ import {
   lotLeftAfterCart,
   lotTapQuantity,
   posLineProblem,
+  resolveDateOverrideReason,
   resolvePosBillDateTime,
   saleEditTotals,
 } from "./posCheckout.js";
@@ -125,4 +133,112 @@ test("a tap adds one unit, or what is left of a lot holding less than one", () =
   assert.equal(lotTapQuantity({ available: 3.6, inCart: 3.2 }), 0.4, "3 decimals, no float tail");
   assert.equal(lotTapQuantity({ available: 2, inCart: 2 }), 1, "nothing left: the stock check refuses as before");
   assert.equal(lotTapQuantity({ available: undefined }), 1, "unknown balance: unchanged behaviour");
+});
+
+// ------------------------------------------------------------------------------------------------
+// Phase 3: checkout's questions in the app's own box. Same checks, same order, Go back stops.
+// ------------------------------------------------------------------------------------------------
+
+test("every checkout gate asks in a danger box whose safe choice is Go back", () => {
+  for (const gate of Object.values(CHECKOUT_GATE)) {
+    const dialog = checkoutGateDialog(gate, { billDate: "12/11/2026", productName: "Apple" });
+    assert.equal(dialog.tone, "danger", gate);
+    assert.equal(dialog.cancelLabel, "Go back", gate);
+    assert.ok(dialog.title.endsWith("?"), `${gate} asks a question`);
+    assert.notEqual(dialog.confirmLabel, "OK", `${gate} names what confirming does`);
+  }
+  assert.match(checkoutGateDialog(CHECKOUT_GATE.BACKDATE, { billDate: "12/11/2026" }).message, /12\/11\/2026/);
+  assert.match(checkoutGateDialog(CHECKOUT_GATE.FUTURE_DATE, { billDate: "18/11/2026" }).message, /18\/11\/2026/);
+  assert.equal(checkoutGateDialog(CHECKOUT_GATE.BELOW_COST, { productName: "Apple" }).title, "Sell Apple below cost?");
+  assert.equal(checkoutGateDialog(CHECKOUT_GATE.ZERO_RATE, { productName: "Kiwi" }).confirmLabel, "Sell at ₹0");
+  // When the server is the one asking (HTTP 409), its own sentence is shown.
+  assert.equal(checkoutGateDialog(CHECKOUT_GATE.BELOW_COST, { serverMessage: "Rate 10 is below cost 12." }).message, "Rate 10 is below cost 12.");
+});
+
+test("the reason after a re-dated bill is optional, and skipping it keeps the old default reason", () => {
+  for (const gate of [CHECKOUT_GATE.BACKDATE, CHECKOUT_GATE.FUTURE_DATE]) {
+    const dialog = checkoutDateReasonDialog(gate);
+    assert.equal(dialog.required, false);
+    assert.equal(dialog.cancelLabel, "Skip");
+    assert.equal(dialog.defaultValue, DEFAULT_DATE_OVERRIDE_REASON[gate]);
+    // The old prompt: Cancel (null) and an emptied box both saved the default.
+    assert.equal(resolveDateOverrideReason(gate, null), DEFAULT_DATE_OVERRIDE_REASON[gate]);
+    assert.equal(resolveDateOverrideReason(gate, "   "), DEFAULT_DATE_OVERRIDE_REASON[gate]);
+    assert.equal(resolveDateOverrideReason(gate, "  Missed yesterday's bill "), "Missed yesterday's bill");
+  }
+  assert.equal(DEFAULT_DATE_OVERRIDE_REASON[CHECKOUT_GATE.BACKDATE], "Backdated POS bill created");
+  assert.equal(DEFAULT_DATE_OVERRIDE_REASON[CHECKOUT_GATE.FUTURE_DATE], "Future-dated POS bill created");
+});
+
+test("a gate that stops a person who may not answer it says why", () => {
+  assert.match(checkoutGateRefusal(CHECKOUT_GATE.ZERO_RATE), /Owner or an Admin/);
+  assert.match(checkoutGateRefusal(CHECKOUT_GATE.BELOW_COST), /below cost/);
+  assert.match(checkoutGateRefusal(CHECKOUT_GATE.FUTURE_DATE), /future date/);
+  assert.match(checkoutGateRefusal(CHECKOUT_GATE.WALK_IN_CREDIT), /saved customer/);
+});
+
+const appText = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+const checkoutStart = appText.indexOf("  const checkout = async (printAfterSave = false, confirmations = {}) => {");
+const checkoutBody = appText.slice(checkoutStart, appText.indexOf("  const handleSearchKeys = ", checkoutStart));
+const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+test("checkout has no browser alert, confirm or prompt left", () => {
+  assert.ok(checkoutStart > 0 && checkoutBody.length > 2000, "checkout found");
+  assert.doesNotMatch(checkoutBody, /window\.(confirm|prompt|alert)\(|[^.\w]alert\(/);
+});
+
+test("each checkout gate is still there, in the same order, and Go back stops checkout", () => {
+  const gates = [
+    // [what is asked, the line that asks it and returns on Go back]
+    ["back-dated bill", "if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BACKDATE, { billDate: formatDisplayDate(selectedBillDate) }))))) return;"],
+    ["future-dated bill", "if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.FUTURE_DATE, { billDate: formatDisplayDate(selectedBillDate) }))))) return;"],
+    ["mobile number", "if (customer.mobile && !/^\\d{10,15}$/.test(customer.mobile)) {"],
+    ["credit with no saved customer", "if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.WALK_IN_CREDIT))))) return;"],
+    ["zero rate", "if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.ZERO_RATE, { productName: item.product_name }))))) return;"],
+    ["below cost", "if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BELOW_COST, { productName: item.product_name }))))) return;"],
+  ];
+  let previous = -1;
+  for (const [name, line] of gates) {
+    const at = checkoutBody.indexOf(line);
+    assert.ok(at > 0, `${name}: the gate is missing or changed`);
+    assert.ok(at > previous, `${name}: asked out of order`);
+    previous = at;
+  }
+  // Each gate keeps its own condition.
+  assert.match(checkoutBody, /if \(selectedBillDate < today && !confirmations\.backdate_confirmed\) \{\s*(\/\/[^\n]*\n\s*)*if \(!\(await askCheckout/);
+  assert.match(checkoutBody, /if \(selectedBillDate > today && !confirmations\.future_date_confirmed\) \{\s*if \(!\["Owner", "Admin"\]\.includes\(user\.role\)\) \{/);
+  assert.match(checkoutBody, /if \(paymentMode === "CREDIT" && !customer\.account_id\) \{\s*if \(!\["Owner", "Admin"\]\.includes\(user\.role\)\) \{/);
+  assert.match(checkoutBody, /if \(rateChanged && !discountControlledRate && rate === 0 && !zeroRateConfirmed\) \{\s*if \(!\["Owner", "Admin"\]\.includes\(user\.role\)\) \{/);
+  assert.match(checkoutBody, /if \(rateChanged && !discountControlledRate && estimatedCost > 0 && rate < estimatedCost && !belowCostConfirmed\) \{\s*if \(!\["Owner", "Admin"\]\.includes\(user\.role\)\) \{/);
+  // A person who may not answer is stopped, now with a reason, and nothing is asked.
+  for (const gate of ["FUTURE_DATE", "WALK_IN_CREDIT", "ZERO_RATE", "BELOW_COST"]) {
+    assert.match(checkoutBody, new RegExp(`showCheckoutNotice\\(errorNotice\\(checkoutGateRefusal\\(CHECKOUT_GATE\\.${gate}\\)\\)\\);\\s*return;`), gate);
+  }
+  // The reason after a re-dated bill never stops checkout: Skip keeps the default, as Cancel did.
+  for (const gate of ["BACKDATE", "FUTURE_DATE"]) {
+    assert.match(checkoutBody, new RegExp(escape(`dateOverrideReason = resolveDateOverrideReason(CHECKOUT_GATE.${gate}, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.${gate}))));`)));
+  }
+});
+
+test("when the server asks (409), the same four questions come in the same order, and Go back falls to the refusal", () => {
+  const conflict = checkoutBody.slice(checkoutBody.indexOf("if (error.response?.status === 409) {"));
+  assert.ok(conflict.length > 200, "the 409 branch is there");
+  const order = ["below_cost", "zero_rate", "backdate", "future_date"].map((key) => conflict.indexOf(`responseData.requires_${key}_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(`));
+  order.forEach((at, index) => assert.ok(at > 0 && (index === 0 || at > order[index - 1]), `409 question ${index + 1} is in its place`));
+  for (const flag of ["below_cost_confirmed", "zero_rate_confirmed", "backdate_confirmed", "future_date_confirmed"]) {
+    assert.match(conflict, new RegExp(`checkout\\(printAfterSave, \\{ \\.\\.\\.confirmations, ${flag}: true,[^}]*retry: true \\}\\)`), flag);
+  }
+  const refusal = conflict.indexOf("showCheckoutNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, ");
+  assert.ok(refusal > order[3], "a declined question falls through to the refusal");
+});
+
+test("while a question is open, a second F4 or an Alt shortcut does nothing behind it", () => {
+  assert.match(appText, /const askCheckout = async \(ask\) => \{\s*checkoutAskingRef\.current = true;\s*try \{\s*return await ask\(\);\s*\} finally \{\s*checkoutAskingRef\.current = false;/);
+  assert.match(checkoutBody, /if \(checkoutAskingRef\.current\) return;/);
+  assert.ok(checkoutBody.indexOf("if (checkoutAskingRef.current) return;") < checkoutBody.indexOf("CHECKOUT_GATE.BACKDATE"));
+  assert.match(appText, /const handleShortcuts = \(event\) => \{\s*if \(event\.defaultPrevented \|\| shortcutsPaused\) return;\s*(\/\/[^\n]*\n\s*)*if \(appDialogQueue\.current\(\)\) return;/);
+  assert.match(appText, /if \(shortcutTarget && user && !appDialogQueue\.current\(\)\) \{/);
+  // Enter never confirms: the box opens with the focus on the safe choice.
+  const dialogs = readFileSync(new URL("../feedbackDialogs.jsx", import.meta.url), "utf8");
+  assert.match(dialogs, /cancelRef\.current\?\.focus\(\);/);
 });

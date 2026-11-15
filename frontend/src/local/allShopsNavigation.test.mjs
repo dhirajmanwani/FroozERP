@@ -230,7 +230,8 @@ test("POS is given the orders it needs to check against", () => {
 
 test("promised stock is shown on the cart line, not only on refusal", () => {
   // A refusal at the till happens with a customer standing there.
-  assert.match(app, /reservedNote\(reservedIndex, item\.product_id, item\.unit\)/);
+  // The unit is read the counter's way ("Kg", "Piece") since Phase 3; the note itself is the same.
+  assert.match(app, /reservedNote\(reservedIndex, item\.product_id, cartUnitName\(item\.unit\)\)/);
 });
 
 test("sending an order builds a POS cart instead of writing a sale directly", () => {
