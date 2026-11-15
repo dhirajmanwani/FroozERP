@@ -239,3 +239,9 @@ test("a total row that spans columns is drawn without losing a page or a figure"
   const doc = renderReportPdf({ model, jsPDF });
   assert.equal(doc.internal.getNumberOfPages(), 1);
 });
+
+test("the screen-only 'N item lines' note under a sale stays out of the PDF", async () => {
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /<small className="cell-note no-print">\{row\.item_rows\?\.length \|\| 0\} item line/);
+});
