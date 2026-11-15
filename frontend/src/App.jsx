@@ -3,8 +3,10 @@ import { flushSync } from "react-dom";
 import axios from "axios";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
-import * as pdfjsLib from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
+// The legacy build carries its own polyfills. The modern build calls Map.getOrInsertComputed, which
+// older WebView2 and Chromium lack, so "View PDF" showed a black page with a script error instead.
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
 import QRCode from "qrcode";
 import "./App.css";
 import {
@@ -1726,6 +1728,37 @@ const reportMetaLines = (element) => Array.from(element?.querySelectorAll?.(".re
 // enough to survive the backend 25mb JSON body limit when base64-encoded for WhatsApp.
 // Returns null when the report has no extractable tables/metrics (e.g. chart-only), so the
 // caller can fall back to the raster path.
+// The shop on top of every report PDF: the name and tagline from Settings > Business Identity, and
+// the logo chosen there, or THE PEP lockup that ships inside the app (read from the app's own files,
+// never the internet). Without a logo the PDF still prints, with the name alone.
+let shippedReportLogo = null;
+const readShippedReportLogo = async () => {
+  if (shippedReportLogo !== null) return shippedReportLogo;
+  try {
+    const base = import.meta.env.BASE_URL || "/";
+    const response = await fetch(`${base}branding/pep-logo-invoice-320.png`.replace(/([^:]\/)\/+/g, "$1"));
+    if (!response.ok) throw new Error("missing");
+    const blob = await response.blob();
+    shippedReportLogo = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(String(reader.result || ""));
+      reader.onerror = () => resolve("");
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    shippedReportLogo = "";
+  }
+  return shippedReportLogo;
+};
+const reportPdfBrand = async () => {
+  const identity = brandIdentityStore.getSnapshot() || DEFAULT_BRAND_IDENTITY;
+  return {
+    title: identity.title,
+    tagline: identity.tagline,
+    logo: identity.logo || await readShippedReportLogo() || null,
+  };
+};
+
 const exportReportTextPdf = async ({ element, fileName, title, printProfile = "", save = true }) => {
   if (!element) return null;
   const meta = reportMetaLines(element);
@@ -1736,6 +1769,7 @@ const exportReportTextPdf = async ({ element, fileName, title, printProfile = ""
     jsPDF,
     orientation: printProfile === "A4_LANDSCAPE" ? "landscape" : "portrait",
     generatedAt: formatKolkataDateTime(new Date()),
+    brand: await reportPdfBrand(),
   });
   const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
   const blob = ensurePdfBlob(pdf.output("blob"));
@@ -19976,7 +20010,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         <div className="pl-title-block">
           <span>Financial Report</span>
           <h2>PROFIT &amp; LOSS STATEMENT</h2>
-          <p data-report-note="">For Period: {periodFrom} to {periodTo}</p>
+          <p data-report-note="">For Period: {periodFrom === MISSING_VALUE ? periodFrom : formatDisplayDate(periodFrom)} to {periodTo === MISSING_VALUE ? periodTo : formatDisplayDate(periodTo)}</p>
         </div>
         {!hasTransactions && <div className="pl-empty-note" data-report-note="">No transactions found for selected period.</div>}
         <section className="pl-section">
@@ -21341,7 +21375,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
             return (
               <React.Fragment key={product.product_id}>
                 <tr className="report-row-clickable" data-inventory-product-row={String(product.product_id)} onClick={toggleProduct} tabIndex={0} onKeyDown={activateOnEnter(toggleProduct)}>
-                  <td className="primary-cell">{product.product_name}<small className="cell-note">{expandedProductId === String(product.product_id) ? "Hide lots" : "Show lots"}</small></td>
+                  <td className="primary-cell">{product.product_name}<small className="cell-note no-print">{expandedProductId === String(product.product_id) ? "Hide lots" : "Show lots"}</small></td>
                   <td>{product.category}</td>
                   <td>{product.total_stock_summary}</td>
                   <td>{product.filtered_active_lots}</td>
