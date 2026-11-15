@@ -172,3 +172,70 @@ test("a statement drawn as lines (Profit & Loss) exports every line with its amo
   assert.deepEqual(model.blocks[6].rows, [["Less Supplier Rebate Received", "(₹50.00)"], ["NET PROFIT", "₹1,200.00"]]);
   assert.equal(reportPdfHasContent(model), true);
 });
+
+test("report PDFs embed a font that can draw the rupee sign and a true minus", () => {
+  // Helvetica, the old font, has neither: "₹1,240.00" printed as "¹1,240.00" and "−₹1,900" as '"¹1,900'.
+  const doc = renderReportPdf({
+    model: { title: "Sales", meta: [], blocks: [{ type: "metrics", items: [{ label: "Profit", value: "−₹1,900.00" }] }] },
+    jsPDF,
+  });
+  assert.equal(doc.getFont().fontName, "PepInter");
+  const fonts = Object.values(doc.getFontList ? doc.getFontList() : {});
+  assert.ok(fonts.length > 0);
+});
+
+test("negative figures, totals and quantities are recognised for colour, weight and alignment", async () => {
+  const { isNegativeFigure, isTotalRow } = await import("./reportPdf.js");
+  for (const value of ["−₹1,900.00", "-₹45.00", "(₹45.00)", "- 12.000 Kg"]) assert.equal(isNegativeFigure(value), true, value);
+  for (const value of ["₹45.00", "Banana - Robusta", "—", ""]) assert.equal(isNegativeFigure(value), false, value);
+  assert.equal(isTotalRow(["", "", "Total", "", "₹1,24,560.00"]), true);
+  assert.equal(isTotalRow(["Net Purchase Total for 24 Sep", "₹4,000.00"]), true);
+  assert.equal(isTotalRow(["Closing cash", "₹1,03,700.00"]), true);
+  assert.equal(isTotalRow(["01/11/2026", "Apple", "₹120.00"]), false);
+  for (const value of ["-₹45.00", "−₹1,900.00", "71.500 Kg", "6 Piece", "12.5%"]) assert.equal(isNumericCell(value), true, value);
+  for (const value of ["—", "Apple Kinnaur", "141126-001"]) assert.equal(isNumericCell(value), false, value);
+});
+
+test("the shop's name, tagline and logo head the first page, and a bad logo never stops the PDF", () => {
+  const model = { title: "Cash Book", meta: ["Range: 01/11/2026 – 15/11/2026"], blocks: [{ type: "table", columns: ["Particulars", "Amount"], rows: [["Opening cash", "₹10,000.00"], ["Closing cash", "₹12,000.00"]] }] };
+  const doc = renderReportPdf({ model, jsPDF, generatedAt: "15/11/2026 10:47:00 PM", brand: { title: "THE PEP", tagline: "Pulp Eat Up.", logo: "data:image/png;base64,not-a-picture" } });
+  assert.equal(doc.internal.getNumberOfPages(), 1);
+  assert.ok(doc.output("arraybuffer").byteLength > 0);
+});
+
+test("App hands the shop's identity to every report PDF", async () => {
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /brand: await reportPdfBrand\(\),/);
+  assert.match(app, /branding\/pep-logo-invoice-320\.png/);
+});
+
+test("a name and the phone number under it are read with a space between them", () => {
+  const textNode = (text) => ({ nodeType: 3, textContent: text });
+  const element = (tagName, children) => ({ nodeType: 1, tagName, classList: { contains: () => false }, childNodes: children, textContent: children.map((child) => child.textContent).join("") });
+  const cell = element("TD", [element("STRONG", [textNode("Walk-in Customer")]), element("SMALL", [textNode("9876543210")])]);
+  const table = {
+    tagName: "TABLE", textContent: "", classList: { contains: () => false }, getAttribute: () => null, parentElement: null,
+    querySelectorAll: (selector) => (selector === "tr" ? [
+      { querySelectorAll: (s) => (s === "th" ? [{ textContent: "Customer" }] : []) },
+      { querySelectorAll: (s) => (s === "td" ? [cell] : []) },
+    ] : []),
+  };
+  const model = buildReportPdfModel({ querySelectorAll: (selector) => (selector === "tr" ? [] : [table]) }, { title: "Sales" });
+  assert.equal(model.blocks[0].rows[0][0], "Walk-in Customer 9876543210");
+});
+
+test("a total row that spans columns is drawn without losing a page or a figure", () => {
+  const model = {
+    title: "Cash Book",
+    meta: [],
+    blocks: [{
+      type: "table",
+      columns: ["Date", "Particulars", "L.F.", "Cash (₹)", "Bank (₹)"],
+      rows: [["01/11/2026", "To Balance b/d", "—", "₹0.00", "₹0.00"], ["Total Dr. Side", "₹450.00", "₹400.00"]],
+      spans: { 1: [3, 1, 1] },
+    }],
+  };
+  const doc = renderReportPdf({ model, jsPDF });
+  assert.equal(doc.internal.getNumberOfPages(), 1);
+});
