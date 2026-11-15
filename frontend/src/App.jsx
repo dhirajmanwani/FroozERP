@@ -1228,13 +1228,13 @@ const icons = {
 
 const navigationItems = [
   ["dashboard", "Dashboard"],
+  ["sales", "POS Billing"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
   ["pending-bills", "Pending Bills"],
   ["accounts", "Accounts"],
   ["returns", "Sale Returns"],
   ["waste", "Waste Management"],
-  ["sales", "POS Billing"],
   ["discounts", "Discounts"],
   ["combos", "PEP Menu"],
   ["frooz-pack", "PEP Pack"],

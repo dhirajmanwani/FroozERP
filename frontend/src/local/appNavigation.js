@@ -82,6 +82,14 @@ const modules = [
     sections: [],
   },
   {
+    id: "sales",
+    label: "POS Billing",
+    icon: "receipt",
+    shortcut: "1",
+    keywords: ["pos", "counter", "till", "invoice", "bill", "sell", "cart"],
+    sections: [],
+  },
+  {
     id: "products",
     label: "Products",
     icon: "box",
@@ -127,14 +135,6 @@ const modules = [
     icon: "alert",
     shortcut: "W",
     keywords: ["spoilage", "damage", "rotten", "wastage", "throw"],
-    sections: [],
-  },
-  {
-    id: "sales",
-    label: "POS Billing",
-    icon: "receipt",
-    shortcut: "1",
-    keywords: ["pos", "counter", "till", "invoice", "bill", "sell", "cart"],
     sections: [],
   },
   {
