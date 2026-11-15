@@ -19535,7 +19535,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                 </td>
                 <td className="primary-cell purchase-items-cell sales-items-cell">
                   <span>{salesNarrationDisplay(row)}</span>
-                  <small className="cell-note">{row.item_rows?.length || 0} item line{(row.item_rows?.length || 0) === 1 ? "" : "s"}</small>
+                  <small className="cell-note no-print">{row.item_rows?.length || 0} item line{(row.item_rows?.length || 0) === 1 ? "" : "s"}</small>
                 </td>
                 <td className="status-cell">{row.quantity_summary || MISSING_VALUE}</td>
                 <td className="amount-cell">{money(row.gross_total)}</td>
