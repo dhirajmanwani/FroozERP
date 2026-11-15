@@ -183,6 +183,7 @@ import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/sett
 import { FeedbackDialogHost, SaveNotice } from "./feedbackDialogs";
 import { appDialogQueue, useAskReason, useConfirm, useSaveInFlight, useSaveNotice } from "./feedbackContext";
 import { errorNotice, successNotice, warningNotice } from "./local/feedback";
+import { errorOrDash, formatFileSize, isNegativeFigure, isZeroFigure, reportDraftPending, reportHasContent, reportResultsHeading, scopeChangeDialog, settingsSavedNotice, tidyStoredDecimal } from "./local/backOfficeScreens";
 import { costPerUnitSummary, distributionLotOptions, distributionStatusClass, formatQuantityWithUnit, isPendingBillCompletion, pendingItemNarration, pendingPurchasesPresentation, purchaseEntryHeadings, purchaseSavedMessage, stockLotName, wasteProductOptionLabel } from "./local/stockScreens";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
@@ -2192,6 +2193,9 @@ function Icon({ name, size = 18 }) {
     bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
     mic: <><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" /></>,
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
+    // The menu-collapse button: a panel with its side column, so it is not mistaken for the phone
+    // menu's three lines.
+    sidebar: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
     keyboard: <><rect x="2" y="6" width="20" height="12" rx="2" /><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8" /></>,
@@ -2334,7 +2338,7 @@ function App() {
   const [syncStatus, setSyncStatus] = useState(null);
   const [syncMessage, setSyncMessage] = useState("");
   // The notification centre. Messages used to live in a dozen separate useState boxes and 186
-  // blocking alert() popups: anything not read in the instant it appeared was gone, and a genuine
+  // blocking browser alert popups: anything not read in the instant it appeared was gone, and a genuine
   // warning looked identical to a routine status line. This is the one list that persists.
   const [notifications, setNotifications] = useState([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -9633,7 +9637,13 @@ function App() {
       }
     }
     if (!accountKey) {
-      alert("Supplier account is not linked to this purchase.");
+      // The report stays where it is; the bell says why the ledger did not open.
+      notify({
+        severity: NOTIFICATION_SEVERITY.WARNING,
+        title: "No supplier ledger for this purchase",
+        message: "This purchase is not linked to a supplier account, so there is no ledger to open.",
+        source: "Reports",
+      });
       return;
     }
     setAccountLedgerFocusKey(accountKey);
@@ -9653,7 +9663,12 @@ function App() {
     // customer the sale actually names (local/accountsPresentation.js).
     const customer = findSaleCustomer(customerRows, sale);
     if (!customer?.id) {
-      alert("Customer account is not linked to this sale.");
+      notify({
+        severity: NOTIFICATION_SEVERITY.WARNING,
+        title: "No customer ledger for this sale",
+        message: "This sale is not linked to a customer account, so there is no ledger to open.",
+        source: "Reports",
+      });
       return;
     }
     const accountKey = `CUSTOMER-${customer.id}`;
@@ -10483,7 +10498,7 @@ function App() {
                 title={sidebarCollapsed ? "Expand the menu" : "Collapse the menu to icons"}
                 type="button"
               >
-                <Icon name="menu" />
+                <Icon name="sidebar" />
               </button>
               <button
                 aria-label="Search screens and settings"
@@ -11479,7 +11494,7 @@ function App() {
                 {!editingPurchaseId && purchaseCart.length === 0 && <div className="cart-empty">No items on this bill yet. Choose a product above and press Add item.</div>}
               </ModuleCard>
 
-              <ModuleCard eyebrow="Bill details" onChange={clearPurchaseNotice} title="Charges, rebate and payment" subtitle="Charges are shared across the items by value when the bill is saved.">
+              <ModuleCard eyebrow="Bill details" title="Charges, rebate and payment" onChange={clearPurchaseNotice} subtitle="Charges are shared across the items by value when the bill is saved.">
                 {purchaseBillStatus === "BILL_COMPLETED" && (
                   <div className="form-grid supplier-form-grid">
                     <Field label="Freight charges (₹)"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
@@ -14140,65 +14155,69 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
           <BrandLogo />
         </div>
         <div className="login-copy">
-          <span className="eyebrow">Device Activation Required</span>
+          <span className="eyebrow">This computer needs activating</span>
           <h1>{APP_DISPLAY_NAME}</h1>
-          <p>This device is not yet activated. Import the activation file (.lic) supplied by the FroozERP owner to enable this installation.</p>
+          <p>Before this computer can be used, the Owner activates it. Follow the two steps below.</p>
         </div>
         <div className="device-activation-panel">
           <span className="eyebrow">This device</span>
-          <small>Device ID: {deviceInfo?.device_id || "(resolving...)"}</small>
+          <small>Device ID: {deviceInfo?.device_id || "Reading…"}</small>
           <p>Ask the FroozERP owner to issue an activation for this device from Branches &amp; Counters &gt; Activation licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
           <span className="eyebrow">Step 1: send this device to the shop</span>
           <p>Sign in once so the shop can see this device. It does not open the app; the Owner still has to approve it.</p>
-          <input
-            aria-label="Username"
-            autoComplete="username"
-            disabled={busy}
-            onChange={(event) => setEnrolUsername(event.target.value)}
-            placeholder="Username"
-            value={enrolUsername}
-          />
-          <PasswordInput
-            aria-label="Password"
-            autoComplete="current-password"
-            disabled={busy}
-            onChange={(event) => setEnrolPassword(event.target.value)}
-            placeholder="Password"
-            value={enrolPassword}
-          />
-          <button className="secondary-button" type="button" disabled={busy} onClick={sendToShop}>
-            {busy ? "Sending…" : "Send to Shop"}
-          </button>
+          {/* Labels above the boxes, not placeholders that vanish as soon as somebody types. */}
+          <div className="activation-fields">
+            <Field label="Username">
+              <input
+                autoComplete="username"
+                disabled={busy}
+                onChange={(event) => setEnrolUsername(event.target.value)}
+                value={enrolUsername}
+              />
+            </Field>
+            <Field label="Password">
+              <PasswordInput
+                autoComplete="current-password"
+                disabled={busy}
+                onChange={(event) => setEnrolPassword(event.target.value)}
+                value={enrolPassword}
+              />
+            </Field>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" disabled={busy} onClick={sendToShop}>
+              {busy ? "Sending…" : "Send to Shop"}
+            </button>
+          </div>
           <span className="eyebrow">Step 2: activate</span>
-          <textarea
-            aria-label="Activation text"
-            disabled={busy}
-            onChange={(event) => setPastedActivation(event.target.value)}
-            placeholder="Paste the activation text the Owner sent"
-            rows={4}
-            value={pastedActivation}
-          />
-          <button className="primary-button" type="button" disabled={busy} onClick={activatePasted}>
-            {busy ? "Activating…" : "Activate"}
-          </button>
-          <small>Or choose the .lic file instead:</small>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".lic,.txt,text/plain"
-            disabled={busy}
-            onChange={(event) => importFile(event.target.files?.[0])}
-          />
-          <button
-            className="primary-button"
-            type="button"
-            disabled={busy}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            {busy ? "Activating…" : "Choose Activation File"}
-          </button>
-          {notice && <small>{notice}</small>}
-          {error && <small className="startup-status-error">{error}</small>}
+          <Field label="Activation text from the Owner">
+            <textarea
+              disabled={busy}
+              onChange={(event) => setPastedActivation(event.target.value)}
+              placeholder="Paste it here"
+              rows={4}
+              value={pastedActivation}
+            />
+          </Field>
+          {/* One primary (Activate) and one file chooser: the file box and a second primary button
+              that opened it used to sit one under the other for the same job. */}
+          <div className="button-row">
+            <button className="primary-button" type="button" disabled={busy} onClick={activatePasted}>
+              {busy ? "Activating…" : "Activate"}
+            </button>
+            <label className={busy ? "secondary-button product-photo-file activation-file-button is-disabled" : "secondary-button product-photo-file activation-file-button"}>
+              Or choose the .lic file
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".lic,.txt,text/plain"
+                disabled={busy}
+                onChange={(event) => importFile(event.target.files?.[0])}
+              />
+            </label>
+          </div>
+          {notice && <p className="form-note stock-ok save-notice" role="status">{notice}</p>}
+          {error && <p className="error-banner" role="alert">{error}</p>}
         </div>
         <div className="startup-actions">
           <button className="secondary-button" type="button" disabled={busy} onClick={() => onRefresh(deviceInfo?.device_id)}>
@@ -14242,6 +14261,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
   const [issuing, setIssuing] = useState(false);
   const [issued, setIssued] = useState(null);
   const [outcome, setOutcome] = useState(null);
+  const confirmRetire = useConfirm();
 
   const loadLicences = useCallback(async () => {
     setLoading(true);
@@ -14362,7 +14382,14 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
   const retireOldIds = async () => {
     const old = view.ok ? view.oldIds : [];
     if (!old.length) return;
-    if (!window.confirm(`Retire ${old.length} old ${old.length === 1 ? "id" : "ids"} left by earlier installs?\n\nNone of them is placed at a counter or has ever had a licence, and each machine keeps the id it uses now. Bills stay in the books.`)) return;
+    const retire = await confirmRetire({
+      title: `Retire ${old.length} old ${old.length === 1 ? "id" : "ids"} left by earlier installs?`,
+      message: "None of them is placed at a counter or has ever had a licence, and each machine keeps the id it uses now. Bills stay in the books.",
+      confirmLabel: old.length === 1 ? "Retire old id" : "Retire old ids",
+      cancelLabel: "Keep them",
+      tone: "danger",
+    });
+    if (!retire) return;
     setRetiringOld(true);
     const failed = [];
     for (const row of old) {
@@ -14642,7 +14669,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
  * The notification list itself.
  *
  * Deliberately not a toast: a toast that disappears after four seconds is the same failure as the
- * `alert()` popups this replaces, only quieter. Entries stay until the operator deals with them.
+ * browser alert popups this replaces, only quieter. Entries stay until the operator deals with them.
  */
 function NotificationPanel({ notifications, onClose, onDismiss, onClearAll, onMarkAllRead }) {
   const severityLabel = {
@@ -15419,16 +15446,21 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   );
 }
 
-function ReportToolbar({ canWhatsappSend = false, exporting = false, onExcelExport, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
+// `emptyReason`: the report has nothing in it yet, so Print, PDF, Excel and WhatsApp wait (with the
+// reason on hover) instead of making an empty page. `title` is left out where the card above the
+// toolbar already names the report.
+function ReportToolbar({ canWhatsappSend = false, emptyReason = "", exporting = false, onExcelExport, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
+  const empty = Boolean(emptyReason);
+  const hint = empty ? emptyReason : undefined;
   return (
     <div className="report-toolbar no-print">
-      <strong>{title}</strong>
+      {title && <strong>{title}</strong>}
       <div className="button-row">
-        <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
-        {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing…" : "View PDF"}</button>}
-        <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting…" : "PDF Export"}</button>
-        {onExcelExport && <button className="secondary-button" disabled={exporting} onClick={onExcelExport}>Excel</button>}
-        <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
+        <button className="secondary-button" disabled={empty} onClick={onPrint} title={hint}><Icon name="print" /> Print</button>
+        {onPdfView && <button className="secondary-button" disabled={exporting || empty} onClick={onPdfView} title={hint}>{exporting ? "Preparing…" : "View PDF"}</button>}
+        <button className="secondary-button" disabled={exporting || empty} onClick={onPdfExport || onPrint} title={hint}>{exporting ? "Exporting…" : "PDF Export"}</button>
+        {onExcelExport && <button className="secondary-button" disabled={exporting || empty} onClick={onExcelExport} title={hint}>Excel</button>}
+        <button className="whatsapp-button" disabled={exporting || empty || !canWhatsappSend} title={hint || (canWhatsappSend ? "" : "WhatsApp Send permission required")} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
     </div>
   );
@@ -15535,7 +15567,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
       <section className="invoice-modal profile-panel">
         <div className="invoice-toolbar">
           <div>
-            <span className="eyebrow">User Profile</span>
+            <span className="eyebrow">Your profile</span>
             <strong>{userDisplayName}</strong>
           </div>
           <button aria-label="Close profile" className="remove-button" onClick={onClose}><Icon name="close" /></button>
@@ -15544,17 +15576,17 @@ function UserProfilePanel({ onClose, onLogout, user }) {
           <div className="purchase-summary-grid supplier-payment-preview">
             <SummaryMetric label="Role" value={userRoleLabel} featured />
             <SummaryMetric label="Branch" value={user.branch || "Main Branch"} />
-            <SummaryMetric label="Last Login" value={user.last_login_at ? formatKolkataDateTime(user.last_login_at) || "Not recorded" : "Not recorded"} />
-            <SummaryMetric label="Device" value="Local Counter" />
+            <SummaryMetric label="Last sign-in" value={user.last_login_at ? formatKolkataDateTime(user.last_login_at) || "Not recorded" : "Not recorded"} />
           </div>
+          {/* Read-only facts: a blank box read as "type here", so an empty one says "Not given". */}
           <div className="form-grid supplier-form-grid">
             <Field label="Username"><input disabled value={user.username || ""} /></Field>
-            <Field label="Mobile"><input disabled value={user.mobile_number || ""} /></Field>
-            <Field label="Email"><input disabled value={user.email || ""} /></Field>
-            <Field label="Joining Date"><input disabled value={user.joining_date ? formatDisplayDate(user.joining_date) : ""} /></Field>
-            <Field label="Notes"><textarea disabled value={user.notes || ""} /></Field>
+            <Field label="Mobile"><input disabled placeholder="Not given" value={user.mobile_number || ""} /></Field>
+            <Field label="Email"><input disabled placeholder="Not given" value={user.email || ""} /></Field>
+            <Field label="Joining Date"><input disabled placeholder="Not given" value={user.joining_date ? formatDisplayDate(user.joining_date) : ""} /></Field>
+            {user.notes && <Field label="Notes"><textarea disabled value={user.notes} /></Field>}
           </div>
-          <ModuleCard eyebrow="Recovery Security" title="Owner Recovery Contacts" subtitle="Recovery contacts are usable only after OTP verification. Password recovery requires backend connectivity.">
+          <ModuleCard eyebrow="Account recovery" title="Owner Recovery Contacts" subtitle="An email or mobile number you can get back in with if the password is forgotten. Each works only after it is checked with a one-time code (OTP), and recovery needs the internet.">
             <div className="purchase-summary-grid supplier-payment-preview">
               <SummaryMetric label="Email Status" value={profile?.recovery_email_verified ? "Verified" : profile?.pending_recovery_email ? "Pending" : "Not Verified"} featured={profile?.recovery_email_verified} />
               <SummaryMetric label="Mobile Status" value={profile?.recovery_mobile_verified ? "Verified" : profile?.pending_recovery_mobile ? "Pending" : "Not Verified"} featured={profile?.recovery_mobile_verified} />
@@ -15612,7 +15644,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
 // screen hands the file all of them (Stock Inventory's Lot View).
 const ReportExportContext = React.createContext(false);
 
-function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false, children, fileName, reportClassName = "", title, user, whatsappRecipients = [] }) {
+function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false, children, emptyReason = "", fileName, reportClassName = "", showToolbarTitle = true, title, user, whatsappRecipients = [] }) {
   const [printTarget, setPrintTarget] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
@@ -15622,8 +15654,10 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   const reportRef = useRef(null);
   const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
   const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
-  const printReport = () => {
-    if (beforePrint && beforePrint() === false) return;
+  // beforePrint / beforePdfExport may ask something first (narration: in-app, so it is awaited).
+  const printReport = async () => {
+    setExcelNotice(null);
+    if (beforePrint && (await beforePrint()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     applyPrintPageProfile(printProfile);
     setTimeout(() => {
@@ -15638,7 +15672,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     }, 0);
   };
   const exportReport = async () => {
-    if (beforePdfExport && beforePdfExport() === false) return;
+    setExcelNotice(null);
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
@@ -15646,7 +15681,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
       await new Promise((resolve) => setTimeout(resolve, 80));
       await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
     } catch (error) {
-      alert(`Unable to export PDF: ${error.message}`);
+      setExcelNotice({ tone: "error", text: `The PDF could not be made (${error?.message || String(error)}). Nothing was saved; try again.` });
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -15655,8 +15690,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   const exportExcel = async () => {
     // The same preparation as the PDF (narration choice, print layout), so the sheet carries the
     // rows the PDF would.
-    if (beforePdfExport && beforePdfExport() === false) return;
     setExcelNotice(null);
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     setPrintTarget(true);
     setExporting(true);
     try {
@@ -15673,7 +15708,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     }
   };
   const viewReportPdf = async () => {
-    if (beforePdfExport && beforePdfExport() === false) return;
+    setExcelNotice(null);
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
@@ -15682,14 +15718,14 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
       const result = await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false });
       setPdfPreview({ ...result });
     } catch (error) {
-      alert(`Unable to view PDF: ${error.message}`);
+      setExcelNotice({ tone: "error", text: `The PDF could not be opened (${error?.message || String(error)}). Try again.` });
     } finally {
       setExporting(false);
       setPrintTarget(false);
     }
   };
   const generateWhatsappPdf = async () => {
-    if (beforePdfExport && beforePdfExport() === false) return;
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
@@ -15703,9 +15739,9 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onExcelExport={exportExcel} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onExcelExport={exportExcel} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={showToolbarTitle ? title : ""} emptyReason={emptyReason} />
       {excelNotice && (
-        <p className={`report-excel-notice no-print${excelNotice.tone === "error" ? " report-excel-notice-error" : ""}`} role="status">{excelNotice.text}</p>
+        <p className={`report-excel-notice no-print${excelNotice.tone === "error" ? " report-excel-notice-error" : ""}`} role={excelNotice.tone === "error" ? "alert" : "status"}>{excelNotice.text}</p>
       )}
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
@@ -16103,7 +16139,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
           )}
 
           {paymentDraft.customer_id && (
-            <ModuleCard eyebrow="Customer receipt" onChange={clearPaymentNotice} title="Receive a payment" subtitle="The payment lowers what the customer owes and goes into the cash or bank book by its mode.">
+            <ModuleCard eyebrow="Customer receipt" title="Receive a payment" onChange={clearPaymentNotice} subtitle="The payment lowers what the customer owes and goes into the cash or bank book by its mode.">
               <div className="form-grid supplier-form-grid">
                 <Field label={<RequiredLabel>Customer</RequiredLabel>}>
                   <select id="customer-payment-customer" value={paymentDraft.customer_id} onChange={(event) => setPaymentDraft({ ...paymentDraft, customer_id: event.target.value })}>
@@ -18463,6 +18499,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
+  const askNarration = useConfirm();
   /**
    * Open the report category a search asked for.
    *
@@ -18610,6 +18647,9 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     }
   };
   const appliedSearch = String(appliedQuery.search ?? search).trim();
+  // The dates and the search go with "Show report"; until it is pressed, the figures are the last
+  // report's, and the screen says so (local/backOfficeScreens.js).
+  const filtersPending = reportDraftPending({ range, customRange, search }, appliedQuery, resolveReportDateRange);
   const matchesSearch = (row) => !appliedSearch || Object.values(row || {}).some((value) => {
     const text = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value ?? "");
     return text.toLowerCase().includes(appliedSearch.toLowerCase());
@@ -19970,9 +20010,16 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       </div>
     );
   };
+  // Stock on hand has no dates or search of its own, so it never says its filters changed.
+  const showReportButton = (label = "Show report", { tracksFilters = true } = {}) => (
+    <div className="report-apply-row">
+      <button className="primary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Loading…" : label}</button>
+      {tracksFilters && filtersPending && !refreshBusy && <span className="warning-note report-apply-note" role="status">Filters changed — press {label}</span>}
+    </div>
+  );
   const renderFilters = () => selectedReport === "stockInventory" ? (
     <div className="ledger-toolbar">
-      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing…" : "Refresh"}</button>
+      {showReportButton("Refresh stock", { tracksFilters: false })}
       {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   ) : (
@@ -20275,7 +20322,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           <button className="secondary-button" onClick={() => setPurchaseFilters({ supplier: "", product: "", status: "ACTIVE", paymentType: "", date: "" })}>Clear Purchase Filters</button>
         </>
       )}
-      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing…" : "Refresh"}</button>
+      {showReportButton()}
       {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   );
@@ -20479,10 +20526,10 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     );
     return (
       <section className="cash-book-statement">
+        {/* What this book covers, in one line. The report's name is already the card's (and the
+            printed page's) heading; "Traditional Double-Sided Format / CASH BOOK" said it twice more. */}
         <div className="pl-title-block cash-book-title">
-          <span>Traditional Double-Sided Format</span>
-          <h2>CASH BOOK</h2>
-          <p>{cashBookAccountLabel} | {cashBookViewMode === "SUMMARY" ? "Account Summary" : "Entry-wise"} | {cashBookGroupBy === "PERIOD" ? "Entire Selected Period" : cashBookGroupBy === "DATE" ? "Date-wise" : "Month-wise"} | {formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to {formatDisplayDate(cashBookData.dateTo || data.dateTo)}</p>
+          <p>{cashBookAccountLabel} · {cashBookViewMode === "SUMMARY" ? "Account summary" : "Entry by entry"} · {cashBookGroupBy === "PERIOD" ? "Whole period" : cashBookGroupBy === "DATE" ? "Day by day" : "Month by month"} · {formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to {formatDisplayDate(cashBookData.dateTo || data.dateTo)}</p>
         </div>
         {(cashBookClosingCash < 0 || cashBookClosingBank < 0) && (
           <div className="cash-book-warning">
@@ -20529,33 +20576,42 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             </DataTable>
           </section>
         </div>
-        <div className="cash-book-closing">
-          <span>Total Cash Receipts: <strong>{money(cashBookReceiptsCash)}</strong></span>
-          <span>Total Bank Receipts: <strong>{money(cashBookReceiptsBank)}</strong></span>
-          <span>Total Cash Payments: <strong>{money(cashBookPaymentsCash)}</strong></span>
-          <span>Total Bank Payments: <strong>{money(cashBookPaymentsBank)}</strong></span>
-          <span>Closing Cash: <strong>{money(cashBookClosingCash)}</strong></span>
-          <span>Closing Bank: <strong>{money(cashBookClosingBank)}</strong></span>
-          <span>Total Cash + Bank: <strong>{money(cashBookData.total_closing)}</strong></span>
-        </div>
+        {/* The receipts, payments and closing totals are the tiles above the book; the line of
+            "Closing Cash:" figures that repeated them here is gone. */}
       </section>
     );
   };
   if (currentReport) {
     const rows = currentReport.rows || [];
-    const handleReportPrintOption = () => {
+    // The results card is named after the report, with its row count small beside it (it was titled
+    // "0 rows"), and says which dates and search it shows, or that new ones are waiting.
+    const resultsHeading = reportResultsHeading({ title: currentReport.title, selectedReport, rowCount: rows.length });
+    const resultsSubtitle = selectedReport === "stockInventory"
+      ? "Stock as it is now. The filters are just below."
+      : filtersPending
+        ? "Still showing the last report. Press Show report for the new dates or search."
+        : `${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}${appliedSearch ? `, search "${appliedSearch}"` : ""}.`;
+    // Asked in the app, not a browser box. Either answer goes on to print; "Leave it out" is what
+    // the old Cancel did.
+    const askIncludeNarration = (title) => askNarration({
+      title,
+      message: "Narration is the notes and item details under each entry.",
+      confirmLabel: "Include narration",
+      cancelLabel: "Leave it out",
+    });
+    const handleReportPrintOption = async () => {
       if (selectedReport === "purchaseHistory") {
-        const includeNarration = window.confirm("Print narration/details?");
+        const includeNarration = await askIncludeNarration("Print narration and details?");
         purchasePrintNarrationRef.current = includeNarration;
         setPurchasePrintNarration(includeNarration);
       }
       if (selectedReport === "salesHistory") {
-        const includeNarration = window.confirm("Print narration/details?");
+        const includeNarration = await askIncludeNarration("Print narration and details?");
         salesPrintNarrationRef.current = includeNarration;
         setSalesPrintNarration(includeNarration);
       }
       if (["customerLedger", "supplierLedger", "accountStatement"].includes(selectedReport)) {
-        const includeNarration = window.confirm("Print narration/details also?");
+        const includeNarration = await askIncludeNarration("Print narration and details too?");
         ledgerPrintNarrationRef.current = includeNarration;
         setLedgerPrintNarration(includeNarration);
       }
@@ -20627,11 +20683,17 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             </div>
             {renderFilters()}
           </ModuleCard>
-          <ModuleCard eyebrow="Results" title={selectedReport === "stockInventory" ? "Stock on hand" : ["profitLoss", "balanceSheet", "cashBook"].includes(selectedReport) ? "Statement" : `${rows.length} row${rows.length === 1 ? "" : "s"}`} subtitle={selectedReport === "stockInventory" ? "Uses the filters shown below." : "Matching the filters above."}>
+          <ModuleCard
+            eyebrow="Results"
+            title={<>{resultsHeading.title}{resultsHeading.count && <small className="report-result-count">{resultsHeading.count}</small>}</>}
+            subtitle={resultsSubtitle}
+          >
             <PrintableReport
               beforePdfExport={handleReportPrintOption}
               beforePrint={handleReportPrintOption}
               canWhatsappSend={canWhatsappSend}
+              emptyReason={reportHasContent({ selectedReport, rowCount: rows.length, available: reportAvailability.available }) ? "" : "Nothing to print or export: this report has no rows for these filters."}
+              showToolbarTitle={false}
               fileName={reportFileName}
               reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : selectedReport === "cashBook" ? "cash-book-print-report" : ""}
               title={currentReport.title}
@@ -20724,13 +20786,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     <section className="settings-layout">
       {/* The range every report opens with. Named here because it is an effective filter: an
           unnamed "today" once made a month of sales look missing. */}
-      <section className="content-card">
-        <p className="form-note">
-          Reports open for <strong>{REPORT_RANGE_LABELS[appliedQuery.range] || "the chosen dates"}</strong>
-          {` (${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}). `}
-          Change the dates inside any report.
-        </p>
-      </section>
+      <ModuleCard
+        eyebrow="Report Center"
+        title="Choose a report"
+        subtitle={<>Reports open for <strong>{REPORT_RANGE_LABELS[appliedQuery.range] || "the chosen dates"}</strong>{` (${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}). `}Change the dates inside any report.</>}
+      />
       <section className="report-center-grid">
         {categories.map((category) => (
           <button className="report-category-card" key={category.id} onClick={() => setSelectedCategory(category.id)}>
@@ -21760,7 +21820,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
   });
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Record waste" onChange={clearWasteNotice} title="Fruit taken off the shelf" subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
+      <ModuleCard eyebrow="Record waste" title="Fruit taken off the shelf" onChange={clearWasteNotice} subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
         <div className="form-grid supplier-form-grid">
           <Field label={<RequiredLabel>Product</RequiredLabel>}>
             <select autoFocus id="waste-product" value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
@@ -22682,9 +22742,9 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
             onChange={(event) => onReload(event.target.value)}
           />
         </label>{" "}
-        <button className="table-action" type="button" onClick={() => onReload(state.dateTo || "")}>Refresh</button>
+        <button className="secondary-button" type="button" onClick={() => onReload(state.dateTo || "")}>Refresh</button>
         {state.dateTo && (
-          <button className="table-action" type="button" onClick={() => onReload("")}>Today</button>
+          <button className="secondary-button" type="button" onClick={() => onReload("")}>Today</button>
         )}
       </p>
 
@@ -22716,11 +22776,11 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
         <DataTable headers={markNumericColumns(["Shop", "Cash", "Bank", "Stock Value", "Customers Owe", "We Owe", "Net Profit"])}>
           {presentation.shops.map((shop) => (
             <tr key={shop.branchId ?? shop.branchName}>
-              <td>{shop.branchName}</td>
+              <td className="primary-cell">{shop.branchName}</td>
               {shop.ok ? (
                 <>
-                  <td>{money(shop.cash)}</td>
-                  <td>{money(shop.bank)}</td>
+                  <SignedAmountCell format={money} value={shop.cash} />
+                  <SignedAmountCell format={money} value={shop.bank} />
                   <td>{money(shop.inventory)}</td>
                   <td>{money(shop.customerReceivable)}</td>
                   <td>{money(shop.supplierPayable)}</td>
@@ -23009,6 +23069,16 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
   const [ledgerExporting, setLedgerExporting] = useState(false);
   const [ledgerWhatsappOpen, setLedgerWhatsappOpen] = useState(false);
   const ledgerPrintRef = useRef(null);
+  // The list comes first; "Add account" (or Edit on a row) opens the form above it.
+  const [accountFormOpen, setAccountFormOpen] = useState(false);
+  const askPaymentReason = useAskReason();
+  const [accountNotice, showAccountNotice, clearAccountNotice] = useSaveNotice();
+  const [accountListNotice, showAccountListNotice, clearAccountListNotice] = useSaveNotice();
+  const [paymentNotice, showPaymentNotice, clearPaymentNotice] = useSaveNotice();
+  const [paymentListNotice, showPaymentListNotice, clearPaymentListNotice] = useSaveNotice();
+  const [ledgerNotice, showLedgerNotice, clearLedgerNotice] = useSaveNotice();
+  const [accountSaving, runAccountSave] = useSaveInFlight();
+  const [paymentSaving, runPaymentSave] = useSaveInFlight();
   // From the role's permission map (Owner always), as the server decides them -- a Cashier whose
   // Customer Payments box is unticked no longer gets a form that can only be refused.
   const canUseSupplierPayments = accountPermissions.supplierPayments === true;
@@ -23081,6 +23151,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
   const ledgerDocumentTitle = `${accountLedger.account?.account_name || accountLedger.account?.customer_name || accountLedger.account?.supplier_name || "Account"} - Ledger Statement`;
   const exportLedgerPdf = async () => {
     if (!ledgerPrintRef.current) return;
+    clearLedgerNotice();
     setLedgerExporting(true);
     try {
       await exportDocumentPdf({
@@ -23089,7 +23160,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
         title: ledgerDocumentTitle,
       });
     } catch (error) {
-      alert(`Unable to export ledger PDF: ${error.message}`);
+      showLedgerNotice(errorNotice(`The ledger PDF could not be made (${error?.message || String(error)}). Nothing was saved; try again.`));
     } finally {
       setLedgerExporting(false);
     }
@@ -23112,7 +23183,35 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     });
   };
 
-  const saveAccount = async () => {
+  const closeAccountForm = () => {
+    setDraft(emptyAccount);
+    setEditingKey("");
+    setAccountFormOpen(false);
+    clearAccountNotice();
+  };
+  const openNewAccountForm = () => {
+    setDraft(emptyAccount);
+    setEditingKey("");
+    clearAccountNotice();
+    clearAccountListNotice();
+    setAccountFormOpen(true);
+    focusField("account-name", { scroll: true });
+  };
+  const saveAccount = () => runAccountSave(async () => {
+    clearAccountNotice();
+    // The server refuses a nameless account ("Enter valid account details"); said here first, at the box.
+    if (!String(draft.account_name || "").trim()) {
+      showAccountNotice(errorNotice("Enter the account name.", "account-name"));
+      // The name box is at the top of a long form; take the person to it (it is marked red).
+      focusField("account-name");
+      return;
+    }
+    if (draft.opening_balance !== "" && !Number.isFinite(Number(draft.opening_balance))) {
+      showAccountNotice(errorNotice("Enter the opening balance as a number, or leave it blank.", "account-opening"));
+      focusField("account-opening");
+      return;
+    }
+    const wasEditing = Boolean(editingKey);
     try {
       const payload = { ...draft, opening_balance: Number(draft.opening_balance || 0) };
       const normalizedName = payload.account_name.trim().toLowerCase();
@@ -23133,7 +23232,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
         return false;
       });
       if (duplicate) {
-        alert(payload.account_type === "CUSTOMER" ? "This customer already exists." : "This supplier already exists.");
+        showAccountNotice(errorNotice(payload.account_type === "CUSTOMER"
+          ? `${duplicate.account_name} is already a customer with this mobile number. Search the list and press Edit on it instead.`
+          : `${duplicate.account_name} is already a supplier with this name or firm. Search the list and press Edit on it instead.`, "account-name"));
+        focusField("account-name");
         return;
       }
       const supplierAccount = ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(payload.account_type);
@@ -23153,15 +23255,23 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       } else {
         await axios.post(`${API_URL}/accounts`, payload);
       }
+      const savedName = payload.account_name.trim();
       setDraft(emptyAccount);
       setEditingKey("");
-      await onReload();
-      alert(editingKey ? "Account updated" : "Account saved");
+      setAccountFormOpen(false);
+      // Saved; a list that does not refresh afterwards is a warning, not a failed save.
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const saved = `${savedName} ${wasEditing ? "updated" : "added"}.`;
+      showAccountListNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Refresh.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save account"));
+      showAccountNotice(errorNotice(getErrorMessage(error, "The account could not be saved. Nothing was changed; try again.")));
     }
-  };
+  });
   const editAccount = (account) => {
+    clearAccountNotice();
+    clearAccountListNotice();
+    setAccountFormOpen(true);
+    focusField("account-name", { scroll: true });
     setEditingKey(account.account_key);
     setDraft({
       account_name: account.account_name || "",
@@ -23195,7 +23305,26 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     setLedgerMode(ledgerFocusKey.startsWith("SUPPLIER-") ? "SUPPLIER" : "ANY");
     setLedgerAccountKey(ledgerFocusKey);
   }, [ledgerFocusKey]);
-  const savePayment = async () => {
+  const savePayment = () => runPaymentSave(async () => {
+    clearPaymentNotice();
+    // What the server refuses, asked here first so the cursor lands on the gap.
+    if (!payment.account_key) {
+      showPaymentNotice(errorNotice("Choose the account this payment is for.", "payment-account"));
+      focusField("payment-account", { scroll: false });
+      return;
+    }
+    if (!isSupplierPayment && !(Number(payment.amount) > 0)) {
+      showPaymentNotice(errorNotice("Enter the amount received.", "payment-amount"));
+      focusField("payment-amount", { scroll: false });
+      return;
+    }
+    if (isSupplierPayment && !(Number(payment.amount || 0) >= 0)) {
+      showPaymentNotice(errorNotice("Enter the amount paid.", "payment-amount"));
+      focusField("payment-amount", { scroll: false });
+      return;
+    }
+    const wasEditing = Boolean(editingPaymentKey);
+    const savedWords = `${currency.format(Number(payment.amount || 0))} ${isSupplierPayment ? "to" : "from"} ${selectedPaymentAccount?.account_name || "the account"}`;
     try {
       const payload = {
         ...payment,
@@ -23208,7 +23337,13 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       };
       let response;
       if (editingPaymentKey) {
-        const reason = window.prompt("Enter reason for editing this payment");
+        const reason = await askPaymentReason({
+          title: "Why is this payment being changed?",
+          message: "The reason is kept with the payment and shows in its history.",
+          label: "Reason for the change",
+          placeholder: "Example: wrong amount typed",
+          confirmLabel: "Save change",
+        });
         if (!reason) return;
         response = await axios.put(`${API_URL}/accounts/payments/${editingPaymentKey}`, { ...payload, reason });
       } else {
@@ -23229,13 +23364,16 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       });
       setEditingPaymentKey("");
       setPayment((current) => ({ ...current, amount: "", rebate_amount: "", reference_number: "", remarks: "" }));
-      await onReload();
-      alert(editingPaymentKey ? "Payment updated" : "Payment saved");
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const saved = `Payment of ${savedWords} ${wasEditing ? "updated" : "saved"}.`;
+      showPaymentNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Refresh Payment History.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save payment"));
+      showPaymentNotice(errorNotice(getErrorMessage(error, "The payment could not be saved. Nothing was recorded; try again.")));
     }
-  };
+  });
   const editPayment = (row) => {
+    clearPaymentNotice();
+    clearPaymentListNotice();
     setEditingPaymentKey(row.payment_key);
     setPayment({
       payment_action: row.payment_source === "CUSTOMER" ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER",
@@ -23250,22 +23388,32 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     setTab("payments");
   };
   const cancelPayment = async (row) => {
-    const reason = window.prompt(`Enter cancellation reason for ${row.account_name} payment`);
+    clearPaymentListNotice();
+    const reason = await askPaymentReason({
+      title: `Cancel the ${currency.format(Number(row.payment_amount || 0))} payment for ${row.account_name}?`,
+      message: "The payment stays in the history, marked cancelled, and the balance goes back to what it was.",
+      label: "Why is it being cancelled?",
+      confirmLabel: "Cancel payment",
+      cancelLabel: "Keep payment",
+      tone: "danger",
+    });
     if (!reason) return;
     try {
       await axios.post(`${API_URL}/accounts/payments/${row.payment_key}/cancel`, { reason, cancelled_by: user.id });
-      await onReload();
-      alert("Payment cancelled");
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const done = `Payment for ${row.account_name} cancelled.`;
+      showPaymentListNotice(refresh ? warningNotice(`${done} But ${refresh}; press Refresh Payment History.`) : successNotice(done));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to cancel payment"));
+      showPaymentListNotice(errorNotice(getErrorMessage(error, "The payment was not cancelled. Nothing was changed; try again.")));
     }
   };
   const viewPaymentHistory = async (row) => {
+    clearPaymentListNotice();
     try {
       const response = await axios.get(`${API_URL}/accounts/payments/${row.payment_key}/audit`);
       setPaymentAudit({ payment: row, rows: response.data });
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to load payment history"));
+      showPaymentListNotice(errorNotice(getErrorMessage(error, "The payment history could not be loaded. Try again.")));
     }
   };
   const refreshPaymentsForSelection = async (accountKey) => {
@@ -23283,7 +23431,8 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
 
       {tab === "master" && (
         <>
-          <ModuleCard eyebrow="Account details" title={editingKey ? "Edit account" : "Add an account"} subtitle="The account type decides where it shows up: purchases, POS bills, ledgers and payments.">
+          {accountFormOpen && (
+          <ModuleCard eyebrow="Account details" onChange={clearAccountNotice} title={editingKey ? `Edit ${draft.account_name || "account"}` : "Add an account"} subtitle="The account type decides where it shows up: purchases, POS bills, ledgers and payments.">
             <div className="pm-form-section">
               <h3>Account</h3>
               <div className="form-grid supplier-form-grid">
@@ -23292,13 +23441,15 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                     {masterTypeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                   </select>
                 </Field>
-                <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
+                <Field label={<RequiredLabel>Account Name</RequiredLabel>}><input aria-invalid={accountNotice?.field === "account-name" ? "true" : undefined} id="account-name" value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
                 <Field label="Firm Name"><input value={draft.firm_name} onChange={(event) => setDraft({ ...draft, firm_name: event.target.value })} /></Field>
                 <Field label="GST Number"><input value={draft.gst_number} onChange={(event) => setDraft({ ...draft, gst_number: event.target.value })} /></Field>
-                <Field label="Opening Balance"><input min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
+                <Field label="Opening Balance"><input aria-invalid={accountNotice?.field === "account-opening" ? "true" : undefined} id="account-opening" min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
                 <Field label="Notes"><textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
               </div>
               <label className="check-field pm-check"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
+              {/* A refusal about a box in this section is said here, beside the box, not under Save. */}
+              {accountNotice?.field && <SaveNotice notice={accountNotice} />}
             </div>
             <div className="pm-form-section">
               <h3>Contact</h3>
@@ -23321,15 +23472,23 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               </div>
             </div>
             <div className="button-row">
-              <button className="primary-button" onClick={saveAccount}>{editingKey ? "Update Account" : "Add Account"}</button>
-              {editingKey && <button className="secondary-button" onClick={() => { setDraft(emptyAccount); setEditingKey(""); }}>Cancel Edit</button>}
+              <button className="primary-button" disabled={accountSaving} onClick={saveAccount}>{accountSaving ? "Saving…" : editingKey ? "Save changes" : "Add account"}</button>
+              <button className="secondary-button" disabled={accountSaving} onClick={closeAccountForm}>Cancel</button>
             </div>
+            {!accountNotice?.field && <SaveNotice notice={accountNotice} />}
           </ModuleCard>
-          <ModuleCard eyebrow="Account List" title="All Accounts" subtitle="Inactive accounts remain in history and can be reactivated.">
+          )}
+          <ModuleCard
+            actions={!accountFormOpen && masterTypeOptions.length > 0 ? <button className="primary-button" onClick={openNewAccountForm}><Icon name="add" /> Add account</button> : null}
+            eyebrow="Account master"
+            title="All accounts"
+            subtitle="Customers, suppliers and other accounts. Inactive accounts stay in history and can be made active again."
+          >
             <div className="ledger-toolbar">
               <Field label="Search"><input placeholder="Search account or mobile" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
               <button className="secondary-button" onClick={onReload}>Refresh</button>
             </div>
+            <SaveNotice notice={accountListNotice} />
             <DataTable headers={markNumericColumns(["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", "Actions"])}>
               {filteredAccounts.map((account) => (
                 <tr key={account.account_key}>
@@ -23346,6 +23505,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                   <td><button className="table-action" disabled={!canEditAccountRow(account, accountPermissions)} onClick={() => editAccount(account)} title={!account.system_account && !canEditAccountRow(account, accountPermissions) ? "Your role cannot change this type of account." : undefined}>{account.system_account ? "Protected" : "Edit"}</button></td>
                 </tr>
               ))}
+              {filteredAccounts.length === 0 && (
+                <tr><td className="empty-cell" colSpan={8}>{search ? "No account matches this search." : "No accounts yet. Press Add account to make the first one."}</td></tr>
+              )}
             </DataTable>
           </ModuleCard>
         </>
@@ -23367,13 +23529,14 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
             </Field>
             <button className="secondary-button" onClick={() => loadLedger(ledgerAccountKey)}>Refresh Ledger</button>
           </div>
-          <div className="ledger-toolbar">
+          <div className="ledger-toolbar ledger-dates-toolbar">
             <Field label="Statement From"><input type="date" value={ledgerDateRange.date_from} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_from: event.target.value })} /></Field>
             <Field label="Statement To"><input type="date" value={ledgerDateRange.date_to} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_to: event.target.value })} /></Field>
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Statement</button>
             <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting…" : "PDF Export"}</button>
             <button className="whatsapp-button" disabled={!accountLedger.account || ledgerExporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setLedgerWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
           </div>
+          <SaveNotice notice={ledgerNotice} />
           <div ref={ledgerPrintRef} className="print-area report-paper">
             <header className="report-print-header">
               <BrandLogo invoice />
@@ -23397,7 +23560,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                   <td>{currency.format(Number(row.debit || 0))}</td>
                   <td>{currency.format(Number(row.credit || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
-                  <td>{row.remarks || MISSING_VALUE}</td>
+                  <td className="wrap-cell">{row.remarks || MISSING_VALUE}</td>
                 </tr>
               ))}
               {printableLedgerRows.length === 0 && (
@@ -23422,32 +23585,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       )}
 
       {tab === "payments" && (
-        <ModuleCard eyebrow="Payments" title="Account Payments" subtitle="Receive customer payments, pay suppliers, or record supplier rebates.">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            {selectedSupplierSummary ? (
-              <>
-                <SummaryMetric label="Total Purchase" value={currency.format(selectedSupplierSummary.totalPurchases)} />
-                <SummaryMetric label="Total Paid" value={currency.format(selectedSupplierSummary.totalPaid)} />
-                <SummaryMetric label="Total Rebate Received" value={currency.format(selectedSupplierSummary.totalRebate)} positive />
-                <SummaryMetric label="Outstanding Payable" value={currency.format(selectedSupplierSummary.outstanding)} featured />
-              </>
-            ) : selectedCustomerSummary ? (
-              <>
-                <SummaryMetric label="Total Sales" value={currency.format(selectedCustomerSummary.totalSales)} />
-                <SummaryMetric label="Total Received" value={currency.format(selectedCustomerSummary.totalPaid)} />
-                <SummaryMetric label="Outstanding Receivable" value={currency.format(selectedCustomerSummary.outstanding)} featured />
-                <SummaryMetric label="Account Type" value="Customer" />
-              </>
-            ) : (
-              <>
-                {/* Nothing is outstanding "before" or "after" an account nobody has chosen. */}
-                <SummaryMetric label="Selected Account" value="None" />
-                <SummaryMetric label="Outstanding Before" value={MISSING_VALUE} />
-                <SummaryMetric label="Payment Impact" value={MISSING_VALUE} />
-                <SummaryMetric label="Outstanding After" value={MISSING_VALUE} featured />
-              </>
-            )}
-          </div>
+        <ModuleCard eyebrow="Payments" onChange={clearPaymentNotice} title={editingPaymentKey ? "Edit payment" : "Record a payment"} subtitle="Receive customer payments, pay suppliers, or record supplier rebates.">
           <div className="form-grid">
             <Field label="Payment Action">
               <select value={payment.payment_action} onChange={(event) => setPayment({ ...payment, payment_action: event.target.value, account_key: "", rebate_amount: "" })}>
@@ -23455,13 +23593,16 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               </select>
             </Field>
             <Field label="Account">
-              <select value={payment.account_key} onChange={(event) => refreshPaymentsForSelection(event.target.value)}>
+              <select aria-invalid={paymentNotice?.field === "payment-account" ? "true" : undefined} id="payment-account" value={payment.account_key} onChange={(event) => refreshPaymentsForSelection(event.target.value)}>
                 <option value="">Select account</option>
                 {paymentAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {labelFor("accountType", account.account_type)}</option>)}
               </select>
+              {/* The account's history in one line; the before and after figures are the tiles below. */}
+              {selectedSupplierSummary && <small className="cell-note">{`Purchases ${currency.format(selectedSupplierSummary.totalPurchases)} · Paid ${currency.format(selectedSupplierSummary.totalPaid)} · Rebate ${currency.format(selectedSupplierSummary.totalRebate)}`}</small>}
+              {selectedCustomerSummary && <small className="cell-note">{`Sales ${currency.format(selectedCustomerSummary.totalSales)} · Received ${currency.format(selectedCustomerSummary.totalPaid)}`}</small>}
             </Field>
             <Field label="Payment Date"><input type="date" value={payment.payment_date} onChange={(event) => setPayment({ ...payment, payment_date: event.target.value })} /></Field>
-            <Field label={isSupplierPayment ? "Payment Amount" : "Payment Amount / Receipt"}><input min="0" step="0.01" type="number" value={payment.amount} onChange={(event) => setPayment({ ...payment, amount: event.target.value })} /></Field>
+            <Field label={<RequiredLabel>{isSupplierPayment ? "Amount paid" : "Amount received"}</RequiredLabel>}><input aria-invalid={paymentNotice?.field === "payment-amount" ? "true" : undefined} id="payment-amount" min="0" step="0.01" type="number" value={payment.amount} onChange={(event) => setPayment({ ...payment, amount: event.target.value })} /></Field>
             {isSupplierPayment && <Field label="Rebate Received"><input min="0" step="0.01" type="number" value={payment.rebate_amount} onChange={(event) => setPayment({ ...payment, rebate_amount: event.target.value })} /></Field>}
             <Field label="Payment Mode">
               <select value={payment.payment_mode} onChange={(event) => setPayment({ ...payment, payment_mode: event.target.value })}>
@@ -23473,19 +23614,22 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
           </div>
           <div className="purchase-summary-grid supplier-payment-preview">
             <SummaryMetric label={isSupplierPayment ? "Outstanding Payable Before" : "Outstanding Receivable Before"} value={payment.account_key ? currency.format(outstandingBefore) : MISSING_VALUE} />
-            <SummaryMetric label="Payment Amount" value={currency.format(paymentAmount)} />
+            <SummaryMetric label={isSupplierPayment ? "This payment" : "This receipt"} value={currency.format(paymentAmount)} />
             {isSupplierPayment && <SummaryMetric label="Rebate Received" value={currency.format(rebateAmount)} positive />}
             <SummaryMetric label={balancePreview.overpaid ? "Balance After Payment (advance)" : "Balance After Payment"} value={payment.account_key ? currency.format(outstandingAfter) : MISSING_VALUE} featured />
           </div>
           {overpaymentNote && <div className="warning-note" role="status">{overpaymentNote}</div>}
           <div className="button-row">
-            <button className="primary-button" onClick={savePayment}>{editingPaymentKey ? "Update Payment" : "Save Payment"}</button>
-            {editingPaymentKey && <button className="secondary-button" onClick={() => { setEditingPaymentKey(""); setPayment({ payment_action: canUseCustomerPayments ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER", account_key: "", payment_date: toDateKey(new Date()), amount: "", rebate_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" }); }}>Cancel Edit</button>}
+            <button className="primary-button" disabled={paymentSaving} onClick={savePayment}>{paymentSaving ? "Saving…" : editingPaymentKey ? "Save changes" : "Save payment"}</button>
+            {editingPaymentKey && <button className="secondary-button" onClick={() => { clearPaymentNotice(); setEditingPaymentKey(""); setPayment({ payment_action: canUseCustomerPayments ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER", account_key: "", payment_date: toDateKey(new Date()), amount: "", rebate_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" }); }}>Cancel Edit</button>}
           </div>
+          <SaveNotice notice={paymentNotice} />
+          <h3 className="section-subheading">Payment history</h3>
           <div className="ledger-toolbar">
             <button className="secondary-button" onClick={() => onPaymentsLoad(payment.account_key)}>Refresh Payment History</button>
             <button className="secondary-button" onClick={() => onPaymentsLoad()}>Show All Payments</button>
           </div>
+          <SaveNotice notice={paymentListNotice} />
           <DataTable headers={markNumericColumns(["Date", "Party", "Type", "Payment", "Rebate", "Mode", "Status", "Reference", "Remarks", "Actions"], { also: ["Payment"] })}>
             {(accountPayments || []).map((row) => (
               <tr key={row.payment_key}>
@@ -23617,6 +23761,9 @@ function SettingsModule({
    * screen they were last editing.
    */
   const [settingsGroup, setSettingsGroup] = useState(null);
+  // Kept here, not in the cards: both cards are remounted with fresh rows after each save.
+  const [permissionNotice, showPermissionNotice, clearPermissionNotice] = useSaveNotice();
+  const [userNotice, showUserNotice, clearUserNotice] = useSaveNotice();
   /**
    * Open the group that holds a searched-for section, then scroll to it.
    *
@@ -23690,8 +23837,8 @@ function SettingsModule({
     "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
     "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
     "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} onChanged={onDiscountRulesChanged} saleRateSettings={settingsData.saleRateSettings} unavailableReason={discountUnavailableReason} />,
-    "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
-    "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
+    "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} notice={permissionNotice} onClearNotice={clearPermissionNotice} onNotice={showPermissionNotice} onReload={onReload} roles={settingsData.roles} user={user} />,
+    "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} notice={userNotice} onClearNotice={clearUserNotice} onNotice={showUserNotice} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
@@ -23767,21 +23914,20 @@ function SettingsModule({
   return (
     <section className="settings-layout">
       {banner}
-      <section className="content-card">
-        <p className="form-note">Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.</p>
-        <section className="report-center-grid">
-          {SETTINGS_GROUPS.map((group) => {
-            const count = sectionsInGroup(group.id).length;
-            return (
-              <button className="report-menu-card" key={group.id} onClick={() => setSettingsGroup(group.id)} type="button">
-                <Icon name={group.icon} size={22} />
-                <strong>{group.label}</strong>
-                <span>{group.description}</span>
-                <span className="settings-group-count">{count} setting{count === 1 ? "" : "s"}</span>
-              </button>
-            );
-          })}
-        </section>
+      {/* The same cards as Report Center's, so the two choosers look like one app. */}
+      <ModuleCard eyebrow="Settings" title="What do you want to set up?" subtitle="Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting." />
+      <section className="report-center-grid settings-group-grid">
+        {SETTINGS_GROUPS.map((group) => {
+          const count = sectionsInGroup(group.id).length;
+          return (
+            <button className="report-category-card" key={group.id} onClick={() => setSettingsGroup(group.id)} type="button">
+              <span className="report-category-icon"><Icon name={group.icon} size={24} /></span>
+              <strong>{group.label}</strong>
+              <span>{group.description}</span>
+              <em className="settings-group-count">{count} setting{count === 1 ? "" : "s"}</em>
+            </button>
+          );
+        })}
       </section>
     </section>
   );
@@ -23799,8 +23945,8 @@ function AppearanceAccessibilitySettings({
   // nothing about what they are about to get, and the answer changes without them touching it.
   const resolved = resolveTheme(themeMode, systemPrefersDark);
   return (
-    <ModuleCard eyebrow="Appearance / Accessibility" title="Display Typography" subtitle="Device-local display preference. This changes the app UI only; invoices and report print typography stay on their own print profiles.">
-      <div className="form-grid supplier-form-grid">
+    <ModuleCard eyebrow="Appearance / Accessibility" title="Display Typography" subtitle="Light or dark, and how big the text is, on this computer only. Printed bills and reports keep their own sizes.">
+      <div className="form-grid supplier-form-grid display-settings-grid">
         <Field label="Display Mode">
           <select onChange={(event) => setThemeMode?.(event.target.value)} value={themeMode}>
             {THEME_MODES.map((mode) => (
@@ -23874,6 +24020,26 @@ const settleSettingsSave = async (onReload, resetDraft) => {
   return refreshed;
 };
 
+/**
+ * A settings card's Save: one save at a time, and what happened said under the button instead of a
+ * browser popup. `run(task, failure)`: the task returns the notice to show (or nothing); a thrown
+ * error is shown in the server's plain words, or `failure`.
+ */
+function useSettingsSave() {
+  const [notice, showNotice, clearNotice] = useSaveNotice();
+  const [saving, runSave] = useSaveInFlight();
+  const run = useCallback((task, failure) => runSave(async () => {
+    clearNotice();
+    try {
+      const outcome = await task();
+      if (outcome) showNotice(outcome);
+    } catch (error) {
+      showNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, failure)));
+    }
+  }), [clearNotice, runSave, showNotice]);
+  return { clearNotice, notice, run, saving, showNotice };
+}
+
 function BusinessSettingsSection({ businessSettings, canManage, onReload, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(businessSettings, defaultBusinessSettings);
   const [logoMessage, setLogoMessage] = useState("");
@@ -23909,19 +24075,15 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
     event.preventDefault();
     takeLogo(found.file, found.message);
   };
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
-      setLogoMessage("");
-      await settleSettingsSave(onReload, resetDraft);
-      alert("Business settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update business settings"));
-    }
-  };
+  const businessSave = useSettingsSave();
+  const save = () => businessSave.run(async () => {
+    await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
+    setLogoMessage("");
+    return settingsSavedNotice("Business identity", await settleSettingsSave(onReload, resetDraft));
+  }, "The business details could not be saved. Nothing was changed; try again.");
 
   return (
-    <ModuleCard eyebrow="Business Settings" title="Business Identity" subtitle="The name and logo at the top of every screen and on bills, and the shop's invoice details.">
+    <ModuleCard eyebrow="Business Settings" title="Business Identity" onChange={businessSave.clearNotice} subtitle="The name and logo at the top of every screen and on bills, and the shop's invoice details.">
       <div className="brand-identity-editor">
         <div className="brand-identity-preview">
           <span className="product-photo-label">How the top of the app will look</span>
@@ -24007,7 +24169,10 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
         <Field label="Address"><textarea disabled={!canManage} value={draft.address || ""} onChange={(event) => updateDraft("address", event.target.value)} /></Field>
         <Field label="Invoice Footer Text"><textarea disabled={!canManage} value={draft.invoice_footer_text || ""} onChange={(event) => updateDraft("invoice_footer_text", event.target.value)} /></Field>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Business Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || businessSave.saving} onClick={save}>{businessSave.saving ? "Saving…" : "Save Business Settings"}</button>
+      </div>
+      <SaveNotice notice={businessSave.notice} />
     </ModuleCard>
   );
 }
@@ -24197,7 +24362,8 @@ function ScaleConnectionPanel() {
       <div className="button-row">
         <button className="primary-button" disabled={work.busy} type="button" onClick={find}>{work.busy ? "Working…" : "Find scale"}</button>
         <button className="secondary-button" disabled={work.busy || !port} type="button" onClick={connect}>Connect</button>
-        <button className="secondary-button" disabled={work.busy} type="button" onClick={disconnect}>Disconnect</button>
+        {/* Nothing to disconnect while no scale is connected or being connected. */}
+        <button className="secondary-button" disabled={work.busy || [SCALE_STATES.OFF, SCALE_STATES.UNAVAILABLE].includes(view.state)} type="button" onClick={disconnect}>Disconnect</button>
         <button className="secondary-button" disabled={work.busy || ports.status === "loading"} type="button" onClick={loadPorts}>Refresh ports</button>
       </div>
       {work.message && <p className={work.tone === "error" ? "inline-error" : work.tone === "warning" ? "stock-low" : "form-note"} role={work.tone === "error" ? "alert" : "status"}>{work.message}</p>}
@@ -24211,40 +24377,39 @@ function ScaleConnectionPanel() {
 
 function PosSettingsSection({ canManage, onReload, posSettings, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(posSettings, defaultPosSettings);
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/pos`, { ...draft, updated_by: user.id });
-      await settleSettingsSave(onReload, resetDraft);
-      alert("POS settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update POS settings"));
-    }
-  };
+  const posSave = useSettingsSave();
+  const save = () => posSave.run(async () => {
+    await axios.put(`${API_URL}/settings/pos`, { ...draft, updated_by: user.id });
+    return settingsSavedNotice("Scale setting", await settleSettingsSave(onReload, resetDraft));
+  }, "The scale setting could not be saved. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="A scale on the counter puts the weight straight into the bill. Weights can always be typed in by hand.">
+    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" onChange={posSave.clearNotice} subtitle="A scale on the counter puts the weight straight into the bill. Weights can always be typed in by hand.">
       <div className="form-grid supplier-form-grid">
         <label className="check-field"><input checked={draft.enable_weighing_scale === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_weighing_scale", event.target.checked)} /><span>Use the weighing scale in POS (all counters)</span></label>
       </div>
       <p className="form-note">In POS, put the fruit on the scale and add the item: its steady weight becomes the quantity (kg items only). F6 reads the weight again into the item being edited.</p>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save POS Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || posSave.saving} onClick={save}>{posSave.saving ? "Saving…" : "Save POS Settings"}</button>
+      </div>
+      <SaveNotice notice={posSave.notice} />
       <ScaleConnectionPanel />
     </ModuleCard>
   );
 }
 
-function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) {
+function PaymentSettingsSection({ canManage, onReload, paymentSettings: storedPaymentSettings, user }) {
+  // The saved rate reads "0" or "2.5", not the database's "0.000"; what is typed is left alone.
+  const paymentSettings = useMemo(() => (storedPaymentSettings
+    ? { ...storedPaymentSettings, sales_mandi_tax_percent: tidyStoredDecimal(storedPaymentSettings.sales_mandi_tax_percent) }
+    : storedPaymentSettings), [storedPaymentSettings]);
   const { draft, updateDraft, resetDraft } = useSettingsDraft(paymentSettings, defaultPaymentSettings);
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/payment`, { ...draft, updated_by: user.id });
-      await settleSettingsSave(onReload, resetDraft);
-      alert("Payment settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update payment settings"));
-    }
-  };
+  const paymentSave = useSettingsSave();
+  const save = () => paymentSave.run(async () => {
+    await axios.put(`${API_URL}/settings/payment`, { ...draft, updated_by: user.id });
+    return settingsSavedNotice("Payment and tax settings", await settleSettingsSave(onReload, resetDraft));
+  }, "The payment settings could not be saved. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Payment & Tax Settings" title="UPI, Payment QR and Sales Mandi Tax" subtitle="Configure invoice payment QR and registered-customer Mandi Tax rules used by POS, print, PDF and WhatsApp exports.">
+    <ModuleCard eyebrow="Payment & Tax Settings" title="UPI, Payment QR and Sales Mandi Tax" onChange={paymentSave.clearNotice} subtitle="Configure invoice payment QR and registered-customer Mandi Tax rules used by POS, print, PDF and WhatsApp exports.">
       <div className="form-grid supplier-form-grid">
         <Field label="Business UPI ID"><input disabled={!canManage} placeholder="name@bank" value={draft.business_upi_id || ""} onChange={(event) => updateDraft("business_upi_id", event.target.value)} /></Field>
         <Field label="Payee Name"><input disabled={!canManage} value={draft.upi_payee_name || ""} onChange={(event) => updateDraft("upi_payee_name", event.target.value)} /></Field>
@@ -24258,7 +24423,7 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         <label className="check-field"><input checked={draft.enable_upi_qr_on_invoice === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_upi_qr_on_invoice", event.target.checked)} /><span>Enable UPI QR on Invoice</span></label>
         <label className="check-field"><input checked={draft.show_upi_qr_on_all_bills === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_upi_qr_on_all_bills", event.target.checked)} /><span>Show UPI QR on all bills</span></label>
         <label className="check-field"><input checked={draft.enable_sales_mandi_tax === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_sales_mandi_tax", event.target.checked)} /><span>Enable Mandi Tax on registered-customer sales</span></label>
-        <Field label="Sales Mandi Tax Rate (%)"><input disabled={!canManage} min="0" step="0.001" type="number" value={draft.sales_mandi_tax_percent || 0} onChange={(event) => updateDraft("sales_mandi_tax_percent", event.target.value)} /></Field>
+        <Field label="Sales Mandi Tax Rate (%)"><input disabled={!canManage} min="0" step="0.001" type="number" value={draft.sales_mandi_tax_percent ?? ""} onChange={(event) => updateDraft("sales_mandi_tax_percent", event.target.value)} /></Field>
         <Field label="Customer Applicability">
           <select disabled={!canManage} value={draft.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS"} onChange={(event) => updateDraft("sales_mandi_tax_customer_scope", event.target.value)}>
             <option value="REGISTERED_CUSTOMERS">Registered/Saved Customer Accounts</option>
@@ -24286,7 +24451,10 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         {draft.enable_sales_mandi_tax === true && Number(draft.sales_mandi_tax_percent || 0) <= 0 && <p className="form-note stock-low">Enter a Mandi Tax rate before saving registered-customer sales with tax.</p>}
         {draft.enable_sales_mandi_tax !== true && <p className="form-note">Mandi Tax warnings stay disabled in POS while this setting is off. Use the reason field to document why it is not applicable.</p>}
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || paymentSave.saving} onClick={save}>{paymentSave.saving ? "Saving…" : "Save Payment Settings"}</button>
+      </div>
+      <SaveNotice notice={paymentSave.notice} />
     </ModuleCard>
   );
 }
@@ -24348,25 +24516,29 @@ function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }
 
 function MandiTaxSettings({ canManage, onReload, rules, user }) {
   const [newRule, setNewRule] = useState({ origin_type: "", tax_percent: "", active: true });
-  const addRule = async () => {
-    try {
-      await axios.post(`${API_URL}/settings/mandi-tax-rules`, { ...newRule, updated_by: user.id });
-      setNewRule({ origin_type: "", tax_percent: "", active: true });
-      await onReload();
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to add mandi tax rule"));
-    }
-  };
+  // One notice for the card: adding a rule, and saving or removing one in the table.
+  const mandiSave = useSettingsSave();
+  const addRule = () => mandiSave.run(async () => {
+    await axios.post(`${API_URL}/settings/mandi-tax-rules`, { ...newRule, updated_by: user.id });
+    const added = `${labelFor("origin", newRule.origin_type) || newRule.origin_type || "The"} mandi tax rule added.`;
+    setNewRule({ origin_type: "", tax_percent: "", active: true });
+    await onReload();
+    return successNotice(added);
+  }, "The mandi tax rule could not be added. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Mandi Tax Settings" title="Origin-Based Mandi Tax" subtitle="Database-backed tax percentages for local and imported fruit purchases.">
+    <ModuleCard eyebrow="Mandi Tax Settings" title="Origin-Based Mandi Tax" onChange={mandiSave.clearNotice} subtitle="The mandi tax percentage on purchases, by where the fruit comes from (local or imported).">
       <div className="form-grid settings-add-grid">
         <Field label="Origin Type"><input disabled={!canManage} placeholder="LOCAL or IMPORTED" value={newRule.origin_type} onChange={(event) => setNewRule({ ...newRule, origin_type: event.target.value.toUpperCase() })} /></Field>
         <Field label="Tax Percentage"><input disabled={!canManage} min="0" step="0.001" type="number" value={newRule.tax_percent} onChange={(event) => setNewRule({ ...newRule, tax_percent: event.target.value })} /></Field>
         <label className="check-field"><input disabled={!canManage} checked={newRule.active} type="checkbox" onChange={(event) => setNewRule({ ...newRule, active: event.target.checked })} /><span>Active</span></label>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={addRule}>Add Mandi Tax Rule</button>
-      <DataTable headers={["Origin Type", "Tax Percentage", "Status", ""]}>
-        {rules.map((rule) => <MandiRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || mandiSave.saving} onClick={addRule}>{mandiSave.saving ? "Adding…" : "Add Mandi Tax Rule"}</button>
+      </div>
+      <SaveNotice notice={mandiSave.notice} />
+      <DataTable headers={["Origin Type", { label: "Tax Percentage", numeric: true }, "Status", ""]}>
+        {rules.map((rule) => <MandiRuleRow canManage={canManage} key={rule.id} onNotice={mandiSave.showNotice} onReload={onReload} rule={rule} user={user} />)}
+        {rules.length === 0 && <tr><td className="empty-cell" colSpan={4}>No mandi tax rules yet.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -24389,8 +24561,10 @@ function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
   const blank = { charge_name: "", basis: "FLAT", measure_unit: "", flat_rate: "" };
   const [draft, setDraft] = useState(blank);
   const slabbed = draft.basis === "SLAB";
+  const chargeSave = useSettingsSave();
 
-  const addChargeType = async () => {
+  const addChargeType = () => chargeSave.run(async () => {
+    const added = draft.charge_name.trim() || "The charge";
     try {
       await axios.post(`${API_URL}/settings/charge-types`, {
         charge_name: draft.charge_name,
@@ -24403,15 +24577,17 @@ function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
       });
       setDraft(blank);
       await onReload();
+      return successNotice(`${added} added.${slabbed ? " Add its rates in the table below." : ""}`);
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to add this charge"));
+      return errorNotice(getSettingsWriteErrorMessage(error, "This charge could not be added. Nothing was changed; try again."));
     }
-  };
+  }, "This charge could not be added. Nothing was changed; try again.");
 
   return (
     <ModuleCard
       eyebrow="Charge Settings"
       title="Other Charges"
+      onChange={chargeSave.clearNotice}
       subtitle="Crate, labour, delivery, or anything else you charge for. Set one rate, or a rate that depends on a measurement."
     >
       <div className="form-grid settings-add-grid">
@@ -24453,21 +24629,25 @@ function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
             </Field>
           )}
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={addChargeType}>Add Charge</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || chargeSave.saving} onClick={addChargeType}>{chargeSave.saving ? "Adding…" : "Add Charge"}</button>
+      </div>
       {slabbed && <p className="form-note">Add the charge first, then add its rates below — 10 kg costs 40, 20 kg costs 50, and so on.</p>}
+      <SaveNotice notice={chargeSave.notice} />
 
       <DataTable headers={["Charge", "Priced By", "Rates", "Status", ""]}>
         {chargeTypes.map((chargeType) => (
-          <ChargeTypeRow canManage={canManage} chargeType={chargeType} key={chargeType.id} onReload={onReload} user={user} />
+          <ChargeTypeRow canManage={canManage} chargeType={chargeType} key={chargeType.id} onNotice={chargeSave.showNotice} onReload={onReload} user={user} />
         ))}
+        {!chargeTypes.length && <tr><td className="empty-cell" colSpan={5}>No charges set up yet.</td></tr>}
       </DataTable>
-      {!chargeTypes.length && <p className="form-note">No charges set up yet.</p>}
     </ModuleCard>
   );
 }
 
 /** One charge and its rates. Slabs are edited here because a slab means nothing on its own. */
-function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
+function ChargeTypeRow({ canManage, chargeType, onNotice = () => {}, onReload, user }) {
+  const confirmTurnOff = useConfirm();
   const [slabDraft, setSlabDraft] = useState({ upto_value: "", rate: "" });
   const slabs = [...(chargeType.slabs || [])].sort((first, second) => Number(first.upto_value) - Number(second.upto_value));
   const unit = chargeType.measure_unit || "";
@@ -24482,8 +24662,9 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
       });
       setSlabDraft({ upto_value: "", rate: "" });
       await onReload();
+      onNotice(successNotice(`Rate added to ${chargeType.charge_name}.`));
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to add this rate"));
+      onNotice(errorNotice(getSettingsWriteErrorMessage(error, `The rate could not be added to ${chargeType.charge_name}. Nothing was changed; try again.`)));
     }
   };
 
@@ -24491,18 +24672,27 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
     try {
       await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/slabs/${slabId}/deactivate`, { updated_by: user.id });
       await onReload();
+      onNotice(successNotice(`Rate removed from ${chargeType.charge_name}.`));
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to remove this rate"));
+      onNotice(errorNotice(getSettingsWriteErrorMessage(error, `The rate could not be removed from ${chargeType.charge_name}. Nothing was changed; try again.`)));
     }
   };
 
   const retireCharge = async () => {
-    if (!window.confirm(`Turn off "${chargeType.charge_name}"? It will stop appearing on new bills. Bills that already carry it keep it.`)) return;
+    const sure = await confirmTurnOff({
+      title: `Turn off "${chargeType.charge_name}"?`,
+      message: "It will stop appearing on new bills. Bills that already carry it keep it.",
+      confirmLabel: "Turn off",
+      cancelLabel: "Keep it on",
+      tone: "danger",
+    });
+    if (!sure) return;
     try {
       await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/deactivate`, { updated_by: user.id });
       await onReload();
+      onNotice(successNotice(`${chargeType.charge_name} turned off. New bills no longer offer it.`));
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to turn off this charge"));
+      onNotice(errorNotice(getSettingsWriteErrorMessage(error, `${chargeType.charge_name} could not be turned off. Nothing was changed; try again.`)));
     }
   };
 
@@ -24517,7 +24707,7 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
               {slabs.filter((slab) => slab.active !== false).map((slab) => (
                 <div className="charge-slab-row" key={slab.id}>
                   <span>up to {slab.upto_value} {unit} — {currency.format(Number(slab.rate || 0))}</span>
-                  <button className="remove-button" disabled={!canManage} onClick={() => retireSlab(slab.id)}><Icon name="trash" size={14} /></button>
+                  <button aria-label={`Remove the rate up to ${slab.upto_value} ${unit}`} className="remove-button" disabled={!canManage} onClick={() => retireSlab(slab.id)} title="Remove rate"><Icon name="trash" size={14} /></button>
                 </div>
               ))}
               {!slabs.some((slab) => slab.active !== false) && <p className="form-note stock-low">No rates yet — this charge cannot be billed until one is added.</p>}
@@ -24542,25 +24732,28 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
 
 function RebateSettings({ canManage, onReload, rules, user }) {
   const [newRule, setNewRule] = useState({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
-  const addRebateRule = async () => {
-    try {
-      await axios.post(`${API_URL}/settings/rebate-rules`, { ...newRule, updated_by: user.id });
-      setNewRule({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
-      await onReload();
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to add rebate rule"));
-    }
-  };
+  const rebateSave = useSettingsSave();
+  const addRebateRule = () => rebateSave.run(async () => {
+    await axios.post(`${API_URL}/settings/rebate-rules`, { ...newRule, updated_by: user.id });
+    const added = `Rebate rule ${newRule.rule_name ? `"${newRule.rule_name}" ` : ""}added.`;
+    setNewRule({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+    await onReload();
+    return successNotice(added);
+  }, "The rebate rule could not be added. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Supplier Rebate Settings" title="Payment-Speed Rebate Slabs" subtitle="Owner/Admin can change payment days, rebate percentages and active status from software.">
+    <ModuleCard eyebrow="Supplier Rebate Settings" title="Payment-Speed Rebate Slabs" onChange={rebateSave.clearNotice} subtitle="The rebate a supplier gives when paid within so many days.">
       <div className="form-grid settings-add-grid">
         <Field label="Rule Name"><input disabled={!canManage} value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
         <Field label="Pay Within Days"><input disabled={!canManage} min="0" type="number" value={newRule.pay_within_days} onChange={(event) => setNewRule({ ...newRule, pay_within_days: event.target.value })} /></Field>
         <Field label="Rebate Percentage"><input disabled={!canManage} min="0" step="0.001" type="number" value={newRule.rebate_percent} onChange={(event) => setNewRule({ ...newRule, rebate_percent: event.target.value })} /></Field>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={addRebateRule}>Add Rebate Rule</button>
-      <DataTable headers={["Rule", "Pay Within Days", "Rebate Percentage", "Status", ""]}>
-        {rules.map((rule) => <RebateRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || rebateSave.saving} onClick={addRebateRule}>{rebateSave.saving ? "Adding…" : "Add Rebate Rule"}</button>
+      </div>
+      <SaveNotice notice={rebateSave.notice} />
+      <DataTable headers={["Rule", { label: "Pay Within Days", numeric: true }, { label: "Rebate Percentage", numeric: true }, "Status", ""]}>
+        {rules.map((rule) => <RebateRuleRow canManage={canManage} key={rule.id} onNotice={rebateSave.showNotice} onReload={onReload} rule={rule} user={user} />)}
+        {rules.length === 0 && <tr><td className="empty-cell" colSpan={5}>No rebate rules yet.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -24568,17 +24761,13 @@ function RebateSettings({ canManage, onReload, rules, user }) {
 
 function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(saleRateSettings, defaultSaleRateSettings);
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/sale-rate`, { ...draft, updated_by: user.id });
-      await settleSettingsSave(onReload, resetDraft);
-      alert("Sale rate settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update sale rate settings"));
-    }
-  };
+  const saleRateSave = useSettingsSave();
+  const save = () => saleRateSave.run(async () => {
+    await axios.put(`${API_URL}/settings/sale-rate`, { ...draft, updated_by: user.id });
+    return settingsSavedNotice("Sale rate settings", await settleSettingsSave(onReload, resetDraft));
+  }, "The sale rate settings could not be saved. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="How Sale Rate Update suggests a rate from each lot's cost. A suggestion is only filled in when you choose it.">
+    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" onChange={saleRateSave.clearNotice} subtitle="How Sale Rate Update suggests a rate from each lot's cost. A suggestion is only filled in when you choose it.">
       <p className="form-note">The margin is on cost: a ₹100 cost at 25% suggests ₹125. Sale Rate Update starts at this margin; changing it on that screen does not change this setting.</p>
       <div className="form-grid settings-add-grid">
         <Field label="Target margin on cost %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent ?? ""} onChange={(event) => updateDraft("desired_margin_percent", event.target.value)} /></Field>
@@ -24597,7 +24786,10 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
         <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => updateDraft("suggestion_enabled", event.target.checked)} /><span>Show suggested rates</span></label>
         <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Sale Rate Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || saleRateSave.saving} onClick={save}>{saleRateSave.saving ? "Saving…" : "Save Sale Rate Settings"}</button>
+      </div>
+      <SaveNotice notice={saleRateSave.notice} />
     </ModuleCard>
   );
 }
@@ -24879,9 +25071,11 @@ function DiscountSettings({ canManage, onChanged, saleRateSettings = {}, unavail
   );
 }
 
-function MandiRuleRow({ canManage, onReload, rule, user }) {
-  const [taxPercent, setTaxPercent] = useState(rule.tax_percent);
+function MandiRuleRow({ canManage, onNotice = () => {}, onReload, rule, user }) {
+  const [taxPercent, setTaxPercent] = useState(() => tidyStoredDecimal(rule.tax_percent));
   const [active, setActive] = useState(rule.active);
+  const confirmRemove = useConfirm();
+  const ruleName = labelFor("origin", rule.origin_type);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/mandi-tax-rules/${rule.id}`, {
@@ -24890,16 +25084,27 @@ function MandiRuleRow({ canManage, onReload, rule, user }) {
         updated_by: user.id,
       });
       await onReload();
+      onNotice(successNotice(`${ruleName} mandi tax saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update mandi tax rule"));
+      onNotice(errorNotice(getErrorMessage(error, `The ${ruleName} rule could not be saved. Nothing was changed; try again.`)));
     }
   };
   const remove = async () => {
+    // It used to go on one click of the bin.
+    const sure = await confirmRemove({
+      title: `Remove the ${ruleName} mandi tax rule?`,
+      message: "New purchases from this origin will carry no mandi tax until a rule is added again. Bills already saved keep theirs.",
+      confirmLabel: "Remove rule",
+      cancelLabel: "Keep rule",
+      tone: "danger",
+    });
+    if (!sure) return;
     try {
       await axios.delete(`${API_URL}/settings/mandi-tax-rules/${rule.id}`, { data: { updated_by: user.id } });
       await onReload();
+      onNotice(successNotice(`${ruleName} mandi tax rule removed.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to delete mandi tax rule"));
+      onNotice(errorNotice(getErrorMessage(error, `The ${ruleName} rule could not be removed. Nothing was changed; try again.`)));
     }
   };
   return (
@@ -24907,27 +25112,40 @@ function MandiRuleRow({ canManage, onReload, rule, user }) {
       <td className="primary-cell">{labelFor("origin", rule.origin_type)}</td>
       <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={taxPercent} onChange={(event) => setTaxPercent(event.target.value)} /></td>
       <td><label className="check-field"><input checked={active} disabled={!canManage} type="checkbox" onChange={(event) => setActive(event.target.checked)} /><span>{active ? "Active" : "Inactive"}</span></label></td>
-      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
+      <td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button aria-label={`Remove the ${ruleName} rule`} className="remove-button" disabled={!canManage} onClick={remove} title="Remove rule"><Icon name="trash" size={15} /></button></div></td>
     </tr>
   );
 }
 
-function RebateRuleRow({ canManage, onReload, rule, user }) {
-  const [draft, setDraft] = useState(rule);
+function RebateRuleRow({ canManage, onNotice = () => {}, onReload, rule, user }) {
+  const [draft, setDraft] = useState(() => ({ ...rule, rebate_percent: tidyStoredDecimal(rule.rebate_percent) }));
+  const confirmRemove = useConfirm();
+  const ruleName = rule.rule_name || "this";
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/rebate-rules/${rule.id}`, { ...draft, updated_by: user.id });
       await onReload();
+      onNotice(successNotice(`Rebate rule "${draft.rule_name || ruleName}" saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update rebate rule"));
+      onNotice(errorNotice(getErrorMessage(error, "The rebate rule could not be saved. Nothing was changed; try again.")));
     }
   };
   const remove = async () => {
+    // It used to go on one click of the bin.
+    const sure = await confirmRemove({
+      title: `Remove the rebate rule "${ruleName}"?`,
+      message: "Payments already recorded keep the rebate they had.",
+      confirmLabel: "Remove rule",
+      cancelLabel: "Keep rule",
+      tone: "danger",
+    });
+    if (!sure) return;
     try {
       await axios.delete(`${API_URL}/settings/rebate-rules/${rule.id}`, { data: { updated_by: user.id } });
       await onReload();
+      onNotice(successNotice(`Rebate rule "${ruleName}" removed.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to delete rebate rule"));
+      onNotice(errorNotice(getErrorMessage(error, "The rebate rule could not be removed. Nothing was changed; try again.")));
     }
   };
   return (
@@ -24936,7 +25154,7 @@ function RebateRuleRow({ canManage, onReload, rule, user }) {
       <td><input className="table-input" disabled={!canManage} min="0" type="number" value={draft.pay_within_days} onChange={(event) => setDraft({ ...draft, pay_within_days: event.target.value })} /></td>
       <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={draft.rebate_percent} onChange={(event) => setDraft({ ...draft, rebate_percent: event.target.value })} /></td>
       <td><label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
-      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
+      <td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button aria-label={`Remove the rebate rule ${ruleName}`} className="remove-button" disabled={!canManage} onClick={remove} title="Remove rule"><Icon name="trash" size={15} /></button></div></td>
     </tr>
   );
 }
@@ -24982,43 +25200,72 @@ const permissionLabels = [
   ["ai_settings_manage", "AI Settings"],
 ];
 
-function PermissionSettings({ canManage, onReload, roles, user }) {
+// Roles across the top, permissions down the side: 35 permissions used to be 35 columns, which put
+// each role's Save about 5000px to the right at 1366. Each role's Save sits under its name in the
+// table's (sticky) heading, so it is in view wherever the list is scrolled. The notice is kept by
+// Settings: this card is remounted with fresh rows after every save.
+function PermissionSettings({ canManage, notice = null, onClearNotice = () => {}, onNotice = () => {}, onReload, roles, user }) {
   const [drafts, setDrafts] = useState(() => {
     const next = {};
     for (const role of roles || []) next[role.role_name] = role.permissions || {};
     return next;
   });
+  const [savingRole, setSavingRole] = useState("");
+  const roleRows = roles || [];
+  const changedRoles = new Set(roleRows
+    .filter((role) => permissionLabels.some(([key]) => Boolean(drafts[role.role_name]?.[key]) !== Boolean(role.permissions?.[key])))
+    .map((role) => role.role_name));
   const toggle = (roleName, key) => {
+    onClearNotice();
     setDrafts((current) => ({
       ...current,
       [roleName]: { ...(current[roleName] || {}), [key]: !current[roleName]?.[key] },
     }));
   };
   const saveRole = async (roleName) => {
+    if (savingRole) return;
+    onClearNotice();
+    setSavingRole(roleName);
     try {
       await axios.put(`${API_URL}/settings/role-permissions/${encodeURIComponent(roleName)}`, {
         permissions: drafts[roleName] || {},
         updated_by: user.id,
       });
+      onNotice(successNotice(`${roleName} permissions saved. They apply from that person's next screen change.`));
       await onReload();
-      alert("Role permissions updated");
     } catch (error) {
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to update role permissions"));
+      onNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, `${roleName} permissions could not be saved. Nothing was changed; try again.`)));
+    } finally {
+      setSavingRole("");
     }
   };
+  const roleHeader = (role) => {
+    const locked = !canManage || role.role_name === "Owner";
+    const changed = changedRoles.has(role.role_name);
+    return {
+      label: (
+        <span className="permission-role-head">
+          <strong>{role.role_name}</strong>
+          {role.role_name === "Owner"
+            ? <small>Always everything</small>
+            : <button className={changed ? "table-action permission-save-changed" : "table-action"} disabled={locked || Boolean(savingRole)} onClick={() => saveRole(role.role_name)} type="button">{savingRole === role.role_name ? "Saving…" : changed ? "Save changes" : "Save"}</button>}
+        </span>
+      ),
+    };
+  };
   return (
-    <ModuleCard eyebrow="Role Management" title="Permission Matrix" subtitle="Owner/Admin can control access to billing, settings, tax, rebates, payments, reports and inventory functions.">
-      <p className="form-note">{`${permissionLabels.length} permissions, one column each: scroll the table sideways to see them all. The role stays in view.`}</p>
-      <DataTable className="permission-matrix-table" headers={["Role", ...permissionLabels.map(([, label]) => label), ""]}>
-        {(roles || []).map((role) => (
-          <tr key={role.role_name}>
-            <td className="primary-cell">{role.role_name}</td>
-            {permissionLabels.map(([key]) => (
-              <td key={key}>
-                <input checked={Boolean(drafts[role.role_name]?.[key])} disabled={!canManage || role.role_name === "Owner"} type="checkbox" onChange={() => toggle(role.role_name, key)} />
+    <ModuleCard eyebrow="Role Management" title="Permission Matrix" subtitle="What each role may open and change. Tick or untick, then press Save under the role's name.">
+      <SaveNotice notice={notice} />
+      {changedRoles.size > 0 && <p className="warning-note" role="status">{`Not saved yet: ${[...changedRoles].join(", ")}. Press Save changes under the role's name.`}</p>}
+      <DataTable className="permission-matrix-table" headers={["Permission", ...roleRows.map(roleHeader)]}>
+        {permissionLabels.map(([key, label]) => (
+          <tr key={key}>
+            <td className="primary-cell">{label}</td>
+            {roleRows.map((role) => (
+              <td className="permission-cell" key={role.role_name}>
+                <input aria-label={`${label} for ${role.role_name}`} checked={Boolean(drafts[role.role_name]?.[key])} disabled={!canManage || role.role_name === "Owner"} type="checkbox" onChange={() => toggle(role.role_name, key)} />
               </td>
             ))}
-            <td><button className="table-action" disabled={!canManage || role.role_name === "Owner"} onClick={() => saveRole(role.role_name)}>Save</button></td>
           </tr>
         ))}
       </DataTable>
@@ -25068,8 +25315,8 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
           <input checked={draft.require_exit_code_to_close !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("require_exit_code_to_close", event.target.checked)} />
           <span>Require Exit Code to Close App</span>
         </label>
-        <Field label="Current Owner/Admin Password"><PasswordInput disabled={!canManage} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Required only when changing exit code" /></Field>
-        <Field label="New Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={exitCode} onChange={(event) => setExitCode(event.target.value.replace(/\D/g, ""))} placeholder="Minimum 4 digits, recommended 6" /></Field>
+        <Field label="Current Owner/Admin Password"><PasswordInput disabled={!canManage} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Only to change the code" /></Field>
+        <Field label="New Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={exitCode} onChange={(event) => setExitCode(event.target.value.replace(/\D/g, ""))} placeholder="4+ digits, 6 is best" /></Field>
         <Field label="Confirm Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={confirmExitCode} onChange={(event) => setConfirmExitCode(event.target.value.replace(/\D/g, ""))} /></Field>
       </div>
       <div className="button-row">
@@ -25092,7 +25339,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
   );
 }
 
-function UserManagementSection({ canManage, onReload, roles = [], user, users = [] }) {
+function UserManagementSection({ canManage, notice = null, onClearNotice = () => {}, onNotice = () => {}, onReload, roles = [], user, users = [] }) {
   const emptyForm = {
     title: "",
     full_name: "",
@@ -25141,7 +25388,16 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
     setEditingId(null);
     setDraft(emptyForm);
   };
-  const saveUser = async () => {
+  const [userSaving, runUserSave] = useSaveInFlight();
+  // Said under Save, at the box it is about (the card is remounted after a save, so the notice is
+  // kept by Settings).
+  const refuse = (message, field) => {
+    onNotice(errorNotice(message, field));
+    if (field) focusField(field, { scroll: false });
+  };
+  const saveUser = () => runUserSave(async () => {
+    onClearNotice();
+    const wasEditing = Boolean(editingId);
     try {
       const duplicate = users.find((item) =>
         Number(item.id) !== Number(editingId || 0) &&
@@ -25152,30 +25408,29 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
         )
       );
       if (duplicate) {
-        if (duplicate.username?.trim().toLowerCase() === draft.username.trim().toLowerCase()) alert("This username already exists.");
-        else if (draft.mobile_number && duplicate.mobile_number === draft.mobile_number) alert("This mobile number already exists.");
-        else alert("This email already exists.");
+        const owner = duplicate.full_name || duplicate.username;
+        if (duplicate.username?.trim().toLowerCase() === draft.username.trim().toLowerCase()) refuse(`The username "${draft.username.trim()}" is already ${owner}'s. Choose another.`, "user-username");
+        else if (draft.mobile_number && duplicate.mobile_number === draft.mobile_number) refuse(`This mobile number is already ${owner}'s.`, "user-mobile");
+        else refuse(`This email is already ${owner}'s.`, "user-email");
         return;
       }
-      if (!draft.full_name.trim() || !draft.username.trim() || !draft.role) {
-        alert("Enter full name, username and role.");
-        return;
-      }
-      if (!editingId && (draft.password.length < 4 || draft.password !== draft.confirm_password)) {
-        alert("Enter matching password with at least 4 characters.");
-        return;
-      }
+      if (!draft.full_name.trim()) return refuse("Enter the person's name.", "user-name");
+      if (!draft.username.trim()) return refuse("Enter a username to sign in with.", "user-username");
+      if (!draft.role) return refuse("Choose a role.", "user-role");
+      if (!editingId && draft.password.length < 4) return refuse("Enter a password of at least 4 characters.", "user-password");
+      if (!editingId && draft.password !== draft.confirm_password) return refuse("The two passwords do not match. Type the same password in both boxes.", "user-confirm-password");
       const { title, ...rest } = draft;
       const payload = { ...rest, full_name: joinPersonName(title, draft.full_name), updated_by: user.id };
       if (editingId) await axios.put(`${API_URL}/users/${editingId}`, payload);
       else await axios.post(`${API_URL}/users`, payload);
+      const savedName = joinPersonName(title, draft.full_name) || draft.username;
       resetForm();
+      onNotice(successNotice(`${savedName} ${wasEditing ? "updated" : "added"}.`));
       await onReload();
-      alert(editingId ? "User updated" : "User added");
     } catch (error) {
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to save user"));
+      onNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The user could not be saved. Nothing was changed; try again.")));
     }
-  };
+  });
   const changePassword = async () => {
     if (!passwordTarget) return;
     try {
@@ -25235,11 +25490,12 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
       await onReload();
     } catch (error) {
       if (action === "delete") setDeleteTarget(null);
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to update user status"));
+      onNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, `${item.full_name || item.username} could not be changed. Nothing was changed; try again.`)));
     }
   };
   return (
-    <ModuleCard eyebrow="User Management" title="Owner User Administration" subtitle="Add, edit, reset password, deactivate and protect user records with transaction history.">
+    <ModuleCard eyebrow="User Management" title="Users" onChange={onClearNotice} subtitle="Add staff, change their role or password, and switch off anyone who has left. People with bills are switched off, never deleted.">
+      {editingId && <p className="form-note">{`Editing ${draft.full_name || draft.username || "this user"}. Press Save changes, or Cancel Edit to leave them as they were.`}</p>}
       <div className="form-grid supplier-form-grid">
         <Field label="Title">
           <select disabled={!canManage} value={draft.title} onChange={(event) => updateDraft("title", event.target.value)}>
@@ -25251,29 +25507,30 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
             ))}
           </select>
         </Field>
-        <Field label="Name"><input disabled={!canManage} value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
-        <Field label="Username"><input disabled={!canManage} value={draft.username} onChange={(event) => updateDraft("username", event.target.value)} /></Field>
-        <Field label="Mobile"><input disabled={!canManage} value={draft.mobile_number} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
-        <Field label="Email"><input disabled={!canManage} type="email" value={draft.email} onChange={(event) => updateDraft("email", event.target.value)} /></Field>
-        <Field label="Role">
-          <select disabled={!canManage} value={draft.role} onChange={(event) => updateDraft("role", event.target.value)}>
+        <Field label={<RequiredLabel>Name</RequiredLabel>}><input aria-invalid={notice?.field === "user-name" ? "true" : undefined} disabled={!canManage} id="user-name" value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
+        <Field label={<RequiredLabel>Username</RequiredLabel>}><input aria-invalid={notice?.field === "user-username" ? "true" : undefined} disabled={!canManage} id="user-username" value={draft.username} onChange={(event) => updateDraft("username", event.target.value)} /></Field>
+        <Field label="Mobile"><input aria-invalid={notice?.field === "user-mobile" ? "true" : undefined} disabled={!canManage} id="user-mobile" value={draft.mobile_number} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
+        <Field label="Email"><input aria-invalid={notice?.field === "user-email" ? "true" : undefined} disabled={!canManage} id="user-email" type="email" value={draft.email} onChange={(event) => updateDraft("email", event.target.value)} /></Field>
+        <Field label={<RequiredLabel>Role</RequiredLabel>}>
+          <select disabled={!canManage} id="user-role" value={draft.role} onChange={(event) => updateDraft("role", event.target.value)}>
             {(roleNames.length ? roleNames : ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"]).map((role) => <option key={role} value={role}>{role}</option>)}
           </select>
         </Field>
         <Field label="Joining Date"><input disabled={!canManage} type="date" value={draft.joining_date} onChange={(event) => updateDraft("joining_date", event.target.value)} /></Field>
-        {!editingId && <Field label="Password"><PasswordInput disabled={!canManage} value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
-        {!editingId && <Field label="Confirm Password"><PasswordInput disabled={!canManage} value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
+        {!editingId && <Field label={<RequiredLabel>Password</RequiredLabel>}><PasswordInput aria-invalid={notice?.field === "user-password" ? "true" : undefined} disabled={!canManage} id="user-password" value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
+        {!editingId && <Field label={<RequiredLabel>Confirm Password</RequiredLabel>}><PasswordInput aria-invalid={notice?.field === "user-confirm-password" ? "true" : undefined} disabled={!canManage} id="user-confirm-password" value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
         <label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} /><span>Active user</span></label>
         <label className="check-field"><input checked={draft.recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("recovery_enabled", event.target.checked)} /><span>Recovery enabled</span></label>
         <label className="check-field"><input checked={draft.staff_self_recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("staff_self_recovery_enabled", event.target.checked)} /><span>Allow staff self-recovery</span></label>
         <Field label="Notes"><textarea disabled={!canManage} value={draft.notes} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
       </div>
-      {recoveryMessage && <div className="startup-status-panel"><p>{recoveryMessage}</p></div>}
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage} onClick={saveUser}>{editingId ? "Update User" : "Add User"}</button>
-        {editingId && <button className="secondary-button" onClick={resetForm}>Cancel Edit</button>}
+        <button className="primary-button" disabled={!canManage || userSaving} onClick={saveUser}>{userSaving ? "Saving…" : editingId ? "Save changes" : "Add User"}</button>
+        {editingId && <button className="secondary-button" onClick={() => { onClearNotice(); resetForm(); }}>Cancel Edit</button>}
       </div>
-      <DataTable headers={["Name", "Username", "Role", "Mobile", "Last Login", "Status", "Actions"]}>
+      <SaveNotice notice={notice} />
+      {recoveryMessage && <p className="form-note stock-ok save-notice" role="status">{recoveryMessage}</p>}
+      <DataTable className="users-table" headers={["Name", "Username", "Role", "Mobile", "Last Login", "Status", "Actions"]}>
         {users.map((item) => (
           <tr key={item.id}>
             <td className="primary-cell">
@@ -25286,18 +25543,24 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
             <td>{item.username}</td>
             <td><span className="tag">{item.role}</span></td>
             <td>{item.mobile_number || MISSING_VALUE}</td>
-            <td>{item.last_login_at ? formatKolkataDateTime(item.last_login_at) : "Not recorded"}</td>
+            <td className="users-login-cell">{item.last_login_at ? formatKolkataDateTime(item.last_login_at) : "Not recorded"}</td>
             <td><span className={item.active ? "stock-ok" : "stock-low"}>{item.active ? "Active" : "Inactive"}</span></td>
             <td>
               <div className="button-row table-actions-row">
-                <button className="table-action" disabled={!canManage} onClick={() => startEdit(item)}>Edit</button>
+                <button className="table-action" disabled={!canManage} onClick={() => { onClearNotice(); startEdit(item); focusField("user-name"); }}>Edit</button>
                 <button className="table-action" disabled={!canManage} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "" })}>Password</button>
-                <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "", recoveryAction: true })}>Reset Staff Password</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "UNLOCK_ACCOUNT")}>Unlock</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "RESEND_USERNAME")}>Resend Username</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REVOKE_SESSIONS")}>Revoke Sessions</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REQUIRE_PASSWORD_CHANGE")}>Require Change</button>
-                {item.active ? <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "deactivate")}>Deactivate</button> : <button className="secondary-button" disabled={!canManage} onClick={() => userAction(item, "reactivate")}>Reactivate</button>}
+                {item.active ? <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "deactivate")}>Deactivate</button> : <button className="table-action" disabled={!canManage} onClick={() => userAction(item, "reactivate")}>Reactivate</button>}
+                {/* The rarer account-recovery jobs fold under More, so the row fits at 1366. */}
+                <details className="row-more-actions">
+                  <summary className="table-action">More</summary>
+                  <div className="row-more-menu">
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "", recoveryAction: true })}>Reset Staff Password</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "UNLOCK_ACCOUNT")}>Unlock</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "RESEND_USERNAME")}>Resend Username</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REVOKE_SESSIONS")}>Revoke Sessions</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REQUIRE_PASSWORD_CHANGE")}>Require Change</button>
+                  </div>
+                </details>
                 <button className="remove-button" disabled={!canManage || item.id === user.id} aria-label={`Delete ${item.full_name || item.username}`} onClick={() => setDeleteTarget({ item, saving: false })}><Icon name="trash" size={15} /></button>
               </div>
             </td>
@@ -25601,6 +25864,8 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, holdbackDays = 0,
 }
 
 function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceControlSettings, onReload }) {
+  // In-app questions before installing and before cleaning old installs (were browser boxes).
+  const confirmUpdateStep = useConfirm();
   /**
    * When this particular counter is allowed to update itself.
    *
@@ -26006,9 +26271,12 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
       }));
       return;
     }
-    const confirmed = window.confirm(
-      "Install the downloaded FroozERP update and restart now?\n\nConfirm only after POS billing, purchase saving and sync activity are idle. Local SQLite data, device identity and settings remain in the app data folder."
-    );
+    const confirmed = await confirmUpdateStep({
+      title: "Install the update and restart FroozERP now?",
+      message: "Do this only when no bill, purchase or sync is in progress on this computer. Your data, this computer's identity and settings stay as they are.",
+      confirmLabel: "Install and restart",
+      cancelLabel: "Not now",
+    });
     if (!confirmed) {
       setUpdaterState((current) => ({ ...current, errorMessage: "Install postponed by owner." }));
       return;
@@ -26051,9 +26319,13 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
   const cleanOldVersions = async () => {
     if (!canManage || cleanupBusy) return;
     const count = cleanupResult?.candidates?.length || 0;
-    const confirmed = window.confirm(
-      `Clean ${count} old FroozERP shortcut/install item(s)?\n\nBusiness data will be preserved:\n${cleanupResult?.data_path || "%APPDATA%\\com.srtcompany.froozerp"}`
-    );
+    const confirmed = await confirmUpdateStep({
+      title: `Clean ${count} old FroozERP ${count === 1 ? "shortcut or install folder" : "shortcuts and install folders"}?`,
+      message: `Business data is kept, in ${cleanupResult?.data_path || "%APPDATA%\\com.srtcompany.froozerp"}.`,
+      confirmLabel: "Clean old versions",
+      cancelLabel: "Keep them",
+      tone: "danger",
+    });
     if (!confirmed) return;
     try {
       setCleanupBusy(true);
@@ -26076,33 +26348,40 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
   const versionsMatch = normalizeVersion(desktopVersion) && normalizeVersion(desktopVersion) === normalizeVersion(backendVersion);
   const compatibilityStatus = versionsMatch ? "Compatible" : "Mixed installation detected";
   return (
-    <ModuleCard eyebrow="Software Updates" title="FroozERP Windows Updates" subtitle="Signed in-app updates with owner confirmation and local data preservation checks.">
+    <ModuleCard eyebrow="Software Updates" title="FroozERP Updates" subtitle="New versions are checked, downloaded and installed from here. Your data stays where it is.">
+      {/* Three facts for the owner; everything a technician needs is folded under Technical details. */}
       <div className={updateAvailable ? "update-available-panel" : "update-foundation-panel"}>
         <strong>{updateStatusText}</strong>
-        <div className="cleanup-result-grid">
+        <div className="cleanup-result-grid update-owner-facts">
           <SummaryMetric label="Desktop App Version" value={desktopVersion} featured />
-          <SummaryMetric label="Local Backend Version" value={backendVersion} />
           <SummaryMetric label="Latest Available Version" value={displayLatestVersion} />
+          <SummaryMetric label="Last Checked" value={updaterState.lastCheckedAt ? formatKolkataDateTime(updaterState.lastCheckedAt) : "Not checked"} />
+        </div>
+        {updaterState.releaseNotes && <span>{updaterState.releaseNotes}</span>}
+        {!versionsMatch && <small className="stock-low">The app and its background service are on different versions. Install the update (or reinstall) to bring them together.</small>}
+      </div>
+      {updaterState.errorMessage && <p className={updaterState.phase === "error" ? "error-banner" : "form-note"} role={updaterState.phase === "error" ? "alert" : "status"}>{updaterState.errorMessage}</p>}
+      <details className="update-technical-details">
+        <summary>Technical details</summary>
+        <div className="cleanup-result-grid">
+          <SummaryMetric label="Local Backend Version" value={backendVersion} />
           <SummaryMetric label="Compatibility" value={compatibilityStatus} />
-          <SummaryMetric label="Status" value={updateStatusText} />
           <SummaryMetric label="Published" value={updaterState.publishedAt ? formatKolkataDateTime(updaterState.publishedAt) : "Not available"} />
           <SummaryMetric label="Download Status" value={downloadStatus} />
           <SummaryMetric label="Signature Status" value={signatureStatus} />
-          <SummaryMetric label="Last Checked" value={updaterState.lastCheckedAt ? formatKolkataDateTime(updaterState.lastCheckedAt) : "Not checked"} />
           <SummaryMetric label="Download Size" value={formatBytes(updaterState.downloadProgress.total)} />
           <SummaryMetric label="Current Executable" value={installDiagnostics?.current_executable || "Desktop diagnostic pending"} />
           <SummaryMetric label="Backend PID" value={backendVersionDiagnostics?.pid || "Unknown"} />
           <SummaryMetric label="Backend Executable" value={backendVersionDiagnostics?.executablePath || "Unknown"} />
         </div>
-        {updaterState.releaseNotes && <span>{updaterState.releaseNotes}</span>}
         <small>Update Feed: {updaterState.feedUrl || "Not Configured"}</small>
         {installDiagnostics?.stale_installations?.map((path) => (
           <small key={path}>Another FroozERP installation was detected at {path}.</small>
         ))}
         {!versionsMatch && <small>Mixed installation detected: desktop {desktopVersion}, backend {backendVersion}.</small>}
         {updaterState.errorCode && <small>Error Code: {updaterState.errorCode}</small>}
-      </div>
-      <p className="form-note">{updaterState.errorMessage || "Tauri updater is authoritative for availability, signature verification, download and installation. Backend manifest is diagnostics only."}</p>
+        <small>Tauri updater is authoritative for availability, signature verification, download and installation. Backend manifest is diagnostics only.</small>
+      </details>
       {updaterState.phase === "downloading" && (
         <div className="update-download-progress">
           <div className="update-download-progress-bar" style={{ width: `${progressPercent}%` }} />
@@ -26234,7 +26513,9 @@ function SyncSettingsSection({
   // machine, what "connected" meant -- and the machine's real behaviour then depended on all of
   // them agreeing. Nothing here is drafted now, because nothing here is chosen.
   const [configMessage, setConfigMessage] = useState("");
-  const save = async () => {
+  const deviceNameSave = useSettingsSave();
+  const save = () => deviceNameSave.run(async () => {
+    setStatusMessage("");
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
         device_display_name: draft.device_display_name || "Main Counter Device",
@@ -26242,14 +26523,11 @@ function SyncSettingsSection({
       });
       // What the server saved stands on screen until the reload brings it back as the live value.
       if (response.data?.device_display_name !== undefined) updateDraft("device_display_name", response.data.device_display_name);
-      await settleSettingsSave(onReload, resetDraft);
-      setStatusMessage("Device display name saved");
-      alert("Device display name saved");
+      return settingsSavedNotice("Device display name", await settleSettingsSave(onReload, resetDraft));
     } catch (error) {
-      setStatusMessage(getErrorMessage(error, "Unable to save device display name"));
-      alert(getErrorMessage(error, "Unable to save device display name"));
+      return errorNotice(getErrorMessage(error, "The device display name could not be saved. Nothing was changed; try again."));
     }
-  };
+  }, "The device display name could not be saved. Nothing was changed; try again.");
   const testApiUrl = async (url, label = "API") => {
     const apiUrl = normalizeApiBase(url);
     if (!isValidHttpApiUrl(apiUrl)) {
@@ -26565,9 +26843,10 @@ function SyncSettingsSection({
                 what the app is actually talking to is a diagnosis, not a setting -- and it now
                 names the one address there is instead of whichever box was on screen. */}
             <button className="secondary-button" disabled={!canManage} onClick={() => testApiUrl(API_CONFIG.apiUrl, "This app's server")}>Test Connection</button>
-            <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
+            <button className="primary-button" disabled={!canManage || deviceNameSave.saving} onClick={save}>{deviceNameSave.saving ? "Saving…" : "Save Device Name"}</button>
             <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud…" : "Cloud Readiness Check"}</button>
           </div>
+          <SaveNotice notice={deviceNameSave.notice} />
           {cloudDiagnostics?.results?.length > 0 && (
             <DataTable headers={["Check", "Result", "URL", "HTTP", "Message"]}>
               {cloudDiagnostics.results.map((row) => (
@@ -26631,6 +26910,9 @@ function OperationalScopeManagement({
   const [locationDraft, setLocationDraft] = useState({ branch_id: "", location_code: "", location_name: "", location_type: "STORE", address: "", is_default: false });
   const [staffDraft, setStaffDraft] = useState({ user_id: "", branch_id: "", operational_location_id: "", role_id: "", is_default: true, effective_from: "", effective_to: "" });
   const [approvalDrafts, setApprovalDrafts] = useState({});
+  // In-app boxes: a rename asks for the new name and the reason in one box, not two prompts in a row.
+  const askScopeReason = useAskReason();
+  const confirmScope = useConfirm();
   // Read once when the screen opens, after each save, and when the signed-in session itself changes
   // -- not whenever the user object is rebuilt. The full-page loading card is for the first read
   // only: a later reload keeps the page (and where it is scrolled to) and refreshes in place.
@@ -26704,11 +26986,17 @@ function OperationalScopeManagement({
       setBranchDraft({ branch_name: "", address: "", phone_number: "", gst_number: "" });
     } catch (requestError) { report("branches", "error", getErrorMessage(requestError, "The branch could not be added.")); }
   };
+  // A rename answers { name, reason }; a close answers the reason. Cancel answers null.
+  const askScopeChange = async (kind, name, closing) => {
+    const answer = await askScopeReason(scopeChangeDialog({ kind, name, closing }));
+    if (!answer) return null;
+    return closing ? { name, reason: answer } : answer;
+  };
   const updateBranch = async (branch, active = branch.active !== false) => {
-    const branchName = active ? window.prompt("New name for this branch", branch.branch_name) : branch.branch_name;
-    if (!branchName?.trim()) return;
-    const reason = window.prompt(active ? "Reason for the change" : `Why is branch "${branch.branch_name}" being closed?`);
-    if (!reason?.trim()) return;
+    const change = await askScopeChange("branch", branch.branch_name, !active);
+    if (!change) return;
+    const branchName = active ? change.name : branch.branch_name;
+    const { reason } = change;
     try {
       await saveWrite("put", `/api/v3/admin/branches/${branch.id}`, {
         ...branch,
@@ -26732,10 +27020,10 @@ function OperationalScopeManagement({
     } catch (requestError) { report("counters", "error", getErrorMessage(requestError, "The counter could not be added.")); }
   };
   const updateLocation = async (location, active = location.active !== false) => {
-    const locationName = active ? window.prompt("New name for this counter", location.location_name) : location.location_name;
-    if (!locationName?.trim()) return;
-    const reason = window.prompt(active ? "Reason for the change" : `Why is counter "${location.location_name}" being closed?`);
-    if (!reason?.trim()) return;
+    const change = await askScopeChange("counter", location.location_name, !active);
+    if (!change) return;
+    const locationName = active ? change.name : location.location_name;
+    const { reason } = change;
     try {
       await saveWrite("put", `/api/v3/admin/operational-locations/${location.id}`, {
         target_branch_id: location.branch_id,
@@ -26769,7 +27057,14 @@ function OperationalScopeManagement({
     } catch (requestError) { report("staff", "error", getErrorMessage(requestError, "The staff member could not be placed at the counter.")); }
   };
   const deactivateStaffAssignment = async (assignment) => {
-    const reason = window.prompt(`Why is ${assignment.full_name} being removed from ${assignment.location_name}?`);
+    const reason = await askScopeReason({
+      title: `Remove ${assignment.full_name} from ${assignment.location_name}?`,
+      message: "They can no longer sign in at this counter. Their bills stay in the books.",
+      label: "Why are they being removed?",
+      confirmLabel: "Remove from counter",
+      cancelLabel: "Keep them here",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       await saveWrite("put", `/api/v3/admin/staff-assignments/${assignment.user_id}`, {
@@ -26835,7 +27130,15 @@ function OperationalScopeManagement({
   // An id a machine no longer uses (an install from before one-machine-one-id). Kept in the books --
   // old bills name it -- but no longer drawn as a box. The server refuses this computer's own id.
   const retireDevice = async (device) => {
-    if (!window.confirm(retireDeviceConfirmText(device))) return;
+    const [question, ...detail] = retireDeviceConfirmText(device).split("\n\n");
+    const retire = await confirmScope({
+      title: question,
+      message: detail.join(" "),
+      confirmLabel: "Remove old id",
+      cancelLabel: "Keep it",
+      tone: "danger",
+    });
+    if (!retire) return;
     try {
       await saveWrite("post", `/api/v3/admin/devices/${encodeURIComponent(device.device_id)}/retire`, {
         reason: "Owner removed an id this machine no longer uses",
@@ -26845,7 +27148,7 @@ function OperationalScopeManagement({
     } catch (requestError) { report("computers", "error", getErrorMessage(requestError, "The old id could not be removed.")); }
   };
 
-  if (loading && !loadedOnce) return <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters"><p>Loading branches and counters...</p></ModuleCard>;
+  if (loading && !loadedOnce) return <ModuleCard title="Branches & Counters"><p className="form-note">Loading branches and counters…</p></ModuleCard>;
   const stepMessage = (step) => {
     const status = stepStatus[step];
     if (!status?.text) return null;
@@ -26855,7 +27158,7 @@ function OperationalScopeManagement({
   const locationTypeLabel = (type) => ({ STORE: "Shop counter", WAREHOUSE: "Store room / warehouse", MANDI_COUNTER: "Mandi counter", OFFICE: "Office" })[type] || type;
   return (
     <div className="scope-page">
-      <ModuleCard eyebrow="Setup" title="Branches & Counters" subtitle="Your shops, their counters, who works where, and which computers and phones may bill. Set them up in this order.">
+      <ModuleCard eyebrow="Setup" title="Your shops and counters" subtitle="Your shops, their counters, who works where, and which computers and phones may bill. Set them up in this order.">
         {error && <div className="startup-status-error" role="alert"><p>{error}</p></div>}
         {!scopePlan.readsScope && <p className="scope-locked-note">Branches, counters, staff and computers are the Owner's. As an Admin you can manage the Counter screen lock below.</p>}
         {scopePlan.readsScope && !canManage && !error && <p className="scope-locked-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
@@ -27006,6 +27309,8 @@ function _LegacySecurityDevicesSection(props) {
 function LegacySecurityDevicesSection({ activationCodes, branches, canManage, counters, devices, onReload, user }) {
   const [generatedCode, setGeneratedCode] = useState("");
   const [codeDraft, setCodeDraft] = useState({ code_label: "Counter device activation", expires_in_hours: 24, branch_id: "1", counter_id: "" });
+  // Not drawn any more (Branches & Counters replaced it); its outcomes go to one notice, not alerts.
+  const [legacyNotice, showLegacyNotice] = useSaveNotice();
   const deviceAction = async (device, action) => {
     try {
       await axios.put(`${API_URL}/settings/devices/${encodeURIComponent(device.device_id)}`, {
@@ -27016,9 +27321,9 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
         assigned_counter_id: device.assigned_counter_id || null,
       });
       await onReload();
-      alert(`Device ${action.toLowerCase()} saved`);
+      showLegacyNotice(successNotice(`${device.device_name || "Device"}: change saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update device"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The device could not be changed. Nothing was changed; try again.")));
     }
   };
   const generateCode = async () => {
@@ -27029,9 +27334,9 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
       });
       setGeneratedCode(response.data.code);
       await onReload();
-      alert("Activation code generated. Share it only with the device being approved.");
+      showLegacyNotice(successNotice("Activation code made. Share it only with the device being approved."));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to generate activation code"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The activation code could not be made. Try again.")));
     }
   };
   const revokeCode = async (code) => {
@@ -27039,7 +27344,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
       await axios.put(`${API_URL}/settings/activation-codes/${code.id}/revoke`, { updated_by: user.id });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to revoke activation code"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The activation code could not be revoked. Try again.")));
     }
   };
   return (
@@ -27088,6 +27393,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
         <button className="primary-button" disabled={!canManage} onClick={generateCode}>Generate Activation Code</button>
         {generatedCode && <span className="batch-id">New Code: {generatedCode}</span>}
       </div>
+      <SaveNotice notice={legacyNotice} />
       <DataTable headers={["Label", "Branch", "Counter", "Expires", "Status", "Used By", "Actions"]}>
         {activationCodes.map((code) => (
           <tr key={code.id}>
@@ -27112,13 +27418,14 @@ function _LegacyBranchCounterSettings(props) {
 function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, user }) {
   const [branchDraft, setBranchDraft] = useState({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
   const [counterDraft, setCounterDraft] = useState({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
+  const [legacyNotice, showLegacyNotice] = useSaveNotice();
   const addBranch = async () => {
     try {
       await axios.post(`${API_URL}/settings/branches`, { ...branchDraft, updated_by: user.id });
       setBranchDraft({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save branch"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The branch could not be saved. Try again.")));
     }
   };
   const addCounter = async () => {
@@ -27127,11 +27434,12 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
       setCounterDraft({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save counter"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The counter could not be saved. Try again.")));
     }
   };
   return (
     <ModuleCard eyebrow="Multi-Branch Foundation" title="Branch & Counter Master" subtitle="Future-ready branch/counter structure. Current store remains Main Branch unless more branches are added.">
+      <SaveNotice notice={legacyNotice} />
       <div className="form-grid supplier-form-grid">
         <Field label="Branch Name"><input disabled={!canManage} value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
         <Field label="Phone"><input disabled={!canManage} value={branchDraft.phone_number} onChange={(event) => setBranchDraft({ ...branchDraft, phone_number: event.target.value })} /></Field>
@@ -27179,74 +27487,93 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
   useEffect(() => {
     onBusyChange?.(busy);
   }, [busy, onBusyChange]);
+  const [backupNotice, showBackupNotice, clearBackupNotice] = useSaveNotice();
+  const confirmClosingBackup = useConfirm();
   const save = async () => {
+    clearBackupNotice();
     try {
       await axios.put(`${API_URL}/settings/backup`, { ...draft, updated_by: user.id });
       await onReload();
-      alert("Backup settings saved");
+      showBackupNotice(successNotice("Backup settings saved."));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save backup settings"));
+      showBackupNotice(errorNotice(getErrorMessage(error, "The backup settings could not be saved. Nothing was changed; try again.")));
     }
   };
   const backupNow = async (backupType = "Manual") => {
+    clearBackupNotice();
     setBusy(true);
     try {
       const response = await axios.post(`${API_URL}/settings/backup-now`, { created_by: user.id, backup_type: backupType });
       await onReload();
-      alert(`Backup created: ${response.data.backup_file_name}`);
+      showBackupNotice(successNotice(`Backup made: ${response.data.backup_file_name}${response.data.backup_size ? ` (${formatFileSize(response.data.backup_size)})` : ""}.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Backup failed"));
+      showBackupNotice(errorNotice(getErrorMessage(error, "The backup could not be made. Try again, or call FroozERP support.")));
     } finally {
       setBusy(false);
     }
   };
+  // This makes a backup marked "Shutdown"; it closes nothing. The old wording sent people looking
+  // for a "server window" the desktop app does not have.
   const safeShutdown = async () => {
-    if (!window.confirm("Run shutdown backup now? After success, close the server window manually.")) return;
+    clearBackupNotice();
+    const sure = await confirmClosingBackup({
+      title: "Make a closing backup now?",
+      message: "FroozERP makes a backup marked Shutdown. When it says the backup is done, close FroozERP as you normally do.",
+      confirmLabel: "Make closing backup",
+      cancelLabel: "Not now",
+    });
+    if (!sure) return;
     setBusy(true);
     try {
       const response = await axios.post(`${API_URL}/settings/safe-shutdown`, { created_by: user.id });
       await onReload();
-      alert(response.data.message || "Backup completed. You may now close the server window.");
+      showBackupNotice(successNotice(`Closing backup done${response.data?.backup_file_name ? `: ${response.data.backup_file_name}` : ""}. You can close FroozERP now.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Safe shutdown backup failed"));
+      showBackupNotice(errorNotice(getErrorMessage(error, "The closing backup could not be made. Keep FroozERP open and try again.")));
     } finally {
       setBusy(false);
     }
   };
+  const latestBackup = backupLogs[0] || null;
+  // The folder is said once, above the list; each row names its file (the whole path is on hover).
+  const backupFolder = String(draft.backup_location || "").trim()
+    || String(latestBackup?.backup_path || "").replace(/[\\/][^\\/]*$/, "");
   return (
-    <ModuleCard eyebrow="Backup & Restore" title="Auto Backup and Safe Shutdown" subtitle="Manual, scheduled and shutdown backup workflow. Restore is prepared but kept disabled until verified.">
-      <div className="purchase-summary-grid">
-        <SummaryMetric label="Auto Backup" value={draft.auto_backup_enabled ? "ON" : "OFF"} featured />
-        <SummaryMetric label="Backup on Shutdown" value={draft.backup_on_shutdown ? "ON" : "OFF"} />
-        <SummaryMetric label="Daily Backup Time" value={draft.daily_backup_time} />
-        <SummaryMetric label="Keep Backups" value={draft.keep_last_backups} />
-      </div>
-      <div className="form-grid supplier-form-grid">
-        <label className="check-field"><input checked={draft.auto_backup_enabled} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, auto_backup_enabled: event.target.checked })} /><span>Auto Backup ON/OFF</span></label>
+    <ModuleCard eyebrow="Backup & Restore" title="Backups" onChange={clearBackupNotice} subtitle="Backups are made by themselves at the time below, and whenever you press Backup Now.">
+      {latestBackup && (
+        <p className="form-note">
+          {`Last backup: ${latestBackup.completed_at || latestBackup.started_at ? formatKolkataDateTime(latestBackup.completed_at || latestBackup.started_at) : MISSING_VALUE}, ${formatFileSize(latestBackup.backup_size)}, ${labelFor("backupStatus", latestBackup.status)}.`}
+        </p>
+      )}
+      <div className="form-grid supplier-form-grid backup-settings-grid">
+        <label className="check-field"><input checked={draft.auto_backup_enabled} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, auto_backup_enabled: event.target.checked })} /><span>Make a backup every day by itself</span></label>
         <label className="check-field"><input checked={draft.backup_on_shutdown} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, backup_on_shutdown: event.target.checked })} /><span>Backup on Shutdown</span></label>
         <Field label="Daily Backup Time"><input disabled={!canManage} type="time" value={draft.daily_backup_time} onChange={(event) => setDraft({ ...draft, daily_backup_time: event.target.value })} /></Field>
         <Field label="Keep Last X Backups"><input disabled={!canManage} min="1" type="number" value={draft.keep_last_backups} onChange={(event) => setDraft({ ...draft, keep_last_backups: event.target.value })} /></Field>
         <Field label="Backup Location"><input disabled={!canManage} value={draft.backup_location} onChange={(event) => setDraft({ ...draft, backup_location: event.target.value })} /></Field>
       </div>
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage || busy} onClick={() => backupNow("Manual")}>Backup Now</button>
+        <button className="primary-button" disabled={!canManage || busy} onClick={() => backupNow("Manual")}>{busy ? "Backing up…" : "Backup Now"}</button>
         <button className="secondary-button" disabled={!canManage || busy} onClick={save}>Save Backup Settings</button>
-        <button className="secondary-button" disabled={!canManage || busy} onClick={safeShutdown}>Close Software Safely</button>
+        <button className="secondary-button" disabled={!canManage || busy} onClick={safeShutdown}>Backup Before Closing</button>
       </div>
+      <SaveNotice notice={backupNotice} />
       <p className="form-note">A backup is restored by FroozERP support, not from this screen. If you need one back, contact support and name the file from the list below.</p>
-      <DataTable headers={["File", "Type", "Size", "Started", "Completed", "Status", "Error"]}>
+      {/* The Backup Location box already shows the folder; it is said here only when that box is empty. */}
+      {backupFolder && !String(draft.backup_location || "").trim() && <p className="form-note">Saved in <code className="backup-folder">{backupFolder}</code></p>}
+      <DataTable headers={["File", "Type", { label: "Size", numeric: true }, "Made at", "Status", "Error"]}>
         {backupLogs.map((log) => (
           <tr key={log.id}>
-            <td className="primary-cell">{log.backup_file_name || MISSING_VALUE}<small className="cell-note">{log.backup_path || MISSING_VALUE}</small></td>
+            <td className="primary-cell" title={log.backup_path || undefined}>{log.backup_file_name || MISSING_VALUE}</td>
             <td>{labelFor("backupType", log.backup_type)}</td>
-            <td>{Number(log.backup_size || 0).toLocaleString("en-IN")} bytes</td>
-            <td>{log.started_at ? formatKolkataDateTime(log.started_at) : MISSING_VALUE}</td>
-            <td>{log.completed_at ? formatKolkataDateTime(log.completed_at) : MISSING_VALUE}</td>
+            <td>{formatFileSize(log.backup_size)}</td>
+            {/* Started and finished are seconds apart: one time, the finish, with the start on hover. */}
+            <td title={log.started_at ? `Started ${formatKolkataDateTime(log.started_at)}` : undefined}>{log.completed_at || log.started_at ? formatKolkataDateTime(log.completed_at || log.started_at) : MISSING_VALUE}</td>
             <td><span className={statusClass("backupStatus", log.status)}>{labelFor("backupStatus", log.status)}</span></td>
-            <td>{log.error_message || MISSING_VALUE}</td>
+            <td>{errorOrDash(log.error_message)}</td>
           </tr>
         ))}
-        {backupLogs.length === 0 && <tr><td className="empty-cell" colSpan={7}>No backups recorded yet. Backup Now makes the first one.</td></tr>}
+        {backupLogs.length === 0 && <tr><td className="empty-cell" colSpan={6}>No backups recorded yet. Backup Now makes the first one.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -31234,6 +31561,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
   const receiptRef = useRef(null);
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
+  const [receiptNotice, showReceiptNotice, clearReceiptNotice] = useSaveNotice();
   const receiptFileName = `FroozERP_Payment_Receipt_${payment.payment_key || payment.id || toDateKey(new Date())}.pdf`;
   const receiptRecipients = useMemo(() => buildWhatsappRecipients({
     accounts: [{
@@ -31248,6 +31576,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
   }), [payment]);
   const exportReceiptPdf = async () => {
     if (!receiptRef.current) return;
+    clearReceiptNotice();
     setExporting(true);
     try {
       await exportElementToPdf({
@@ -31256,7 +31585,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
         mode: "A4",
       });
     } catch (error) {
-      alert(`Unable to export receipt PDF: ${error.message}`);
+      showReceiptNotice(errorNotice(`The receipt PDF could not be made (${error?.message || String(error)}). Nothing was saved; try again.`));
     } finally {
       setExporting(false);
     }
@@ -31276,13 +31605,14 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
             <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
+        <SaveNotice className="pdf-preview-notice no-print" notice={receiptNotice} />
         <article ref={receiptRef} className="invoice-paper print-area">
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">
               <strong>Payment Receipt</strong>
               <span>Receipt #{payment.payment_key || payment.id}</span>
-              <span>{payment.payment_date ? new Date(payment.payment_date).toLocaleDateString("en-IN") : toDateKey(new Date())}</span>
+              <span>{formatDisplayDate(payment.payment_date || new Date())}</span>
             </div>
           </header>
           <section className="invoice-customer">
@@ -32397,10 +32727,12 @@ function SummaryMetric({ featured = false, label, positive = false, value }) {
   // A negative amount stays on one line, with a true minus, in the loss colour -- even on a tile
   // marked `positive`, which only means "green when this is good". A loss is never painted green.
   const signed = presentSignedFigure(displayValue);
+  // A zero is plain, not a green "₹0.00".
+  const gain = positive && !isZeroFigure(displayValue);
   return (
     <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"} title={`${label}: ${displayValue}`}>
       <span>{label}</span>
-      <strong className={signed.negative ? "metric-value metric-negative" : positive ? "metric-value profit-cell" : "metric-value"}>{signed.text}</strong>
+      <strong className={signed.negative ? "metric-value metric-negative" : gain ? "metric-value profit-cell" : "metric-value"}>{signed.text}</strong>
     </div>
   );
 }
@@ -32411,7 +32743,17 @@ function ProfitCell({ className = "", format = (number) => currency.format(numbe
   const number = Number(value);
   const loss = Number.isFinite(number) && number < 0;
   const signed = presentSignedFigure(format(value));
-  return <td className={`profit-cell ${loss || signed.negative ? "loss-cell" : ""} ${className}`.replace(/\s+/g, " ").trim()}>{signed.text}</td>;
+  // Zero is neither: plain, right-aligned, not green bold.
+  const zero = !loss && !signed.negative && (number === 0 || isZeroFigure(signed.text));
+  return <td className={`profit-cell ${loss || signed.negative ? "loss-cell" : ""} ${zero ? "profit-zero" : ""} ${className}`.replace(/\s+/g, " ").trim()}>{signed.text}</td>;
+}
+
+// A money cell that can go below zero (cash, bank): a true minus and the loss colour when it does,
+// plain otherwise. Never green: a cash balance is not a profit.
+function SignedAmountCell({ format = (number) => currency.format(number), value }) {
+  const signed = presentSignedFigure(format(value));
+  const negative = signed.negative || isNegativeFigure(Number(value));
+  return <td className={negative ? "amount-cell amount-negative" : "amount-cell"}>{signed.text}</td>;
 }
 
 // A password box with its own show/hide eye (4 Oct 2026). The eye Windows' WebView draws by itself

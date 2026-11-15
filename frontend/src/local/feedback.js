@@ -129,10 +129,20 @@ export const confirmDialogOptions = (options = {}) => {
   };
 };
 
-/** The reason box's settings with every gap filled. A reason is required unless said otherwise. */
+/**
+ * The reason box's settings with every gap filled. A reason is required unless said otherwise.
+ *
+ * `nameLabel` adds a one-line name box above the reason (a rename: the new name and why, in one box
+ * instead of two prompts in a row); the box then answers `{ name, reason }` instead of the reason.
+ */
 export const reasonDialogOptions = (options = {}) => {
   const safe = options && typeof options === "object" ? options : { title: options };
+  const nameLabel = text(safe.nameLabel);
   return {
+    ...(nameLabel ? {
+      nameLabel,
+      nameDefault: safe.nameDefault === undefined || safe.nameDefault === null ? "" : String(safe.nameDefault),
+    } : {}),
     title: text(safe.title) || "Give a reason",
     message: text(safe.message),
     label: text(safe.label) || "Reason",
@@ -153,6 +163,18 @@ export const reasonSubmission = (typed, { required = true } = {}) => {
   const value = text(typed);
   if (!value && required) return { ok: false, value: "", error: "Enter a reason to continue." };
   return { ok: true, value, error: "" };
+};
+
+/**
+ * A rename box's answer: the new name (never blank) and the reason (as `reasonSubmission`).
+ * `{ ok, value: { name, reason }, error, field }`, `field` naming the box to go back to.
+ */
+export const namedReasonSubmission = ({ name, reason } = {}, { required = true } = {}) => {
+  const newName = text(name);
+  if (!newName) return { ok: false, value: null, error: "Enter the new name.", field: "name" };
+  const why = reasonSubmission(reason, { required });
+  if (!why.ok) return { ok: false, value: null, error: why.error, field: "reason" };
+  return { ok: true, value: { name: newName, reason: why.value }, error: "", field: "" };
 };
 
 /**
@@ -186,7 +208,12 @@ export const createDialogQueue = () => {
       if (!head || head.id !== id) return false;
       waiting.shift();
       if (head.kind === "confirm") head.resolve(value === true);
-      else head.resolve(typeof value === "string" ? value : null);
+      else if (head.options?.nameLabel) {
+        // A rename box answers its name and reason together, or null.
+        head.resolve(value && typeof value === "object" && typeof value.name === "string" && typeof value.reason === "string"
+          ? { name: value.name, reason: value.reason }
+          : null);
+      } else head.resolve(typeof value === "string" ? value : null);
       notify();
       return true;
     },

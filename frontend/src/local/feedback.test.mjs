@@ -8,6 +8,7 @@ import {
   createInFlightGuard,
   errorNotice,
   makeNotice,
+  namedReasonSubmission,
   noticeFromResult,
   noticePresentation,
   normalizeEllipsis,
@@ -128,4 +129,37 @@ test("the boxes follow the existing dialog patterns and are mounted once", () =>
   assert.match(dialogsSource, /event\.key === "Enter" && !event\.shiftKey/, "Enter submits a reason");
   assert.equal((appSource.match(/<FeedbackDialogHost /g) || []).length >= 1, true);
   assert.match(appSource, /queue=\{appDialogQueue\}/);
+});
+
+test("a rename box asks for the name and the reason together (Branches & Counters)", async () => {
+  const options = reasonDialogOptions({ title: "Rename", nameLabel: "New name", nameDefault: "Main Branch" });
+  assert.equal(options.nameLabel, "New name");
+  assert.equal(options.nameDefault, "Main Branch");
+  assert.equal("nameLabel" in reasonDialogOptions({ title: "Why?" }), false, "a plain reason box has no name field");
+
+  assert.deepEqual(namedReasonSubmission({ name: "  Ratanada  ", reason: " Board changed " }), { ok: true, value: { name: "Ratanada", reason: "Board changed" }, error: "", field: "" });
+  const noName = namedReasonSubmission({ name: " ", reason: "x" });
+  assert.equal(noName.ok, false);
+  assert.equal(noName.field, "name");
+  const noReason = namedReasonSubmission({ name: "Ratanada", reason: "" });
+  assert.equal(noReason.ok, false);
+  assert.equal(noReason.field, "reason");
+  assert.equal(namedReasonSubmission({ name: "Ratanada", reason: "" }, { required: false }).ok, true);
+
+  const queue = createDialogQueue();
+  const answer = queue.askReason({ title: "Rename", nameLabel: "New name" });
+  queue.settle(queue.current().id, { name: "Ratanada", reason: "Board changed" });
+  assert.deepEqual(await answer, { name: "Ratanada", reason: "Board changed" });
+  const cancelled = queue.askReason({ title: "Rename", nameLabel: "New name" });
+  queue.settle(queue.current().id, null);
+  assert.equal(await cancelled, null, "Cancel answers null, as the browser prompt did");
+  const plain = queue.askReason({ title: "Rename", nameLabel: "New name" });
+  queue.settle(queue.current().id, "just a string");
+  assert.equal(await plain, null, "a rename box never answers a bare string");
+});
+
+test("the reason box draws the name field only for a rename", () => {
+  assert.match(dialogsSource, /const named = Boolean\(options\.nameLabel\);/);
+  assert.match(dialogsSource, /namedReasonSubmission\(/);
+  assert.match(dialogsSource, /aria-invalid=/);
 });

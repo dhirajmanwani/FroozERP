@@ -12096,3 +12096,440 @@ button.shortcut-sheet-row:focus-visible {
 .checkout-footer .checkout-actions > button svg {
   flex-shrink: 0;
 }
+
+/* ------------------------------------------------------------------------------------------------
+   Phase 4 polish: the back office (Accounts, Reports, All Shops, Settings, Branches & Counters)
+   and what was left of the shell.
+   ------------------------------------------------------------------------------------------------ */
+
+/* The FROST launcher is fixed over the bottom-right corner on every screen, so every screen's cards
+   stop short of it (Phase 3 did this for the counter screens only). POS keeps its own layout: its
+   checkout panel already docks above the launcher. */
+@media (min-width: 821px) {
+  .erp-shell .content-area[data-view]:not([data-view="sales"]) {
+    padding-right: calc(62px + 22px + 10px);
+  }
+}
+
+/* A heading inside a card, below its first block (Payments: "Payment history"). */
+.section-subheading {
+  margin: var(--space-5) 0 var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+}
+
+/* Reports: the results card is named after the report, with its row count small beside it. */
+.report-result-count {
+  margin-left: var(--space-3);
+  color: var(--ink-muted);
+  font-family: var(--font-body, inherit);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+/* "Show report" and, when the dates or search no longer match the figures, the line saying so. */
+.report-apply-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-self: end;
+  gap: var(--space-3);
+}
+
+.report-apply-row .primary-button {
+  width: auto;
+}
+
+.report-apply-note {
+  margin: 0;
+  padding: 6px 10px;
+}
+
+/* The Back button row and the filters under it were touching. */
+.content-card > .button-row + .ledger-toolbar,
+.content-card > .button-row + .purchase-history-toolbar {
+  margin-top: var(--space-4);
+}
+
+/* Settings landing: the four group cards two by two (they were three and an orphan), four across
+   on a wide screen. */
+.settings-group-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (min-width: 1700px) {
+  .settings-group-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 820px) {
+  .settings-group-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.report-category-card em.settings-group-count {
+  margin-top: auto;
+  font-size: var(--font-size-sm);
+}
+
+/* Display settings: a select keeps its own height beside the taller explanation card. */
+.display-settings-grid {
+  align-items: start;
+}
+
+/* Weighing Scale: the scale panel starts clear of the Save button and its notice. */
+.content-card > .button-row + .discount-block,
+.content-card > .save-notice + .discount-block {
+  margin-top: var(--space-5);
+}
+
+/* Permission Matrix, roles across the top: each role's Save sits under its name in the sticky
+   heading, the permission names stay in the left column. */
+.permission-matrix-table table {
+  min-width: 0;
+}
+
+.permission-matrix-table th:not(:first-child),
+.permission-matrix-table td.permission-cell {
+  text-align: center;
+}
+
+.permission-matrix-table td:first-child {
+  min-width: 180px;
+}
+
+/* Role names wrap ("Inventory / Manager") and rows are a tick high, not a button high. */
+.permission-matrix-table th:not(:first-child) {
+  white-space: normal;
+  vertical-align: bottom;
+}
+
+.permission-matrix-table td {
+  padding-block: 8px;
+}
+
+.permission-role-head {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.permission-role-head strong {
+  color: var(--ink);
+  font-size: var(--font-size-sm);
+}
+
+.permission-role-head small {
+  color: var(--ink-muted);
+  font-weight: 500;
+  text-transform: none;
+}
+
+.permission-save-changed {
+  border-color: var(--accent-line-strong);
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.permission-cell input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-height: 0;
+  margin: 0;
+  vertical-align: middle;
+}
+
+/* Users: the name column keeps a readable width, and the row's rarer jobs fold under More. */
+.users-table td.primary-cell {
+  min-width: 160px;
+}
+
+.users-table :is(th, td) {
+  padding-inline: 10px;
+}
+
+/* "15/11/2026 07:11:45 AM": the time drops under the date instead of widening the table. */
+.users-table td.users-login-cell {
+  min-width: 90px;
+  max-width: 110px;
+  white-space: normal;
+}
+
+.users-table td .table-actions-row {
+  flex-wrap: wrap;
+  max-width: 250px;
+}
+
+.row-more-actions {
+  position: relative;
+}
+
+.row-more-actions > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+
+.row-more-actions > summary::-webkit-details-marker {
+  display: none;
+}
+
+.row-more-actions > summary::after {
+  content: "▾";
+  margin-left: 4px;
+  font-size: 0.8em;
+}
+
+.row-more-menu {
+  position: absolute;
+  right: 0;
+  z-index: 5;
+  display: grid;
+  gap: 6px;
+  min-width: 190px;
+  margin-top: 6px;
+  padding: var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 10px);
+  background: var(--card);
+  box-shadow: var(--shadow-card);
+}
+
+.row-more-menu .table-action {
+  justify-content: flex-start;
+  width: 100%;
+  text-align: left;
+}
+
+/* Updates: three facts for the owner; the rest folded. */
+.update-technical-details {
+  margin-top: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+}
+
+.update-technical-details > summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 650;
+}
+
+.update-technical-details[open] > summary {
+  margin-bottom: var(--space-3);
+}
+
+.update-technical-details small {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+}
+
+/* Backups: the folder, said once, wraps rather than pushing the card wide. */
+.backup-folder {
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-sm);
+}
+
+/* A cash or bank figure below zero: the loss colour with a true minus. A zero profit is plain. */
+td.amount-negative {
+  color: var(--danger-ink);
+  font-weight: 700;
+}
+
+.profit-cell.profit-zero {
+  color: var(--ink-muted);
+  font-weight: inherit;
+}
+
+/* Activation: labelled boxes side by side, and the file chooser is one button. */
+.activation-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-3);
+}
+
+.device-activation-panel .button-row {
+  margin: var(--space-2) 0 var(--space-3);
+}
+
+.activation-file-button.is-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* The rename box's one-line name field matches the reason box under it. */
+.feedback-dialog-field input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Accounts, Users, the rename box: the box a refusal names gets the same red edge as PEP Menu's. */
+:is(.content-card, .feedback-dialog) :is(input, select, textarea)[aria-invalid="true"] {
+  border-color: var(--danger-ink);
+  box-shadow: 0 0 0 1px var(--danger-ink);
+}
+
+/* A warning under the payment tiles keeps its distance from the Save button below it. */
+.content-card > .warning-note + .button-row {
+  margin-top: var(--space-3);
+}
+
+/* Ledger: the two statement dates side by side, with Print, PDF and WhatsApp on the same line. The
+   grid gave "Statement From" the whole row and pushed PDF Export onto a line of its own. */
+.ledger-toolbar.ledger-dates-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.ledger-toolbar.ledger-dates-toolbar > label {
+  flex: 0 1 210px;
+  min-width: 160px;
+}
+
+/* A free-text cell (narration, remarks) wraps between words instead of widening the table. */
+td.wrap-cell {
+  min-width: 140px;
+  max-width: 280px;
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
+/* Reports and the ledger: a heading of several words wraps, and cells sit a little closer, so a
+   twelve-column report fits a 1366 screen without a sideways scroll (Discount Report was 1466px
+   wide in a 936px card). Print and PDF keep their own table rules. */
+@media screen {
+  .content-area[data-view="reports"] .table-wrap table th:not([colspan]),
+  .content-area[data-view="accounts"] .table-wrap table th:not([colspan]) {
+    white-space: normal;
+    vertical-align: bottom;
+  }
+
+  /* The cash book's two-sided columns are sized by their own widths; "Bank (₹)" stays one line. */
+  .content-area[data-view="reports"] .cash-book-panel .table-wrap table th:not([colspan]) {
+    white-space: nowrap;
+  }
+
+  .content-area[data-view="reports"] .table-wrap :is(th, td),
+  .content-area[data-view="accounts"] .table-wrap :is(th, td) {
+    padding-left: 9px;
+    padding-right: 9px;
+  }
+}
+
+/* A card that is only a heading (Report Center, Settings) ends at its words: no rule and gap under
+   them leading to nothing. */
+.content-card > .card-heading:only-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+/* Backups: the folder box is wide enough to read the folder. */
+.backup-settings-grid > label:last-child {
+  grid-column: span 2;
+}
+
+@media (max-width: 820px) {
+  .backup-settings-grid > label:last-child {
+    grid-column: auto;
+  }
+}
+
+/* Settings: a note under a row of buttons does not touch them. */
+.content-area:is([data-view="settings"], [data-view="branches"]) .button-row + :is(.form-note, small, p) {
+  margin-top: var(--space-3);
+}
+
+/* Permission Matrix: a role name breaks between words only ("Purchase / Manager", never
+   "Cashie / r"), and its Save button stays on one line. */
+.permission-matrix-table th:not(:first-child) {
+  min-width: 104px;
+}
+
+.permission-role-head strong {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.permission-role-head .table-action {
+  white-space: nowrap;
+}
+
+/* Extra Large text: the 920px floor on every table made each back-office table scroll sideways in
+   an 884px card even when it fitted. Here a table is as wide as its content, its headings wrap
+   between words, and only a table that truly does not fit scrolls (inside its own frame). The
+   Products table with more columns and the stock-lots table are condensed the same way. POS is
+   untouched: its tables keep the floor. */
+@media screen {
+  :root[data-app-font-size] .content-area:is([data-view="reports"], [data-view="accounts"], [data-view="settings"], [data-view="all-shops"], [data-view="branches"]) .table-wrap table,
+  :root[data-app-font-size] .content-area[data-view="products"] :is(.product-entry-item-table, .pm-lot-table) table {
+    min-width: 0;
+  }
+
+  :root[data-app-font-size] .content-area:is([data-view="settings"], [data-view="all-shops"], [data-view="branches"]) .table-wrap table th:not([colspan]),
+  :root[data-app-font-size] .content-area[data-view="products"] :is(.product-entry-item-table, .pm-lot-table) table th:not([colspan]) {
+    white-space: normal;
+    vertical-align: bottom;
+  }
+
+  :root[data-app-font-size] .content-area[data-view="products"] #product-lots-card .table-wrap table {
+    min-width: 0;
+  }
+
+  :root[data-app-font-size="extra-large"] .content-area[data-view="products"] :is(.product-entry-item-table, .pm-lot-table) :is(th, td) {
+    padding-inline: 6px;
+  }
+
+  /* With more columns on at Extra Large: the name takes less room (the whole name is on hover), a
+     stock figure puts its unit under the number, and a long barcode is cut short (whole on hover). */
+  :root[data-app-font-size="extra-large"] .product-entry-item-table:has(th:nth-child(10)) .pm-product-cell {
+    min-width: 150px;
+  }
+
+  :root[data-app-font-size="extra-large"] .product-entry-item-table:has(th:nth-child(10)) table td.pm-num:nth-child(4) {
+    white-space: normal;
+    min-width: 72px;
+  }
+
+  :root[data-app-font-size="extra-large"] .product-entry-item-table:has(th:nth-child(10)) td:nth-child(5) {
+    max-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Stock lots at Extra Large: the lot and supplier wrap, and the row's buttons stack sooner. */
+  :root[data-app-font-size="extra-large"] :is(.product-entry-item-table, .pm-lot-table) th {
+    letter-spacing: 0.2px;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table td:nth-child(1) {
+    max-width: 116px;
+    white-space: normal;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table td:nth-child(2) {
+    max-width: 110px;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table .pm-row-actions {
+    max-width: 140px;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table .pm-row-actions .table-action {
+    padding-inline: 8px;
+  }
+}

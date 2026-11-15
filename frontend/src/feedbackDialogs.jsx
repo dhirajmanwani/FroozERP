@@ -10,7 +10,7 @@
 // The decisions (tones, defaults, the queue) are in `local/feedback.js`, where they are tested.
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { noticePresentation, reasonSubmission } from "./local/feedback";
+import { namedReasonSubmission, noticePresentation, reasonSubmission } from "./local/feedback";
 
 export function SaveNotice({ notice, className = "" }) {
   const presentation = noticePresentation(notice);
@@ -59,20 +59,37 @@ export function ConfirmDialog({ options, onAnswer }) {
 
 export function ReasonDialog({ options, onAnswer }) {
   const [value, setValue] = useState(options.defaultValue);
+  const [name, setName] = useState(options.nameDefault || "");
   const [error, setError] = useState("");
+  const [errorField, setErrorField] = useState("");
   const inputRef = useRef(null);
+  const nameRef = useRef(null);
   const danger = options.tone === "danger";
+  const named = Boolean(options.nameLabel);
   useEffect(() => {
-    const input = inputRef.current;
+    // A rename starts in the name box; otherwise in the reason.
+    const input = named ? nameRef.current : inputRef.current;
     if (!input) return;
     input.focus();
-    // A suggested reason is selected, so typing replaces it and Enter keeps it.
+    // A suggested name or reason is selected, so typing replaces it and Enter keeps it.
     input.select();
-  }, []);
+  }, [named]);
   const submit = () => {
+    if (named) {
+      const outcome = namedReasonSubmission({ name, reason: value }, { required: options.required });
+      if (!outcome.ok) {
+        setError(outcome.error);
+        setErrorField(outcome.field);
+        (outcome.field === "name" ? nameRef : inputRef).current?.focus();
+        return;
+      }
+      onAnswer(outcome.value);
+      return;
+    }
     const outcome = reasonSubmission(value, { required: options.required });
     if (!outcome.ok) {
       setError(outcome.error);
+      setErrorField("reason");
       inputRef.current?.focus();
       return;
     }
@@ -96,10 +113,25 @@ export function ReasonDialog({ options, onAnswer }) {
         >
           <strong className="feedback-dialog-title" id="feedback-reason-title">{options.title}</strong>
           {options.message && <p>{options.message}</p>}
+          {named && (
+            <label className="feedback-dialog-field">
+              <span>{options.nameLabel}<span aria-hidden="true" className="pm-required"> *</span></span>
+              <input
+                aria-invalid={error && errorField === "name" ? "true" : undefined}
+                ref={nameRef}
+                type="text"
+                value={name}
+                onChange={(event) => {
+                  setName(event.target.value);
+                  if (error) setError("");
+                }}
+              />
+            </label>
+          )}
           <label className="feedback-dialog-field">
             <span>{options.label}{options.required && <span aria-hidden="true" className="pm-required"> *</span>}</span>
             <textarea
-              aria-invalid={error ? "true" : undefined}
+              aria-invalid={error && errorField !== "name" ? "true" : undefined}
               placeholder={options.placeholder || undefined}
               ref={inputRef}
               rows={3}
