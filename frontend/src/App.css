@@ -257,7 +257,7 @@ input[type="number"] {
 
 .brand-copy strong {
   color: var(--ink);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   font-weight: 850;
   letter-spacing: 0.8px;
   line-height: 1.18;
@@ -393,7 +393,7 @@ input[type="number"] {
 
 .sidebar-profile strong {
   color: var(--ink-strong);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
 }
 
 .sidebar-profile small {
@@ -473,6 +473,7 @@ input[type="number"] {
 .branch-pill {
   gap: 7px;
   padding: 7px 11px;
+  font-size: var(--font-size-sm);
   color: var(--ink-body);
   background: var(--card);
 }
@@ -486,7 +487,7 @@ input[type="number"] {
   border-radius: var(--radius-pill);
   background: var(--attention-soft);
   color: var(--attention-ink);
-  font-size: 11px;
+  font-size: var(--font-size-sm);
   font-weight: 700;
 }
 
@@ -530,7 +531,7 @@ input[type="number"] {
 
 .global-clock {
   color: var(--ink-strong);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   font-variant-numeric: tabular-nums;
   font-weight: 750;
   line-height: 1.2;
@@ -563,6 +564,19 @@ input[type="number"] {
 
 .local-only-banner strong {
   color: var(--ink-strong-warm);
+}
+
+/* One line: headline and sentence side by side, wrapping only when the window is too narrow. */
+.local-only-banner-compact {
+  padding: 6px 14px;
+}
+
+.local-only-banner-compact div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: var(--space-2);
+  row-gap: 2px;
 }
 
 /* `--ink-muted-warm`, not `--ink-muted`: on the gold fill the plainer muted ink measured 4.44:1 in
@@ -612,9 +626,26 @@ input[type="number"] {
   color: var(--ink-muted);
 }
 
-.login-close-exit-button {
+/* Retry Online, Continue Offline and Close & Exit: one row, equal widths. */
+.login-secondary-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
   width: 100%;
   margin-top: 2px;
+}
+
+.login-secondary-actions > button {
+  width: 100%;
+  min-height: var(--control-height);
+}
+
+.login-form {
+  display: grid;
+}
+
+.login-close-exit-button {
+  width: 100%;
   border-color: var(--line-strong);
   color: var(--ink-body);
   background: var(--veil-strong);
@@ -679,6 +710,17 @@ input[type="number"] {
   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.12);
 }
 
+/* Offline or waiting is the notice amber; a fault is the danger red. Never green while offline. */
+.status-dot[data-tone="notice"] {
+  background: var(--attention-strong);
+  box-shadow: 0 0 0 3px var(--attention-soft);
+}
+
+.status-dot[data-tone="problem"] {
+  background: var(--danger-strong);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
 .content-area {
   padding: 28px 32px;
 }
@@ -740,6 +782,61 @@ input[type="number"] {
   border-color: transparent;
   border-left-color: var(--danger);
   background: var(--danger-soft);
+}
+
+/* Fatal start-up screen: the brand ground with a danger edge, not a hard-coded red page. */
+.fatal-startup-page {
+  background: radial-gradient(circle at top left, var(--danger-soft), transparent 40%), var(--ground);
+}
+
+.login-panel.fatal-startup-panel {
+  display: grid;
+  gap: 10px;
+  border-left: 4px solid var(--danger);
+  max-width: min(640px, 100%);
+}
+
+.fatal-startup-panel h1,
+.fatal-startup-panel p {
+  margin: 0;
+}
+
+.fatal-startup-panel h1 {
+  color: var(--danger-ink);
+}
+
+.fatal-startup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.fatal-startup-actions > button {
+  width: auto;
+  min-width: 150px;
+  min-height: var(--control-height);
+}
+
+.fatal-startup-details summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+}
+
+.fatal-startup-message {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--shadow-faint);
+  color: var(--ink-body);
+  font-size: var(--font-size-sm);
 }
 
 .startup-api-panel {
@@ -813,7 +910,7 @@ input[type="number"] {
 }
 
 .startup-details-toggle:hover {
-  color: #fbdda4;
+  color: var(--accent);
   transform: none;
   box-shadow: none;
 }
@@ -885,7 +982,7 @@ input[type="number"] {
 }
 
 .welcome-banner .brand-copy strong {
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   letter-spacing: 1.05px;
 }
 
@@ -1060,7 +1157,7 @@ input[type="number"] {
   border-radius: 999px;
   color: var(--accent-bright);
   background: var(--accent-soft);
-  font-size: 11px;
+  font-size: var(--font-size-sm);
   font-style: normal;
   font-weight: 800;
 }
@@ -1447,7 +1544,7 @@ input[type="number"] {
 .top-product-row strong,
 .low-stock-row strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .top-product-row span,
@@ -1578,9 +1675,23 @@ button:disabled {
 
 /* One focus ring for every button, drawn outside the edge so it never changes the size. */
 :is(.primary-button, .secondary-button, .table-action, .remove-button, .danger-text-button,
-  .whatsapp-button, .compact-button, .quick-action, .range-button, .account-tab, .settings-tabs > button):focus-visible {
+  .whatsapp-button, .compact-button, .quick-action, .range-button, .account-tab, .settings-tabs > button,
+  .nav-item, .report-category-card, .report-menu-card, .startup-details-toggle, .recovery-link-button,
+  .sidebar-profile, input[type="checkbox"], input[type="radio"]):focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* A clickable report row is reached with Tab and opened with Enter; the ring sits inside the row. */
+tr.report-row-clickable:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* Every checkbox and radio in the brand accent, not the browser's blue. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
 }
 
 textarea {
@@ -1736,6 +1847,29 @@ tbody tr:last-child td {
 .profit-cell {
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* A DataTable column declared `{ label, numeric: true }`: money and quantities right-aligned,
+   heading included, so a column of figures lines up on its last digit. */
+table.num-col-1 :is(th, td):nth-child(1):not(.empty-cell):not([colspan]),
+table.num-col-2 :is(th, td):nth-child(2):not(.empty-cell):not([colspan]),
+table.num-col-3 :is(th, td):nth-child(3):not(.empty-cell):not([colspan]),
+table.num-col-4 :is(th, td):nth-child(4):not(.empty-cell):not([colspan]),
+table.num-col-5 :is(th, td):nth-child(5):not(.empty-cell):not([colspan]),
+table.num-col-6 :is(th, td):nth-child(6):not(.empty-cell):not([colspan]),
+table.num-col-7 :is(th, td):nth-child(7):not(.empty-cell):not([colspan]),
+table.num-col-8 :is(th, td):nth-child(8):not(.empty-cell):not([colspan]),
+table.num-col-9 :is(th, td):nth-child(9):not(.empty-cell):not([colspan]),
+table.num-col-10 :is(th, td):nth-child(10):not(.empty-cell):not([colspan]),
+table.num-col-11 :is(th, td):nth-child(11):not(.empty-cell):not([colspan]),
+table.num-col-12 :is(th, td):nth-child(12):not(.empty-cell):not([colspan]),
+table.num-col-13 :is(th, td):nth-child(13):not(.empty-cell):not([colspan]),
+table.num-col-14 :is(th, td):nth-child(14):not(.empty-cell):not([colspan]),
+table.num-col-15 :is(th, td):nth-child(15):not(.empty-cell):not([colspan]),
+table.num-col-16 :is(th, td):nth-child(16):not(.empty-cell):not([colspan]) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .date-cell,
@@ -2164,6 +2298,11 @@ td.origin-rate {
   font-weight: 800;
 }
 
+/* A loss in a profit column: the loss colour, never the profit green. */
+.profit-cell.loss-cell {
+  color: var(--danger-ink);
+}
+
 .purchase-summary {
   margin: 4px 0 18px;
   padding: 16px;
@@ -2213,7 +2352,7 @@ td.origin-rate {
 .summary-metric strong {
   margin-top: 4px;
   color: var(--ink-strong);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 .summary-metric-featured {
@@ -2265,7 +2404,7 @@ td.origin-rate {
 
 .sync-owner-row strong {
   color: var(--ink-strong);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-weight: 800;
   overflow-wrap: anywhere;
 }
@@ -2462,6 +2601,21 @@ td.origin-rate {
   margin-bottom: 16px;
 }
 
+/* A button in a toolbar or a button row is as wide as its label, at the inputs' height, at the
+   start of its cell. In the toolbar's grid it used to fill a whole track: "Refresh Payment History"
+   and "PDF Export" became 500px slabs that read as fields. */
+.ledger-toolbar > :is(button, .primary-button, .secondary-button, .whatsapp-button),
+.button-row > :is(.primary-button, .secondary-button, .whatsapp-button) {
+  justify-self: start;
+  width: auto;
+  max-width: 100%;
+  min-height: var(--control-height);
+}
+
+.ledger-toolbar > :is(button, .primary-button, .secondary-button, .whatsapp-button) {
+  align-self: end;
+}
+
 .supplier-detail {
   display: grid;
   gap: 18px;
@@ -2496,7 +2650,7 @@ td.origin-rate {
 .detail-item strong {
   margin-top: 5px;
   color: var(--ink-strong);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .supplier-payment-preview {
@@ -2579,7 +2733,7 @@ td.origin-rate {
 
 .permission-card strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .permission-card span {
@@ -2627,9 +2781,11 @@ td.origin-rate {
   background: var(--hover);
 }
 
+/* The shelf and cart take what the checkout panel leaves. A 690px floor for them made the page
+   scroll sideways at 1366 with Large or Extra Large text (1370 > 1366). */
 .pos-layout {
   display: grid;
-  grid-template-columns: minmax(690px, 1fr) minmax(320px, 380px);
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
   gap: var(--module-gap);
   align-items: start;
   min-height: 0;
@@ -2700,12 +2856,23 @@ td.origin-rate {
   padding-left: 38px;
 }
 
+/* auto-fill: one combo on a tab keeps a tile's width instead of stretching across the card. */
 .product-results {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(245px, 1fr));
   gap: 10px;
   margin-top: 13px;
   align-items: stretch;
+}
+
+/* The shelf scrolls inside its card, so the cart under it stays on screen while items are added
+   (each tap used to push the cart ~1500px further down at 1366). */
+.pos-search-card .product-results {
+  max-height: clamp(220px, calc(100vh - 480px), 640px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 4px 2px 2px;
+  scrollbar-width: thin;
 }
 
 .product-result {
@@ -2746,7 +2913,7 @@ td.origin-rate {
 .product-result strong {
   min-width: 0;
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   line-height: 1.25;
   overflow: hidden;
   display: -webkit-box;
@@ -2859,7 +3026,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .cart-table table {
-  min-width: 710px;
+  min-width: 0;
   width: 100%;
   table-layout: fixed;
   border-collapse: separate;
@@ -2875,31 +3042,33 @@ tbody tr:has(> .empty-cell):hover {
   text-overflow: ellipsis;
 }
 
+/* Sized to fit the cart card at 1366 with every column, the remove button included: the product
+   takes what is left, the figures keep fixed widths so they line up. */
 .cart-table th:nth-child(1),
 .cart-table td:nth-child(1) {
-  width: 23%;
+  width: auto;
 }
 
 .cart-table th:nth-child(2),
 .cart-table td:nth-child(2) {
-  width: 18%;
+  width: 16%;
 }
 
 .cart-table th:nth-child(3),
 .cart-table th:nth-child(4),
 .cart-table td:nth-child(3),
 .cart-table td:nth-child(4) {
-  width: 82px;
+  width: 76px;
 }
 
 .cart-table th:nth-last-child(3),
 .cart-table td:nth-last-child(3) {
-  width: 104px;
+  width: 96px;
 }
 
 .cart-table th:nth-last-child(2),
 .cart-table td:nth-last-child(2) {
-  width: 104px;
+  width: 94px;
 }
 
 .cart-table th:last-child,
@@ -2931,10 +3100,16 @@ tbody tr:has(> .empty-cell):hover {
   white-space: nowrap;
 }
 
+/* The lot on one line, cut with "…" (its full name is the tooltip): in a narrow column it used to
+   break one letter per line. */
 .cart-table .batch-id {
   display: block;
+  max-width: 100%;
+  overflow: hidden;
   color: var(--ink-body);
   line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cart-table .amount-cell {
@@ -2948,9 +3123,10 @@ tbody tr:has(> .empty-cell):hover {
 
 .cart-table .table-input {
   width: 100%;
-  min-width: 72px;
+  min-width: 0;
   max-width: 108px;
   padding-inline: 6px;
+  text-align: right;
   white-space: nowrap;
 }
 
@@ -3035,7 +3211,7 @@ tbody tr:has(> .empty-cell):hover {
   top: 78px;
   z-index: 2;
   display: grid;
-  grid-template-columns: minmax(260px, 1.6fr) repeat(5, minmax(118px, 0.7fr)) minmax(150px, auto);
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
   align-items: end;
   padding: 14px 16px;
@@ -3048,6 +3224,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .lot-selector-search {
+  grid-column: span 2;
   min-width: 0;
 }
 
@@ -3093,7 +3270,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .lot-selector-table {
   width: 100%;
-  min-width: 920px;
+  min-width: 0;
   border-collapse: separate;
   border-spacing: 0;
 }
@@ -3199,10 +3376,13 @@ tbody tr:has(> .empty-cell):hover {
   background: var(--danger-soft);
 }
 
+/* Docked above the FROST launcher: the panel ends before the launcher's corner, so Checkout &
+   Print and the Mandi Tax badge are never under it. */
 .checkout-card {
   position: sticky;
   top: calc(var(--topbar-height, 0px) + 18px);
-  max-height: calc(100vh - 104px - var(--topbar-height, 0px));
+  /* 106px = the FROST launcher (62px) and its 22px gap above and below it. */
+  max-height: calc(100vh - 18px - 106px - var(--topbar-height, 0px));
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -3256,7 +3436,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .discount-preview strong {
   color: var(--accent);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   white-space: nowrap;
 }
 
@@ -3450,6 +3630,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .total-line strong {
   color: var(--ink-body);
+  font-size: var(--font-size-base);
 }
 
 .total-line-muted {
@@ -3465,7 +3646,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .total-line-main strong {
   color: var(--accent);
-  font-size: 18px;
+  font-size: calc(18px * var(--font-scale));
 }
 
 .checkout-button {
@@ -3607,7 +3788,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .customer-sales-group-summary strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 .customer-sales-group-summary span {
@@ -3791,7 +3972,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .sale-change-approval > strong {
   color: var(--ink-strong);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .sale-change-approval .form-grid,
@@ -3888,7 +4069,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .report-toolbar strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 /* minmax(0, 1fr): a grid item's own minimum is its content's, so a wide tile row or table pushed
@@ -4000,7 +4181,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .pl-line strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-weight: 850;
   white-space: nowrap;
 }
@@ -4198,7 +4379,7 @@ tbody tr:has(> .empty-cell):hover {
   display: block;
   margin-top: 5px;
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-weight: 900;
 }
 
@@ -4571,7 +4752,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .pos-paid-qr strong {
   color: var(--ink-strong);
-  font-size: 24px;
+  font-size: calc(24px * var(--font-scale));
   font-variant-numeric: tabular-nums;
 }
 
@@ -5247,7 +5428,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .login-brand .brand-copy strong {
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
   letter-spacing: 1.2px;
 }
 
@@ -5315,7 +5496,7 @@ tbody tr:has(> .empty-cell):hover {
 }
 
 .recovery-link-button:hover {
-  color: #fbdda4;
+  color: var(--accent);
   transform: none;
   box-shadow: none;
 }
@@ -5410,7 +5591,7 @@ tbody tr:has(> .empty-cell):hover {
 
 .device-activation-panel strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
 }
 
 .device-activation-panel small,
@@ -7575,6 +7756,19 @@ tbody tr:has(> .empty-cell):hover {
   scrollbar-color: var(--accent-line-strong) var(--veil-subtle);
 }
 
+/* More modules below the fold: the last row fades out and the scrollbar shows, so the list is
+   plainly a list that scrolls (App sets data-more-below as it scrolls). */
+.sidebar-nav[data-more-below="true"] {
+  -webkit-mask-image: linear-gradient(to bottom, #000000 calc(100% - 36px), transparent);
+  mask-image: linear-gradient(to bottom, #000000 calc(100% - 36px), transparent);
+  scrollbar-color: var(--accent-line-strong) var(--veil-subtle);
+}
+
+/* The active module is scrolled into view clear of that fade, not left half-hidden under it. */
+.sidebar-nav .nav-item {
+  scroll-margin-block: 40px;
+}
+
 .sidebar-nav::-webkit-scrollbar,
 .frost-drawer-body::-webkit-scrollbar,
 .command-list::-webkit-scrollbar {
@@ -7586,6 +7780,23 @@ tbody tr:has(> .empty-cell):hover {
 .command-list::-webkit-scrollbar-thumb {
   border-radius: 999px;
   background: var(--accent-line);
+}
+
+.sidebar-nav::-webkit-scrollbar-thumb {
+  background: var(--accent-line-strong);
+}
+
+/* Read on the sidebar panel: the faint ink measured 3.3:1 there, under the 4.5:1 small text needs. */
+.sidebar-shop-picker .sidebar-section,
+.sidebar-profile small {
+  color: var(--ink-muted);
+}
+
+/* The content area leaves room at its foot for the FROST launcher fixed in the bottom-right
+   corner, so the last row of a table, a Save button or a total is never left under it. Two classes
+   so the narrow-window rules, which reset `padding`, keep this. */
+.erp-shell .content-area {
+  padding-bottom: calc(62px + 2 * 22px);
 }
 
 .nav-item {
@@ -7950,9 +8161,10 @@ tbody tr:has(> .empty-cell):hover {
   height: 18px;
   padding: 0 5px;
   border-radius: 999px;
-  background: #ef4444;
+  /* White on the bright error red measured 3.76:1; the deep error red keeps the alarm and reads. */
+  background: #7f1d1d;
   color: #fff;
-  font-size: 10px;
+  font-size: calc(10px * var(--font-scale, 1));
   font-weight: 800;
   line-height: 18px;
   text-align: center;
@@ -8268,7 +8480,7 @@ tbody tr:has(> .empty-cell):hover {
   border-radius: 5px;
   border: 1px solid var(--line-strong);
   font-family: inherit;
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.04em;
@@ -9722,7 +9934,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .discount-confirm strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   white-space: normal;
 }
 
@@ -9799,7 +10011,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .discount-lot strong {
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
 }
 
 .discount-lot small {
@@ -10015,7 +10227,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .slab-text strong {
   color: var(--ink);
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   font-variant-numeric: tabular-nums;
 }
 
@@ -10177,15 +10389,17 @@ button.shortcut-sheet-row:focus-visible {
 
 /* A small chip on the box's corner, half outside it, so it never covers a box's own title or
    buttons: a box made of several cards (today's figures, the graphs) has no padding of its own. */
+/* Inside the box's top-right corner, small, so it reads as part of the box (half outside it, it
+   looked misplaced) and still clears a box's own title and buttons. */
 .dash-handle {
   position: absolute;
-  top: -9px;
-  right: -9px;
+  top: 6px;
+  right: 6px;
   z-index: 5;
   display: inline-grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 1px solid var(--line-soft);
   border-radius: var(--radius-pill);
@@ -10649,6 +10863,76 @@ button.shortcut-sheet-row:focus-visible {
   width: min(420px, calc(100vw - 32px));
 }
 
+/* The in-app confirm and reason boxes (feedbackDialogs.jsx), in place of the browser's own popups.
+   Above every other modal: one of them may be asked for from inside another. */
+.feedback-dialog-backdrop {
+  z-index: 140;
+}
+
+.feedback-dialog {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.feedback-dialog-body {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-5);
+}
+
+.feedback-dialog-title {
+  color: var(--ink-strong);
+  font-size: var(--font-size-lg);
+  font-weight: 750;
+  line-height: 1.3;
+}
+
+.feedback-dialog-body p {
+  margin: 0;
+  color: var(--ink-body);
+  line-height: 1.5;
+}
+
+.feedback-dialog-field {
+  display: grid;
+  gap: var(--space-2);
+  color: var(--ink-muted);
+  font-weight: 700;
+}
+
+.feedback-dialog-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.feedback-dialog-actions {
+  justify-content: flex-end;
+  margin-top: var(--space-2);
+}
+
+.feedback-dialog-actions > button {
+  min-height: var(--control-height);
+}
+
+.feedback-dialog-danger {
+  border-top: 3px solid var(--danger);
+}
+
+.primary-button.primary-button-danger {
+  border: 1px solid var(--danger);
+  color: var(--card);
+  background: var(--danger);
+}
+
+.primary-button.primary-button-danger:hover {
+  color: var(--card);
+  background: var(--danger-ink);
+}
+
+/* The line under a Save button. Spaced from the button it reports on, never jammed against it. */
+.save-notice {
+  margin: var(--space-3) 0 0;
+}
+
 .pos-combo-ask-body {
   display: grid;
   gap: 12px;
@@ -11078,7 +11362,7 @@ button.shortcut-sheet-row:focus-visible {
 .packing-purchase-total strong {
   margin-left: auto;
   color: var(--ink);
-  font-size: 16px;
+  font-size: calc(16px * var(--font-scale));
   font-variant-numeric: tabular-nums;
 }
 
@@ -11104,7 +11388,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .packing-count-after strong {
   color: var(--ink);
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
 }
 
 /* A size's count stays near its name on a wide screen, and Edit / Correct count sit in the same
@@ -11194,7 +11478,7 @@ button.shortcut-sheet-row:focus-visible {
 
 .combo-example strong {
   color: var(--ink);
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
 }
 
 #combo-form,
@@ -11272,4 +11556,980 @@ button.shortcut-sheet-row:focus-visible {
 .permission-matrix-table th:first-child {
   z-index: 3;
   background: linear-gradient(180deg, var(--card-veil-solid), var(--veil-solid));
+}
+
+/* --- Stock screens (whole-app polish, phase 2) -------------------------------------------------
+   Purchase Entry, Pending Bills, Waste, Expenses, Stock Distribution and Sale Rate Update at
+   1366 x 768: tables that fit without scrolling sideways, figures on one line, and the boxes a
+   screen stacks spaced by the shared --module-gap. */
+
+/* Quantities and money never break across lines ("71.500 Kg", "₹273.73"). */
+.purchase-cart-table td,
+.purchase-amendment-table td,
+.pending-bills-table td {
+  vertical-align: top;
+}
+
+.purchase-amendment-table td.primary-cell,
+.pending-bills-table td.primary-cell {
+  white-space: normal;
+}
+
+/* A bill's items wrap inside the cell instead of widening the table. */
+.pending-bills-table td.purchase-items-cell {
+  max-width: 420px;
+  min-width: 220px;
+}
+
+.pending-bills-table td.purchase-items-cell span {
+  max-width: none;
+}
+
+/* The receipt form opens under the list; land its top below the sticky bar. */
+#customer-payment-amount,
+#expense-form,
+#product-name-input {
+  scroll-margin-top: 96px;
+}
+
+/* Expenses: seven filters on one tidy grid that wraps, Search a little wider, Refresh as wide as
+   its label. The shared toolbar is a three-track grid built for three controls. */
+.ledger-toolbar.expense-toolbar {
+  grid-template-columns: minmax(200px, 1.6fr) repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.expense-register td.expense-notes-cell {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.expense-register td:nth-child(3) {
+  max-width: 150px;
+  white-space: normal;
+}
+
+/* Two or three small buttons in a row need their own width, not the shared 250px floor. */
+:is(.expense-register, .pending-bills-table, .purchase-cart-table, .purchase-amendment-table) .table-actions-row {
+  min-width: 0;
+}
+
+/* A notes box straight under a form grid, then the buttons: the same gap as between fields. */
+.content-card > label + .button-row {
+  margin-top: var(--space-4);
+}
+
+/* Stock Distribution. */
+.distribution-board td.distribution-number {
+  white-space: nowrap;
+}
+
+.distribution-board td:nth-child(2),
+.distribution-board td:nth-child(3) {
+  white-space: normal;
+}
+
+.distribution-board td:nth-child(2),
+.distribution-board td:nth-child(3) {
+  min-width: 160px;
+}
+
+.distribution-board .table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* A long note under the buttons wraps inside the cell instead of pushing the board sideways. */
+.distribution-board td:last-child,
+.distribution-board .table-actions .cell-note {
+  white-space: normal;
+}
+
+.distribution-board .table-actions .cell-note {
+  flex-basis: 100%;
+  max-width: 420px;
+}
+
+.distribution-allocation-row > td {
+  white-space: normal;
+  background: var(--fill);
+}
+
+.distribution-allocation {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 760px;
+}
+
+.distribution-allocation-line {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.distribution-allocation-line .muted-note {
+  margin: 0;
+}
+
+/* One line of a consignment: the lot (or product) picker, its quantity and Remove, labelled and
+   sized to what they hold rather than stretched across the card. */
+.distribution-line {
+  display: grid;
+  grid-template-columns: minmax(240px, 520px) minmax(110px, 160px) auto;
+  gap: var(--space-3);
+  align-items: end;
+  margin-bottom: var(--space-3);
+}
+
+.distribution-allocation .distribution-line {
+  grid-template-columns: minmax(220px, 440px) minmax(110px, 160px);
+  margin-bottom: 0;
+}
+
+.distribution-line > .danger-text-button {
+  justify-self: start;
+  min-height: var(--control-height);
+}
+
+/* Send / Ask tabs sit above the form with the usual gap, and "Send to" is as wide as a shop's
+   name, matching the lot picker under it. */
+.distribution-page .account-tabs {
+  margin-bottom: var(--space-4);
+}
+
+.distribution-page .supplier-form-grid {
+  grid-template-columns: minmax(240px, 520px);
+}
+
+@media (max-width: 760px) {
+  .distribution-line,
+  .distribution-allocation .distribution-line,
+  .distribution-page .supplier-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Sale Rate Update's combo prices: its own six columns (it borrowed PEP Menu's five-column
+   widths, which clipped "Cost today" and "New price" and wrapped "₹273.73"). */
+.sale-rate-combo-table table {
+  table-layout: auto;
+}
+
+.sale-rate-combo-table td {
+  white-space: nowrap;
+}
+
+.sale-rate-combo-table td.primary-cell {
+  min-width: 180px;
+  white-space: normal;
+}
+
+.sale-rate-combo-table td input {
+  width: calc(110px * var(--font-scale, 1));
+  min-width: 0;
+}
+
+/* Products: the extra columns and a product's stock lots fit the card at 1366. Headings may wrap
+   onto two lines, and a row's buttons wrap instead of setting the column's width. */
+:is(.product-entry-item-table, .pm-lot-table) th,
+:is(.product-entry-item-table, .pm-lot-table) th .pm-num-head {
+  white-space: normal;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+:is(.product-entry-item-table, .pm-lot-table) .pm-row-actions {
+  flex-wrap: wrap;
+}
+
+.product-entry-item-table .pm-row-actions {
+  max-width: 190px;
+}
+
+.pm-lot-table .pm-row-actions {
+  max-width: 216px;
+}
+
+.pm-lot-table table {
+  min-width: 0;
+}
+
+.pm-lot-table td:nth-child(2) {
+  max-width: 160px;
+  white-space: normal;
+}
+
+/* With the four extra columns on, the cells sit a little closer so the ten still fit. */
+.product-entry-item-table:has(th:nth-child(10)) :is(th, td) {
+  padding-inline: 10px;
+}
+
+/* Stock Inventory's product table: its nine headings may take two lines, so Status is not pushed
+   off the card's right edge at 1366. */
+/* Specific enough to win over the num-col-N rule that keeps figure cells on one line. */
+.stock-inventory-products table thead tr th:nth-child(n):not(.empty-cell):not([colspan]),
+.stock-inventory-products th * {
+  white-space: normal;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+/* ------------------------------------------------------------------------------------------------
+   Phase 3 polish: the counter screens (POS, Sale Returns, Orders, Discounts, Dashboard).
+   ------------------------------------------------------------------------------------------------ */
+
+/* The FROST launcher is fixed over the bottom-right corner. On these screens the cards stop short of
+   it, so a figure or a button at the right edge is never under it while the page scrolls. POS docks
+   its checkout panel above the launcher instead (the max-height on .checkout-card). */
+@media (min-width: 821px) {
+  .erp-shell .content-area:is([data-view="dashboard"], [data-view="returns"], [data-view="orders"], [data-view="discounts"]) {
+    padding-right: calc(62px + 22px + 10px);
+  }
+}
+
+@media (max-width: 820px) {
+  /* A phone has one scroll box, the page: the shelf is not boxed in there. */
+  .pos-search-card .product-results {
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+/* A tile's stock, once, with its unit and lots: "68 Kg · 4 lots". */
+.product-result-stock {
+  justify-self: start;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  color: var(--ink-body);
+  background: var(--veil);
+  font-weight: 800;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.product-result-stock.stock-low {
+  border-color: transparent;
+}
+
+.product-result em {
+  font-size: var(--font-size-sm);
+}
+
+/* Notices that replaced POS's browser boxes, right where the cashier is looking. */
+.pos-add-notice,
+.pos-cart-notice {
+  margin: var(--space-3) 0 0;
+}
+
+.pos-cart-notice {
+  margin: 0 0 var(--space-3);
+}
+
+/* The cart's figure columns: headings over their numbers, inputs typed from the right. */
+.cart-table th.amount-cell {
+  text-align: right;
+}
+
+.cart-table th.cart-discount-head {
+  white-space: normal;
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+}
+
+.cart-table th.cart-discount-head .pos-discount-limit-note {
+  display: block;
+  margin-top: 2px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.cart-table .pos-discount-over-note {
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.mixed-payment-panel input,
+#pos-bill-discount-input,
+.lot-selector-controls .numeric-input {
+  text-align: right;
+}
+
+/* The foot of the checkout panel: Net Payable, why checkout stopped, and the buttons, pinned in
+   sight while the customer fields above it scroll. */
+.checkout-card {
+  box-sizing: border-box;
+}
+
+/* Widths include the cell padding, so the fixed figure columns leave the product its share. */
+.cart-table th,
+.cart-table td {
+  box-sizing: border-box;
+  padding-inline: 8px;
+}
+
+.checkout-footer {
+  position: sticky;
+  bottom: calc(-1 * var(--space-6));
+  z-index: 3;
+  display: grid;
+  gap: var(--space-2);
+  margin: 0 calc(-1 * var(--space-6)) calc(-1 * var(--space-6));
+  padding: var(--space-3) var(--space-6) var(--space-5);
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 var(--radius-card) var(--radius-card);
+  background: var(--card);
+  box-shadow: 0 -12px 18px -16px var(--shadow-soft);
+}
+
+.checkout-footer .total-line-main {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.checkout-footer .pos-discount-notice,
+.checkout-footer .save-notice {
+  margin: 0;
+}
+
+.checkout-footer .checkout-actions {
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  margin-top: 0;
+}
+
+.checkout-footer .checkout-actions > button {
+  width: 100%;
+  white-space: nowrap;
+}
+
+.pos-bill-date-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+@media (max-width: 820px) {
+  .checkout-footer {
+    position: static;
+    margin: 0;
+    padding: var(--space-3) 0 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+}
+
+/* The lot picker with one size and one unit: the search and "Show" only. */
+.lot-selector-controls.lot-selector-controls-simple {
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 210px);
+}
+
+.lot-selector-controls.lot-selector-controls-simple .lot-selector-search {
+  grid-column: auto;
+}
+
+@media (max-width: 820px) {
+  .lot-selector-controls.lot-selector-controls-simple {
+    grid-template-columns: 1fr;
+  }
+}
+
+.lot-selector-table td small {
+  display: block;
+  color: var(--ink-faint);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.lot-selector-table th.amount-cell,
+.lot-selector-table td.amount-cell {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.lot-selector-notice {
+  margin: var(--space-3) 16px 0;
+}
+
+.lot-selector-foot {
+  margin: 0;
+  padding: 0 16px 16px;
+}
+
+/* Sale Returns (Phase 3). Each field keeps its own height: the reason box beside Refund Option used
+   to stretch the select to its 68px. The history's long return numbers and free-text reasons wrap
+   inside their cells, so the table fits its card at 1366 instead of scrolling the Items off it. */
+.return-entry-grid > label {
+  align-content: start;
+}
+
+.return-entry-grid textarea {
+  min-height: 42px;
+  resize: vertical;
+}
+
+.return-history-table table,
+.return-items-table table {
+  min-width: 0;
+}
+
+/* The return number as plain small text that may break, not a pill: wrapped, a pill became a
+   rounded blob three lines tall. The number itself is the server's and is shown as it is. */
+.return-history-table .batch-id {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-sm);
+}
+
+.return-history-table td.return-wrap-cell {
+  min-width: 120px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.return-outcome {
+  margin-top: var(--space-3);
+}
+
+.return-outcome + .button-row,
+.return-blockers + .button-row {
+  margin-top: var(--space-3);
+}
+
+/* The saved bill's way out sits at the end of its actions; a PDF that failed is said under them. */
+.invoice-actions-bill .invoice-done-button {
+  margin-left: auto;
+}
+
+.invoice-pdf-error {
+  margin-top: var(--space-3);
+}
+
+.pdf-preview-notice {
+  margin: var(--space-3) var(--space-4) 0;
+}
+
+/* Orders (Phase 3). The order's number and its value sit at either end of the card's top line
+   ("ORD-… · Sunita Sharma" … "₹540.00"), never run together; buttons sit in rows with a gap. */
+.order-card .carrier-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-2);
+}
+
+.order-card .carrier-top > span {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.order-card + .order-card {
+  margin-top: var(--space-4);
+}
+
+.order-card .order-actions,
+.orders-form-actions {
+  margin-top: var(--space-3);
+}
+
+.orders-toolbar {
+  align-items: center;
+  margin-bottom: var(--space-3);
+}
+
+.orders-saved-notice {
+  margin: 0 0 var(--space-3);
+}
+
+.order-draft-table .numeric-input {
+  text-align: right;
+}
+
+/* Dashboard (Phase 3): the price list's reminder and group settings fold under one line. */
+.price-list-schedule-details {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--line);
+}
+
+.price-list-schedule-details > summary {
+  cursor: pointer;
+  color: var(--ink-body);
+  font-size: var(--font-size-sm);
+  font-weight: 650;
+}
+
+.price-list-schedule-state {
+  color: var(--ink-muted);
+  font-weight: 500;
+}
+
+.price-list-schedule-details[open] > summary {
+  margin-bottom: var(--space-3);
+}
+
+.price-list-schedule-details .price-list-schedule {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.insight-list .empty-inline {
+  margin: 0;
+}
+
+.return-items-table input.table-input {
+  text-align: right;
+}
+
+/* At the largest text size the print icon was squeezed to a dot beside "Checkout & Print". */
+.checkout-footer .checkout-actions > button svg {
+  flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------------------------------------
+   Phase 4 polish: the back office (Accounts, Reports, All Shops, Settings, Branches & Counters)
+   and what was left of the shell.
+   ------------------------------------------------------------------------------------------------ */
+
+/* The FROST launcher is fixed over the bottom-right corner on every screen, so every screen's cards
+   stop short of it (Phase 3 did this for the counter screens only). POS keeps its own layout: its
+   checkout panel already docks above the launcher. */
+@media (min-width: 821px) {
+  .erp-shell .content-area[data-view]:not([data-view="sales"]) {
+    padding-right: calc(62px + 22px + 10px);
+  }
+}
+
+/* A heading inside a card, below its first block (Payments: "Payment history"). */
+.section-subheading {
+  margin: var(--space-5) 0 var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+}
+
+/* Reports: the results card is named after the report, with its row count small beside it. */
+.report-result-count {
+  margin-left: var(--space-3);
+  color: var(--ink-muted);
+  font-family: var(--font-body, inherit);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+/* "Show report" and, when the dates or search no longer match the figures, the line saying so. */
+.report-apply-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-self: end;
+  gap: var(--space-3);
+}
+
+.report-apply-row .primary-button {
+  width: auto;
+}
+
+.report-apply-note {
+  margin: 0;
+  padding: 6px 10px;
+}
+
+/* The Back button row and the filters under it were touching. */
+.content-card > .button-row + .ledger-toolbar,
+.content-card > .button-row + .purchase-history-toolbar {
+  margin-top: var(--space-4);
+}
+
+/* Settings landing: the four group cards two by two (they were three and an orphan), four across
+   on a wide screen. */
+.settings-group-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (min-width: 1700px) {
+  .settings-group-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 820px) {
+  .settings-group-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.report-category-card em.settings-group-count {
+  margin-top: auto;
+  font-size: var(--font-size-sm);
+}
+
+/* Display settings: a select keeps its own height beside the taller explanation card. */
+.display-settings-grid {
+  align-items: start;
+}
+
+/* Weighing Scale: the scale panel starts clear of the Save button and its notice. */
+.content-card > .button-row + .discount-block,
+.content-card > .save-notice + .discount-block {
+  margin-top: var(--space-5);
+}
+
+/* Permission Matrix, roles across the top: each role's Save sits under its name in the sticky
+   heading, the permission names stay in the left column. */
+.permission-matrix-table table {
+  min-width: 0;
+}
+
+.permission-matrix-table th:not(:first-child),
+.permission-matrix-table td.permission-cell {
+  text-align: center;
+}
+
+.permission-matrix-table td:first-child {
+  min-width: 180px;
+}
+
+/* Role names wrap ("Inventory / Manager") and rows are a tick high, not a button high. */
+.permission-matrix-table th:not(:first-child) {
+  white-space: normal;
+  vertical-align: bottom;
+}
+
+.permission-matrix-table td {
+  padding-block: 8px;
+}
+
+.permission-role-head {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.permission-role-head strong {
+  color: var(--ink);
+  font-size: var(--font-size-sm);
+}
+
+.permission-role-head small {
+  color: var(--ink-muted);
+  font-weight: 500;
+  text-transform: none;
+}
+
+.permission-save-changed {
+  border-color: var(--accent-line-strong);
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.permission-cell input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-height: 0;
+  margin: 0;
+  vertical-align: middle;
+}
+
+/* Users: the name column keeps a readable width, and the row's rarer jobs fold under More. */
+.users-table td.primary-cell {
+  min-width: 160px;
+}
+
+.users-table :is(th, td) {
+  padding-inline: 10px;
+}
+
+/* "15/11/2026 07:11:45 AM": the time drops under the date instead of widening the table. */
+.users-table td.users-login-cell {
+  min-width: 90px;
+  max-width: 110px;
+  white-space: normal;
+}
+
+.users-table td .table-actions-row {
+  flex-wrap: wrap;
+  max-width: 250px;
+}
+
+.row-more-actions {
+  position: relative;
+}
+
+.row-more-actions > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+
+.row-more-actions > summary::-webkit-details-marker {
+  display: none;
+}
+
+.row-more-actions > summary::after {
+  content: "▾";
+  margin-left: 4px;
+  font-size: 0.8em;
+}
+
+.row-more-menu {
+  position: absolute;
+  right: 0;
+  z-index: 5;
+  display: grid;
+  gap: 6px;
+  min-width: 190px;
+  margin-top: 6px;
+  padding: var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 10px);
+  background: var(--card);
+  box-shadow: var(--shadow-card);
+}
+
+.row-more-menu .table-action {
+  justify-content: flex-start;
+  width: 100%;
+  text-align: left;
+}
+
+/* Updates: three facts for the owner; the rest folded. */
+.update-technical-details {
+  margin-top: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+}
+
+.update-technical-details > summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 650;
+}
+
+.update-technical-details[open] > summary {
+  margin-bottom: var(--space-3);
+}
+
+.update-technical-details small {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+}
+
+/* Backups: the folder, said once, wraps rather than pushing the card wide. */
+.backup-folder {
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-sm);
+}
+
+/* A cash or bank figure below zero: the loss colour with a true minus. A zero profit is plain. */
+td.amount-negative {
+  color: var(--danger-ink);
+  font-weight: 700;
+}
+
+.profit-cell.profit-zero {
+  color: var(--ink-muted);
+  font-weight: inherit;
+}
+
+/* Activation: labelled boxes side by side, and the file chooser is one button. */
+.activation-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-3);
+}
+
+.device-activation-panel .button-row {
+  margin: var(--space-2) 0 var(--space-3);
+}
+
+.activation-file-button.is-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* The rename box's one-line name field matches the reason box under it. */
+.feedback-dialog-field input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Accounts, Users, the rename box: the box a refusal names gets the same red edge as PEP Menu's. */
+:is(.content-card, .feedback-dialog) :is(input, select, textarea)[aria-invalid="true"] {
+  border-color: var(--danger-ink);
+  box-shadow: 0 0 0 1px var(--danger-ink);
+}
+
+/* A warning under the payment tiles keeps its distance from the Save button below it. */
+.content-card > .warning-note + .button-row {
+  margin-top: var(--space-3);
+}
+
+/* Ledger: the two statement dates side by side, with Print, PDF and WhatsApp on the same line. The
+   grid gave "Statement From" the whole row and pushed PDF Export onto a line of its own. */
+.ledger-toolbar.ledger-dates-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.ledger-toolbar.ledger-dates-toolbar > label {
+  flex: 0 1 210px;
+  min-width: 160px;
+}
+
+/* A free-text cell (narration, remarks) wraps between words instead of widening the table. */
+td.wrap-cell {
+  min-width: 140px;
+  max-width: 280px;
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
+/* Reports and the ledger: a heading of several words wraps, and cells sit a little closer, so a
+   twelve-column report fits a 1366 screen without a sideways scroll (Discount Report was 1466px
+   wide in a 936px card). Print and PDF keep their own table rules. */
+@media screen {
+  .content-area[data-view="reports"] .table-wrap table th:not([colspan]),
+  .content-area[data-view="accounts"] .table-wrap table th:not([colspan]) {
+    white-space: normal;
+    vertical-align: bottom;
+  }
+
+  /* The cash book's two-sided columns are sized by their own widths; "Bank (₹)" stays one line. */
+  .content-area[data-view="reports"] .cash-book-panel .table-wrap table th:not([colspan]) {
+    white-space: nowrap;
+  }
+
+  .content-area[data-view="reports"] .table-wrap :is(th, td),
+  .content-area[data-view="accounts"] .table-wrap :is(th, td) {
+    padding-left: 9px;
+    padding-right: 9px;
+  }
+}
+
+/* A card that is only a heading (Report Center, Settings) ends at its words: no rule and gap under
+   them leading to nothing. */
+.content-card > .card-heading:only-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+/* Backups: the folder box is wide enough to read the folder. */
+.backup-settings-grid > label:last-child {
+  grid-column: span 2;
+}
+
+@media (max-width: 820px) {
+  .backup-settings-grid > label:last-child {
+    grid-column: auto;
+  }
+}
+
+/* Settings: a note under a row of buttons does not touch them. */
+.content-area:is([data-view="settings"], [data-view="branches"]) .button-row + :is(.form-note, small, p) {
+  margin-top: var(--space-3);
+}
+
+/* Permission Matrix: a role name breaks between words only ("Purchase / Manager", never
+   "Cashie / r"), and its Save button stays on one line. */
+.permission-matrix-table th:not(:first-child) {
+  min-width: 104px;
+}
+
+.permission-role-head strong {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.permission-role-head .table-action {
+  white-space: nowrap;
+}
+
+/* Extra Large text: the 920px floor on every table made each back-office table scroll sideways in
+   an 884px card even when it fitted. Here a table is as wide as its content, its headings wrap
+   between words, and only a table that truly does not fit scrolls (inside its own frame). The
+   Products table with more columns and the stock-lots table are condensed the same way. POS is
+   untouched: its tables keep the floor. */
+@media screen {
+  :root[data-app-font-size] .content-area:is([data-view="reports"], [data-view="accounts"], [data-view="settings"], [data-view="all-shops"], [data-view="branches"]) .table-wrap table,
+  :root[data-app-font-size] .content-area[data-view="products"] :is(.product-entry-item-table, .pm-lot-table) table {
+    min-width: 0;
+  }
+
+  :root[data-app-font-size] .content-area:is([data-view="settings"], [data-view="all-shops"], [data-view="branches"]) .table-wrap table th:not([colspan]),
+  :root[data-app-font-size] .content-area[data-view="products"] :is(.product-entry-item-table, .pm-lot-table) table th:not([colspan]) {
+    white-space: normal;
+    vertical-align: bottom;
+  }
+
+  :root[data-app-font-size] .content-area[data-view="products"] #product-lots-card .table-wrap table {
+    min-width: 0;
+  }
+
+  :root[data-app-font-size="extra-large"] .content-area[data-view="products"] :is(.product-entry-item-table, .pm-lot-table) :is(th, td) {
+    padding-inline: 6px;
+  }
+
+  /* With more columns on at Extra Large: the name takes less room (the whole name is on hover), a
+     stock figure puts its unit under the number, and a long barcode is cut short (whole on hover). */
+  :root[data-app-font-size="extra-large"] .product-entry-item-table:has(th:nth-child(10)) .pm-product-cell {
+    min-width: 150px;
+  }
+
+  :root[data-app-font-size="extra-large"] .product-entry-item-table:has(th:nth-child(10)) table td.pm-num:nth-child(4) {
+    white-space: normal;
+    min-width: 72px;
+  }
+
+  :root[data-app-font-size="extra-large"] .product-entry-item-table:has(th:nth-child(10)) td:nth-child(5) {
+    max-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Stock lots at Extra Large: the lot and supplier wrap, and the row's buttons stack sooner. */
+  :root[data-app-font-size="extra-large"] :is(.product-entry-item-table, .pm-lot-table) th {
+    letter-spacing: 0.2px;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table td:nth-child(1) {
+    max-width: 116px;
+    white-space: normal;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table td:nth-child(2) {
+    max-width: 110px;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table .pm-row-actions {
+    max-width: 140px;
+  }
+
+  :root[data-app-font-size="extra-large"] .pm-lot-table .pm-row-actions .table-action {
+    padding-inline: 8px;
+  }
 }

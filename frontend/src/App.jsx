@@ -72,7 +72,8 @@ import { buildCommandIndex, highlightSegments, searchCommands } from "./local/co
 import { SHORTCUT_SHEET_CHORD, SHORTCUT_SHEET_STATUS, buildShortcutSheet, isShortcutSheetChord } from "./local/keyboardShortcuts";
 import { WHATSAPP_OPENED, describeChatHandoff, initialWhatsappSelection } from "./local/whatsappHandoff";
 import { RETURN_INVOICE_DEFAULT_DAYS, buildSaleReturnDraft, filterReturnInvoices, refundPerUnit, returnInvoiceListParams, saleReturnFingerprint, saleReturnPayload } from "./local/saleReturnDraft";
-import { cartEntryFits, cartLineProblem, chargeRefusalProblem, describeMandiTaxPanel, describeSavedBillRefreshFailure, editLineAmount, editedBillDateTime, lotLeftAfterCart, resolvePosBillDateTime, saleEditTotals } from "./local/posCheckout";
+import { CHECKOUT_GATE, cartEntryFits, cartLineProblem, chargeRefusalProblem, checkoutDateReasonDialog, checkoutGateDialog, checkoutGateRefusal, describeMandiTaxPanel, describeSavedBillRefreshFailure, editLineAmount, editedBillDateTime, lotLeftAfterCart, lotTapQuantity, resolveDateOverrideReason, resolvePosBillDateTime, saleEditTotals } from "./local/posCheckout";
+import { billDateHint, counterQuantityWithUnit, invoiceCloseLabel, lotShortMessage, orderSavedText, ordersNeedCheckingText, posRateLabel, posTileStockLine, returnInvoiceOptionLabel, returnItemsText, shouldShowLotFilters } from "./local/counterScreens";
 import { POS_LEAVE_PROMPT, shouldConfirmLeavingPos } from "./local/posLeaveGuard";
 import { canRetireDeviceId, normalizeMachineFingerprint, previousIdsNote, retireDeviceConfirmText, waitingIdsNote } from "./local/deviceBoxes";
 import { DASHBOARD_BLOCKS, DEFAULT_DASHBOARD_ORDER, dashboardDropIndex, isDefaultDashboardOrder, moveDashboardBlock, nudgeDashboardBlock, readDashboardOrder, writeDashboardOrder } from "./local/dashboardLayout";
@@ -107,7 +108,7 @@ import {
 } from "./local/notificationCenter";
 import { sameIdentityRecord, buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot, localSalesWindow } from "./local/dashboardSnapshot";
-import { INCLUDED_IN_COST_HEADING, balanceSheetAsAtInput, ledgerWithRunningBalance, profitLossCostOfGoods, supplierLedgerOpening } from "./local/financialStatements";
+import { INCLUDED_IN_COST_HEADING, balanceSheetAsAtInput, ledgerStatementBounds, ledgerWithRunningBalance, profitLossCostOfGoods, supplierLedgerOpening } from "./local/financialStatements";
 import { DASHBOARD_FILL, NULL_DASHBOARD_METRICS, fillUncomputedMetrics, shouldFetchCloudDashboardMetrics, unknownMetricNote } from "./local/dashboardCloudFill";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
@@ -115,6 +116,7 @@ import { resolveShellStatus } from "./local/shellStatus";
 import { plainServerMessage } from "./local/plainServerMessage";
 import { describeReport } from "./local/reportDescriptions";
 import { labelFor, toneFor } from "./local/displayLabels";
+import { markNumericColumns } from "./local/tableColumns";
 import { BILL_DISCOUNT_PAYMENT_MODES, DISCOUNT_APPROVAL_ACTION, DISCOUNT_APPROVAL_MODE, DISCOUNT_APPROVAL_NOTE, MANUAL_BILL_DISCOUNT_MODE, activeLotDiscount, applyLotDiscount, billGross, buildDiscountRows, buildLotDiscountPayload, buildSlabPayload, currentLotDiscount, describeBillDiscountPreview, describeDiscountApprovalError, describeDiscountApprovalLine, discountApprovalExempt, describeLotOffer, describeSlab, describeSlabOverlap, describeStartResult, discountableLots, discountableProducts, discountedUnitPrice, findSlabOverlap, formatRupees as formatDiscountRupees, formatShortDate, lotCost, lotCurrentRate, lotDiscountStatusText, lotLabel, lotOfferChoices, lotStock, matchBillSlab, billDiscountRuleName, describeBillApprovalLine, lineGross, describePosDiscountApprovalReason, posDiscountApproval, readBillDiscountTooLarge, readDiscountApprovalRequired, readDiscountConflict, reconcileCartLotDiscounts, slabBase, resolveDiscountApprovalRoute, resolveDiscountAvailability, resolveManualBillDiscount, roundMoney as roundDiscountMoney, slabDisplayName, slabPaymentMode, slabSnapshot, unitWord, validateLotDiscountDraft, validateSlabDraft } from "./local/discounts";
 import { buildBulkRatePayload, buildSaleRateRows, collectSaleRateChanges, describeSaveResult, filterSaleRateRows, marginOnCost, parseTargetMargin, rateTone, resolveSaleRateAvailability, suggestedDrafts } from "./local/saleRateUpdate";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
@@ -130,6 +132,7 @@ import {
   DISTRIBUTION_BOARD_STATUS,
   pendingAllocationLines,
   resolveDistributionBoard,
+  transferActionFailureMessage,
   transferQuantity,
   validateAllocation,
   validateDistributionDraft,
@@ -177,6 +180,11 @@ import {
 import { deviceKind, deviceSeenParts, formatDeviceDate, shortDeviceId } from "./local/deviceDisplay";
 import { billNoFloorKey, billNumbersOf, displayBillNo, nextBillNo, parseBillNo } from "./local/billNumber";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
+import { FeedbackDialogHost, SaveNotice } from "./feedbackDialogs";
+import { appDialogQueue, useAskReason, useConfirm, useSaveInFlight, useSaveNotice } from "./feedbackContext";
+import { errorNotice, successNotice, warningNotice } from "./local/feedback";
+import { errorOrDash, formatFileSize, isNegativeFigure, isZeroFigure, reportDraftPending, reportHasContent, reportResultsHeading, scopeChangeDialog, settingsSavedNotice, tidyStoredDecimal } from "./local/backOfficeScreens";
+import { costPerUnitSummary, distributionLotOptions, distributionStatusClass, formatQuantityWithUnit, isPendingBillCompletion, pendingItemNarration, pendingPurchasesPresentation, purchaseEntryHeadings, purchaseSavedMessage, stockLotName, wasteProductOptionLabel } from "./local/stockScreens";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
@@ -189,7 +197,7 @@ import { COMBO_EDIT_REFUSAL, COMBO_IN_USE_NOTE, COMBO_KINDS, COMBO_KIND_LABELS, 
 import { PACKING_PAYMENT_MODES, PACKING_QUICK_START_TYPES, PACKING_SIZE_LABELS, PACKING_SIZE_NAMES, advancePackingPurchaseLine, applyPackingToPurchaseLine, backPackingDrill, buildPackingAdjustmentPayload, checkPackingNodeForm, newPackingPurchaseClientRef, packingSetupStart, startPackingNodeForm, buildPackingPurchasePayload, buildPackingSetupPayload, buildSalePackingUsage, createPackingDrill, createPackingPurchaseLine, createPackingSetupDraft, enterPackingDrill, packingCostOf, packingDrillView, packingEmptyPickerMessage, packingManageView, packingPurchaseDraftTotal, packingPurchaseLineAmount, packingQuickStartOffered, packingSetupChoices, packingSetupPickRow, packingDeletable, PACKING_IN_USE_NOTE, packingPathLabel, packingShortageNotifications, packingShortages, packingSizeLabel, readPackingCatalogue, resolvePackAvailability, PACKING_STATE_WORDS, packingAddHereLabel, packingCountAfter, packingHasPickableSize, applyPackingToTransferLine, buildPackingTransferPayload, changePackingTransferFrom, createPackingTransferDraft, createPackingTransferLine, packingCatalogueAtShop, packingMovementText, packingShopName, packingShopPlace, packingTransferDestinations, packingTransferDoneText, packingTransferLineView, packingTransferOffered, packingTransferSummary, PACKING_TRANSFER_NOTE_MAX, readPackingShops } from "./local/froozPack";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
-import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
+import { buildReportRefreshParams, describeReportRefreshFailures, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { NAME_TITLES, getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel, joinPersonName, splitPersonName } from "./local/userPresentation";
 import { FROST_GREETING_PROMPT, resolveFrostGreeting } from "./local/frostGreeting";
@@ -208,7 +216,7 @@ import {
   preserveVerifiedLocalCollection,
   preserveVerifiedLocalValue,
 } from "./local/cloudAvailability";
-import { completionLinesPayload, completionLinesProblem, groupPurchaseBills, pendingCompletionLines, pendingItemRate, purchaseChangeBlock, purchaseHistoryAmounts, purchaseItemCounts, purchaseRowNet } from "./local/purchaseRows";
+import { PURCHASE_FORM_AFTER_SAVE, completionLinesPayload, completionLinesProblem, groupPurchaseBills, pendingCompletionLines, pendingItemRate, purchaseChangeBlock, purchaseHistoryAmounts, purchaseFormAfterSave, purchaseItemCounts, purchaseRowNet } from "./local/purchaseRows";
 import {
   describeFrostTransportFailure,
   hasCloudSession,
@@ -957,7 +965,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     syncSummary = "Selected backend reachable";
   }
 
-  let banner = "Checking FroozERP backend status...";
+  let banner = "Checking FroozERP backend status…";
   if (localStarting) {
     banner = "Starting local service...";
   } else if (cloudPaused) {
@@ -1220,13 +1228,13 @@ const icons = {
 
 const navigationItems = [
   ["dashboard", "Dashboard"],
+  ["sales", "POS Billing"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
   ["pending-bills", "Pending Bills"],
   ["accounts", "Accounts"],
   ["returns", "Sale Returns"],
   ["waste", "Waste Management"],
-  ["sales", "POS Billing"],
   ["discounts", "Discounts"],
   ["combos", "PEP Menu"],
   ["frooz-pack", "PEP Pack"],
@@ -1454,9 +1462,26 @@ const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
 
 const toDateKey = (date) =>
   typeof date === "string" ? date.slice(0, 10) : date.toLocaleDateString("en-CA");
+// Puts the cursor in the field a notice is about (by its id), after React has drawn it. The page
+// is not scrolled by the focus itself unless asked; a smooth scroll is usually already running.
+const focusField = (id, { scroll = true } = {}) => {
+  window.requestAnimationFrame(() => {
+    const element = document.getElementById(id);
+    if (!element) return;
+    if (scroll) element.scrollIntoView({ behavior: "smooth", block: "center" });
+    element.focus({ preventScroll: true });
+  });
+};
+// The question asked before a second lot with the same name, supplier, grade and date is added.
+const duplicateLotQuestion = (lotName) => ({
+  title: "This lot already exists",
+  message: `A lot called "${lotName}" with the same supplier, grade and date is already there. Add this one as a separate lot anyway?`,
+  confirmLabel: "Add as a separate lot",
+  cancelLabel: "Go back",
+});
 const formatDisplayDate = (dateValue) => {
   const key = toDateKey(dateValue || "");
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return key || "-";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return key || MISSING_VALUE;
   const [year, month, day] = key.split("-");
   return `${day}/${month}/${year}`;
 };
@@ -1632,7 +1657,7 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
   if (!element) throw new Error("Nothing to export");
   const isThermal = mode === "THERMAL";
   const resolvedProfile = isThermal ? (receiptWidth === "58MM" ? "THERMAL_58" : "THERMAL_80") : (printProfile || "A4_PORTRAIT");
-  const hidePdfExportOverlay = showPdfExportOverlay(isThermal ? "Preparing receipt..." : "Preparing PDF...");
+  const hidePdfExportOverlay = showPdfExportOverlay(isThermal ? "Preparing receipt…" : "Preparing PDF…");
   element.dataset.printProfile = resolvedProfile;
   element.classList.add("pdf-export-mode", isThermal ? "pdf-export-thermal" : "pdf-export-a4");
   if (!isThermal) {
@@ -1690,7 +1715,7 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
   }
 };
 
-// The filter line printed above a report ("Range: ... Status: ..."). The PDF and the Excel file
+// The filter line printed above a report ("Range: ... Status: …"). The PDF and the Excel file
 // both carry it, so neither can show numbers without saying which slice of the books they are.
 // Each filter is its own line: the spans have no separator between them in textContent.
 const reportMetaLines = (element) => Array.from(element?.querySelectorAll?.(".report-filter-summary > span") || [])
@@ -1710,7 +1735,7 @@ const exportReportTextPdf = async ({ element, fileName, title, printProfile = ""
     model,
     jsPDF,
     orientation: printProfile === "A4_LANDSCAPE" ? "landscape" : "portrait",
-    generatedAt: new Date().toLocaleString("en-IN"),
+    generatedAt: formatKolkataDateTime(new Date()),
   });
   const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
   const blob = ensurePdfBlob(pdf.output("blob"));
@@ -1725,7 +1750,7 @@ const exportReportExcel = ({ element, fileName, title }) => {
   if (!element) return null;
   const model = buildReportPdfModel(element, { title, meta: reportMetaLines(element) });
   if (!reportWorkbookHasContent(model)) return null;
-  const bytes = renderXlsx(buildReportWorkbook(model, { generatedAt: new Date().toLocaleString("en-IN") }));
+  const bytes = renderXlsx(buildReportWorkbook(model, { generatedAt: formatKolkataDateTime(new Date()) }));
   const finalFileName = reportXlsxFileName(safeFileName(fileName || title), title);
   const url = URL.createObjectURL(new Blob([bytes], { type: XLSX_MIME }));
   const link = document.createElement("a");
@@ -1924,15 +1949,16 @@ const roundingRules = [
 ];
 
 const defaultBusinessSettings = {
-  business_name: "FroozERP Retail",
-  brand_name: "FEEL THE FREAKIN' FROOZ",
+  // Shown only until the real settings load; matches the identity in local/brandIdentity.js.
+  business_name: "THE PEP",
+  brand_name: "Pulp Eat Up.",
   company_name: "SRT Company",
   address: "",
   phone_number: "",
   gst_number: "",
   logo_url: "",
-  compact_logo_text: "FTF",
-  invoice_footer_text: "Thank you for shopping with FEEL THE FREAKIN' FROOZ.",
+  compact_logo_text: "PEP",
+  invoice_footer_text: "Thank you for shopping with THE PEP.",
   default_printer_type: "THERMAL",
   receipt_width: "80MM",
   auto_print_after_billing: false,
@@ -2167,6 +2193,9 @@ function Icon({ name, size = 18 }) {
     bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
     mic: <><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" /></>,
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
+    // The menu-collapse button: a panel with its side column, so it is not mistaken for the phone
+    // menu's three lines.
+    sidebar: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
     keyboard: <><rect x="2" y="6" width="20" height="12" rx="2" /><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8" /></>,
@@ -2256,21 +2285,35 @@ const NeutralStartupScreen = ({ state = "checking" }) => (
     <section className="login-panel" style={{ minHeight: 280, display: "grid", placeItems: "center", textAlign: "center" }}>
       <div>
         <BrandLogo />
-        <h1>Starting local services</h1>
-        <p>Preparing the local database and application shell.</p>
+        <h1>Starting FroozERP</h1>
+        <p>Opening this computer's shop data. This takes a few seconds.</p>
       </div>
     </section>
   </main>
 );
 
-const ConfirmedLocalRuntimeFailure = ({ message }) => (
-  <main className="login-page" data-startup-state="fatal-local-runtime" data-fatal-startup="true" style={{ background: "#7f0000" }}>
-    <section className="login-panel startup-status-panel startup-status-error">
-      <span className="eyebrow">Local Runtime Failure</span>
-      <h1>FroozERP could not start</h1>
-      <p>The local SQLite database or runtime could not be initialized after bounded recovery attempts.</p>
-      <pre>{message || "Local runtime initialization failed."}</pre>
+// Shown only when the local database could not be opened after every retry. It has to give the
+// person a way out: Try Again reloads the window (the start-up checks run again from the top), and
+// Close goes through the same controlled exit as the sign-in page, so a counter in screen-lock mode
+// still asks for the Owner exit code. The technical message stays readable and wraps.
+const ConfirmedLocalRuntimeFailure = ({ message, onExit, exitModal = null }) => (
+  <main className="login-page fatal-startup-page" data-startup-state="fatal-local-runtime" data-fatal-startup="true">
+    <section className="login-panel fatal-startup-panel" role="alert">
+      <BrandLogo />
+      <span className="eyebrow">Could not start</span>
+      <h1>FroozERP could not open its data on this computer</h1>
+      <p>The shop data on this computer could not be opened, even after several tries. Nothing has been changed or deleted.</p>
+      <p>Try again. If this keeps happening, close FroozERP, restart the computer, and call support with the details below.</p>
+      <div className="fatal-startup-actions">
+        <button type="button" className="primary-button" onClick={() => window.location.reload()}>Try Again</button>
+        {onExit && <button type="button" className="secondary-button" onClick={onExit}>Close FroozERP</button>}
+      </div>
+      <details className="fatal-startup-details" open>
+        <summary>Details for support</summary>
+        <pre className="fatal-startup-message">{message || "Local runtime initialization failed."}</pre>
+      </details>
     </section>
+    {exitModal}
   </main>
 );
 
@@ -2295,13 +2338,16 @@ function App() {
   const [syncStatus, setSyncStatus] = useState(null);
   const [syncMessage, setSyncMessage] = useState("");
   // The notification centre. Messages used to live in a dozen separate useState boxes and 186
-  // blocking alert() popups: anything not read in the instant it appeared was gone, and a genuine
+  // blocking browser alert popups: anything not read in the instant it appeared was gone, and a genuine
   // warning looked identical to a routine status line. This is the one list that persists.
   const [notifications, setNotifications] = useState([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [startupError, setStartupError] = useState("");
+  // The last sign-in was answered and refused (wrong password, locked): a credential problem, not a
+  // connection one. Only changes what the sign-in screen shows beside the error.
+  const [loginRefused, setLoginRefused] = useState(false);
   const [startupNotice, setStartupNotice] = useState(() => (
-    isTauriRuntime() ? "Starting local FroozERP service and checking the local database..." : ""
+    isTauriRuntime() ? "Starting local FroozERP service and checking the local database…" : ""
   ));
   const [startupLogPath, setStartupLogPath] = useState("");
   const [startupTechnicalOpen, setStartupTechnicalOpen] = useState(false);
@@ -2351,6 +2397,8 @@ function App() {
   const [lastReferenceSyncAt, setLastReferenceSyncAt] = useState("");
   const [deviceGate, setDeviceGate] = useState(null);
   const [activationCode, setActivationCode] = useState("");
+  // What happened to the last activation attempt, shown in the activation panel itself.
+  const [activationNotice, setActivationNotice] = useState(null);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [activeView, setActiveView] = useState(initialView);
   const [applicationFontSize, setApplicationFontSize] = useState(getStoredApplicationFontSize);
@@ -2548,6 +2596,26 @@ function App() {
   const [customers, setCustomers] = useState([]);
   const [purchases, setPurchases] = useState([]);
   const [purchaseSaveBusy, setPurchaseSaveBusy] = useState(false);
+  // The stock screens' in-app notices and boxes, in place of the browser's alert, confirm and
+  // prompt (local/feedback.js). Each notice is drawn next to the button whose result it reports.
+  const confirmDialog = useConfirm();
+  const askReason = useAskReason();
+  const [productNotice, showProductNotice, clearProductNotice] = useSaveNotice();
+  const [productListNotice, showProductListNotice, clearProductListNotice] = useSaveNotice();
+  const [categoryNotice, showCategoryNotice, clearCategoryNotice] = useSaveNotice();
+  const [lotPanelNotice, showLotPanelNotice, clearLotPanelNotice] = useSaveNotice();
+  const [lotNotice, showLotNotice, clearLotNotice] = useSaveNotice();
+  const [purchaseNotice, showPurchaseNotice, clearPurchaseNotice] = useSaveNotice();
+  const [purchaseItemNotice, showPurchaseItemNotice, clearPurchaseItemNotice] = useSaveNotice();
+  const [purchaseActionNotice, showPurchaseActionNotice, clearPurchaseActionNotice] = useSaveNotice();
+  // A purchase notice with no field to point at (a save that worked, or one that failed as a
+  // whole) sits under the Save button, often below the fold: bring it into view so it is seen.
+  useEffect(() => {
+    if (!purchaseNotice || purchaseNotice.field) return;
+    document.getElementById("purchase-save-notice")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [purchaseNotice]);
+  // Set when a pending bill has just been completed, so Purchase Entry offers the way back.
+  const [purchaseCompletedFor, setPurchaseCompletedFor] = useState("");
   const purchaseSaveInFlightRef = useRef(false);
   const purchaseSubmissionRef = useRef(createPurchaseSubmissionTracker());
   const reportRequestGateRef = useRef(createLatestRequestGate());
@@ -2591,6 +2659,8 @@ function App() {
   // register and ₹0.00.
   const [expensesLoad, setExpensesLoad] = useState({ status: "idle", message: "" });
   const [wasteLoad, setWasteLoad] = useState({ status: "idle", message: "" });
+  // Pending Bills reads the purchases list; a failed read must not look like "nothing pending".
+  const [purchasesLoad, setPurchasesLoad] = useState({ status: "idle", message: "" });
   // Kept as one object rather than three pieces of state so the view can never render a stale
   // payload beside a fresh error, which is how a failed refresh ends up looking like real figures.
   const [allShopsState, setAllShopsState] = useState({ loadState: "idle", loadError: "", payload: null, dateTo: "" });
@@ -2606,6 +2676,8 @@ function App() {
     loadState: "idle", loadError: "", transfers: [], destinations: [],
   });
   const [distributionBusy, setDistributionBusy] = useState(false);
+  // What the last consignment action did, said on the board rather than in the shell's banner.
+  const [distributionNotice, showDistributionNotice, clearDistributionNotice] = useSaveNotice();
   // Where a purchase's goods were actually received. Empty means "this counter", which is what the
   // backend assumes when no destination is sent -- so an untouched picker changes nothing.
   const [purchaseDestinationId, setPurchaseDestinationId] = useState("");
@@ -2877,6 +2949,9 @@ function App() {
   const [editingSale, setEditingSale] = useState(null);
   const [saleEditLoading, setSaleEditLoading] = useState(false);
   const [saleEditError, setSaleEditError] = useState("");
+  // A bill that could not be opened, printed or cancelled, said in a window like the edit refusal
+  // below instead of a browser alert: { title, message }.
+  const [saleActionProblem, setSaleActionProblem] = useState(null);
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [exitCodeModalOpen, setExitCodeModalOpen] = useState(false);
@@ -3116,7 +3191,9 @@ function App() {
       // would be a defect, not a nuisance. The guard lives in the module because that is where it
       // can be tested; removing it fails three tests.
       const shortcutTarget = resolveShortcutTarget(event);
-      if (shortcutTarget && user) {
+      // Not while an in-app question is open (a checkout gate, a reason box): the browser's own boxes
+      // froze the page, and an Alt key must not take the screen away from under the question either.
+      if (shortcutTarget && user && !appDialogQueue.current()) {
         event.preventDefault();
         setCommandPaletteOpen(false);
         setShortcutSheetOpen(false);
@@ -3217,11 +3294,34 @@ function App() {
     return () => unlisten();
   }, []);
 
+  // The module list scrolls on a 768-high laptop (and at Large / Extra Large text), and Branches &
+  // Counters and Settings sat below the fold with nothing to say so. The open module is scrolled
+  // into view, and `data-more-below` fades the bottom edge while there is more list underneath.
+  const sidebarNavRef = useRef(null);
+  useEffect(() => {
+    const nav = sidebarNavRef.current;
+    if (!nav) return undefined;
+    const markMore = () => {
+      nav.dataset.moreBelow = nav.scrollHeight - nav.scrollTop - nav.clientHeight > 4 ? "true" : "false";
+    };
+    nav.querySelector(".nav-item-active")?.scrollIntoView?.({ block: "nearest" });
+    markMore();
+    nav.addEventListener("scroll", markMore, { passive: true });
+    window.addEventListener("resize", markMore);
+    return () => {
+      nav.removeEventListener("scroll", markMore);
+      window.removeEventListener("resize", markMore);
+    };
+  }, [activeView, user, sidebarCollapsed]);
+
   useEffect(() => {
     const onPopState = (event) => {
       const requestedView = new URLSearchParams(window.location.search).get("view");
       if (requestedView && navigationItems.some(([view]) => view === requestedView)) {
-        setActiveView(requestedView);
+        // Through navigate(), so the screen's loaders run exactly as they do from the sidebar.
+        // Setting the view alone left All Shops on "Loading every shop…" and Orders on an empty
+        // queue for good. The URL already names the view, so navigate pushes no history entry.
+        navigateRef.current?.(requestedView, { fromHistory: true });
       }
       // Only the index moves here. `max` is the high-water mark of this session and must survive
       // going back, or Forward would switch itself off the moment it became useful.
@@ -3773,7 +3873,7 @@ function App() {
       return status;
     }
     if (force) lastAutoSyncStartedAtRef.current = Date.now();
-    setSyncMessage("Syncing...");
+    setSyncMessage("Syncing…");
     // A forced sync that finds a cycle running gets one more cycle after it, so a purchase saved
     // mid-cycle is pushed now rather than on the next timer tick (local/syncSingleFlight.js).
     const status = await syncNow({
@@ -4546,6 +4646,7 @@ function App() {
         netPayable: 0,
         balanceAmount: 0,
         effectiveCostPerUnit: expectedRate,
+        costPerUnit: costPerUnitSummary([{ quantity, unit: selectedPurchaseProduct?.unit }], quantity * expectedRate),
         paymentStatus: "Bill Pending",
       };
     }
@@ -4574,6 +4675,7 @@ function App() {
       netPayable,
       balanceAmount: Math.max(netPayable - paidAmount, 0),
       effectiveCostPerUnit: quantity > 0 ? netPayable / quantity : 0,
+      costPerUnit: costPerUnitSummary([{ quantity, unit: selectedPurchaseProduct?.unit }], netPayable),
       paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
   }, [expectedPurchaseRate, purchaseBillStatus, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
@@ -4584,11 +4686,13 @@ function App() {
       purchase_rate: Number(line.purchase_rate || 0),
       expected_purchase_rate: Number(line.expected_rate || 0),
       origin_type: line.origin_type || "LOCAL",
+      unit: line.unit,
     })) : editingPurchaseId ? [{
       quantity: Number(purchaseQuantity || 0),
       purchase_rate: Number(purchaseRateInput || 0),
       expected_purchase_rate: Number(expectedPurchaseRate || 0),
       origin_type: selectedPurchaseProduct?.origin_type || "LOCAL",
+      unit: selectedPurchaseProduct?.unit,
     }] : purchaseCart;
     const itemCount = items.length;
     const receivedQuantity = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
@@ -4612,6 +4716,8 @@ function App() {
         netPayable: 0,
         balanceAmount: 0,
         effectiveCostPerUnit: receivedQuantity > 0 ? provisionalCost / receivedQuantity : 0,
+        // Per unit only when every item is in one unit (logic C, local/stockScreens.js).
+        costPerUnit: costPerUnitSummary(items, provisionalCost),
         paymentStatus: "Bill Pending",
       };
     }
@@ -4648,9 +4754,35 @@ function App() {
       netPayable,
       balanceAmount: Math.max(netPayable - paidAmount, 0),
       effectiveCostPerUnit: receivedQuantity > 0 ? netPayable / receivedQuantity : 0,
+      costPerUnit: costPerUnitSummary(items, netPayable),
       paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
   }, [completionLines, editingPurchaseId, expectedPurchaseRate, purchaseBillStatus, purchaseCart, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
+
+  // Purchase Entry opened with "Complete Bill": a pending bill being finished, not amended.
+  const purchaseCompleting = isPendingBillCompletion({
+    editingPurchaseId,
+    billStatus: purchaseBillStatus,
+    originalBillStatus: purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status,
+  });
+  const purchaseHeadings = purchaseEntryHeadings({
+    completing: purchaseCompleting,
+    editing: Boolean(editingPurchaseId),
+    pending: purchaseBillStatus === "BILL_PENDING",
+    multiFruit: completionLines?.length || 0,
+    supplierName: activeSuppliers.find((supplier) => String(supplier.id) === String(purchaseSupplierId))?.supplier_name || "",
+  });
+  // Field labels carry the chosen product's unit: "Quantity (Kg)", "Purchase rate (₹ per kg)".
+  const purchaseUnitName = selectedPurchaseProduct ? unitDisplayName(selectedPurchaseProduct.unit) : MISSING_VALUE;
+  const purchaseUnitLabel = (label) => (purchaseUnitName === MISSING_VALUE ? label : `${label} (${purchaseUnitName})`);
+  const purchaseRateLabel = (label) => (purchaseUnitName === MISSING_VALUE ? `${label} (₹)` : `${label} (₹ per ${purchaseUnitName.toLowerCase()})`);
+  // Enter in an item box adds the line, as the Add item button does. Only on a new bill's cart:
+  // never while one saved item is being corrected, where there is no cart to add to.
+  const addPurchaseLineOnEnter = (event) => {
+    if (event.key !== "Enter" || editingPurchaseId || completionLines) return;
+    event.preventDefault();
+    addPurchaseCartItem();
+  };
 
   const applySettingsBundle = (bundle = {}) => {
     const nextSaleRateSettings = { ...defaultSaleRateSettings, ...(bundle.saleRateSettings || {}) };
@@ -4700,6 +4832,7 @@ function App() {
     setCustomers((current) => preserveVerifiedLocalCollection(snapshot?.customers, current));
     setSalesHistory((current) => preserveVerifiedLocalCollection(snapshot?.sales_history, current));
     setPurchases(snapshot?.offline_purchases || bundle.offlinePurchases || []);
+    setPurchasesLoad({ status: "ready", message: "" });
     setSuppliers(bundle.offlineSuppliers || []);
     setAccounts(bundle.offlineAccounts || []);
     // `{}` when the saved bundle has none: the Outstanding tab then says "not available" instead of
@@ -5830,13 +5963,21 @@ function App() {
   };
 
   const loadPurchases = async () => {
-    if (isTauriRuntime() && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
-      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
-      setPurchases(snapshot?.offline_purchases || snapshot?.settings_bundle?.offlinePurchases || await listLocalPurchases());
-      return;
+    setPurchasesLoad((current) => (current.status === "ready" ? current : { status: "loading", message: "" }));
+    try {
+      if (isTauriRuntime() && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
+        const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+        setPurchases(snapshot?.offline_purchases || snapshot?.settings_bundle?.offlinePurchases || await listLocalPurchases());
+        setPurchasesLoad({ status: "ready", message: "" });
+        return;
+      }
+      const response = await axios.get(`${API_URL}/purchases`);
+      setPurchases(response.data);
+      setPurchasesLoad({ status: "ready", message: "" });
+    } catch (error) {
+      setPurchasesLoad({ status: "failed", message: `The purchases could not be loaded: ${getErrorMessage(error, "no answer from the server")}.` });
+      throw error;
     }
-    const response = await axios.get(`${API_URL}/purchases`);
-    setPurchases(response.data);
   };
 
   const loadSettingsData = async (currentUser = user) => {
@@ -7065,10 +7206,10 @@ function App() {
       });
       await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
       await loadDistribution();
-      setSyncMessage("Request sent. The other shop decides what to send and when.");
+      showDistributionNotice(successNotice("Request sent. The other shop decides what to send and when."));
       return true;
     } catch (error) {
-      setSyncMessage(getErrorMessage(error, "The request could not be sent"));
+      showDistributionNotice(errorNotice(getErrorMessage(error, "The request could not be sent.")));
       return false;
     } finally {
       setDistributionBusy(false);
@@ -7106,7 +7247,7 @@ function App() {
     } catch (error) {
       setDistributionState({
         loadState: "error",
-        loadError: getErrorMessage(error, "Consignments could not be loaded"),
+        loadError: getErrorMessage(error, "There was no answer from the server. Nothing has changed; check the connection and try again."),
         transfers: [],
         destinations: [],
       });
@@ -7134,9 +7275,9 @@ function App() {
       // The shelf changed: approving holds stock, dispatching takes it off, receiving adds it. POS
       // reads its own snapshot, so without this the till would go on offering fruit that has left.
       setPosRefreshToken((token) => token + 1);
-      setSyncMessage("");
+      clearDistributionNotice();
     } catch (error) {
-      setSyncMessage(getErrorMessage(error, `The consignment could not be ${action}ed`));
+      showDistributionNotice(errorNotice(getErrorMessage(error, transferActionFailureMessage(action))));
     } finally {
       setDistributionBusy(false);
     }
@@ -7177,10 +7318,10 @@ function App() {
       });
       await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
       await loadDistribution();
-      setSyncMessage("Consignment created. It is not sent until it has been approved and dispatched.");
+      showDistributionNotice(successNotice("Consignment created. It is not sent until it has been approved and dispatched."));
       return true;
     } catch (error) {
-      setSyncMessage(getErrorMessage(error, "The consignment could not be created"));
+      showDistributionNotice(errorNotice(getErrorMessage(error, "The consignment could not be created.")));
       return false;
     } finally {
       setDistributionBusy(false);
@@ -7297,8 +7438,8 @@ function App() {
         return { ok: false, message: "Orders are stored on this device and need the desktop app. This looks like a browser." };
       }
       await loadOrders();
-      setSyncMessage(`Order ${saved.order_no} saved. Stock is set aside.`);
-      return { ok: true, message: "" };
+      // Said on the Orders screen itself, beside the form that was just cleared (orderSavedText).
+      return { ok: true, message: "", orderNo: saved.order_no || "" };
     } catch (error) {
       // The reason travels back to the form. It used to go only to the sync banner while the form
       // said "that order was not saved" — which names no cause, so the operator has nothing to try
@@ -7621,6 +7762,7 @@ function App() {
   const login = async () => {
     setLoginBusy(true);
     setStartupError("");
+    setLoginRefused(false);
     setStartupNotice("");
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
@@ -7747,6 +7889,7 @@ function App() {
           if (opened) return;
         }
         setDeviceGate(null);
+        setLoginRefused(true);
         setStartupError(credentialMessage);
         return;
       }
@@ -7759,6 +7902,7 @@ function App() {
         const opened = await continueOffline(latestDevice);
         if (opened) return;
       }
+      setLoginRefused(Boolean(error?.response) && !mayOpenOfflineSession(error));
       setStartupError(getAuthErrorMessage(error, `Unable to sign in through ${AUTH_API_URL}. Connect once to the FroozERP cloud backend to authorise this device.`));
     } finally {
       setLoginBusy(false);
@@ -7768,6 +7912,7 @@ function App() {
   const retryOnline = async () => {
     setLoginBusy(true);
     setStartupError("");
+    setLoginRefused(false);
     setStartupNotice(`Checking backend at ${API_URL}/api/health...`);
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
@@ -7787,7 +7932,7 @@ function App() {
         setDeviceGate(bootstrapStatus.approved ? null : bootstrapStatus);
         if (bootstrapStatus.approved) {
           if (username.trim() && password) {
-            setStartupNotice("Device approval confirmed. Completing secure provisioning...");
+            setStartupNotice("Device approval confirmed. Completing secure provisioning…");
             return await login();
           }
           setStartupNotice("Device approval confirmed. Enter credentials and click Sign In to complete secure provisioning and the initial pull.");
@@ -7914,9 +8059,10 @@ function App() {
 
   const activateDevice = async () => {
     if (!activationCode.trim()) {
-      alert("Enter activation code.");
+      setActivationNotice(errorNotice("Enter the activation code the owner gave you.", "activation_code"));
       return;
     }
+    setActivationNotice(null);
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       const response = await axios.post(`${API_URL}/devices/activate`, {
@@ -7926,9 +8072,11 @@ function App() {
       setDeviceInfo(response.data.device || latestDevice);
       setDeviceGate(null);
       setActivationCode("");
-      alert("Device activated. Please login again.");
+      // The activation panel closes with the gate, so the confirmation goes on the sign-in status line.
+      setStartupError("");
+      setStartupNotice("This computer is activated. Sign in again to start work.");
     } catch (error) {
-      alert(getErrorMessage(error, "Device activation failed"));
+      setActivationNotice(errorNotice(getErrorMessage(error, "This computer could not be activated. Check the code and try again.")));
     }
   };
 
@@ -7957,7 +8105,7 @@ function App() {
       return;
     }
     try {
-      setProductPhotoMessage("Preparing photo...");
+      setProductPhotoMessage("Preparing photo…");
       const dataUrl = await shrinkProductPhoto(file, {
         createImageBitmap: (blob) => window.createImageBitmap(blob),
         createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
@@ -7981,6 +8129,11 @@ function App() {
   };
 
   const addProduct = async () => {
+    clearProductNotice();
+    const refuse = (message, fieldId) => {
+      showProductNotice(errorNotice(message, fieldId));
+      focusField(fieldId);
+    };
     try {
       const wasEditing = Boolean(editingProductId);
       const editingKeys = wasEditing
@@ -7990,21 +8143,24 @@ function App() {
       const finalCategoryName = selectedCategory?.category_name || newProductCategoryName.trim() || productCategory.trim();
       const duplicateProduct = findDuplicateProductName(products, productName, editingKeys);
       if (duplicateProduct) {
-        alert("This product already exists.");
+        refuse(`A product called "${productName.trim()}" already exists. Use another name, or edit that product.`, "product-name-input");
         return;
       }
       if (!finalCategoryName) {
-        alert("Please select or add product category.");
+        refuse("Choose a category, or add a new one.", "product-category-input");
         return;
       }
       const parsedSellingRate = Number(sellingRate);
       const parsedMinimumStock = Number(productMinimumStock || 0);
       if (!productName.trim() || !unit || !Number.isFinite(parsedSellingRate) || parsedSellingRate <= 0) {
-        alert("Enter a product name, a unit and a sale price above zero.");
+        refuse(
+          "Enter a product name, a unit and a sale price above zero.",
+          !productName.trim() ? "product-name-input" : !unit ? "product-unit-input" : "product-sale-price-input",
+        );
         return;
       }
       if (!Number.isFinite(parsedMinimumStock) || parsedMinimumStock < 0) {
-        alert("Enter a valid low-stock alert quantity (zero or more).");
+        refuse("Enter a valid low-stock alert quantity (zero or more).", "product-min-stock-input");
         return;
       }
       const normalizedOpeningStockLots = (addOpeningStock ? openingStockLots : [])
@@ -8060,7 +8216,7 @@ function App() {
       if (wasEditing) {
         const resolved = await serverIdForProduct(editingKeys);
         if (!resolved.ok) {
-          alert(resolved.message);
+          showProductNotice(errorNotice(resolved.message));
           return;
         }
         const serverProductId = resolved.id;
@@ -8089,13 +8245,14 @@ function App() {
       // The photo is saved after the product, separately. If it fails the product is still saved,
       // and the owner is told the photo is not, rather than the whole save looking like a success.
       const photoProblem = productPhotoDraft.changed ? await saveProductPhoto(savedProductId, productPhotoDraft.dataUrl, savedProductGlobalId) : "";
+      const savedName = productName.trim();
       resetProductForm();
       // The product is saved at this point. Reloading the lists afterwards is a separate matter: a
       // failed reload used to land in the catch below and report "Error Adding Product" for a
       // product that had in fact been saved, so the owner would try again and make a duplicate.
       const reloads = await Promise.allSettled([loadProducts(), loadProductCategories(), loadDashboardData()]);
       const reloadFailure = reloads.find((result) => result.status === "rejected");
-      const savedMessage = wasEditing ? "Product Updated" : "Product Added";
+      const savedMessage = wasEditing ? `Product "${savedName}" saved` : `Product "${savedName}" added`;
       // POS on this desktop reads SQLite, which learns of the change (a new POS section, a rate) only
       // at the next background cycle. Pull it now, as after a purchase save; never fails the save, and
       // LOCAL_ONLY is refused inside runSyncNow before any request.
@@ -8109,7 +8266,8 @@ function App() {
         reloadFailure ? `the list could not be refreshed (${productSaveErrorMessage(reloadFailure.reason, "no answer")}); open Product Master again to see it` : "",
       ].filter(Boolean);
       if (reloadFailure) console.error("Product list refresh after save failed", reloadFailure.reason);
-      alert(notes.length ? `${savedMessage}, but ${notes.join("; and ")}.` : savedMessage);
+      // Saved either way; a photo or a refresh that did not follow is a warning, not a failure.
+      showProductNotice(notes.length ? warningNotice(`${savedMessage}, but ${notes.join("; and ")}.`) : successNotice(`${savedMessage}.`));
     } catch (error) {
       console.error("Product save failed", {
         status: error.response?.status,
@@ -8117,7 +8275,7 @@ function App() {
         message: error.message,
         error,
       });
-      alert(productSaveErrorMessage(error, editingProductId ? "The product could not be updated." : "The product could not be added."));
+      showProductNotice(errorNotice(productSaveErrorMessage(error, editingProductId ? "The product could not be updated." : "The product could not be added.")));
     }
   };
 
@@ -8157,15 +8315,19 @@ function App() {
   };
 
   const saveProductCategory = async () => {
+    clearCategoryNotice();
+    // The Categories tab and the product form's "+ New category" each have a name box; one shows.
+    const nameField = document.getElementById("category-new-name") ? "category-new-name" : "category-inline-name";
     try {
       const categoryName = newProductCategoryName.trim();
       if (!categoryName) {
-        alert("Please enter category name.");
+        showCategoryNotice(errorNotice("Enter a name for the new category.", nameField));
+        focusField(nameField, { scroll: false });
         return;
       }
       const duplicate = productCategories.find((category) => category.category_name?.trim().toLowerCase() === categoryName.toLowerCase());
       if (duplicate) {
-        alert("Category already exists.");
+        showCategoryNotice(errorNotice(`A category called "${duplicate.category_name}" already exists. It is now chosen for this product.`, nameField));
         setProductCategoryId(String(duplicate.id));
         setProductCategory(duplicate.category_name);
         return;
@@ -8183,14 +8345,22 @@ function App() {
       setProductCategoryId(String(response.data.id));
       setProductCategory(response.data.category_name);
       setNewProductCategoryName("");
-      alert("Category saved");
+      showCategoryNotice(successNotice(`Category "${response.data.category_name || categoryName}" added.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save category"));
+      showCategoryNotice(errorNotice(getErrorMessage(error, "The category could not be saved.")));
     }
   };
 
   const editProductCategory = async (category) => {
-    const nextName = window.prompt("Edit category name", category.category_name);
+    clearCategoryNotice();
+    // Not required: an empty name, like Cancel, leaves the category as it is (as the prompt did).
+    const nextName = await askReason({
+      title: `Rename the category "${category.category_name}"`,
+      label: "New name",
+      defaultValue: category.category_name,
+      confirmLabel: "Rename",
+      required: false,
+    });
     if (!nextName?.trim()) return;
     try {
       const categoryWrite = createOperationalWrite(user, {
@@ -8206,14 +8376,21 @@ function App() {
         categoryWrite.config
       );
       await Promise.all([loadProductCategories(), loadProducts()]);
-      alert("Category updated");
+      showCategoryNotice(successNotice(`Category renamed to "${nextName.trim()}".`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update category"));
+      showCategoryNotice(errorNotice(getErrorMessage(error, "The category could not be renamed.")));
     }
   };
 
   const deactivateProductCategory = async (category) => {
-    const reason = window.prompt(`Reason for deactivating the category ${category.category_name}`);
+    clearCategoryNotice();
+    const reason = await askReason({
+      title: `Deactivate the category "${category.category_name}"?`,
+      message: "New products can no longer be put in it. Past bills and reports keep it.",
+      label: "Reason for deactivating",
+      confirmLabel: "Deactivate",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       const categoryWrite = createOperationalWrite(user, { updated_by: user.id, reason });
@@ -8222,10 +8399,10 @@ function App() {
         data: categoryWrite.body,
       });
       await loadProductCategories();
-      alert("Category removed");
+      showCategoryNotice(successNotice(`Category "${category.category_name}" is no longer active.`));
     } catch (error) {
-      await loadProductCategories();
-      alert(getErrorMessage(error, "This category has products or transactions. It can only be deactivated."));
+      await loadProductCategories().catch(() => null);
+      showCategoryNotice(errorNotice(getErrorMessage(error, "This category has products or transactions. It can only be deactivated.")));
     }
   };
 
@@ -8256,22 +8433,19 @@ function App() {
     });
   };
 
-  const buildOpeningStockLotFromDraft = () => {
+  // `show` is the notice of the card the lot form is in (the product form, or the stock lots card).
+  const buildOpeningStockLotFromDraft = async (show) => {
     const quantity = Number(openingStockDraft.quantity || 0);
     const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
     const saleRate = Number(openingStockDraft.sale_rate || sellingRate || 0);
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      alert("Enter the lot quantity.");
+    const refuse = (message, fieldId) => {
+      show(errorNotice(message, fieldId));
+      focusField(fieldId);
       return null;
-    }
-    if (!Number.isFinite(purchaseRate) || purchaseRate <= 0) {
-      alert("Enter the lot cost price.");
-      return null;
-    }
-    if (!Number.isFinite(saleRate) || saleRate <= 0) {
-      alert("Enter the lot sale price.");
-      return null;
-    }
+    };
+    if (!Number.isFinite(quantity) || quantity <= 0) return refuse("Enter the lot quantity.", "opening-lot-quantity");
+    if (!Number.isFinite(purchaseRate) || purchaseRate <= 0) return refuse("Enter the lot cost price.", "opening-lot-cost");
+    if (!Number.isFinite(saleRate) || saleRate <= 0) return refuse("Enter the lot sale price.", "opening-lot-sale");
     const nextLotName = getOpeningLotName(openingStockDraft, productLots.length + openingStockLots.length + 1);
     const nextLot = {
       ...openingStockDraft,
@@ -8281,27 +8455,29 @@ function App() {
     };
     const duplicateLot = [...productLots, ...openingStockLots].find((lot) => isSameOpeningLot(lot, nextLot));
     if (duplicateLot) {
-      const confirmed = window.confirm("This lot already exists. Add as separate lot anyway?");
+      const confirmed = await confirmDialog(duplicateLotQuestion(nextLot.lot_name));
       if (!confirmed) return null;
       nextLot.allow_duplicate_lot = true;
     }
     return nextLot;
   };
 
-  const addOpeningStockLot = () => {
-    const nextLot = buildOpeningStockLotFromDraft();
+  const addOpeningStockLot = async () => {
+    clearProductNotice();
+    const nextLot = await buildOpeningStockLotFromDraft(showProductNotice);
     if (!nextLot) return;
     setOpeningStockLots((current) => [...current, nextLot]);
     resetOpeningStockDraft();
   };
 
   const saveNewOpeningStockLot = async () => {
+    clearLotPanelNotice();
     const activeProductId = editingProductId || lotPanelProduct?.id;
     if (!activeProductId) {
-      alert("Product id missing. Close this form and reopen it from the product lot panel.");
+      showLotPanelNotice(errorNotice("This product could not be found. Close the stock lots and open them again from the product list."));
       return;
     }
-    const nextLot = buildOpeningStockLotFromDraft();
+    const nextLot = await buildOpeningStockLotFromDraft(showLotPanelNotice);
     if (!nextLot) return;
     try {
       const payload = {
@@ -8316,7 +8492,7 @@ function App() {
         : productIdentityKeys(lotPanelProduct);
       const resolved = await serverIdForProduct(activeKeys);
       if (!resolved.ok) {
-        alert(resolved.message);
+        showLotPanelNotice(errorNotice(resolved.message));
         return;
       }
       try {
@@ -8328,7 +8504,7 @@ function App() {
         );
       } catch (error) {
         const message = getErrorMessage(error, "Unable to add opening stock lot");
-        if (message.includes("Add as separate lot anyway?") && window.confirm("This lot already exists. Add as separate lot anyway?")) {
+        if (message.includes("Add as separate lot anyway?") && await confirmDialog(duplicateLotQuestion(nextLot.lot_name))) {
           const duplicateWrite = createOperationalWrite(user, { ...payload, allow_duplicate_lot: true });
           await axios.post(
             `${API_URL}/api/v3/products/${resolved.id}/opening-stock-lots`,
@@ -8343,9 +8519,9 @@ function App() {
       setShowOpeningLotForm(false);
       setAddOpeningStock(false);
       await refreshLotContext(lotPanelProduct || { id: activeProductId, product_name: productName });
-      alert("Stock lot added");
+      showLotPanelNotice(successNotice(`Stock lot "${nextLot.lot_name}" added.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to add opening stock lot"));
+      showLotPanelNotice(errorNotice(getErrorMessage(error, "The stock lot could not be added.")));
     }
   };
 
@@ -8361,7 +8537,7 @@ function App() {
     try {
       const resolved = await serverIdForProduct(productIdentityKeys(product));
       if (!resolved.ok) {
-        alert(resolved.message);
+        showProductListNotice(errorNotice(resolved.message));
         return;
       }
       const response = await axios.get(`${API_URL}/products/${resolved.id}/lots`);
@@ -8369,11 +8545,13 @@ function App() {
       setProductLotAudit(response.data.audit || []);
       if (showPanel) setLotPanelProduct(product);
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to load product lots"));
+      showProductListNotice(errorNotice(`The stock lots of ${product?.product_name || "this product"} could not be loaded: ${getErrorMessage(error, "no answer from the server")}.`));
     }
   };
 
   const openLotAction = (type, lot) => {
+    clearLotNotice();
+    clearLotPanelNotice();
     setLotAction({ type, lot });
     setLotDraft({
       lot_name: lot.lot_name || lot.batch_no || "",
@@ -8393,6 +8571,7 @@ function App() {
   };
 
   const closeLotAction = () => {
+    clearLotNotice();
     setLotAction(null);
     setLotDraft({
       lot_name: "",
@@ -8420,6 +8599,13 @@ function App() {
 
   const saveLotAction = async () => {
     if (!lotAction?.lot?.id) return;
+    clearLotNotice();
+    const refuse = (message, fieldId) => {
+      showLotNotice(errorNotice(message, fieldId));
+      focusField(fieldId, { scroll: false });
+    };
+    const lotName = lotAction.lot.lot_name || lotAction.lot.batch_no || "the lot";
+    let doneMessage = "";
     try {
       const selectedSupplier = activeSuppliers.find((supplier) => String(supplier.id) === String(lotDraft.supplier_id));
       const basePayload = {
@@ -8431,15 +8617,15 @@ function App() {
         const nextQty = Number(lotDraft.purchase_qty || 0);
         const nextCost = Number(lotDraft.purchase_rate || 0);
         if (!lotDraft.lot_name.trim()) {
-          alert("Enter a lot name.");
+          refuse("Enter a lot name.", "lot-action-name");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Enter a valid lot quantity.");
+          refuse("Enter a valid lot quantity.", "lot-action-quantity");
           return;
         }
         if (!Number.isFinite(nextCost) || nextCost <= 0) {
-          alert("Enter a cost price above zero.");
+          refuse("Enter a cost price above zero.", "lot-action-cost");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8460,11 +8646,11 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Lot updated");
+        doneMessage = `Lot "${lotDraft.lot_name.trim()}" saved.`;
       }
       if (lotAction.type === "add") {
         if (Number(lotDraft.quantity || 0) <= 0) {
-          alert("Enter quantity to add.");
+          refuse("Enter the quantity to add.", "lot-action-add-quantity");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8477,16 +8663,16 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Quantity added");
+        doneMessage = `${formatQuantityWithUnit(lotDraft.quantity, lotAction.lot.unit || lotPanelProduct?.unit)} added to "${lotName}".`;
       }
       if (lotAction.type === "adjust") {
         const nextQty = Number(lotDraft.new_quantity || 0);
         if (!lotDraft.reason.trim()) {
-          alert("Enter a reason for the count correction.");
+          refuse("Enter a reason for the count correction.", "lot-action-reason");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Enter a valid counted quantity.");
+          refuse("Enter a valid counted quantity.", "lot-action-counted");
           return;
         }
         const adjustmentWrite = createOperationalWrite(user, {
@@ -8502,11 +8688,11 @@ function App() {
           adjustmentWrite.body,
           adjustmentWrite.config
         );
-        alert("Count corrected");
+        doneMessage = `Count of "${lotName}" corrected to ${formatQuantityWithUnit(lotDraft.new_quantity, lotAction.lot.unit || lotPanelProduct?.unit)}.`;
       }
       if (lotAction.type === "deactivate") {
         if (!lotDraft.reason.trim()) {
-          alert("Reason is required to deactivate a lot.");
+          refuse("Enter a reason to deactivate the lot.", "lot-action-reason");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8519,11 +8705,11 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Lot deactivated");
+        doneMessage = `Lot "${lotName}" deactivated.`;
       }
       if (lotAction.type === "reactivate") {
         if (!lotDraft.reason.trim()) {
-          alert("Reason is required to reactivate a lot.");
+          refuse("Enter a reason to reactivate the lot.", "lot-action-reason");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -8536,12 +8722,14 @@ function App() {
           lotWrite.body,
           lotWrite.config
         );
-        alert("Lot reactivated");
+        doneMessage = `Lot "${lotName}" reactivated.`;
       }
       closeLotAction();
+      // Said in the stock lots card the box closed back to, so it is seen.
+      if (doneMessage) showLotPanelNotice(successNotice(doneMessage));
       await refreshLotContext();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update lot"));
+      showLotNotice(errorNotice(getErrorMessage(error, "The lot could not be updated.")));
     }
   };
 
@@ -8591,30 +8779,35 @@ function App() {
     setEditingPurchaseItemLineId(null);
   };
 
-  const addPurchaseCartItem = () => {
+  const addPurchaseCartItem = async () => {
     const product = selectedPurchaseProduct;
     const quantity = Number(purchaseQuantity || 0);
     const purchaseRate = Number(purchaseRateInput || 0);
     const temporaryRate = Number(temporarySaleRate || 0);
     const expectedRate = Number(expectedPurchaseRate || 0);
+    clearPurchaseItemNotice();
+    const refuse = (message, fieldId) => {
+      showPurchaseItemNotice(errorNotice(message, fieldId));
+      focusField(fieldId);
+    };
     if (!purchaseSupplierId) {
-      alert("Select supplier before adding purchase items.");
+      refuse("Choose the supplier before adding items.", "purchase-supplier");
       return;
     }
     if (!product || quantity <= 0) {
-      alert("Select product and enter quantity.");
+      refuse(product ? `Enter the quantity of ${product.product_name}.` : "Choose a product and enter its quantity.", product ? "purchase-quantity" : "purchase-product");
       return;
     }
     if (!purchaseLotName.trim()) {
-      alert("Please enter lot name / size.");
+      refuse("Enter a lot name or number.", "purchase-lot-name");
       return;
     }
     if (purchaseBillStatus === "BILL_PENDING" && temporaryRate <= 0) {
-      alert("Pending bill stock requires a temporary sale rate.");
+      refuse("Stock waiting for its bill needs a temporary sale rate.", "purchase-temp-rate");
       return;
     }
     if (purchaseBillStatus === "BILL_COMPLETED" && purchaseRate <= 0) {
-      alert("Completed bill items require a purchase rate.");
+      refuse("Enter the purchase rate.", "purchase-rate");
       return;
     }
     const item = {
@@ -8632,43 +8825,57 @@ function App() {
       lot_size: purchaseLotSize,
       remarks: purchaseItemRemarks,
     };
-    setPurchaseCart((currentCart) => {
-      const nextCart = [...currentCart];
-      const itemIdentity = buildPurchaseLineIdentity(item);
-      if (editingPurchaseItemLineId !== null) {
-        const editingIndex = nextCart.findIndex((cartItem) => cartItem.line_id === editingPurchaseItemLineId);
-        if (editingIndex < 0) return currentCart;
-        const duplicateIndex = nextCart.findIndex((cartItem) =>
-          cartItem.line_id !== editingPurchaseItemLineId &&
-          buildPurchaseLineIdentity(cartItem) === itemIdentity
-        );
-        if (duplicateIndex >= 0) {
-          const shouldMerge = window.confirm("This edited item exactly matches another purchase-cart row. Add this quantity to the existing row and remove the edited row?");
-          if (!shouldMerge) return currentCart;
-          nextCart[duplicateIndex] = {
-            ...nextCart[duplicateIndex],
-            quantity: Number(nextCart[duplicateIndex].quantity || 0) + quantity,
-          };
-          nextCart.splice(editingIndex, 1);
-        } else {
-          nextCart[editingIndex] = item;
-        }
+    // Worked out on the cart as it is now, so the merge question can be asked in the app's own box
+    // (which waits for an answer) before anything changes. Declining leaves the cart and the typed
+    // item as they were.
+    const nextCart = [...purchaseCart];
+    const itemIdentity = buildPurchaseLineIdentity(item);
+    const quantityWords = formatQuantityWithUnit(quantity, product.unit);
+    if (editingPurchaseItemLineId !== null) {
+      const editingIndex = nextCart.findIndex((cartItem) => cartItem.line_id === editingPurchaseItemLineId);
+      if (editingIndex < 0) return;
+      const duplicateIndex = nextCart.findIndex((cartItem) =>
+        cartItem.line_id !== editingPurchaseItemLineId &&
+        buildPurchaseLineIdentity(cartItem) === itemIdentity
+      );
+      if (duplicateIndex >= 0) {
+        const shouldMerge = await confirmDialog({
+          title: "This item is already on the bill",
+          message: `Another line has the same ${product.product_name} lot. Add ${quantityWords} to that line and remove this one?`,
+          confirmLabel: "Add to that line",
+          cancelLabel: "Go back",
+        });
+        if (!shouldMerge) return;
+        nextCart[duplicateIndex] = {
+          ...nextCart[duplicateIndex],
+          quantity: Number(nextCart[duplicateIndex].quantity || 0) + quantity,
+        };
+        nextCart.splice(editingIndex, 1);
       } else {
-        const existingIndex = nextCart.findIndex((cartItem) => buildPurchaseLineIdentity(cartItem) === itemIdentity);
-        if (existingIndex >= 0) {
-          const shouldMerge = window.confirm("This exact product lot already exists in the purchase cart. Add this quantity to the existing row?");
-          if (!shouldMerge) return currentCart;
-          nextCart[existingIndex] = {
-            ...nextCart[existingIndex],
-            quantity: Number(nextCart[existingIndex].quantity || 0) + quantity,
-          };
-        } else {
-          nextCart.push(item);
-        }
+        nextCart[editingIndex] = item;
       }
-      return nextCart;
-    });
+    } else {
+      const existingIndex = nextCart.findIndex((cartItem) => buildPurchaseLineIdentity(cartItem) === itemIdentity);
+      if (existingIndex >= 0) {
+        const shouldMerge = await confirmDialog({
+          title: "This lot is already on the bill",
+          message: `${product.product_name}, lot "${purchaseLotName.trim()}", is already a line. Add ${quantityWords} to that line?`,
+          confirmLabel: "Add to that line",
+          cancelLabel: "Go back",
+        });
+        if (!shouldMerge) return;
+        nextCart[existingIndex] = {
+          ...nextCart[existingIndex],
+          quantity: Number(nextCart[existingIndex].quantity || 0) + quantity,
+        };
+      } else {
+        nextCart.push(item);
+      }
+    }
+    setPurchaseCart(nextCart);
     resetPurchaseItemFields();
+    // Ready for the next fruit on the same bill.
+    focusField("purchase-product", { scroll: false });
   };
 
   const editPurchaseCartItem = (lineId) => {
@@ -8690,54 +8897,72 @@ function App() {
     if (editingPurchaseItemLineId === lineId) resetPurchaseItemFields();
   };
 
+  // The first thing stopping the save, as `{ message, field }` (the field's id, to put the cursor
+  // there), or null. The same checks, in the same order, as before; only the words changed.
   const validatePurchaseBeforeSave = () => {
-    if (!purchaseSupplierId) return "Please select supplier";
+    const problem = (message, field = "") => ({ message, field });
+    if (!purchaseSupplierId) return problem("Choose the supplier.", "purchase-supplier");
     if (editingPurchaseId && completionLines) {
       const linesProblem = completionLinesProblem(completionLines);
-      if (linesProblem) return linesProblem;
-      if (!purchaseRebateRuleId) return "Please select rebate rule";
-      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
-      return "";
+      if (linesProblem) return problem(linesProblem);
+      if (!purchaseRebateRuleId) return problem("Choose the payment timing and rebate.", "purchase-rebate");
+      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return problem("Enter the amount paid.", "purchase-paid");
+      return null;
     }
     if (editingPurchaseId) {
-      const productName = selectedPurchaseProduct?.product_name || "selected item";
-      if (!purchaseProductId) return "Please select product";
-      if (Number(purchaseQuantity || 0) <= 0) return `Please enter quantity for ${productName}`;
+      const productName = selectedPurchaseProduct?.product_name || "the item";
+      if (!purchaseProductId) return problem("Choose the product.", "purchase-product");
+      if (Number(purchaseQuantity || 0) <= 0) return problem(`Enter the quantity of ${productName}.`, "purchase-quantity");
       if (purchaseBillStatus === "BILL_COMPLETED") {
-        if (Number(purchaseRateInput || 0) <= 0) return `Please enter purchase rate for ${productName}`;
-        if (!purchaseRebateRuleId) return "Please select rebate rule";
-        if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
+        if (Number(purchaseRateInput || 0) <= 0) return problem(`Enter the purchase rate of ${productName}.`, "purchase-rate");
+        if (!purchaseRebateRuleId) return problem("Choose the payment timing and rebate.", "purchase-rebate");
+        if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return problem("Enter the amount paid.", "purchase-paid");
       }
-      if (purchaseBillStatus === "BILL_PENDING" && Number(temporarySaleRate || 0) <= 0) return `Please enter temporary sale rate for ${productName}`;
-      return "";
+      if (purchaseBillStatus === "BILL_PENDING" && Number(temporarySaleRate || 0) <= 0) return problem(`Enter a temporary sale rate for ${productName}.`, "purchase-temp-rate");
+      return null;
     }
-    if (purchaseCart.length === 0) return "Please add at least one item";
+    if (purchaseCart.length === 0) return problem("Add at least one item to the bill.", "purchase-product");
     if (purchaseBillStatus === "BILL_COMPLETED") {
       const missingRate = purchaseCart.find((item) => Number(item.purchase_rate || 0) <= 0);
-      if (missingRate) return `Please enter purchase rate for ${missingRate.product_name}`;
-      if (!purchaseRebateRuleId) return "Please select rebate rule";
-      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
+      if (missingRate) return problem(`Enter the purchase rate of ${missingRate.product_name} (Edit its line).`);
+      if (!purchaseRebateRuleId) return problem("Choose the payment timing and rebate.", "purchase-rebate");
+      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return problem("Enter the amount paid.", "purchase-paid");
     }
     if (purchaseBillStatus === "BILL_PENDING") {
       const missingTempRate = purchaseCart.find((item) => Number(item.temporary_sale_rate || 0) <= 0);
-      if (missingTempRate) return `Please enter temporary sale rate for ${missingTempRate.product_name}`;
+      if (missingTempRate) return problem(`Enter a temporary sale rate for ${missingTempRate.product_name} (Edit its line).`);
     }
-    return "";
+    return null;
   };
 
   const savePurchase = async () => {
     if (purchaseSaveInFlightRef.current) return;
     purchaseSaveInFlightRef.current = true;
     setPurchaseSaveBusy(true);
+    clearPurchaseNotice();
+    setPurchaseCompletedFor("");
     try {
       const wasEditing = Boolean(editingPurchaseId);
-      const validationMessage = validatePurchaseBeforeSave();
-      if (validationMessage) {
-        alert(validationMessage);
+      // Finishing a pending bill is not an edit and asks for no edit reason; the server records it
+      // as "Pending purchase bill completed" when no reason is sent.
+      const completing = purchaseCompleting;
+      const savedSupplierName = getSupplierLabel(purchaseSupplierId);
+      const savedAsPending = purchaseBillStatus === "BILL_PENDING";
+      const validation = validatePurchaseBeforeSave();
+      if (validation) {
+        showPurchaseNotice(errorNotice(validation.message, validation.field));
+        if (validation.field) focusField(validation.field);
         return;
       }
-      const reason = editingPurchaseId ? window.prompt("Enter purchase edit reason") : "";
-      if (editingPurchaseId && !reason?.trim()) return;
+      const reason = editingPurchaseId && !completing
+        ? await askReason({
+          title: "Why is this purchase being corrected?",
+          message: "The reason is kept in the purchase's history.",
+          label: "Reason for the change",
+          confirmLabel: "Save correction",
+        })
+        : "";
+      if (editingPurchaseId && !completing && !reason?.trim()) return;
       const purchaseDestination = distributionState.destinations.find(
         (row) => String(row.operational_location_id) === String(purchaseDestinationId),
       ) || null;
@@ -8814,10 +9039,12 @@ function App() {
         setInventory(snapshot?.inventory_lots || inventory);
         resetPurchaseForm();
         await refreshSyncStatus();
-        alert("Purchase saved locally — pending cloud acknowledgement.");
+        showPurchaseNotice(successNotice(purchaseSavedMessage({ queuedOffline: true, supplierName: savedSupplierName })));
         return;
       }
-      if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
+      // A pending bill being finished (`purchaseCompleting`: being saved as completed, and pending
+      // when it was opened) goes to complete-bill, exactly as before.
+      if (completing) {
         // Several fruits: every fruit's final rate goes together, so the bill is never half done.
         const completionWrite = createOperationalWrite(
           user,
@@ -8837,7 +9064,8 @@ function App() {
         );
       } else {
         if (purchaseCart.length === 0) {
-          alert("Add at least one purchase item before saving.");
+          showPurchaseNotice(errorNotice("Add at least one item to the bill before saving.", "purchase-product"));
+          focusField("purchase-product");
           return;
         }
         const purchaseWrite = createOperationalWrite(user, aggregatePayload, aggregateOperationId);
@@ -8848,7 +9076,7 @@ function App() {
         );
         purchaseSubmissionRef.current.complete(aggregateOperationId);
       }
-      if (purchaseAmendmentMode) {
+      if (purchaseFormAfterSave({ wasEditing, amendmentMode: purchaseAmendmentMode }) === PURCHASE_FORM_AFTER_SAVE.CLEAR_ITEMS) {
         setPurchaseCart([]);
         resetPurchaseItemFields();
       } else {
@@ -8877,9 +9105,15 @@ function App() {
           writeDiagnosticLog("WARN", "post-purchase-sync-failed", { message: getErrorMessage(syncError, "Sync after purchase save failed") });
         });
       }
-      alert(purchaseBillStatus === "BILL_PENDING" ? "Stock Arrival Saved - Bill Pending" : wasEditing ? "Purchase Updated" : "Purchase Saved");
+      showPurchaseNotice(successNotice(purchaseSavedMessage({
+        completing,
+        editing: wasEditing,
+        pending: savedAsPending,
+        supplierName: savedSupplierName,
+      })));
+      if (completing) setPurchaseCompletedFor(savedSupplierName || "the supplier");
     } catch (error) {
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Purchase Error"));
+      showPurchaseNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The purchase could not be saved. Nothing was changed; try again.")));
     } finally {
       purchaseSaveInFlightRef.current = false;
       setPurchaseSaveBusy(false);
@@ -8898,14 +9132,14 @@ function App() {
       setSelectedInvoice(response.data);
       setSelectedInvoicePrintMode(options.print ? (options.printMode || "THERMAL") : null);
     } catch (error) {
-      alert(getErrorMessage(error, "Error Loading Invoice"));
+      setSaleActionProblem({ title: "This bill could not be opened", message: getErrorMessage(error, "The bill could not be loaded. Nothing was changed; try again.") });
     }
   };
 
   const printSaleInvoice = async (saleId, printMode = "THERMAL") => {
     const invoiceId = saleId || "";
     if (!invoiceId) {
-      alert("Unable to print invoice. Invoice ID is missing.");
+      setSaleActionProblem({ title: "This bill could not be printed", message: "The bill has no number to print it by. Open it from the sales list and print it from there." });
       return;
     }
     await loadInvoice(invoiceId, { print: true, printMode });
@@ -8933,9 +9167,8 @@ function App() {
       }
       setEditingSale(response.data);
     } catch (error) {
-      const message = getErrorMessage(error, "Error Loading Invoice");
-      setSaleEditError(message);
-      alert(message);
+      // Said once, in the edit window below; the alert that repeated it is gone.
+      setSaleEditError(getErrorMessage(error, "Error Loading Invoice"));
     } finally {
       setSaleEditLoading(false);
     }
@@ -8946,7 +9179,7 @@ function App() {
       const response = await axios.get(`${API_URL}/sales/${saleId}/audit`);
       setChangeHistory({ saleId, rows: response.data });
     } catch (error) {
-      alert(getErrorMessage(error, "Error Loading Change History"));
+      setSaleActionProblem({ title: "The change history could not be opened", message: getErrorMessage(error, "The change history could not be loaded. Try again.") });
     }
   };
 
@@ -9021,13 +9254,13 @@ function App() {
     try {
       const fullSale = await getSaleDetailsForAction(sale);
       if (fullSale.sale_status === "CANCELLED") {
-        alert("Invoice is already cancelled.");
+        setSaleActionProblem({ title: "This bill is already cancelled", message: `${fullSale.invoice_no || "This bill"} was cancelled earlier. Nothing more needs doing.` });
         return false;
       }
       setCancelDraft({ sale: fullSale, ...EMPTY_SALE_CHANGE_FORM, error: "", saving: false });
       return false;
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to open cancellation confirmation"));
+      setSaleActionProblem({ title: "This bill could not be cancelled", message: getErrorMessage(error, "The bill could not be loaded to cancel it. Nothing was changed; try again.") });
       return false;
     }
   };
@@ -9096,14 +9329,18 @@ function App() {
         cancellationWrite.config
       );
       await refreshAfterSaleCancellation();
-      alert("Invoice cancelled");
+      notify({
+        severity: NOTIFICATION_SEVERITY.SUCCESS,
+        title: `${sale.invoice_no || "The bill"} is cancelled`,
+        message: "The sales list now shows it as cancelled.",
+        source: "Sales",
+      });
       setCancelDraft(null);
       return true;
     } catch (error) {
       if (approvalErrorCode(error) === "SALE_CHANGE_APPROVAL_REQUIRED") return stop(describeApprovalError(error));
-      stop("");
-      alert(getErrorMessage(error, "Unable to cancel invoice"));
-      return false;
+      // Said in the cancel window itself, which stays open so the reason is not typed again.
+      return stop(plainRefusalMessage(error) || getErrorMessage(error, "The bill was not cancelled. Nothing was changed; try again."));
     } finally {
       setCancelDraft((current) => current ? { ...current, approverPassword: "", saving: false } : current);
     }
@@ -9133,11 +9370,14 @@ function App() {
     setEditingProductKeys(productIdentityKeys(product));
     setProductPhotoDraft({ dataUrl: photoForProduct(productPhotoIndex, product), changed: false });
     setProductPhotoMessage("");
+    clearProductNotice();
     loadProductLots(product, true);
     // The form sits above a long product list; pressing Edit far down the list used to fill a form
-    // the owner could not see. Take them to it, after React has rendered it as "Edit Item".
+    // the owner could not see. Take them to it, after React has rendered it as "Edit Item", with
+    // the cursor in its first box rather than left on the Edit button.
     window.requestAnimationFrame(() => {
       document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("product-name-input")?.focus({ preventScroll: true });
     });
   };
 
@@ -9154,9 +9394,11 @@ function App() {
   // "Add product" in the page header: a clean form, on screen.
   const startNewProduct = () => {
     resetProductForm();
+    clearProductNotice();
     setProductMasterTab("products");
     window.requestAnimationFrame(() => {
       document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("product-name-input")?.focus({ preventScroll: true });
     });
   };
 
@@ -9178,12 +9420,19 @@ function App() {
   };
 
   const deactivateProduct = async (product) => {
-    const reason = window.prompt(`Reason for deactivating ${product.product_name}`);
+    clearProductListNotice();
+    const reason = await askReason({
+      title: `Deactivate ${product.product_name}?`,
+      message: "It is hidden from the POS. Past bills and reports keep it.",
+      label: "Reason for deactivating",
+      confirmLabel: "Deactivate",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       const resolved = await serverIdForProduct(productIdentityKeys(product));
       if (!resolved.ok) {
-        alert(resolved.message);
+        showProductListNotice(errorNotice(resolved.message));
         return;
       }
       const deactivationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
@@ -9193,9 +9442,9 @@ function App() {
         deactivationWrite.config
       );
       await Promise.all([loadProducts(), loadDashboardData()]);
-      alert("Product marked inactive");
+      showProductListNotice(successNotice(`${product.product_name} is now inactive.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update product status"));
+      showProductListNotice(errorNotice(getErrorMessage(error, `${product.product_name} could not be deactivated.`)));
     }
   };
 
@@ -9230,7 +9479,12 @@ function App() {
     setPurchaseLotSize(purchase.lot_size || purchase.item_lot_size || "");
     setPurchaseCart([]);
     setEditingPurchaseItemLineId(null);
-    setActiveView("purchase");
+    clearPurchaseNotice();
+    clearPurchaseItemNotice();
+    setPurchaseCompletedFor("");
+    // navigate(), not setActiveView: the address then names Purchase Entry, and Back returns to
+    // the list this was opened from.
+    if (activeView !== "purchase") navigate("purchase");
   };
 
   const openPurchaseAmendment = (purchase) => {
@@ -9254,7 +9508,8 @@ function App() {
     setPurchaseRemarks(purchase.remarks || "");
     setPurchaseCart([]);
     resetPurchaseItemFields();
-    setActiveView("purchase");
+    clearPurchaseActionNotice();
+    if (activeView !== "purchase") navigate("purchase");
   };
 
   const openBlankPurchaseAmendment = () => {
@@ -9278,12 +9533,15 @@ function App() {
     setPurchaseRemarks("");
     setPurchaseCart([]);
     resetPurchaseItemFields();
-    setActiveView("purchase");
+    clearPurchaseActionNotice();
+    if (activeView !== "purchase") navigate("purchase");
   };
 
   const startForgottenPurchaseItem = () => {
+    clearPurchaseActionNotice();
     if (!amendmentDate || !amendmentSupplierId) {
-      alert("Select purchase date and supplier first.");
+      showPurchaseActionNotice(errorNotice("Choose the purchase date and the supplier first.", amendmentDate ? "amendment-supplier" : "amendment-date"));
+      focusField(amendmentDate ? "amendment-supplier" : "amendment-date", { scroll: false });
       return;
     }
     setEditingPurchaseId(null);
@@ -9291,6 +9549,7 @@ function App() {
     setPurchaseSupplierId(amendmentSupplierId);
     if (purchaseBillStatus === "BILL_PENDING") setPurchaseType("CREDIT");
     resetPurchaseItemFields();
+    focusField("purchase-product");
   };
 
   const cancelPurchaseAmendment = () => {
@@ -9299,13 +9558,14 @@ function App() {
   };
 
   const completePendingPurchase = (purchase) => {
+    clearPurchaseActionNotice();
     // An arrival with several fruits is completed in one go, with a final rate for each fruit.
     const billRows = purchases.filter((row) => inventoryIdsEqual(row.id, purchase.id));
     let lines = null;
     if (billRows.length > 1) {
       const prepared = pendingCompletionLines(billRows);
       if (prepared.error) {
-        alert(prepared.error);
+        reportPurchaseAction(errorNotice(prepared.error));
         return;
       }
       lines = prepared.lines;
@@ -9324,8 +9584,31 @@ function App() {
     setPurchaseBillDate(toDateKey(new Date()));
   };
 
+  // Pending Bills, Purchase Entry and Reports all start these; the notice is drawn on the first two,
+  // and Reports (which has no place for it) gets it as a notification instead.
+  const reportPurchaseAction = (notice) => {
+    showPurchaseActionNotice(notice);
+    if (activeView === "reports" && notice) {
+      notify({
+        severity: notice.tone === "success" ? "info" : "warning",
+        title: notice.tone === "success" ? "Purchase updated" : "Purchase not changed",
+        message: notice.text,
+        source: "Purchases",
+      });
+    }
+  };
+
   const cancelPurchase = async (purchase) => {
-    const reason = window.prompt(`Enter cancellation reason for Purchase #${purchase.id}`);
+    clearPurchaseActionNotice();
+    const supplier = purchase.supplier_name ? ` from ${purchase.supplier_name}` : "";
+    const reason = await askReason({
+      title: `Cancel purchase #${purchase.id}${supplier}?`,
+      message: "The purchase stays in the history, marked cancelled.",
+      label: "Reason for cancelling",
+      confirmLabel: "Cancel purchase",
+      cancelLabel: "Keep it",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       const cancellationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
@@ -9335,9 +9618,9 @@ function App() {
         cancellationWrite.config
       );
       await Promise.all([loadPurchases(), loadDashboardData(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
-      alert("Purchase cancelled");
+      reportPurchaseAction(successNotice(`Purchase #${purchase.id}${supplier} cancelled.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to cancel purchase"));
+      reportPurchaseAction(errorNotice(getErrorMessage(error, `Purchase #${purchase.id} could not be cancelled.`)));
     }
   };
 
@@ -9354,7 +9637,13 @@ function App() {
       }
     }
     if (!accountKey) {
-      alert("Supplier account is not linked to this purchase.");
+      // The report stays where it is; the bell says why the ledger did not open.
+      notify({
+        severity: NOTIFICATION_SEVERITY.WARNING,
+        title: "No supplier ledger for this purchase",
+        message: "This purchase is not linked to a supplier account, so there is no ledger to open.",
+        source: "Reports",
+      });
       return;
     }
     setAccountLedgerFocusKey(accountKey);
@@ -9374,7 +9663,12 @@ function App() {
     // customer the sale actually names (local/accountsPresentation.js).
     const customer = findSaleCustomer(customerRows, sale);
     if (!customer?.id) {
-      alert("Customer account is not linked to this sale.");
+      notify({
+        severity: NOTIFICATION_SEVERITY.WARNING,
+        title: "No customer ledger for this sale",
+        message: "This sale is not linked to a customer account, so there is no ledger to open.",
+        source: "Reports",
+      });
       return;
     }
     const accountKey = `CUSTOMER-${customer.id}`;
@@ -9385,12 +9679,12 @@ function App() {
 
   const openSaleForEditFromReport = async (sale) => {
     if (!canEditSales) {
-      alert("Your role cannot edit completed sales.");
+      setSaleActionProblem({ title: "This bill can't be edited", message: "Your role cannot edit completed bills. Ask the Owner or an Admin." });
       return;
     }
     const saleId = String(sale.sale_id || sale.id || "");
     if (!saleId) {
-      alert("Sale invoice not found.");
+      setSaleActionProblem({ title: "This bill can't be edited", message: "The bill has no number to open it by. Open it again from the sales list." });
       return;
     }
     const localEligible = isTauriRuntime() && (
@@ -9422,18 +9716,19 @@ function App() {
     await loadSaleForEdit(saleId);
   };
 
-  const navigate = async (view, { posLeaveConfirmed = false } = {}) => {
+  const navigate = async (view, { posLeaveConfirmed = false, fromHistory = false } = {}) => {
     // A bill on the POS counter is asked about before it is thrown away. The question is answered
-    // in the dialog, which comes back here with `posLeaveConfirmed`.
-    if (!posLeaveConfirmed && shouldConfirmLeavingPos({ activeView, nextView: view, cartLines: posWork.cartLines })) {
+    // in the dialog, which comes back here with `posLeaveConfirmed`. Back/Forward (`fromHistory`)
+    // has already moved the page: the top bar's arrows ask before moving, and asking again here
+    // would leave the address naming one screen while another is shown.
+    if (!posLeaveConfirmed && !fromHistory && shouldConfirmLeavingPos({ activeView, nextView: view, cartLines: posWork.cartLines })) {
       setCommandPaletteOpen(false);
       setPosLeavePrompt({ view });
       return;
     }
-    if (!hasModuleAccess(view)) {
-      alert("Your role does not have access to this module.");
-      return;
-    }
+    // A screen this role cannot open is not offered anywhere (sidebar, Ctrl K, Alt keys share
+    // hasModuleAccess), so a request for one is simply ignored rather than answered with a popup.
+    if (!hasModuleAccess(view)) return;
     // Newest first, deduplicated, capped. Feeds the palette's ranking so that where somebody
     // actually works outweighs how well a label happens to match their letters.
     setRecentViews((current) => [view, ...current.filter((id) => id !== view)].slice(0, 8));
@@ -9504,8 +9799,8 @@ function App() {
         await refreshPosInventoryFromSQLite("navigate-auto-pos");
         await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
       }
-      // Discounts loads itself when it opens (and on Back/Forward, which does not come through
-      // here), shows its own failure, and sends nothing in Local Only or offline.
+      // Discounts loads itself when it opens, shows its own failure, and sends nothing in Local
+      // Only or offline.
       if (["purchase", "pending-bills", "accounts"].includes(view)) {
         await loadSupplierData();
       }
@@ -9532,12 +9827,14 @@ function App() {
       if (view === "sales") await loadOrders().catch(() => null);
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
+      // The board is a cloud read; it used to load only the first time the screen opened, so a
+      // consignment sent since then never appeared. This path is never reached in Local Only.
+      if (view === "distribution" && distributionState.loadState !== "idle") await loadDistribution();
       if (view === "dashboard") await loadDashboardData();
       // Branches & Counters shows the device list the licences are issued against and the screen
       // lock, both of which come from the settings bundle.
       if (view === "settings" || view === "branches") await loadSettingsData();
-      // Sale Rate Update loads itself when it opens (and when it is reached by Back/Forward, which
-      // does not come through here), so it is not loaded twice.
+      // Sale Rate Update loads itself when it opens, so it is not loaded here as well.
     } catch (error) {
       console.warn(`Unable to refresh ${view}`, error);
       setSyncMessage(getErrorMessage(error, `${navigationItems.find(([itemView]) => itemView === view)?.[1] || "Module"} data could not be refreshed.`));
@@ -9569,9 +9866,15 @@ function App() {
     : localServiceUnavailable
     ? "Local service could not start."
     : (startupError || startupNotice || "");
+  // A refused password is about the password, not the connection: the connection notice that
+  // happened to be on screen ("Local mode active • Cloud temporarily unavailable.") is not added
+  // under it, where it read as the reason the sign-in failed. Presentation only; the connectivity
+  // state itself is untouched.
   const startupSecondaryMessage = localServiceUnavailable
     ? "FroozERP cannot sign in on this device until the local service is running."
-    : (startupError && startupNotice ? startupNotice : "");
+    : (startupError && startupNotice && !loginRefused ? startupNotice : "");
+  // Something is wrong with the connection or the service: the technical facts are shown unasked.
+  const startupProblem = Boolean(localServiceUnavailable || (startupError && !loginRefused) || backendHealth.online === false);
   const startupConnectionLabel = localServiceUnavailable
     ? `${connectionStatus.internetStatus}, local service unavailable`
     : `${connectionStatus.internetStatus} - ${isCloudMode() ? connectionStatus.cloudBackendStatus : connectionStatus.localBackendStatus}`;
@@ -9597,7 +9900,7 @@ function App() {
 
   if (mandatoryRuntimeState === "checking") return <NeutralStartupScreen />;
   if (mandatoryRuntimeState === "fatal") {
-    return <ConfirmedLocalRuntimeFailure message={localDbStatus?.error || startupError} />;
+    return <ConfirmedLocalRuntimeFailure message={localDbStatus?.error || startupError} onExit={requestControlledExit} exitModal={exitCodeModal} />;
   }
   if (!user && isTauriRuntime() && entitlement
       && (entitlement.state === "Unprovisioned" || entitlement.bootstrap?.pending)) {
@@ -9626,107 +9929,133 @@ function App() {
           <div className="login-copy">
             <span className="eyebrow">Business Management</span>
             <h1>{APP_DISPLAY_NAME}</h1>
-            <p>Preparing FroozERP, checking the local database, device authorisation and sync readiness.</p>
+            <p>Sign in with your username and password to start work.</p>
           </div>
-          <div className="first-launch-steps">
-            <span>Checking local database</span>
-            <span>Checking device authorisation</span>
-            <span>Preparing authorised reference data</span>
-            <span>Ready for online or local-first POS</span>
-          </div>
-          <label>
-            Username
-            <input value={username} onChange={(event) => setUsername(event.target.value)} />
-          </label>
-          <label>
-            Password
-            <PasswordInput
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              onKeyDown={(event) => event.key === "Enter" && login()}
-            />
-          </label>
-          {(startupMainMessage || startupSecondaryMessage || lastReferenceSyncAt) && (
-            <div className={`startup-status-panel ${localServiceUnavailable || startupError ? "startup-status-error" : ""}`}>
-              {startupMainMessage && <p><strong>{startupMainMessage}</strong></p>}
-              {startupSecondaryMessage && <p>{startupSecondaryMessage}</p>}
-              {lastReferenceSyncAt && <small>Last successful local data sync: {new Date(lastReferenceSyncAt).toLocaleString("en-IN")}</small>}
-            </div>
-          )}
-          <div className="startup-api-panel">
-            <span>{connectionStatus.apiModeLabel}</span>
-            <code>{backendHealth.apiUrl}</code>
-            <small>{startupConnectionLabel}</small>
-            {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
-              <div className="startup-service-actions">
-                <button className="table-action" type="button" onClick={async () => {
-                  await ensureLocalBackendService({ restart: true, reason: "login-restart-service" });
-                  await performConnectivityCheck("login-restart-service", { force: true, skipServiceStart: true });
-                  setStartupTechnicalOpen(true);
-                }}>
-                  Restart Service
-                </button>
-                {SHELL_CAPABILITIES.startupLog && (
-                  <button className="secondary-button" type="button" onClick={openStartupLogFile}>
-                    Open Startup Log
+          {/* A form, so Enter in either box signs in, as on every other sign-in page. */}
+          <form
+            className="login-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!loginBusy) login();
+            }}
+          >
+            <label>
+              Username
+              <input
+                autoComplete="username"
+                autoFocus
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+              />
+            </label>
+            <label>
+              Password
+              <PasswordInput
+                value={password}
+                autoComplete="current-password"
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </label>
+            {(startupMainMessage || startupSecondaryMessage || lastReferenceSyncAt) && (
+              <div className={`startup-status-panel ${localServiceUnavailable || startupError ? "startup-status-error" : ""}`} role={startupError || localServiceUnavailable ? "alert" : "status"}>
+                {startupMainMessage && <p><strong>{startupMainMessage}</strong></p>}
+                {startupSecondaryMessage && <p>{startupSecondaryMessage}</p>}
+                {lastReferenceSyncAt && <small>Last successful local data sync: {formatKolkataDateTime(lastReferenceSyncAt)}</small>}
+              </div>
+            )}
+            {/* The connection's technical facts (mode, address, raw codes) are for whoever fixes a
+                problem, not for the cashier signing in: shown when something is wrong, otherwise
+                behind "Show technical details". */}
+            <div className="startup-api-panel">
+              {(startupTechnicalOpen || startupProblem) && (
+                <>
+                  <span>{connectionStatus.apiModeLabel}</span>
+                  <code>{backendHealth.apiUrl}</code>
+                  <small>{startupConnectionLabel}</small>
+                </>
+              )}
+              {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
+                <div className="startup-service-actions">
+                  <button className="table-action" type="button" onClick={async () => {
+                    await ensureLocalBackendService({ restart: true, reason: "login-restart-service" });
+                    await performConnectivityCheck("login-restart-service", { force: true, skipServiceStart: true });
+                    setStartupTechnicalOpen(true);
+                  }}>
+                    Restart Service
                   </button>
+                  {SHELL_CAPABILITIES.startupLog && (
+                    <button className="secondary-button" type="button" onClick={openStartupLogFile}>
+                      Open Startup Log
+                    </button>
+                  )}
+                  <button className="secondary-button" type="button" onClick={copyStartupDiagnostics}>
+                    Copy Diagnostics
+                  </button>
+                </div>
+              )}
+              {localBackendService?.message && (startupTechnicalOpen || startupProblem) && <small>{localBackendService.message}</small>}
+              <button aria-expanded={startupTechnicalOpen} className="startup-details-toggle" type="button" onClick={() => setStartupTechnicalOpen((open) => !open)}>
+                {startupTechnicalOpen ? "Hide technical details" : "Show technical details"}
+              </button>
+              {startupTechnicalOpen && (
+                <div className="startup-technical-details">
+                  {startupDetailRows.map(([label, value]) => (
+                    <div className="startup-detail-row" key={label}>
+                      <span>{label}</span>
+                      <code>{String(value)}</code>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="startup-actions">
+              <button className="primary-button login-button" disabled={loginBusy} type="submit">
+                {loginBusy ? "Signing In…" : "Sign In"}
+              </button>
+              <button className="recovery-link-button" disabled={loginBusy} type="button" onClick={() => setRecoveryOpen(true)}>
+                Forgot Username or Password?
+              </button>
+              {/* One row of equal buttons: none of the three is more important than the others. */}
+              <div className="login-secondary-actions">
+                {isTauriRuntime() && (
+                  <>
+                    <button className="secondary-button" disabled={loginBusy} type="button" onClick={retryOnline}>
+                      Retry Online
+                    </button>
+                    <button className="secondary-button" disabled={loginBusy} type="button" onClick={() => continueOffline()}>
+                      Continue Offline
+                    </button>
+                  </>
                 )}
-                <button className="secondary-button" type="button" onClick={copyStartupDiagnostics}>
-                  Copy Diagnostics
+                <button className="secondary-button login-close-exit-button" disabled={loginBusy} type="button" onClick={requestControlledExit}>
+                  Close &amp; Exit
                 </button>
               </div>
-            )}
-            {localBackendService?.message && <small>{localBackendService.message}</small>}
-            <button className="startup-details-toggle" type="button" onClick={() => setStartupTechnicalOpen((open) => !open)}>
-              {startupTechnicalOpen ? "Hide technical details" : "Show technical details"}
-            </button>
-            {startupTechnicalOpen && (
-              <div className="startup-technical-details">
-                {startupDetailRows.map(([label, value]) => (
-                  <div className="startup-detail-row" key={label}>
-                    <span>{label}</span>
-                    <code>{String(value)}</code>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-          <div className="startup-actions">
-            <button className="primary-button login-button" disabled={loginBusy} onClick={login}>
-              {loginBusy ? "Signing In..." : "Sign In"}
-            </button>
-            <button className="recovery-link-button" disabled={loginBusy} onClick={() => setRecoveryOpen(true)}>
-              Forgot Username or Password?
-            </button>
-            {isTauriRuntime() && (
-              <>
-                <button className="secondary-button" disabled={loginBusy} onClick={retryOnline}>
-                  Retry Online
-                </button>
-                <button className="secondary-button" disabled={loginBusy} onClick={() => continueOffline()}>
-                  Continue Offline
-                </button>
-              </>
-            )}
-            <button className="secondary-button login-close-exit-button" disabled={loginBusy} onClick={requestControlledExit}>
-              Close &amp; Exit
-            </button>
-            <small className="login-exit-helper">
-              {loginDeviceControlSettings.fullscreen_lock_enabled ? "Owner code required to close FroozERP" : "Close FroozERP safely"}
-            </small>
-          </div>
+              <small className="login-exit-helper">
+                {loginDeviceControlSettings.fullscreen_lock_enabled ? "Owner code required to close FroozERP" : "Close FroozERP safely"}
+              </small>
+            </div>
+          </form>
           {deviceGate && (
             <div className="device-activation-panel">
               <span className="eyebrow">Device Activation Required</span>
               <strong>{deviceGate.code === "DEVICE_PENDING_APPROVAL" ? "Device awaiting owner approval." : "This device is not approved."}</strong>
               <small>Device ID: {deviceGate.device_id || deviceInfo.device_id}</small>
               <p>Ask the owner to approve this device in Branches &amp; Counters, then sign in again. A one-time activation code may also be used.</p>
-              <input
-                placeholder="Activation code"
-                value={activationCode}
-                onChange={(event) => setActivationCode(event.target.value.toUpperCase())}
-              />
-              <button className="secondary-button" onClick={activateDevice}>Activate Device</button>
+              <label>
+                Activation code
+                <input
+                  aria-invalid={activationNotice?.field === "activation_code" ? "true" : undefined}
+                  value={activationCode}
+                  onChange={(event) => {
+                    setActivationCode(event.target.value.toUpperCase());
+                    setActivationNotice(null);
+                  }}
+                  onKeyDown={(event) => event.key === "Enter" && activateDevice()}
+                />
+              </label>
+              <button className="secondary-button" type="button" onClick={activateDevice}>Activate Device</button>
+              <SaveNotice notice={activationNotice} />
             </div>
           )}
           {recoveryOpen && (
@@ -9741,6 +10070,7 @@ function App() {
           )}
           {exitCodeModal}
         </section>
+        <FeedbackDialogHost queue={appDialogQueue} />
       </main>
     );
   }
@@ -9871,6 +10201,11 @@ function App() {
 
   // One set of lot fields for both lot forms on Product Master: the lots staged with a new product,
   // and "Add stock lot" on an existing one. Both edit `openingStockDraft`, and never at the same time.
+  // The unit of the product the new lot is for: the one being edited, else the stock lots card's.
+  const openingLotUnit = lotPanelProduct && !editingProductId ? lotPanelProduct.unit : unit;
+  // The lot box's quantities carry the lot's unit (its own, else its product's).
+  const lotActionUnit = lotAction?.lot?.unit || lotPanelProduct?.unit || "";
+  const lotActionUnitLabel = (label) => (lotActionUnit ? `${label} (${unitDisplayName(lotActionUnit)})` : label);
   const openingLotFields = (
     <div className="form-grid supplier-form-grid">
       <Field label="Supplier (optional)">
@@ -9881,9 +10216,9 @@ function App() {
       </Field>
       <Field label="Lot name"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Named for you if left blank" /></Field>
       <Field label="Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Example: Small, Premium" /></Field>
-      <Field label={<RequiredLabel>Quantity</RequiredLabel>}><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
-      <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
-      <Field label={<RequiredLabel>Sale price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>{openingLotUnit ? `Quantity (${unitDisplayName(openingLotUnit)})` : "Quantity"}</RequiredLabel>}><input id="opening-lot-quantity" type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input id="opening-lot-cost" type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Sale price (₹)</RequiredLabel>}><input id="opening-lot-sale" type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
       <Field label="Stock date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
       <Field label="Notes"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
     </div>
@@ -10070,7 +10405,7 @@ function App() {
           <BrandLogo compact={sidebarCollapsed} />
         </div>
         <span className="sidebar-section">Main Menu</span>
-        <nav className="sidebar-nav">
+        <nav className="sidebar-nav" ref={sidebarNavRef}>
           {visibleNavigationItems.map(([view, label]) => {
             const shortcut = navigationRegistry.find((item) => item.id === view)?.shortcut || null;
             return (
@@ -10163,7 +10498,7 @@ function App() {
                 title={sidebarCollapsed ? "Expand the menu" : "Collapse the menu to icons"}
                 type="button"
               >
-                <Icon name="menu" />
+                <Icon name="sidebar" />
               </button>
               <button
                 aria-label="Search screens and settings"
@@ -10233,7 +10568,8 @@ function App() {
                   ? "The counter this machine is set up as. Stock and bills come from here."
                   : undefined}
               >
-                <span className="status-dot" />
+                {/* The dot follows the connection pill beside it: green only when all is well. */}
+                <span className="status-dot" data-tone={shellStatus.pill.tone} />
                 {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
               <div className="offline-pill" data-tone={shellStatus.pill.tone} title={shellStatus.pill.title || undefined}>{shellStatus.pill.label}</div>
@@ -10297,7 +10633,7 @@ function App() {
           </div>
         </header>
 
-        <div className="content-area">
+        <div className="content-area" data-view={activeView}>
           {shopView.banner && (
             // Above the connectivity notice on purpose. Local Only changes where the numbers come
             // from; this changes whose they are, and that is the more surprising of the two.
@@ -10311,13 +10647,15 @@ function App() {
                 disabled={shopSwitchBusy || !shopView.banner.returnBranchId}
                 onClick={() => switchShopView(shopView.banner.returnBranchId)}
               >
-                {shopSwitchBusy ? "Switching..." : shopView.banner.returnLabel}
+                {shopSwitchBusy ? "Switching…" : shopView.banner.returnLabel}
               </button>
             </div>
           )}
           {connectionSentence.showsInTopBar && (
             <div
-              className="local-only-banner"
+              // Without a button to offer, the sentence is one quiet line: the top-bar pill already
+              // says "Working offline", so a 70px block repeating it pushed every screen down.
+              className={connectionSentence.tone === CONNECTION_TONE.ATTENTION ? "local-only-banner" : "local-only-banner local-only-banner-compact"}
               data-connection-state={connectionSentence.state}
               role={connectionNeedsAttention(connectionSentence) ? "alert" : "status"}
             >
@@ -10516,6 +10854,7 @@ function App() {
               >
                 {!canManageRates && <p className="pm-hint">Only the Owner or an Admin can add or switch off products, manage categories or change sale prices.</p>}
                 {productDuplicateWarning && <p className="pm-notice" role="status">{productDuplicateWarning}</p>}
+                <SaveNotice notice={productListNotice} />
                 <div className="purchase-summary-grid pm-summary">
                   <SummaryMetric featured label="Products" value={productCounts.note} />
                   <SummaryMetric label="Categories" value={`${activeProductCategories.length} active`} />
@@ -10541,11 +10880,12 @@ function App() {
                   {canManageRates && (
                     <div className="pm-inline-form">
                       <Field label="New category">
-                        <input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
+                        <input id="category-new-name" value={newProductCategoryName} onChange={(event) => { setNewProductCategoryName(event.target.value); clearCategoryNotice(); }} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
                       </Field>
                       <button className="primary-button" onClick={saveProductCategory} type="button">Add category</button>
                     </div>
                   )}
+                  <SaveNotice notice={categoryNotice} />
                   <DataTable className="pm-table pm-category-table" headers={["Category", <span className="pm-num-head" key="products">Products</span>, "Status", "Actions"]}>
                     {productCategories.map((category) => (
                       <tr key={category.id}>
@@ -10671,14 +11011,14 @@ function App() {
 
                   {/* A new product is Owner/Admin only; anyone else gets this form for Edit. */}
                   {(canManageRates || Boolean(editingProductId)) && (
-                  <ModuleCard id="product-item-form" eyebrow={editingProductId ? "Edit product" : "New product"} title={editingProductId ? `Edit ${productEditingName}` : "Add product"} subtitle="Used by the POS, purchases, stock and reports.">
+                  <ModuleCard id="product-item-form" eyebrow={editingProductId ? "Edit product" : "New product"} onChange={clearProductNotice} title={editingProductId ? `Edit ${productEditingName}` : "Add product"} subtitle="Used by the POS, purchases, stock and reports.">
                     <div className="pm-form-section">
                       <h3>Basics</h3>
                       <div className="form-grid supplier-form-grid">
-                        <Field label={<RequiredLabel>Product name</RequiredLabel>}><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar mango" /></Field>
+                        <Field label={<RequiredLabel>Product name</RequiredLabel>}><input id="product-name-input" value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar mango" /></Field>
                         <div className="pm-category-field">
                           <Field label="Category">
-                            <select value={productCategoryId} onChange={(event) => {
+                            <select id="product-category-input" value={productCategoryId} onChange={(event) => {
                               const selected = productCategories.find((category) => String(category.id) === event.target.value);
                               setProductCategoryId(event.target.value);
                               setProductCategory(selected?.category_name || "");
@@ -10694,13 +11034,14 @@ function App() {
                           )}
                           {canManageRates && showInlineCategoryForm && (
                             <div className="pm-inline-form pm-inline-form-compact">
-                              <Field label="New category name"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
+                              <Field label="New category name"><input id="category-inline-name" value={newProductCategoryName} onChange={(event) => { setNewProductCategoryName(event.target.value); clearCategoryNotice(); }} placeholder="Example: Mango" /></Field>
                               <button className="secondary-button" onClick={saveProductCategory} type="button">Save category</button>
                             </div>
                           )}
+                          {canManageRates && showInlineCategoryForm && <SaveNotice notice={categoryNotice} />}
                         </div>
                         <Field label={<RequiredLabel>Unit</RequiredLabel>}>
-                          <select value={unit} onChange={(event) => setUnit(event.target.value)}>
+                          <select id="product-unit-input" value={unit} onChange={(event) => setUnit(event.target.value)}>
                             <option value="">Choose a unit</option>
                             {PRODUCT_UNITS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                           </select>
@@ -10749,7 +11090,7 @@ function App() {
                     <div className="pm-form-section">
                       <h3>Price</h3>
                       <div className="form-grid supplier-form-grid">
-                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input readOnly={!canManageRates} type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => { if (canManageRates) setSellingRate(event.target.value); }} /></Field>
+                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input id="product-sale-price-input" readOnly={!canManageRates} type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => { if (canManageRates) setSellingRate(event.target.value); }} /></Field>
                       </div>
                       {!canManageRates && <p className="pm-hint">Only the Owner or an Admin changes sale prices (Sale Rate Update).</p>}
                     </div>
@@ -10757,7 +11098,7 @@ function App() {
                     <div className="pm-form-section">
                       <h3>Stock</h3>
                       <div className="form-grid supplier-form-grid">
-                        <Field label="Low-stock alert at"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
+                        <Field label="Low-stock alert at"><input id="product-min-stock-input" type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
                       </div>
                       {editingProductId && <p className="pm-hint">To add stock or correct a count, use the stock lots below.</p>}
                       {!editingProductId && !showOpeningLotForm && (
@@ -10812,8 +11153,12 @@ function App() {
                       <button className="secondary-button" onClick={cancelProductEdit} type="button">Cancel</button>
                       <span className="pm-required-legend"><span aria-hidden="true" className="pm-required">*</span> Required</span>
                     </div>
+                    <SaveNotice notice={productNotice} />
                   </ModuleCard>
                   )}
+                  {/* Someone who may only edit loses the form once the edit is saved; the result is
+                      said here instead, where they are. */}
+                  {!(canManageRates || Boolean(editingProductId)) && <SaveNotice notice={productNotice} />}
 
                   {lotPanelProduct && (
                     <ModuleCard id="product-lots-card" eyebrow="Stock lots" title={`Stock lots — ${lotPanelProduct.product_name}`} subtitle="Each delivery or opening count is its own lot. A lot's quantity cannot go below what has already been sold or used.">
@@ -10841,12 +11186,15 @@ function App() {
                       </div>
                       <DataTable
                         className="pm-table pm-lot-table"
-                        headers={["Lot", "Supplier", "Grade", "Stock date", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="sold">Sold</span>, <span className="pm-num-head" key="in">In stock</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Actions"]}
+                        headers={["Lot", "Supplier", "Stock date", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="sold">Sold</span>, <span className="pm-num-head" key="in">In stock</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Actions"]}
                       >
                         {filteredProductLots.length ? filteredProductLots.map((lot) => {
-                          const lotLabel = lot.lot_name || lot.batch_no || `Lot #${lot.id}`;
+                          // A lot is named for people, never by its row id (local/stockScreens.js).
+                          const lotLabel = stockLotName(lot, formatDisplayDate);
                           const lotCancelled = lot.batch_status === "CANCELLED";
-                          const lotNotes = String(lot.remarks || "").trim();
+                          // The grade rides under the lot name, so the ten columns fit at 1366.
+                          const lotGrade = String(lot.lot_size || "").trim();
+                          const lotNotes = [lotGrade ? `Grade ${lotGrade}` : "", String(lot.remarks || "").trim()].filter(Boolean).join(" · ");
                           return (
                             <tr key={lot.id}>
                               <td className="pm-lot-cell" title={lotNotes ? `${lotLabel} · ${lotNotes}` : lotLabel}>
@@ -10854,7 +11202,6 @@ function App() {
                                 <small className="pm-product-note"><span className={lotStatusClass(lot)}>{lotStatusLabel(lot)}</span>{lotNotes ? ` · ${lotNotes}` : ""}</small>
                               </td>
                               <td title={lot.supplier_name || "None"}>{lot.supplier_name || "None"}</td>
-                              <td title={lot.lot_size || ""}>{lot.lot_size || MISSING_VALUE}</td>
                               <td>{lot.purchase_date ? formatDisplayDate(lot.purchase_date) : MISSING_VALUE}</td>
                               <td className="pm-num">{formatOptionalQuantity(lot.purchase_qty)}</td>
                               <td className="pm-num">{formatOptionalQuantity(lot.sold_qty)}</td>
@@ -10872,9 +11219,10 @@ function App() {
                             </tr>
                           );
                         }) : (
-                          <tr><td colSpan="10" className="empty-cell">{lotListEmptyMessage({ totalCount: productLots.length, search: lotListSearch, showSoldOut: showEmptyLots })}</td></tr>
+                          <tr><td colSpan="9" className="empty-cell">{lotListEmptyMessage({ totalCount: productLots.length, search: lotListSearch, showSoldOut: showEmptyLots })}</td></tr>
                         )}
                       </DataTable>
+                      <SaveNotice notice={lotPanelNotice} />
                       {!showOpeningLotForm && (
                         lotPanelAcceptsNewLot
                           ? (
@@ -10933,7 +11281,7 @@ function App() {
             <section className="settings-layout">
               {purchases.some((purchase) => purchase.operation_id) && (
                 <ModuleCard eyebrow="Saved while offline" title="Purchases waiting to send" subtitle="Purchases entered on this computer stay listed here until the cloud has them.">
-                  <DataTable headers={["Reference", "Purchase Date", "Bill State", "Sync State", "Detail"]}>
+                  <DataTable headers={["Reference", "Purchase date", "Bill", "Sending", "Detail"]}>
                     {Array.from(new Map(
                       purchases
                         .filter((purchase) => purchase.operation_id)
@@ -10941,43 +11289,50 @@ function App() {
                     ).values()).map((purchase) => (
                       <tr key={purchase.operation_id}>
                         <td className="primary-cell">{purchase.provisional_reference || purchase.offline_purchase_ref}</td>
-                        <td>{purchase.purchase_date}</td>
-                        <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : purchase.purchase_type === "CASH" ? "Paid Purchase" : "Credit Purchase"}</td>
-                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Sending" : purchase.sync_status === "completed" ? "Sent to cloud" : purchase.sync_status === "failed" ? "Not sent - can be retried" : purchase.sync_status === "conflict" ? "Clashes with cloud - needs checking" : "Waiting to send"}</span></td>
+                        <td>{formatDisplayDate(purchase.purchase_date)}</td>
+                        <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Bill pending" : purchase.purchase_type === "CASH" ? "Paid purchase" : "Credit purchase"}</td>
+                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Sending" : purchase.sync_status === "completed" ? "Sent to cloud" : purchase.sync_status === "failed" ? "Not sent, can be retried" : purchase.sync_status === "conflict" ? "Clashes with cloud, needs checking" : "Waiting to send"}</span></td>
                         <td>{purchase.last_error || (purchase.sync_status === "completed" ? "Sent, and matched to the cloud copy" : "Saved safely on this computer")}</td>
                       </tr>
                     ))}
                   </DataTable>
                 </ModuleCard>
               )}
-              {purchaseAmendmentMode && (
-                <ModuleCard eyebrow="Purchase Amendment" title="Add / Edit Purchase" subtitle="Select date and supplier to amend old purchase entries without deleting history.">
+              {/* Hidden while a pending bill is being completed: that is one bill, and this card's
+                  list of every purchase on the day only got in the way of it. */}
+              {purchaseAmendmentMode && !purchaseCompleting && (
+                <ModuleCard eyebrow="Earlier purchases" title="Find an earlier purchase" subtitle="Choose the date and the supplier to add a forgotten item, correct an item or cancel a purchase. Nothing is deleted; every change is kept in the history.">
                   <div className="form-grid supplier-form-grid">
-                    <Field label="Purchase Date">
-                      <input type="date" value={amendmentDate} onChange={(event) => {
+                    <Field label="Purchase date">
+                      <input id="amendment-date" type="date" value={amendmentDate} onChange={(event) => {
                         setAmendmentDate(event.target.value);
                         setPurchaseDate(event.target.value);
                         setAmendmentSupplierId("");
                         setPurchaseSupplierId("");
                         setEditingPurchaseId(null);
+                        clearPurchaseActionNotice();
                       }} />
                     </Field>
-                    <Field label="Supplier On Date">
-                      <select value={amendmentSupplierId} onChange={(event) => {
+                    <Field label="Supplier on that date">
+                      <select id="amendment-supplier" value={amendmentSupplierId} onChange={(event) => {
                         setAmendmentSupplierId(event.target.value);
                         setPurchaseSupplierId(event.target.value);
                         setEditingPurchaseId(null);
+                        clearPurchaseActionNotice();
                       }}>
-                        <option value="">Select supplier for this date</option>
+                        <option value="">Choose a supplier</option>
                         {amendmentSuppliers.map((purchase) => (
                           <option key={purchase.supplier_id || purchase.supplier_name} value={purchase.supplier_id || ""}>{purchase.supplier_name}</option>
                         ))}
                       </select>
                     </Field>
-                    <button className="secondary-button" onClick={startForgottenPurchaseItem}>Add Forgotten Item</button>
-                    <button className="secondary-button" onClick={resetPurchaseForm}>Exit Amendment</button>
                   </div>
-                  <DataTable headers={["Purchase", "Item", "Qty", "Rate", "Status", "Net", "Actions"]}>
+                  <div className="button-row">
+                    <button className="secondary-button" onClick={startForgottenPurchaseItem} type="button">Add forgotten item</button>
+                    <button className="secondary-button" onClick={resetPurchaseForm} type="button">Close</button>
+                  </div>
+                  <SaveNotice notice={purchaseActionNotice} />
+                  <DataTable className="purchase-amendment-table" headers={markNumericColumns(["Bill", "Item", "Quantity", "Rate", "Status", "Net", "Actions"])}>
                     {amendmentPurchases.map((purchase, rowIndex) => {
                       // One row per item. A bill with several items is completed with a rate per
                       // fruit, and edited only by cancelling it and entering it again
@@ -10985,21 +11340,23 @@ function App() {
                       const itemCount = amendmentItemCounts.get(canonicalInventoryId(purchase.id)) || 1;
                       const changeBlock = purchaseChangeBlock(itemCount);
                       const rowNet = purchaseRowNet(purchase, itemCount);
+                      // The lot as staff named it; the internal batch code is not shown.
+                      const lotWords = [purchase.lot_name || purchase.item_lot_name, purchase.lot_size || purchase.item_lot_size].filter(Boolean).join(" / ");
                       return (
                       <tr key={`${canonicalInventoryId(purchase.id)}-${purchase.inventory_batch_id ?? rowIndex}`}>
                         <td><span className="batch-id">#{purchase.id}</span>{itemCount > 1 && <small className="cell-note">{itemCount} fruits on this bill</small>}</td>
-                        <td className="primary-cell">{purchase.product_name}<small className="cell-note">{purchase.batch_no || "-"}</small></td>
-                        <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit ? labelFor("unit", purchase.unit) : ""}</td>
+                        <td className="primary-cell">{purchase.product_name}{lotWords && <small className="cell-note">{lotWords}</small>}</td>
+                        <td>{formatQuantityWithUnit(purchase.quantity, purchase.unit)}</td>
                         <td>{currency.format(Number(purchase.purchase_rate || purchase.expected_purchase_rate || 0))}</td>
-                        <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : "Completed Bill"}</span></td>
-                        <td>{rowNet === null ? "-" : currency.format(rowNet)}</td>
+                        <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Bill pending" : "Bill complete"}</span></td>
+                        <td>{rowNet === null ? MISSING_VALUE : currency.format(rowNet)}</td>
                         <td>
                           {/* Edit, complete and cancel are Owner/Admin on the server (requireRateManager). */}
                           {canManagePendingPurchaseBills(user.role) ? (
                             <div className="button-row table-actions-row">
                               <button className="table-action" disabled={purchase.purchase_status === "CANCELLED" || Boolean(changeBlock)} onClick={() => editPurchase(purchase)} title={changeBlock || undefined}>Edit</button>
-                              {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
-                              <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
+                              {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button compact-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete bill</button>}
+                              <button className="danger-text-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
                             </div>
                           ) : <small className="cell-note">Only the Owner or an Admin can edit, complete or cancel a purchase.</small>}
                           {changeBlock && purchase.purchase_status !== "CANCELLED" && <small className="cell-note">{changeBlock}</small>}
@@ -11008,28 +11365,29 @@ function App() {
                       );
                     })}
                   </DataTable>
-                  {amendmentDate && amendmentSupplierId && amendmentPurchases.length === 0 && <div className="cart-empty">No purchases found for selected date and supplier.</div>}
+                  {amendmentDate && amendmentSupplierId && amendmentPurchases.length === 0 && <div className="cart-empty">No purchases from this supplier on that date.</div>}
                 </ModuleCard>
               )}
-              <ModuleCard eyebrow="Procurement" title={editingPurchaseId ? `Add / Edit Purchase #${editingPurchaseId}` : "Purchase Entry"} subtitle={editingPurchaseId ? "Amend one historical purchase item with inventory protection." : "Select supplier once, add multiple fruit items, then save one purchase workflow."}>
+              <ModuleCard eyebrow={purchaseHeadings.eyebrow} onChange={() => { if (purchaseItemNotice?.field === "purchase-supplier") clearPurchaseItemNotice(); }} title={purchaseHeadings.title} subtitle={purchaseHeadings.subtitle}>
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Entry Type">
+                  <Field label="Entry type">
                     <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(completionLines) || Boolean(editingPurchaseId && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
-                      <option value="BILL_COMPLETED">Completed Bill</option>
-                      <option value="BILL_PENDING">Stock Arrival / Pending Bill</option>
+                      <option value="BILL_COMPLETED">Bill in hand</option>
+                      <option value="BILL_PENDING">Stock arrived, bill to follow</option>
                     </select>
                   </Field>
-                  <Field label="Supplier Account">
-                    <select value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
-                      <option value="">Select saved supplier</option>
+                  <Field label={<RequiredLabel>Supplier</RequiredLabel>}>
+                    {/* The first box a new purchase needs, so the cursor starts here. */}
+                    <select autoFocus={!editingPurchaseId && !purchaseAmendmentMode} id="purchase-supplier" value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
+                      <option value="">Choose a supplier</option>
                       {activeSuppliers.map((supplier) => (
                         <option key={supplier.id} value={supplier.id}>
-                          {supplier.supplier_name}{supplier.firm_name ? ` - ${supplier.firm_name}` : ""}
+                          {supplier.supplier_name}{supplier.firm_name ? ` — ${supplier.firm_name}` : ""}
                         </option>
                       ))}
                     </select>
                   </Field>
-                  <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival Date" : "Purchase Date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
+                  <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival date" : "Purchase date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
                   {/* Where the fruit physically landed, which is not always where it was typed in.
                       Bought in bulk into a warehouse, then distributed -- see
                       docs/stock-distribution-decision.md. Only offered when there is somewhere else
@@ -11049,128 +11407,153 @@ function App() {
                   )}
                   {purchaseBillStatus === "BILL_COMPLETED" && (
                     <>
-                      <Field label="Bill Number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
-                      <Field label="Bill Date"><input type="date" value={purchaseBillDate} onChange={(event) => setPurchaseBillDate(event.target.value)} /></Field>
+                      <Field label="Bill number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
+                      <Field label="Bill date"><input type="date" value={purchaseBillDate} onChange={(event) => setPurchaseBillDate(event.target.value)} /></Field>
                     </>
                   )}
                 </div>
+                {/* "Choose the supplier first" is said beside the supplier box it points at. */}
+                {purchaseItemNotice?.field === "purchase-supplier" && <SaveNotice notice={purchaseItemNotice} />}
               </ModuleCard>
 
-              <ModuleCard eyebrow={completionLines ? "Complete Pending Bill" : editingPurchaseId ? "Purchase Item Amendment" : "Purchase Cart"} title={completionLines ? "Final Rate per Fruit" : editingPurchaseId ? "Edit Purchase Item" : "Add Fruit Items"} subtitle={completionLines ? `This arrival has ${completionLines.length} fruits. Enter the final purchase rate from the supplier's bill for each one.` : editingPurchaseId ? "Quantity reductions are blocked if stock from this batch has already been sold." : "Add all products from this supplier before saving the bill."}>
+              <ModuleCard eyebrow={purchaseHeadings.itemsEyebrow} onChange={clearPurchaseItemNotice} title={purchaseHeadings.itemsTitle} subtitle={purchaseHeadings.itemsSubtitle}>
                 {completionLines && (
-                  <DataTable headers={["Product", "Lot / Size", "Qty", "Arrival Rate", "Final Purchase Rate"]}>
+                  <DataTable headers={["Product", "Lot / grade", "Quantity", { label: "Arrival rate", numeric: true }, "Final rate (₹)"]}>
                     {completionLines.map((line, index) => (
                       <tr key={canonicalInventoryId(line.purchase_item_id)}>
                         <td className="primary-cell">{line.product_name}<small className="cell-note">{labelFor("origin", line.origin_type)}</small></td>
-                        <td>{line.lot_name || "-"}{line.lot_size ? ` / ${line.lot_size}` : ""}</td>
+                        <td>{line.lot_name || MISSING_VALUE}{line.lot_size ? ` / ${line.lot_size}` : ""}</td>
                         <td><input type="number" min="0" step="0.001" aria-label={`Quantity of ${line.product_name}`} value={line.quantity} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, quantity: event.target.value } : entry))} />{line.unit && <small className="cell-note">{labelFor("unit", line.unit)}</small>}</td>
-                        <td>{line.expected_rate > 0 ? currency.format(line.expected_rate) : "-"}</td>
-                        <td><input type="number" min="0" step="0.01" aria-label={`Final purchase rate of ${line.product_name}`} value={line.purchase_rate} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, purchase_rate: event.target.value } : entry))} /></td>
+                        <td>{line.expected_rate > 0 ? currency.format(line.expected_rate) : MISSING_VALUE}</td>
+                        <td><input autoFocus={index === 0} type="number" min="0" step="0.01" aria-label={`Final purchase rate of ${line.product_name}`} value={line.purchase_rate} onChange={(event) => setCompletionLines((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, purchase_rate: event.target.value } : entry))} /></td>
                       </tr>
                     ))}
                   </DataTable>
                 )}
                 {!completionLines && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Product">
-                    <select value={purchaseProductId} onChange={selectPurchaseProduct}>
-                      <option value="">Select product</option>
-                      {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.category || "Fruit"} - {product.product_name} ({product.unit})</option>)}
+                  <Field label={<RequiredLabel>Product</RequiredLabel>}>
+                    <select id="purchase-product" value={purchaseProductId} onChange={selectPurchaseProduct}>
+                      <option value="">Choose a product</option>
+                      {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} ({unitDisplayName(product.unit)}){product.category ? ` — ${product.category}` : ""}</option>)}
                     </select>
                   </Field>
-                  <Field label="Lot Name / Number"><input value={purchaseLotName} onChange={(event) => setPurchaseLotName(event.target.value)} placeholder="Lot A / Supplier Bill Lot" /></Field>
-                  <Field label="Size / Grade"><input value={purchaseLotSize} onChange={(event) => setPurchaseLotSize(event.target.value)} placeholder="Small / Premium" /></Field>
-                  <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
+                  <Field label={<RequiredLabel>Lot name or number</RequiredLabel>}><input id="purchase-lot-name" value={purchaseLotName} onChange={(event) => setPurchaseLotName(event.target.value)} onKeyDown={addPurchaseLineOnEnter} placeholder="Example: Lot A, or the bill's lot number" /></Field>
+                  <Field label="Grade"><input value={purchaseLotSize} onChange={(event) => setPurchaseLotSize(event.target.value)} onKeyDown={addPurchaseLineOnEnter} placeholder="Example: Small, Premium" /></Field>
+                  <Field label={<RequiredLabel>{purchaseUnitLabel("Quantity")}</RequiredLabel>}><input id="purchase-quantity" type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                   {purchaseBillStatus === "BILL_PENDING" ? (
                     <>
-                      <Field label="Temporary Sale Rate"><input type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} /></Field>
-                      <Field label="Expected Purchase Rate"><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} /></Field>
+                      <Field label={<RequiredLabel>{purchaseRateLabel("Temporary sale rate")}</RequiredLabel>}><input id="purchase-temp-rate" type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
+                      <Field label={purchaseRateLabel("Expected purchase rate")}><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                     </>
                   ) : (
-                    <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} /></Field>
+                    <Field label={<RequiredLabel>{purchaseRateLabel("Purchase rate")}</RequiredLabel>}><input id="purchase-rate" type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                   )}
-                  <Field label="Origin Type"><input value={selectedPurchaseProduct?.origin_type || "Select product"} readOnly /></Field>
-                  <Field label="Item Remarks"><input value={purchaseItemRemarks} onChange={(event) => setPurchaseItemRemarks(event.target.value)} /></Field>
+                  <Field label="Origin"><input value={selectedPurchaseProduct ? labelFor("origin", selectedPurchaseProduct.origin_type || "LOCAL") : MISSING_VALUE} readOnly tabIndex={-1} /></Field>
+                  <Field label="Item notes"><input value={purchaseItemRemarks} onChange={(event) => setPurchaseItemRemarks(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                 </div>
                 )}
                 {!editingPurchaseId && (
                   <div className="button-row">
-                    <button className="secondary-button" onClick={addPurchaseCartItem}>{editingPurchaseItemLineId !== null ? "Update Item" : purchaseAmendmentMode ? "Add Forgotten Item" : "Add Item"}</button>
-                    {editingPurchaseItemLineId !== null && <button className="secondary-button" onClick={resetPurchaseItemFields}>Cancel Item Edit</button>}
+                    <button className="secondary-button" onClick={addPurchaseCartItem} type="button">{editingPurchaseItemLineId !== null ? "Update item" : purchaseAmendmentMode ? "Add forgotten item" : "Add item"}</button>
+                    {editingPurchaseItemLineId !== null && <button className="secondary-button" onClick={resetPurchaseItemFields} type="button">Cancel item edit</button>}
+                    <span className="pm-required-legend">Press Enter in any box to add the item.</span>
                   </div>
                 )}
+                {purchaseItemNotice?.field !== "purchase-supplier" && <SaveNotice notice={purchaseItemNotice} />}
                 {!editingPurchaseId && (
-                  <DataTable headers={["Product", "Lot / Size", "Qty", "Unit", "Origin", "Purchase / Expected Rate", "Temp Sale Rate", "Remarks", "Actions"]}>
+                  <DataTable className="purchase-cart-table" headers={[
+                    "Product",
+                    "Lot / grade",
+                    { label: "Quantity", numeric: true },
+                    "Origin",
+                    { label: purchaseBillStatus === "BILL_PENDING" ? "Expected rate" : "Rate", numeric: true },
+                    ...(purchaseBillStatus === "BILL_PENDING" ? [{ label: "Sale rate", numeric: true }] : []),
+                    "Notes",
+                    "Actions",
+                  ]}>
                     {purchaseCart.map((item) => (
                       <tr key={item.line_id}>
                         <td className="primary-cell">{item.product_name}</td>
-                        <td>{item.lot_name || "-"}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
-                        <td>{item.quantity}</td>
-                        <td>{labelFor("unit", item.unit)}</td>
+                        <td>{item.lot_name || MISSING_VALUE}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
+                        <td>{formatQuantityWithUnit(item.quantity, item.unit)}</td>
                         <td><span className="origin-rate">{labelFor("origin", item.origin_type)}</span></td>
-                        <td>{currency.format(Number(item.purchase_rate || item.expected_purchase_rate || 0))}</td>
-                        <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : "-"}</td>
-                        <td>{item.remarks || "-"}</td>
+                        <td>{Number(item.purchase_rate || item.expected_purchase_rate || 0) > 0 ? currency.format(Number(item.purchase_rate || item.expected_purchase_rate)) : MISSING_VALUE}</td>
+                        {purchaseBillStatus === "BILL_PENDING" && <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : MISSING_VALUE}</td>}
+                        <td>{item.remarks || MISSING_VALUE}</td>
                         <td>
                           <div className="button-row table-actions-row">
                             <button className="table-action" onClick={() => editPurchaseCartItem(item.line_id)}>Edit</button>
-                            <button className="remove-button" onClick={() => removePurchaseCartItem(item.line_id)}>Remove</button>
+                            <button className="danger-text-button" onClick={() => removePurchaseCartItem(item.line_id)}>Remove</button>
                           </div>
                         </td>
                       </tr>
                     ))}
                   </DataTable>
                 )}
-                {!editingPurchaseId && purchaseCart.length === 0 && <div className="cart-empty">No purchase items added yet.</div>}
+                {!editingPurchaseId && purchaseCart.length === 0 && <div className="cart-empty">No items on this bill yet. Choose a product above and press Add item.</div>}
               </ModuleCard>
 
-              <ModuleCard eyebrow="Bill Details" title="Charges, Rebate and Payment" subtitle="These values are allocated across items by value when the bill is saved.">
+              <ModuleCard eyebrow="Bill details" title="Charges, rebate and payment" onChange={clearPurchaseNotice} subtitle="Charges are shared across the items by value when the bill is saved.">
                 {purchaseBillStatus === "BILL_COMPLETED" && (
                   <div className="form-grid supplier-form-grid">
-                    <Field label="Freight Charges"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
-                    <Field label="Labour Charges"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
-                    <Field label="Other Charges"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
-                    <Field label="Payment Timing / Rebate Rule">
-                      <select value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
-                        <option value="">Select rebate rule</option>
-                        {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} - {rule.pay_within_days} days - {rule.rebate_percent}%</option>)}
+                    <Field label="Freight charges (₹)"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
+                    <Field label="Labour charges (₹)"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
+                    <Field label="Other charges (₹)"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
+                    <Field label={<RequiredLabel>Payment timing and rebate</RequiredLabel>}>
+                      <select id="purchase-rebate" value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
+                        <option value="">Choose when it is paid</option>
+                        {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} — pay within {rule.pay_within_days} days, {rule.rebate_percent}% rebate</option>)}
                       </select>
                     </Field>
-                    <Field label="Payment Type">
+                    <Field label="Payment type">
                       <select value={purchaseType} onChange={(event) => setPurchaseType(event.target.value)}>
-                        <option value="CREDIT">Credit Purchase</option>
-                        <option value="CASH">Cash Purchase</option>
+                        <option value="CREDIT">Credit (pay later)</option>
+                        <option value="CASH">Paid now</option>
                       </select>
                     </Field>
                     {purchaseType === "CASH" && (
                       <>
-                        <Field label="Payment Mode">
+                        <Field label="Payment mode">
                           <select value={purchasePaymentMode} onChange={(event) => setPurchasePaymentMode(event.target.value)}>
                             {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                           </select>
                         </Field>
-                        <Field label="Paid Amount"><input type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
-                        <Field label="Payment Reference"><input value={purchasePaymentReference} onChange={(event) => setPurchasePaymentReference(event.target.value)} /></Field>
-                        <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
+                        <Field label={<RequiredLabel>Amount paid (₹)</RequiredLabel>}><input id="purchase-paid" type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
+                        <Field label="Payment reference"><input value={purchasePaymentReference} onChange={(event) => setPurchasePaymentReference(event.target.value)} /></Field>
+                        <Field label="Payment date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
                       </>
                     )}
                   </div>
                 )}
-                <Field label="Bill Remarks"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
-                {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
-                {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">Purchase bill pending. Inventory will increase immediately and profit from this stock will be provisional until the bill is completed.</p>}
+                <Field label="Bill notes"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
+                {activeSuppliers.length === 0 && <p className="form-note">No suppliers yet. Add one with Add supplier before saving a purchase.</p>}
+                {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">The stock goes into the shop now. Profit on it stays provisional until the bill is completed in Pending Bills.</p>}
                 <PurchaseSummary summary={editingPurchaseId && !completionLines ? purchaseSummary : purchaseCartSummary} />
                 <div className="button-row">
                   <button className="primary-button" disabled={purchaseSaveBusy} onClick={savePurchase}>
                     {purchaseSaveBusy
-                      ? "Saving..."
-                      : purchaseBillStatus === "BILL_PENDING"
-                        ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival"
-                        : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}
+                      ? "Saving…"
+                      : purchaseCompleting
+                        ? "Complete bill"
+                        : purchaseBillStatus === "BILL_PENDING"
+                          ? editingPurchaseId ? "Save arrival changes" : "Save stock arrival"
+                          : editingPurchaseId ? "Save correction" : "Save purchase"}
                   </button>
-                  {editingPurchaseId && <button className="secondary-button" onClick={purchaseAmendmentMode ? cancelPurchaseAmendment : resetPurchaseForm}>Cancel Amendment</button>}
-                  <button className="secondary-button" onClick={() => navigate("accounts")}>Add New Supplier</button>
+                  {editingPurchaseId && (
+                    <button className="secondary-button" onClick={purchaseCompleting
+                      ? () => { resetPurchaseForm(); navigate("pending-bills"); }
+                      : purchaseAmendmentMode ? cancelPurchaseAmendment : resetPurchaseForm}
+                    >
+                      {purchaseCompleting ? "Cancel" : "Cancel correction"}
+                    </button>
+                  )}
+                  {purchaseCompletedFor && (
+                    <button className="secondary-button" onClick={() => { setPurchaseCompletedFor(""); clearPurchaseNotice(); navigate("pending-bills"); }} type="button">Back to Pending Bills</button>
+                  )}
+                  {!editingPurchaseId && !purchaseCompletedFor && <button className="secondary-button" onClick={() => navigate("accounts")}>Add supplier</button>}
                 </div>
+                <div id="purchase-save-notice"><SaveNotice notice={purchaseNotice} /></div>
               </ModuleCard>
             </section>
           )}
@@ -11191,7 +11574,9 @@ function App() {
               }}
               onOpenPurchaseAmendment={openPurchaseAmendment}
               onViewInvoice={loadInvoice}
+              purchaseActionNotice={purchaseActionNotice}
               purchases={purchases}
+              purchasesLoad={purchasesLoad}
               user={user}
             />
           )}
@@ -11382,7 +11767,9 @@ function App() {
           )}
 
           {activeView === "sale-rates" && canManageRates && (
-            <>
+            // One stack with the shared gap: Combos and the website export sat flush against the
+            // rates (0px) because they were siblings outside any layout.
+            <section className="settings-layout sale-rate-page">
               <SaleRateManager
                 history={saleRateHistory}
                 loadState={saleRatesLoad}
@@ -11431,7 +11818,7 @@ function App() {
                 lots={inventory}
                 shop={websiteShopDetails}
               />
-            </>
+            </section>
           )}
 
           {activeView === "settings" && (
@@ -11478,7 +11865,15 @@ function App() {
                   const parts = ["settings", "purchase rules", "discount rules"];
                   const results = await Promise.allSettled([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]);
                   const failedIndex = results.findIndex((result) => result.status === "rejected");
-                  if (failedIndex >= 0) alert(refreshAfterSaveMessage(results[failedIndex].reason, parts[failedIndex]));
+                  // Saved, but the screen may be stale: the bell says so and keeps it, instead of a popup.
+                  if (failedIndex >= 0) {
+                    notify({
+                      severity: "warning",
+                      title: "Saved, but the screen did not refresh",
+                      message: refreshAfterSaveMessage(results[failedIndex].reason, parts[failedIndex]),
+                      source: "Settings",
+                    });
+                  }
                   return failedIndex < 0;
                 }}
                 onRegisterCloudDevice={registerCloudDevice}
@@ -11551,10 +11946,11 @@ function App() {
               busy={distributionBusy}
               destinations={distributionState.destinations}
               inventory={inventory}
+              notice={distributionNotice}
               onAction={runDistributionAction}
-              onNothingToReceive={() => setSyncMessage(
+              onNothingToReceive={() => showDistributionNotice(warningNotice(
                 "This consignment has no dispatched quantity to receive. Ask the sender to check it.",
-              )}
+              ))}
               onReload={loadDistribution}
               onRequest={requestConsignment}
               onSend={sendConsignment}
@@ -11582,7 +11978,12 @@ function App() {
                     await loadSettingsData();
                     return true;
                   } catch (error) {
-                    alert(refreshAfterSaveMessage(error));
+                    notify({
+                      severity: "warning",
+                      title: "Saved, but the screen did not refresh",
+                      message: refreshAfterSaveMessage(error),
+                      source: "Branches & Counters",
+                    });
                     return false;
                   }
                 }}
@@ -11619,6 +12020,7 @@ function App() {
           canEdit={canEditSales && selectedInvoice.sale_status !== "CANCELLED" && !saleHasCombos(selectedInvoice)}
           editRefusal={canEditSales && selectedInvoice.sale_status !== "CANCELLED" && saleHasCombos(selectedInvoice) ? COMBO_EDIT_REFUSAL : null}
           canWhatsappSend={canWhatsappSend}
+          closeLabel={invoiceCloseLabel({ fromPos: activeView === "sales" })}
           invoice={selectedInvoice}
           onCancel={async () => {
             const invoice = selectedInvoice;
@@ -11650,6 +12052,23 @@ function App() {
           </section>
         </div>
       )}
+      {saleActionProblem && (
+        <div className="modal-backdrop">
+          <section aria-label={saleActionProblem.title} aria-modal="true" className="invoice-modal change-history-modal" role="dialog">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Bill</span>
+                <strong>{saleActionProblem.title}</strong>
+              </div>
+              <button aria-label="Close" className="remove-button" type="button" onClick={() => setSaleActionProblem(null)}><Icon name="close" /></button>
+            </div>
+            <div className="error-banner" role="alert">{saleActionProblem.message}</div>
+            <div className="button-row">
+              <button autoFocus className="secondary-button" type="button" onClick={() => setSaleActionProblem(null)}>OK</button>
+            </div>
+          </section>
+        </div>
+      )}
       {saleEditError && !saleEditLoading && !editingSale && (
         <div className="modal-backdrop">
           <section className="invoice-modal change-history-modal">
@@ -11673,6 +12092,7 @@ function App() {
             invoice={editingSale}
             offlineMode={offlineMode}
             onClose={() => setEditingSale(null)}
+            onNotify={notify}
             onAddCustomer={() => {
               setEditingSale(null);
               navigate("accounts");
@@ -11716,11 +12136,22 @@ function App() {
       {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
       {lotAction && (
         <div className="modal-backdrop">
-          <section className="invoice-modal change-history-modal">
+          {/* Esc closes the box, as every other box in the app does. */}
+          <section
+            aria-labelledby="lot-action-title"
+            aria-modal="true"
+            className="invoice-modal change-history-modal"
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              event.stopPropagation();
+              closeLotAction();
+            }}
+            role="dialog"
+          >
             <div className="invoice-toolbar">
               <div>
                 <span className="eyebrow">Stock lot</span>
-                <strong>
+                <strong id="lot-action-title">
                   {lotAction.type === "edit" && "Edit lot"}
                   {lotAction.type === "add" && "Add quantity"}
                   {lotAction.type === "adjust" && "Correct count"}
@@ -11734,9 +12165,9 @@ function App() {
               <div className="purchase-summary-grid supplier-payment-preview">
                 <SummaryMetric label="Product" value={lotAction.lot.product_name || lotPanelProduct?.product_name || MISSING_VALUE} />
                 <SummaryMetric label="Lot" value={lotAction.lot.lot_name || lotAction.lot.batch_no || `#${lotAction.lot.id}`} />
-                <SummaryMetric label="Quantity" value={formatOptionalQuantity(lotAction.lot.purchase_qty)} />
-                <SummaryMetric label="Sold or used" value={formatOptionalQuantity(pickQuantity(lotAction.lot.sold_qty) ?? (pickQuantity(lotAction.lot.purchase_qty) !== null && pickQuantity(lotAction.lot.remaining_qty) !== null ? pickQuantity(lotAction.lot.purchase_qty) - pickQuantity(lotAction.lot.remaining_qty) : null))} />
-                <SummaryMetric label="Stock in system" value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} featured />
+                <SummaryMetric label="Quantity" value={formatQuantityWithUnit(lotAction.lot.purchase_qty, lotActionUnit)} />
+                <SummaryMetric label="Sold or used" value={formatQuantityWithUnit(pickQuantity(lotAction.lot.sold_qty) ?? (pickQuantity(lotAction.lot.purchase_qty) !== null && pickQuantity(lotAction.lot.remaining_qty) !== null ? pickQuantity(lotAction.lot.purchase_qty) - pickQuantity(lotAction.lot.remaining_qty) : null), lotActionUnit)} />
+                <SummaryMetric label="Stock in system" value={formatQuantityWithUnit(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} featured />
               </div>
 
               {lotAction.type === "edit" && (
@@ -11747,11 +12178,11 @@ function App() {
                       {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
                     </select>
                   </Field>
-                  <Field label={<RequiredLabel>Lot name</RequiredLabel>}><input value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>Lot name</RequiredLabel>}><input autoFocus id="lot-action-name" value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
                   <Field label="Grade"><input value={lotDraft.lot_size} onChange={(event) => setLotDraft({ ...lotDraft, lot_size: event.target.value })} /></Field>
-                  <Field label="Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
-                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
-                  <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
+                  <Field label={lotActionUnitLabel("Quantity")}><input id="lot-action-quantity" min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
+                  <Field label="Stock in system"><input readOnly value={formatQuantityWithUnit(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} /></Field>
+                  <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input id="lot-action-cost" min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
                   <Field label="Sale price (₹)"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
                   <Field label="Stock date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
                   <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
@@ -11761,16 +12192,16 @@ function App() {
 
               {lotAction.type === "add" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Quantity to add"><input min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>{lotActionUnitLabel("Quantity to add")}</RequiredLabel>}><input autoFocus id="lot-action-add-quantity" min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter") saveLotAction(); }} /></Field>
                   <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Example: missed opening stock count" /></Field>
                 </div>
               )}
 
               {lotAction.type === "adjust" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
-                  <Field label="Counted quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
-                  <Field label="Difference"><input readOnly value={pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty) === null ? MISSING_VALUE : formatOptionalQuantity(Number(lotDraft.new_quantity || 0) - pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label="Stock in system"><input readOnly value={formatQuantityWithUnit(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} /></Field>
+                  <Field label={lotActionUnitLabel("Counted quantity")}><input autoFocus id="lot-action-counted" min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
+                  <Field label="Difference"><input readOnly value={pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty) === null ? MISSING_VALUE : formatQuantityWithUnit(Number(lotDraft.new_quantity || 0) - pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty), lotActionUnit)} /></Field>
                   <Field label="Type of correction">
                     <select value={lotDraft.adjustment_type} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_type: event.target.value })}>
                       <option>Increase Stock</option>
@@ -11783,25 +12214,26 @@ function App() {
                     </select>
                   </Field>
                   <Field label="Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
-                  <Field label={<RequiredLabel>Reason</RequiredLabel>}><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>Reason</RequiredLabel>}><input id="lot-action-reason" value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} /></Field>
                   <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
                 </div>
               )}
 
               {lotAction.type === "deactivate" && (
-                <Field label="Reason"><textarea value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory. Lots with used stock cannot be deactivated." /></Field>
+                <Field label={<RequiredLabel>Reason</RequiredLabel>}><textarea autoFocus id="lot-action-reason" value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="A lot with stock already sold or used cannot be deactivated." /></Field>
               )}
 
               {lotAction.type === "reactivate" && (
-                <Field label="Reason"><textarea value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory. Reactivated lots return available unsold quantity to active stock." /></Field>
+                <Field label={<RequiredLabel>Reason</RequiredLabel>}><textarea autoFocus id="lot-action-reason" value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="The unsold quantity goes back into stock." /></Field>
               )}
 
               <div className="button-row">
-                <button className="primary-button" onClick={saveLotAction} type="button">
+                <button className={lotAction.type === "deactivate" ? "primary-button primary-button-danger" : "primary-button"} onClick={saveLotAction} type="button">
                   {{ edit: "Save lot", add: "Add quantity", adjust: "Correct count", deactivate: "Deactivate lot", reactivate: "Reactivate lot" }[lotAction.type] || "Save"}
                 </button>
                 <button className="secondary-button" onClick={closeLotAction} type="button">Cancel</button>
               </div>
+              <SaveNotice notice={lotNotice} />
             </div>
           </section>
         </div>
@@ -11893,6 +12325,8 @@ function App() {
           onStay={() => setPosLeavePrompt(null)}
         />
       )}
+      {/* The app's one host for in-app confirm and reason boxes (useConfirm, useAskReason). */}
+      <FeedbackDialogHost queue={appDialogQueue} />
     </main>
   );
 }
@@ -12355,7 +12789,7 @@ function AiBusinessAssistantModule({
             <p className="ai-answer-notice">{chatSelection.message}</p>
           )}
           {chatSelection.status !== FROST_CHAT_SELECTION.UNREADABLE && chatSelection.chats.length === 0 && (
-            <p className="frost-chats-empty">{data.chatsLoading ? "Loading your chats..." : "No earlier chats yet."}</p>
+            <p className="frost-chats-empty">{data.chatsLoading ? "Loading your chats…" : "No earlier chats yet."}</p>
           )}
           {chatSelection.chats.map((chat) => (
             <button
@@ -12683,7 +13117,7 @@ function PaymentsDuePopup({ busyKey = "", collectRows = [], collectTotal = 0, fa
           <a className="table-action" href={item.whatsappLink} rel="noopener noreferrer" target="_blank">Prepare WhatsApp</a>
         )}
         <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "done")} type="button">
-          {busyKey === item.key ? "Saving..." : "Done"}
+          {busyKey === item.key ? "Saving…" : "Done"}
         </button>
         <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "tomorrow")} type="button">Remind tomorrow</button>
       </div>
@@ -12732,7 +13166,7 @@ function PaymentsDuePopup({ busyKey = "", collectRows = [], collectTotal = 0, fa
  */
 function FrostPaymentDate({ amount, canManage = false, entityId, entityName = "", kind, label, onPaymentDate, plan = null, skipped = false }) {
   if (!plan) {
-    return <small className="cell-note">{skipped ? "Payment dates need the cloud connection." : "Reading payment dates..."}</small>;
+    return <small className="cell-note">{skipped ? "Payment dates need the cloud connection." : "Reading payment dates…"}</small>;
   }
   if (plan.status !== PAYMENTS_DUE_STATUS.OK) {
     return <small className="frost-due-date-failure">Date could not be read</small>;
@@ -12761,7 +13195,7 @@ function FrostSupplierPaymentsPanel({ canManageReminders = false, onPaymentDate,
   if (!paymentPlan) {
     return (
       <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
-        <div className="cart-empty">{paymentsSkipped ? "Supplier balances need the cloud connection, which this device is not using right now." : "Reading supplier balances..."}</div>
+        <div className="cart-empty">{paymentsSkipped ? "Supplier balances need the cloud connection, which this device is not using right now." : "Reading supplier balances…"}</div>
       </ModuleCard>
     );
   }
@@ -12847,7 +13281,7 @@ function FrostReminderDueDate({ canManage = false, dueAt, label = "Reminder due 
       />
       {dirty && (
         <button className="table-action" disabled={!canManage || saving} onClick={save} type="button">
-          {saving ? "Saving..." : (draft ? "Set date" : "Clear date")}
+          {saving ? "Saving…" : (draft ? "Set date" : "Clear date")}
         </button>
       )}
       {!dirty && !saved && <small className="cell-note">No date</small>}
@@ -12954,7 +13388,7 @@ function FrostDuesPanel({
         {outreach.rows.length === 0 && <tr><td colSpan="6" className="empty-cell">Nobody has a balance outstanding.</td></tr>}
       </DataTable>
       <div className="button-row">
-        <button className="secondary-button" disabled={loading} onClick={onLoad} type="button">{loading ? "Refreshing..." : "Refresh"}</button>
+        <button className="secondary-button" disabled={loading} onClick={onLoad} type="button">{loading ? "Refreshing…" : "Refresh"}</button>
         {!canManageReminders && <small className="cell-note">You can read this list. Setting reminders needs an owner.</small>}
       </div>
     </ModuleCard>
@@ -13411,15 +13845,20 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
   // path they configured. Their values stay in the draft and are saved back unchanged, so this
   // panel never quietly rewrites settings it no longer shows. Live voice is on-device and has no
   // settings here: it is the switch in the conversation.
-  const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
-  const save = async () => {
+  const [saveNotice, showSaveNotice, clearSaveNotice] = useSaveNotice();
+  const [saving, runSave] = useSaveInFlight();
+  const update = (field, value) => {
+    clearSaveNotice();
+    setDraft((current) => ({ ...current, [field]: value }));
+  };
+  const save = () => runSave(async () => {
     try {
       await onSave(draft);
-      alert("FROST settings updated");
+      showSaveNotice(successNotice("FROST settings saved."));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update FROST settings"));
+      showSaveNotice(errorNotice(getErrorMessage(error, "The FROST settings could not be saved.")));
     }
-  };
+  });
 
   return (
     <ModuleCard eyebrow="FROST Configuration" title="AI Operating System" subtitle="Provider, engine and usage controls shared by every future AI module.">
@@ -13463,8 +13902,9 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         <span>Estimated cost {currency.format(Number(data.usage?.estimated_cost || 0))}</span>
       </div>
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage} onClick={save}><Icon name="settings" /> Save FROST Settings</button>
+        <button className="primary-button" disabled={!canManage || saving} onClick={save}><Icon name="settings" /> {saving ? "Saving…" : "Save FROST Settings"}</button>
       </div>
+      <SaveNotice notice={saveNotice} />
     </ModuleCard>
   );
 }
@@ -13596,7 +14036,7 @@ function BootstrapOwnerSetup({ deviceInfo, entitlement, onActivated }) {
           />
           {error && <small className="startup-status-error">{error}</small>}
           <button className="primary-button" disabled={busy} onClick={completePasswordChange}>
-            {busy ? "Saving..." : "Set Password & Continue"}
+            {busy ? "Saving…" : "Set Password & Continue"}
           </button>
         </>
       )}
@@ -13715,65 +14155,69 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
           <BrandLogo />
         </div>
         <div className="login-copy">
-          <span className="eyebrow">Device Activation Required</span>
+          <span className="eyebrow">This computer needs activating</span>
           <h1>{APP_DISPLAY_NAME}</h1>
-          <p>This device is not yet activated. Import the activation file (.lic) supplied by the FroozERP owner to enable this installation.</p>
+          <p>Before this computer can be used, the Owner activates it. Follow the two steps below.</p>
         </div>
         <div className="device-activation-panel">
           <span className="eyebrow">This device</span>
-          <small>Device ID: {deviceInfo?.device_id || "(resolving...)"}</small>
+          <small>Device ID: {deviceInfo?.device_id || "Reading…"}</small>
           <p>Ask the FroozERP owner to issue an activation for this device from Branches &amp; Counters &gt; Activation licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
           <span className="eyebrow">Step 1: send this device to the shop</span>
           <p>Sign in once so the shop can see this device. It does not open the app; the Owner still has to approve it.</p>
-          <input
-            aria-label="Username"
-            autoComplete="username"
-            disabled={busy}
-            onChange={(event) => setEnrolUsername(event.target.value)}
-            placeholder="Username"
-            value={enrolUsername}
-          />
-          <PasswordInput
-            aria-label="Password"
-            autoComplete="current-password"
-            disabled={busy}
-            onChange={(event) => setEnrolPassword(event.target.value)}
-            placeholder="Password"
-            value={enrolPassword}
-          />
-          <button className="secondary-button" type="button" disabled={busy} onClick={sendToShop}>
-            {busy ? "Sending..." : "Send to Shop"}
-          </button>
+          {/* Labels above the boxes, not placeholders that vanish as soon as somebody types. */}
+          <div className="activation-fields">
+            <Field label="Username">
+              <input
+                autoComplete="username"
+                disabled={busy}
+                onChange={(event) => setEnrolUsername(event.target.value)}
+                value={enrolUsername}
+              />
+            </Field>
+            <Field label="Password">
+              <PasswordInput
+                autoComplete="current-password"
+                disabled={busy}
+                onChange={(event) => setEnrolPassword(event.target.value)}
+                value={enrolPassword}
+              />
+            </Field>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" disabled={busy} onClick={sendToShop}>
+              {busy ? "Sending…" : "Send to Shop"}
+            </button>
+          </div>
           <span className="eyebrow">Step 2: activate</span>
-          <textarea
-            aria-label="Activation text"
-            disabled={busy}
-            onChange={(event) => setPastedActivation(event.target.value)}
-            placeholder="Paste the activation text the Owner sent"
-            rows={4}
-            value={pastedActivation}
-          />
-          <button className="primary-button" type="button" disabled={busy} onClick={activatePasted}>
-            {busy ? "Activating..." : "Activate"}
-          </button>
-          <small>Or choose the .lic file instead:</small>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".lic,.txt,text/plain"
-            disabled={busy}
-            onChange={(event) => importFile(event.target.files?.[0])}
-          />
-          <button
-            className="primary-button"
-            type="button"
-            disabled={busy}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            {busy ? "Activating..." : "Choose Activation File"}
-          </button>
-          {notice && <small>{notice}</small>}
-          {error && <small className="startup-status-error">{error}</small>}
+          <Field label="Activation text from the Owner">
+            <textarea
+              disabled={busy}
+              onChange={(event) => setPastedActivation(event.target.value)}
+              placeholder="Paste it here"
+              rows={4}
+              value={pastedActivation}
+            />
+          </Field>
+          {/* One primary (Activate) and one file chooser: the file box and a second primary button
+              that opened it used to sit one under the other for the same job. */}
+          <div className="button-row">
+            <button className="primary-button" type="button" disabled={busy} onClick={activatePasted}>
+              {busy ? "Activating…" : "Activate"}
+            </button>
+            <label className={busy ? "secondary-button product-photo-file activation-file-button is-disabled" : "secondary-button product-photo-file activation-file-button"}>
+              Or choose the .lic file
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".lic,.txt,text/plain"
+                disabled={busy}
+                onChange={(event) => importFile(event.target.files?.[0])}
+              />
+            </label>
+          </div>
+          {notice && <p className="form-note stock-ok save-notice" role="status">{notice}</p>}
+          {error && <p className="error-banner" role="alert">{error}</p>}
         </div>
         <div className="startup-actions">
           <button className="secondary-button" type="button" disabled={busy} onClick={() => onRefresh(deviceInfo?.device_id)}>
@@ -13817,6 +14261,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
   const [issuing, setIssuing] = useState(false);
   const [issued, setIssued] = useState(null);
   const [outcome, setOutcome] = useState(null);
+  const confirmRetire = useConfirm();
 
   const loadLicences = useCallback(async () => {
     setLoading(true);
@@ -13937,7 +14382,14 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
   const retireOldIds = async () => {
     const old = view.ok ? view.oldIds : [];
     if (!old.length) return;
-    if (!window.confirm(`Retire ${old.length} old ${old.length === 1 ? "id" : "ids"} left by earlier installs?\n\nNone of them is placed at a counter or has ever had a licence, and each machine keeps the id it uses now. Bills stay in the books.`)) return;
+    const retire = await confirmRetire({
+      title: `Retire ${old.length} old ${old.length === 1 ? "id" : "ids"} left by earlier installs?`,
+      message: "None of them is placed at a counter or has ever had a licence, and each machine keeps the id it uses now. Bills stay in the books.",
+      confirmLabel: old.length === 1 ? "Retire old id" : "Retire old ids",
+      cancelLabel: "Keep them",
+      tone: "danger",
+    });
+    if (!retire) return;
     setRetiringOld(true);
     const failed = [];
     for (const row of old) {
@@ -14065,7 +14517,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
                       {row.nameDistinction?.kind === "counter"
                         ? row.nameDistinction.value
                         : row.nameDistinction?.kind === "lastSeen"
-                          ? `Last seen ${new Date(row.nameDistinction.value).toLocaleString("en-IN")}`
+                          ? `Last seen ${formatKolkataDateTime(row.nameDistinction.value)}`
                           : "Same name as another device — check the ID before issuing"}
                     </small>
                   )}
@@ -14107,7 +14559,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
                     {view.oldIds.map((row) => (
                       <li key={row.deviceId}>
                         <span className="device-id-note">{row.deviceId}</span>
-                        <small className="cell-note">{row.lastActiveAt ? `Last seen ${new Date(row.lastActiveAt).toLocaleString("en-IN")}` : "Never seen"}</small>
+                        <small className="cell-note">{row.lastActiveAt ? `Last seen ${formatKolkataDateTime(row.lastActiveAt)}` : "Never seen"}</small>
                       </li>
                     ))}
                   </ul>
@@ -14115,7 +14567,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
               </div>
               {canIssue && (
                 <button className="secondary-button" disabled={retiringOld} onClick={retireOldIds} type="button">
-                  {retiringOld ? "Retiring..." : `Retire ${view.oldIds.length} old ${view.oldIds.length === 1 ? "id" : "ids"}`}
+                  {retiringOld ? "Retiring…" : `Retire ${view.oldIds.length} old ${view.oldIds.length === 1 ? "id" : "ids"}`}
                 </button>
               )}
             </div>
@@ -14149,10 +14601,10 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
           {!validity.ok && <small className="startup-status-error">{validity.message}</small>}
           <div className="button-row">
             <button className="primary-button" disabled={issuing || !selectedRow || !validity.ok} onClick={issue} type="button">
-              <Icon name="settings" /> {issuing ? "Issuing..." : "Issue Activation Licence"}
+              <Icon name="settings" /> {issuing ? "Issuing…" : "Issue Activation Licence"}
             </button>
             <button className="secondary-button" disabled={loading || issuing} onClick={() => { loadLicences(); onReload?.(); }} type="button">
-              {loading ? "Refreshing..." : "Refresh"}
+              {loading ? "Refreshing…" : "Refresh"}
             </button>
           </div>
           {outcome && <small className={outcome.tone === "error" ? "startup-status-error" : "form-note"}>{outcome.text}</small>}
@@ -14217,7 +14669,7 @@ function DeviceActivationIssuingSection({ assignments = [], canIssue, currentDev
  * The notification list itself.
  *
  * Deliberately not a toast: a toast that disappears after four seconds is the same failure as the
- * `alert()` popups this replaces, only quieter. Entries stay until the operator deals with them.
+ * browser alert popups this replaces, only quieter. Entries stay until the operator deals with them.
  */
 function NotificationPanel({ notifications, onClose, onDismiss, onClearAll, onMarkAllRead }) {
   const severityLabel = {
@@ -14317,7 +14769,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
   const onlineRequired = backendHealth?.online === false;
   useEffect(() => {
     let cancelled = false;
-    setStatus("Checking FroozERP service...");
+    setStatus("Checking FroozERP service…");
     Promise.resolve(onCheckOnline?.("recovery-open", { force: true, timeoutMs: 3500 })).then((health) => {
       if (cancelled) return;
       if (health?.online) {
@@ -14336,7 +14788,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
 
   useEffect(() => {
     if (backendHealth?.checking) {
-      setStatus("Checking FroozERP service...");
+      setStatus("Checking FroozERP service…");
       return;
     }
     if (backendHealth?.online) {
@@ -14530,14 +14982,14 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
                   {methods.map((entry) => <option key={entry.method} value={entry.method}>{entry.label}</option>)}
                 </select>
               </Field>
-              <button className="primary-button" disabled={busy} onClick={sendOtp}>{busy ? "Sending..." : "Send Verification Code"}</button>
+              <button className="primary-button" disabled={busy} onClick={sendOtp}>{busy ? "Sending…" : "Send Verification Code"}</button>
             </>
           )}
           {step === "otp" && (
             <>
               {developmentOtp && <div className="startup-status-panel"><p>Development test OTP: <strong>{developmentOtp}</strong></p></div>}
               <Field label="Verification Code"><input inputMode="numeric" value={otp} onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 8))} /></Field>
-              <button className="primary-button" disabled={busy} onClick={verifyOtp}>{busy ? "Verifying..." : "Verify Code"}</button>
+              <button className="primary-button" disabled={busy} onClick={verifyOtp}>{busy ? "Verifying…" : "Verify Code"}</button>
             </>
           )}
           {step === "username-result" && (
@@ -14557,7 +15009,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
               </Field>
               <label className="check-field"><input checked={showPassword} type="checkbox" onChange={(event) => setShowPassword(event.target.checked)} /><span>Show password</span></label>
               <p className="form-note">Use a password the staff member cannot guess. FroozERP stores only a secure password hash.</p>
-              <button className="primary-button" disabled={busy} onClick={resetPassword}>{busy ? "Saving..." : "Reset Password"}</button>
+              <button className="primary-button" disabled={busy} onClick={resetPassword}>{busy ? "Saving…" : "Reset Password"}</button>
             </>
           )}
           {step === "staff" && (
@@ -14717,12 +15169,12 @@ function WhatsAppSendModal({
       return;
     }
     setSending(true);
-    setStatus("Generating PDF...");
+    setStatus("Generating PDF…");
     let pdfResult = null;
     try {
       pdfResult = await generatePdf();
       const fileName = pdfResult.fileName || documentName;
-      setStatus("Sending PDF on WhatsApp...");
+      setStatus("Sending PDF on WhatsApp…");
       const pdfBase64 = await blobToBase64(pdfResult.blob);
       const response = await axios.post(`${API_URL}/api/whatsapp/send-document`, {
         phoneNumbers: normalizedNumbers,
@@ -14837,7 +15289,7 @@ function WhatsAppSendModal({
             </DataTable>
           )}
           <div className="button-row">
-            <button className="primary-button" disabled={sending || selectedRecipients.length === 0} onClick={send}>{sending ? "Sending..." : "Send PDF"}</button>
+            <button className="primary-button" disabled={sending || selectedRecipients.length === 0} onClick={send}>{sending ? "Sending…" : "Send PDF"}</button>
             <button className="secondary-button" disabled={sending} onClick={onClose}>Close</button>
           </div>
         </div>
@@ -14894,6 +15346,8 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   const [zoom, setZoom] = useState(1);
   const [opening, setOpening] = useState(false);
   const [saving, setSaving] = useState(false);
+  // What happened to the last Save or Open, said in this window instead of a browser alert.
+  const [actionNotice, showActionNotice, clearActionNotice] = useSaveNotice();
   useEffect(() => {
     let cancelled = false;
     let loadingTask = null;
@@ -14931,23 +15385,25 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   }, [blob]);
   const openFallback = async () => {
     setOpening(true);
+    clearActionNotice();
     try {
       await openPdfInSystemViewer({ blob, fileName });
     } catch (openError) {
       console.error("FroozERP PDF system viewer failed", openError);
-      alert("Unable to open PDF in system viewer. Please save the PDF and open it manually.");
+      showActionNotice(errorNotice("The PDF could not be opened in the system viewer. Save it, then open the saved file."));
     } finally {
       setOpening(false);
     }
   };
   const handleSave = async () => {
     setSaving(true);
+    clearActionNotice();
     try {
       const result = await onSave?.();
       if (result?.canceled) return;
-      if (result?.path) alert(`PDF saved successfully:\n${result.path}`);
+      if (result?.path) showActionNotice(successNotice(`The PDF is saved: ${result.path}`));
     } catch (saveError) {
-      alert(`Unable to save PDF: ${saveError.message || saveError}`);
+      showActionNotice(errorNotice(`The PDF could not be saved: ${saveError?.message || saveError}`));
     } finally {
       setSaving(false);
     }
@@ -14959,25 +15415,26 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
           <div>
             <span className="eyebrow">PDF Preview</span>
             <strong>{fileName}</strong>
-            <small>{loading ? "Loading PDF pages..." : error ? "Preview fallback available" : `${pages.length} page${pages.length === 1 ? "" : "s"} rendered inside FroozERP`}</small>
+            <small>{loading ? "Loading PDF pages…" : error ? "Preview fallback available" : `${pages.length} page${pages.length === 1 ? "" : "s"} rendered inside FroozERP`}</small>
           </div>
           <div className="invoice-actions">
             <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => setZoom((value) => Math.max(0.65, Number((value - 0.1).toFixed(2))))}>Zoom -</button>
             <span className="tag">{Math.round(zoom * 100)}%</span>
             <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => setZoom((value) => Math.min(1.8, Number((value + 0.1).toFixed(2))))}>Zoom +</button>
             <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => window.print()}><Icon name="print" /> Print</button>
-            <button className="primary-button" disabled={saving} onClick={handleSave}>{saving ? "Saving..." : "Save PDF"}</button>
-            <button className="secondary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening..." : "Open in System Viewer"}</button>
+            <button className="primary-button" disabled={saving} onClick={handleSave}>{saving ? "Saving…" : "Save PDF"}</button>
+            <button className="secondary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening…" : "Open in System Viewer"}</button>
             <button aria-label="Close PDF preview" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
+        <SaveNotice className="pdf-preview-notice" notice={actionNotice} />
         <div className="pdf-preview-pages">
           {loading && <div className="cart-empty">Rendering PDF preview inside FroozERP...</div>}
           {error && (
             <div className="pdf-preview-fallback">
               <strong>Unable to render PDF preview inside FroozERP.</strong>
               <p>{error}</p>
-              <button className="primary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening..." : "Open PDF in system viewer"}</button>
+              <button className="primary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening…" : "Open PDF in system viewer"}</button>
             </div>
           )}
           {!loading && !error && pages.map((page, index) => (
@@ -14989,16 +15446,21 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   );
 }
 
-function ReportToolbar({ canWhatsappSend = false, exporting = false, onExcelExport, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
+// `emptyReason`: the report has nothing in it yet, so Print, PDF, Excel and WhatsApp wait (with the
+// reason on hover) instead of making an empty page. `title` is left out where the card above the
+// toolbar already names the report.
+function ReportToolbar({ canWhatsappSend = false, emptyReason = "", exporting = false, onExcelExport, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
+  const empty = Boolean(emptyReason);
+  const hint = empty ? emptyReason : undefined;
   return (
     <div className="report-toolbar no-print">
-      <strong>{title}</strong>
+      {title && <strong>{title}</strong>}
       <div className="button-row">
-        <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
-        {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing..." : "View PDF"}</button>}
-        <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
-        {onExcelExport && <button className="secondary-button" disabled={exporting} onClick={onExcelExport}>Excel</button>}
-        <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
+        <button className="secondary-button" disabled={empty} onClick={onPrint} title={hint}><Icon name="print" /> Print</button>
+        {onPdfView && <button className="secondary-button" disabled={exporting || empty} onClick={onPdfView} title={hint}>{exporting ? "Preparing…" : "View PDF"}</button>}
+        <button className="secondary-button" disabled={exporting || empty} onClick={onPdfExport || onPrint} title={hint}>{exporting ? "Exporting…" : "PDF Export"}</button>
+        {onExcelExport && <button className="secondary-button" disabled={exporting || empty} onClick={onExcelExport} title={hint}>Excel</button>}
+        <button className="whatsapp-button" disabled={exporting || empty || !canWhatsappSend} title={hint || (canWhatsappSend ? "" : "WhatsApp Send permission required")} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
     </div>
   );
@@ -15009,6 +15471,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   // session left open on a counter cannot be used to lock its owner out.
   const [passwordDraft, setPasswordDraft] = useState({ current_password: "", password: "", confirm_password: "" });
   const [showPasswordForm, setShowPasswordForm] = useState(false);
+  const [passwordNotice, showPasswordNotice, clearPasswordNotice] = useSaveNotice();
   const [profile, setProfile] = useState(null);
   const [recoveryDraft, setRecoveryDraft] = useState({ email: "", mobile: "" });
   const [verification, setVerification] = useState({ type: "", requestId: "", otp: "", maskedContact: "" });
@@ -15044,9 +15507,9 @@ function UserProfilePanel({ onClose, onLogout, user }) {
       });
       setPasswordDraft({ current_password: "", password: "", confirm_password: "" });
       setShowPasswordForm(false);
-      alert("Password changed");
+      showPasswordNotice(successNotice("Password changed. Use the new password next time you sign in."));
     } catch (error) {
-      alert(getAuthErrorMessage(error, "Unable to change password"));
+      showPasswordNotice(errorNotice(getAuthErrorMessage(error, "The password could not be changed.")));
     }
   };
   const requestContactOtp = async (type) => {
@@ -15104,7 +15567,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
       <section className="invoice-modal profile-panel">
         <div className="invoice-toolbar">
           <div>
-            <span className="eyebrow">User Profile</span>
+            <span className="eyebrow">Your profile</span>
             <strong>{userDisplayName}</strong>
           </div>
           <button aria-label="Close profile" className="remove-button" onClick={onClose}><Icon name="close" /></button>
@@ -15113,22 +15576,22 @@ function UserProfilePanel({ onClose, onLogout, user }) {
           <div className="purchase-summary-grid supplier-payment-preview">
             <SummaryMetric label="Role" value={userRoleLabel} featured />
             <SummaryMetric label="Branch" value={user.branch || "Main Branch"} />
-            <SummaryMetric label="Last Login" value={user.last_login_at ? new Date(user.last_login_at).toLocaleString("en-IN") : "Not recorded"} />
-            <SummaryMetric label="Device" value="Local Counter" />
+            <SummaryMetric label="Last sign-in" value={user.last_login_at ? formatKolkataDateTime(user.last_login_at) || "Not recorded" : "Not recorded"} />
           </div>
+          {/* Read-only facts: a blank box read as "type here", so an empty one says "Not given". */}
           <div className="form-grid supplier-form-grid">
             <Field label="Username"><input disabled value={user.username || ""} /></Field>
-            <Field label="Mobile"><input disabled value={user.mobile_number || ""} /></Field>
-            <Field label="Email"><input disabled value={user.email || ""} /></Field>
-            <Field label="Joining Date"><input disabled value={user.joining_date ? toDateKey(user.joining_date) : ""} /></Field>
-            <Field label="Notes"><textarea disabled value={user.notes || ""} /></Field>
+            <Field label="Mobile"><input disabled placeholder="Not given" value={user.mobile_number || ""} /></Field>
+            <Field label="Email"><input disabled placeholder="Not given" value={user.email || ""} /></Field>
+            <Field label="Joining Date"><input disabled placeholder="Not given" value={user.joining_date ? formatDisplayDate(user.joining_date) : ""} /></Field>
+            {user.notes && <Field label="Notes"><textarea disabled value={user.notes} /></Field>}
           </div>
-          <ModuleCard eyebrow="Recovery Security" title="Owner Recovery Contacts" subtitle="Recovery contacts are usable only after OTP verification. Password recovery requires backend connectivity.">
+          <ModuleCard eyebrow="Account recovery" title="Owner Recovery Contacts" subtitle="An email or mobile number you can get back in with if the password is forgotten. Each works only after it is checked with a one-time code (OTP), and recovery needs the internet.">
             <div className="purchase-summary-grid supplier-payment-preview">
               <SummaryMetric label="Email Status" value={profile?.recovery_email_verified ? "Verified" : profile?.pending_recovery_email ? "Pending" : "Not Verified"} featured={profile?.recovery_email_verified} />
               <SummaryMetric label="Mobile Status" value={profile?.recovery_mobile_verified ? "Verified" : profile?.pending_recovery_mobile ? "Pending" : "Not Verified"} featured={profile?.recovery_mobile_verified} />
-              <SummaryMetric label="Email Provider" value={profile?.provider_status?.email || "Checking"} />
-              <SummaryMetric label="SMS Provider" value={profile?.provider_status?.sms || "Checking"} />
+              <SummaryMetric label="Email Provider" value={profile?.provider_status?.email ? labelFor("providerStatus", profile.provider_status.email) : "Checking"} />
+              <SummaryMetric label="SMS Provider" value={profile?.provider_status?.sms ? labelFor("providerStatus", profile.provider_status.sms) : "Checking"} />
             </div>
             <div className="form-grid supplier-form-grid">
               <Field label="Recovery Email">
@@ -15148,7 +15611,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
                 <Field label={`OTP for ${verification.maskedContact || verification.type}`}>
                   <input inputMode="numeric" value={verification.otp} onChange={(event) => setVerification({ ...verification, otp: event.target.value.replace(/\D/g, "").slice(0, 8) })} />
                 </Field>
-                <button className="primary-button" disabled={busy} onClick={verifyContactOtp}>{busy ? "Verifying..." : "Confirm Verification"}</button>
+                <button className="primary-button" disabled={busy} onClick={verifyContactOtp}>{busy ? "Verifying…" : "Confirm Verification"}</button>
               </div>
             )}
             {(message || error) && (
@@ -15160,16 +15623,17 @@ function UserProfilePanel({ onClose, onLogout, user }) {
           </ModuleCard>
           {showPasswordForm && (
             <div className="form-grid settings-add-grid">
-              <Field label="Current Password"><PasswordInput autoComplete="current-password" value={passwordDraft.current_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, current_password: event.target.value })} /></Field>
-              <Field label="New Password"><PasswordInput value={passwordDraft.password} onChange={(event) => setPasswordDraft({ ...passwordDraft, password: event.target.value })} /></Field>
-              <Field label="Confirm Password"><PasswordInput value={passwordDraft.confirm_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value })} /></Field>
+              <Field label="Current Password"><PasswordInput autoComplete="current-password" value={passwordDraft.current_password} onChange={(event) => { clearPasswordNotice(); setPasswordDraft({ ...passwordDraft, current_password: event.target.value }); }} /></Field>
+              <Field label="New Password"><PasswordInput value={passwordDraft.password} onChange={(event) => { clearPasswordNotice(); setPasswordDraft({ ...passwordDraft, password: event.target.value }); }} /></Field>
+              <Field label="Confirm Password"><PasswordInput value={passwordDraft.confirm_password} onChange={(event) => { clearPasswordNotice(); setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value }); }} /></Field>
             </div>
           )}
           <div className="button-row">
-            <button className="secondary-button" onClick={() => setShowPasswordForm((visible) => !visible)}>{showPasswordForm ? "Cancel Password Change" : "Change Password"}</button>
+            <button className="secondary-button" onClick={() => { clearPasswordNotice(); setShowPasswordForm((visible) => !visible); }}>{showPasswordForm ? "Cancel Password Change" : "Change Password"}</button>
             {showPasswordForm && <button className="primary-button" onClick={savePassword}>Save Password</button>}
             <button className="remove-button" onClick={onLogout}>Logout</button>
           </div>
+          <SaveNotice notice={passwordNotice} />
         </div>
       </section>
     </div>
@@ -15180,7 +15644,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
 // screen hands the file all of them (Stock Inventory's Lot View).
 const ReportExportContext = React.createContext(false);
 
-function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false, children, fileName, reportClassName = "", title, user, whatsappRecipients = [] }) {
+function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false, children, emptyReason = "", fileName, reportClassName = "", showToolbarTitle = true, title, user, whatsappRecipients = [] }) {
   const [printTarget, setPrintTarget] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
@@ -15190,8 +15654,10 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   const reportRef = useRef(null);
   const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
   const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
-  const printReport = () => {
-    if (beforePrint && beforePrint() === false) return;
+  // beforePrint / beforePdfExport may ask something first (narration: in-app, so it is awaited).
+  const printReport = async () => {
+    setExcelNotice(null);
+    if (beforePrint && (await beforePrint()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     applyPrintPageProfile(printProfile);
     setTimeout(() => {
@@ -15206,7 +15672,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     }, 0);
   };
   const exportReport = async () => {
-    if (beforePdfExport && beforePdfExport() === false) return;
+    setExcelNotice(null);
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
@@ -15214,7 +15681,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
       await new Promise((resolve) => setTimeout(resolve, 80));
       await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
     } catch (error) {
-      alert(`Unable to export PDF: ${error.message}`);
+      setExcelNotice({ tone: "error", text: `The PDF could not be made (${error?.message || String(error)}). Nothing was saved; try again.` });
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -15223,8 +15690,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   const exportExcel = async () => {
     // The same preparation as the PDF (narration choice, print layout), so the sheet carries the
     // rows the PDF would.
-    if (beforePdfExport && beforePdfExport() === false) return;
     setExcelNotice(null);
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     setPrintTarget(true);
     setExporting(true);
     try {
@@ -15241,7 +15708,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     }
   };
   const viewReportPdf = async () => {
-    if (beforePdfExport && beforePdfExport() === false) return;
+    setExcelNotice(null);
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
@@ -15250,14 +15718,14 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
       const result = await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false });
       setPdfPreview({ ...result });
     } catch (error) {
-      alert(`Unable to view PDF: ${error.message}`);
+      setExcelNotice({ tone: "error", text: `The PDF could not be opened (${error?.message || String(error)}). Try again.` });
     } finally {
       setExporting(false);
       setPrintTarget(false);
     }
   };
   const generateWhatsappPdf = async () => {
-    if (beforePdfExport && beforePdfExport() === false) return;
+    if (beforePdfExport && (await beforePdfExport()) === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
@@ -15271,16 +15739,16 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onExcelExport={exportExcel} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onExcelExport={exportExcel} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={showToolbarTitle ? title : ""} emptyReason={emptyReason} />
       {excelNotice && (
-        <p className={`report-excel-notice no-print${excelNotice.tone === "error" ? " report-excel-notice-error" : ""}`} role="status">{excelNotice.text}</p>
+        <p className={`report-excel-notice no-print${excelNotice.tone === "error" ? " report-excel-notice-error" : ""}`} role={excelNotice.tone === "error" ? "alert" : "status"}>{excelNotice.text}</p>
       )}
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
           <div>
             <strong>{title}</strong>
-            <span>{new Date().toLocaleString("en-IN")}</span>
+            <span>{formatKolkataDateTime(new Date())}</span>
           </div>
         </header>
         <ReportExportContext.Provider value={printTarget}>{children}</ReportExportContext.Provider>
@@ -15316,19 +15784,16 @@ const matchesPendingBillSearch = (values, search) => {
   return values.some((value) => String(value ?? "").toLowerCase().includes(text));
 };
 
-function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, purchases, search = "" }) {
+function PendingPurchaseBillsModule({ actionNotice = null, canManagePending = false, loadState = { status: "ready", message: "" }, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, purchases, search = "" }) {
   const [selectedSupplierKey, setSelectedSupplierKey] = useState("");
+  // A failed or unfinished read of the purchases is said, never shown as "nothing pending" (logic E).
+  const presentation = pendingPurchasesPresentation(loadState);
   const basePendingRows = purchases.filter((purchase) =>
     purchase.purchase_status !== "CANCELLED" &&
     purchase.purchase_bill_status === "BILL_PENDING"
   );
-  const narration = (purchase) => {
-    const product = purchase.product_name || "Item";
-    const qty = Number(purchase.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
-    const unit = String(purchase.unit || "").toLowerCase();
-    const rate = pendingItemRate(purchase);
-    return `${product} ${qty}${unit} @ ${receiptCurrency.format(rate)} = ${receiptCurrency.format(Number(purchase.quantity || 0) * rate)}`;
-  };
+  // "Apple 5.000 Kg × ₹95.00 = ₹475.00" (local/stockScreens.js).
+  const narration = (purchase) => pendingItemNarration(purchase, pendingItemRate(purchase), (value) => currency.format(value));
   const estimatedValue = (purchase) => Number(purchase.quantity || 0) * pendingItemRate(purchase);
   const pendingRows = basePendingRows.filter((purchase) => matchesPendingBillSearch([
     purchase.supplier_name,
@@ -15354,7 +15819,7 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
     const summary = map.get(key) || {
       key,
       supplier_id: purchase.supplier_id,
-      supplier_name: purchase.supplier_name || "Unknown Supplier",
+      supplier_name: purchase.supplier_name || "Unknown supplier",
       from: toDateKey(purchase.purchase_date),
       to: toDateKey(purchase.purchase_date),
       billCount: 0,
@@ -15374,55 +15839,71 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
   }, new Map()).values()].sort((left, right) => left.supplier_name.localeCompare(right.supplier_name));
   const selectedSupplier = supplierSummaries.find((summary) => summary.key === selectedSupplierKey);
   const selectedRows = selectedSupplier?.rows || [];
+  const showFigures = presentation.figures;
 
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Supplier bills" title="Waiting for a bill, by supplier" subtitle="Stock that has arrived but whose supplier bill is not complete yet.">
+        {presentation.kind === "failed" && (
+          <div className="error-banner" role="alert">
+            {`${presentation.message} What is shown may be out of date.`}{" "}
+            <button className="secondary-button compact-button" onClick={() => onReload?.().catch(() => null)} type="button">Try again</button>
+          </div>
+        )}
+        {!selectedSupplier && <SaveNotice notice={actionNotice} />}
         <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Pending Suppliers" value={supplierSummaries.length} featured />
-          <SummaryMetric label="Pending Bills" value={pendingBills.length} />
-          <SummaryMetric label="Estimated Value" value={currency.format(pendingRows.reduce((sum, row) => sum + estimatedValue(row), 0))} />
+          <SummaryMetric label="Suppliers waiting" value={showFigures ? supplierSummaries.length : MISSING_VALUE} featured />
+          <SummaryMetric label="Bills waiting" value={showFigures ? pendingBills.length : MISSING_VALUE} />
+          <SummaryMetric label="Estimated value" value={showFigures ? currency.format(pendingRows.reduce((sum, row) => sum + estimatedValue(row), 0)) : MISSING_VALUE} />
         </div>
-        <DataTable headers={["Supplier Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Pending Items", "Estimated Value", "Action"]}>
+        <DataTable className="pending-bills-table" headers={["Supplier", "From", "To", { label: "Bills", numeric: true }, { label: "Items", numeric: true }, { label: "Value", numeric: true }, ""]}>
           {supplierSummaries.map((summary) => (
             <tr key={summary.key}>
               <td className="primary-cell">{summary.supplier_name}</td>
               <td>{formatDisplayDate(summary.from)}</td>
               <td>{formatDisplayDate(summary.to)}</td>
-              <td>{summary.billCount} bills</td>
-              <td>{summary.itemCount} items</td>
+              <td>{summary.billCount}</td>
+              <td>{summary.itemCount}</td>
               <td>{currency.format(summary.estimatedValue)}</td>
-              <td><button className="table-action" onClick={() => setSelectedSupplierKey(summary.key)}>View</button></td>
+              <td><button className="table-action" onClick={() => setSelectedSupplierKey(summary.key)} type="button">View bills</button></td>
             </tr>
           ))}
+          {supplierSummaries.length === 0 && (
+            <tr>
+              <td className="empty-cell" colSpan={7}>
+                {presentation.kind === "loading" ? "Loading pending bills…" : presentation.kind === "failed" ? MISSING_VALUE : basePendingRows.length ? "No pending bills match the search." : "No bills are waiting. Stock entered as \"bill to follow\" appears here."}
+              </td>
+            </tr>
+          )}
         </DataTable>
-        {supplierSummaries.length === 0 && <div className="cart-empty">{basePendingRows.length ? "No matching pending bills found." : "No pending purchase bills."}</div>}
       </ModuleCard>
 
       {selectedSupplier && (
-        <ModuleCard eyebrow="Supplier Drill-Down" title={selectedSupplier.supplier_name} subtitle="Complete, edit or safely cancel pending bill entries for this supplier.">
-          <DataTable headers={["Date", "Items Narration", "Estimated Total", "Status", "Action"]}>
+        <ModuleCard eyebrow="Bills from one supplier" title={selectedSupplier.supplier_name} subtitle="Complete a bill when the supplier's bill comes in. Edit or cancel an entry that was wrong.">
+          <SaveNotice notice={actionNotice} />
+          <DataTable className="pending-bills-table" headers={["Arrived", "Items", { label: "Estimated", numeric: true }, "Actions"]}>
             {selectedRows.map((bill) => {
               const purchase = bill.items[0];
               const itemsNarration = bill.items.map(narration).join("; ");
               const changeBlock = purchaseChangeBlock(bill.itemCount);
               return (
-              <tr className="report-row-clickable" key={bill.key} onClick={() => onOpenPurchaseAmendment(purchase)}>
-                <td>{formatDisplayDate(purchase.purchase_date)}</td>
+              // No row click: it used to open the amendment screen without saying so. The buttons
+              // say what each one does.
+              <tr key={bill.key}>
+                <td>{formatDisplayDate(purchase.purchase_date)}<small className="cell-note">{`Bill #${purchase.id}`}</small></td>
                 <td className="primary-cell purchase-items-cell">
                   <span title={itemsNarration}>{itemsNarration}</span>
                   {changeBlock && <small className="cell-note">{changeBlock}</small>}
                 </td>
                 <td>{currency.format(bill.items.reduce((sum, item) => sum + estimatedValue(item), 0))}</td>
-                <td><span className="origin-rate">Pending Bill</span></td>
                 <td>
                   {/* The server lets only Owner and Admin complete, edit or cancel a pending bill
                       (requireRateManager). Anyone else got three buttons that could only fail. */}
                   {canManagePending ? (
                     <div className="button-row table-actions-row">
-                      <button className="primary-button" onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }}>Complete Bill</button>
-                      <button className="table-action" disabled={Boolean(changeBlock)} onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }} title={changeBlock || undefined}>Edit Pending Entry</button>
-                      <button className="remove-button" onClick={(event) => { event.stopPropagation(); onCancelPurchase(purchase); }}>Cancel Pending Entry</button>
+                      <button className="primary-button compact-button" onClick={() => onCompletePurchase(purchase)} type="button">Complete bill</button>
+                      <button className="table-action" disabled={Boolean(changeBlock)} onClick={() => onEditPurchase(purchase)} title={changeBlock || undefined} type="button">Edit</button>
+                      <button className="danger-text-button" onClick={() => onCancelPurchase(purchase)} type="button">Cancel</button>
                     </div>
                   ) : <small className="cell-note">{PENDING_BILL_MANAGER_NOTE}</small>}
                 </td>
@@ -15431,8 +15912,8 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
             })}
           </DataTable>
           <div className="button-row">
-            <button className="secondary-button" onClick={() => onOpenPurchaseAmendment(selectedRows[0]?.items[0])}>Add Forgotten Item</button>
-            <button className="secondary-button" onClick={() => setSelectedSupplierKey("")}>Back to Supplier Summary</button>
+            <button className="secondary-button" onClick={() => onOpenPurchaseAmendment(selectedRows[0]?.items[0])} type="button">Add forgotten item</button>
+            <button className="secondary-button" onClick={() => setSelectedSupplierKey("")} type="button">Back to all suppliers</button>
           </div>
         </ModuleCard>
       )}
@@ -15440,10 +15921,14 @@ function PendingPurchaseBillsModule({ canManagePending = false, onCancelPurchase
   );
 }
 
-function PendingBillsModule({ canManagePending = false, canReceivePayment = false, customerPendingBills = { summary: [], invoices: [] }, customerPendingBillsError = "", customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchases, user }) {
+const CUSTOMER_PAYMENT_MODES = Object.freeze([["CASH", "Cash"], ["UPI", "UPI"], ["CARD", "Card"], ["BANK_TRANSFER", "Bank transfer"]]);
+
+function PendingBillsModule({ canManagePending = false, canReceivePayment = false, customerPendingBills = { summary: [], invoices: [] }, customerPendingBillsError = "", customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchaseActionNotice = null, purchases, purchasesLoad = { status: "ready", message: "" }, user }) {
   const [activeTab, setActiveTab] = useState("purchase");
   const [selectedCustomerKey, setSelectedCustomerKey] = useState("");
   const [pendingSearch, setPendingSearch] = useState("");
+  const [paymentNotice, showPaymentNotice, clearPaymentNotice] = useSaveNotice();
+  const [paymentSaving, runPaymentSave] = useSaveInFlight();
   const [paymentDraft, setPaymentDraft] = useState({
     customer_id: "",
     payment_date: toDateKey(new Date()),
@@ -15452,6 +15937,13 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
     reference_number: "",
     remarks: "",
   });
+  // Opened before the purchases were ever read (a fresh start on this screen): read them now,
+  // the way the menu would have.
+  const purchasesNeverLoaded = purchasesLoad.status === "idle";
+  useEffect(() => {
+    if (purchasesNeverLoaded) onReload?.().catch(() => null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [purchasesNeverLoaded]);
   const rawSummaries = Array.isArray(customerPendingBills.summary) ? customerPendingBills.summary : [];
   const summaries = rawSummaries
     .map((summary) => {
@@ -15496,10 +15988,12 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
       summary.balance,
     ], pendingSearch) || summary.rows.length > 0);
   const selectedCustomer = summaries.find((summary) => summary.key === selectedCustomerKey);
+  const emptyPaymentDraft = () => ({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" });
 
   const openReceivePayment = (summary, invoice = null) => {
+    clearPaymentNotice();
     if (!summary?.customer_id) {
-      alert("Customer account is required before receiving payment.");
+      showPaymentNotice(errorNotice(`${summary?.customer_name || "This customer"} has no customer account, so a payment cannot be recorded against them. Add the account in Accounts first.`));
       return;
     }
     setSelectedCustomerKey(summary.key);
@@ -15511,30 +16005,37 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
       reference_number: "",
       remarks: invoice?.invoice_no ? `Against credit invoice ${invoice.invoice_no}` : "Against customer pending bills",
     });
+    // The receipt form opens under the list; take the cursor to its amount.
+    focusField("customer-payment-amount");
   };
 
-  const saveCustomerPayment = async () => {
+  const saveCustomerPayment = () => runPaymentSave(async () => {
+    clearPaymentNotice();
     if (!canReceivePayment) {
-      alert("Your role cannot receive customer payments.");
+      showPaymentNotice(errorNotice("Your role cannot receive customer payments. Ask the Owner or an Admin."));
       return;
     }
     if (!paymentDraft.customer_id || Number(paymentDraft.payment_amount || 0) <= 0) {
-      alert("Enter valid customer payment details.");
+      const field = paymentDraft.customer_id ? "customer-payment-amount" : "customer-payment-customer";
+      showPaymentNotice(errorNotice(paymentDraft.customer_id ? "Enter an amount above ₹0." : "Choose the customer.", field));
+      focusField(field, { scroll: false });
       return;
     }
+    const customerName = customers.find((customer) => String(customer.id) === String(paymentDraft.customer_id))?.customer_name || "the customer";
+    const amountWords = currency.format(Number(paymentDraft.payment_amount));
     try {
       await axios.post(`${API_URL}/customer-payments`, {
         ...paymentDraft,
         branch_id: user.branch_id,
         created_by: user.id,
       });
-      setPaymentDraft({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" });
+      setPaymentDraft(emptyPaymentDraft());
       await onReload();
-      alert("Customer payment saved");
+      showPaymentNotice(successNotice(`Payment of ${amountWords} from ${customerName} saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save customer payment"));
+      showPaymentNotice(errorNotice(getErrorMessage(error, "The payment could not be saved. Nothing was recorded; try again.")));
     }
-  };
+  });
 
   return (
     <section className="settings-layout">
@@ -15542,24 +16043,28 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
         <label className="icon-input table-search-input">
           <Icon name="search" />
           <input
-            placeholder="Search pending bill, customer, supplier, invoice..."
+            aria-label="Search pending bills"
+            placeholder="Search supplier, customer, invoice or fruit"
             value={pendingSearch}
             onChange={(event) => setPendingSearch(event.target.value)}
           />
         </label>
         <div className="settings-tabs">
-          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Supplier bills</button>
-          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer credit</button>
+          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")} type="button">Supplier bills</button>
+          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")} type="button">Customer credit</button>
         </div>
       </ModuleCard>
 
       {activeTab === "purchase" && (
         <PendingPurchaseBillsModule
+          actionNotice={purchaseActionNotice}
           canManagePending={canManagePending}
+          loadState={purchasesLoad}
           onCancelPurchase={onCancelPurchase}
           onCompletePurchase={onCompletePurchase}
           onEditPurchase={onEditPurchase}
           onOpenPurchaseAmendment={onOpenPurchaseAmendment}
+          onReload={onReload}
           purchases={purchases}
           search={pendingSearch}
         />
@@ -15567,92 +16072,96 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
 
       {activeTab === "customer" && (
         <>
-          <ModuleCard eyebrow="Customer Credit" title="Customer-Wise Pending Bills" subtitle="Credit POS bills stay here until customer receipts are entered.">
+          <ModuleCard eyebrow="Customer credit" title="Credit bills, by customer" subtitle="Credit POS bills stay here until the customer pays.">
             {/* A failed read is said, not shown as "no customers owe anything". */}
             {customerPendingBillsError && <div className="error-banner" role="alert">{`Customer pending bills could not be loaded: ${customerPendingBillsError}. What is shown may be out of date.`}</div>}
+            {!paymentDraft.customer_id && <SaveNotice notice={paymentNotice} />}
             <div className="purchase-summary-grid supplier-payment-preview">
-              <SummaryMetric label="Customers Pending" value={customerPendingBillsError ? UNKNOWN_FIGURE : summaries.length} featured />
-              <SummaryMetric label="Credit Amount" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
+              <SummaryMetric label="Customers owing" value={customerPendingBillsError ? UNKNOWN_FIGURE : summaries.length} featured />
+              <SummaryMetric label="Credit amount" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
               <SummaryMetric label="Balance" value={customerPendingBillsError ? UNKNOWN_FIGURE : currency.format(summaries.reduce((sum, row) => sum + Number(row.balance || 0), 0))} />
             </div>
-            <DataTable headers={["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Returned", "Balance", "Action"]}>
+            <DataTable className="pending-bills-table" headers={["Customer", "From", "To", { label: "Bills", numeric: true }, { label: "Credit", numeric: true }, { label: "Received", numeric: true }, { label: "Returned", numeric: true }, { label: "Balance", numeric: true }, ""]}>
               {summaries.map((summary) => (
                 <tr key={summary.key}>
                   <td className="primary-cell">{summary.customer_name}</td>
                   <td>{formatDisplayDate(summary.from)}</td>
                   <td>{formatDisplayDate(summary.to)}</td>
-                  <td>{summary.pending_bill_count} bills</td>
+                  <td>{summary.pending_bill_count}</td>
                   <td>{currency.format(Number(summary.total_credit_amount || 0))}</td>
                   <td>{currency.format(Number(summary.amount_received || 0))}</td>
                   {/* Goods returned on a credit note or future adjustment, so Credit - Received - Returned = Balance. */}
                   <td>{currency.format(Number(summary.amount_returned || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(summary.balance || 0))}</td>
-                  <td><button className="table-action" onClick={() => setSelectedCustomerKey(summary.key)}>View</button></td>
+                  <td><button className="table-action" onClick={() => setSelectedCustomerKey(summary.key)} type="button">View bills</button></td>
                 </tr>
               ))}
+              {summaries.length === 0 && (
+                <tr><td className="empty-cell" colSpan={9}>{customerPendingBillsError ? MISSING_VALUE : rawSummaries.length ? "No credit bills match the search." : "No customer owes anything on credit."}</td></tr>
+              )}
             </DataTable>
-            {summaries.length === 0 && <div className="cart-empty">{rawSummaries.length ? "No matching pending bills found." : "No customer pending bills."}</div>}
           </ModuleCard>
 
           {selectedCustomer && (
-            <ModuleCard eyebrow="Customer Drill-Down" title={selectedCustomer.customer_name} subtitle="Receive payment, view invoices and print customer credit statement.">
-              <DataTable headers={["Bill Date", "Invoice Number", "Items / Narration", "Gross Amount", "Discount", "Net Amount", "Received", "Returned", "Balance", "Due Date", "Status", "Action"]}>
-                {selectedCustomer.rows.map((invoice) => (
+            <ModuleCard eyebrow="Bills of one customer" title={selectedCustomer.customer_name} subtitle="Receive a payment, open an invoice or print the customer's statement.">
+              <DataTable className="pending-bills-table customer-credit-bills" headers={["Bill", "Items", { label: "Net", numeric: true }, { label: "Received", numeric: true }, { label: "Balance", numeric: true }, "Due", "Status", "Actions"]}>
+                {selectedCustomer.rows.map((invoice) => {
+                  const discount = Number(invoice.item_discount_amount || 0) + Number(invoice.invoice_discount_amount || 0);
+                  const returned = Number(invoice.returned_amount || 0);
+                  // Gross, discount and returns are on the Net cell's tooltip and note, so the row
+                  // fits a 1366 screen without scrolling sideways.
+                  const netNote = [discount > 0 ? `after ${currency.format(discount)} off` : "", returned > 0 ? `${currency.format(returned)} returned` : ""].filter(Boolean).join(", ");
+                  return (
                   <tr key={invoice.id}>
-                    <td>{formatDisplayDate(invoice.sale_date)}</td>
-                    <td><span className="batch-id">{invoice.invoice_no || `#${invoice.id}`}</span></td>
+                    <td><span className="batch-id">{invoice.invoice_no || `#${invoice.id}`}</span><small className="cell-note">{formatDisplayDate(invoice.sale_date)}</small></td>
                     <td className="primary-cell purchase-items-cell"><span title={invoice.item_narration}>{String(invoice.item_narration || "").split("\n").slice(0, 2).join(", ")}</span></td>
-                    <td>{currency.format(Number(invoice.gross_amount || 0))}</td>
-                    <td>{currency.format(Number(invoice.item_discount_amount || 0) + Number(invoice.invoice_discount_amount || 0))}</td>
-                    <td>{currency.format(Number(invoice.total_amount || 0))}</td>
+                    <td title={`Gross ${currency.format(Number(invoice.gross_amount || 0))}`}>{currency.format(Number(invoice.total_amount || 0))}{netNote && <small className="cell-note">{netNote}</small>}</td>
                     <td>{currency.format(Number(invoice.received_amount || 0))}</td>
-                    <td>{currency.format(Number(invoice.returned_amount || 0))}</td>
                     <td className="balance-cell">{currency.format(Number(invoice.balance_amount || 0))}</td>
-                    <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : "-"}</td>
+                    <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : MISSING_VALUE}</td>
                     <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{labelFor("credit_status", invoice.credit_status)}</span></td>
                     <td>
                       <div className="button-row table-actions-row">
-                        <button className="primary-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)}>Receive Payment</button>
-                        <button className="table-action" onClick={() => onViewInvoice(invoice.id)}>View Invoice</button>
+                        <button className="primary-button compact-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)} type="button">Receive</button>
+                        <button className="table-action" onClick={() => onViewInvoice(invoice.id)} type="button">Invoice</button>
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </DataTable>
               <div className="button-row">
-                <button className="secondary-button" onClick={() => openReceivePayment(selectedCustomer)}>Receive General Payment</button>
-                <button className="secondary-button" onClick={() => window.print()}>Print Statement</button>
-                <button className="secondary-button" onClick={() => setSelectedCustomerKey("")}>Back to Customer Summary</button>
+                <button className="secondary-button" onClick={() => openReceivePayment(selectedCustomer)} type="button">Receive a general payment</button>
+                <button className="secondary-button" onClick={() => window.print()} type="button">Print statement</button>
+                <button className="secondary-button" onClick={() => setSelectedCustomerKey("")} type="button">Back to all customers</button>
               </div>
             </ModuleCard>
           )}
 
           {paymentDraft.customer_id && (
-            <ModuleCard eyebrow="Customer Receipt" title="Receive Payment Against Credit" subtitle="Payment will reduce customer receivable and update Cash Book based on payment mode.">
+            <ModuleCard eyebrow="Customer receipt" title="Receive a payment" onChange={clearPaymentNotice} subtitle="The payment lowers what the customer owes and goes into the cash or bank book by its mode.">
               <div className="form-grid supplier-form-grid">
-                <Field label="Customer">
-                  <select value={paymentDraft.customer_id} onChange={(event) => setPaymentDraft({ ...paymentDraft, customer_id: event.target.value })}>
-                    <option value="">Select customer</option>
+                <Field label={<RequiredLabel>Customer</RequiredLabel>}>
+                  <select id="customer-payment-customer" value={paymentDraft.customer_id} onChange={(event) => setPaymentDraft({ ...paymentDraft, customer_id: event.target.value })}>
+                    <option value="">Choose a customer</option>
                     {customers.filter((customer) => customer.active !== false).map((customer) => <option key={customer.id} value={customer.id}>{customer.customer_name}</option>)}
                   </select>
                 </Field>
-                <Field label="Payment Date"><input type="date" value={paymentDraft.payment_date} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_date: event.target.value })} /></Field>
-                <Field label="Payment Amount"><input min="0" step="0.01" type="number" value={paymentDraft.payment_amount} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_amount: event.target.value })} /></Field>
-                <Field label="Payment Mode">
+                <Field label="Payment date"><input type="date" value={paymentDraft.payment_date} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_date: event.target.value })} /></Field>
+                <Field label={<RequiredLabel>Amount (₹)</RequiredLabel>}><input id="customer-payment-amount" min="0" step="0.01" type="number" value={paymentDraft.payment_amount} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_amount: event.target.value })} /></Field>
+                <Field label="Payment mode">
                   <select value={paymentDraft.payment_mode} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_mode: event.target.value })}>
-                    <option value="CASH">Cash</option>
-                    <option value="UPI">UPI</option>
-                    <option value="CARD">Card</option>
-                    <option value="BANK_TRANSFER">Bank</option>
+                    {CUSTOMER_PAYMENT_MODES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                   </select>
                 </Field>
-                <Field label="Reference Number"><input value={paymentDraft.reference_number} onChange={(event) => setPaymentDraft({ ...paymentDraft, reference_number: event.target.value })} /></Field>
-                <Field label="Remarks"><input value={paymentDraft.remarks} onChange={(event) => setPaymentDraft({ ...paymentDraft, remarks: event.target.value })} /></Field>
+                <Field label="Reference number"><input value={paymentDraft.reference_number} onChange={(event) => setPaymentDraft({ ...paymentDraft, reference_number: event.target.value })} /></Field>
+                <Field label="Notes"><input value={paymentDraft.remarks} onChange={(event) => setPaymentDraft({ ...paymentDraft, remarks: event.target.value })} /></Field>
               </div>
               <div className="button-row">
-                <button className="primary-button" onClick={saveCustomerPayment}>Save Payment</button>
-                <button className="secondary-button" onClick={() => setPaymentDraft({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" })}>Cancel</button>
+                <button className="primary-button" disabled={paymentSaving} onClick={saveCustomerPayment} type="button">{paymentSaving ? "Saving…" : "Save payment"}</button>
+                <button className="secondary-button" onClick={() => { setPaymentDraft(emptyPaymentDraft()); clearPaymentNotice(); }} type="button">Cancel</button>
               </div>
+              <SaveNotice notice={paymentNotice} />
             </ModuleCard>
           )}
         </>
@@ -17504,7 +18013,8 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
       setCombos(read.combos);
       setLoad({ status: "ready", message: "" });
     } catch (error) {
-      setLoad({ status: "failed", message: `Combos could not be loaded (${getErrorMessage(error, error?.message || "no answer from the server")}).` });
+      // The server's words when it answered; otherwise one plain phrase, never axios's "Network Error".
+      setLoad({ status: "failed", message: `Combos could not be loaded (${getErrorMessage(error, "no answer from the server")}).` });
     }
   };
 
@@ -17560,7 +18070,7 @@ function SaleRateCombos({ desiredMargin = "", onSaved, products = [], rates = []
         </div>
       )}
       {load.status !== "failed" && (
-        <DataTable className="pm-table combo-table" headers={["Combo", "Margin", "Cost today", "Suggested", "Current price", "New price"]}>
+        <DataTable className="pm-table sale-rate-combo-table" headers={["Combo", { label: "Margin", numeric: true }, { label: "Cost today", numeric: true }, { label: "Suggested", numeric: true }, { label: "Current price", numeric: true }, "New price (₹)"]}>
           {load.status !== "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>Loading combos…</td></tr>}
           {load.status === "ready" && rows.length === 0 && <tr><td className="empty-cell" colSpan={6}>No fixed combos are on sale. Add them in PEP Menu.</td></tr>}
           {rows.map((row) => (
@@ -17989,6 +18499,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
+  const askNarration = useConfirm();
   /**
    * Open the report category a search asked for.
    *
@@ -18094,7 +18605,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     try {
       const params = currentRefreshParams();
       const result = await onReload(params);
-      if (result?.failures?.length) throw new Error(result.failures.map((failure) => `${failure.key}: ${failure.message}`).join("; "));
+      if (result?.failures?.length) throw new Error(describeReportRefreshFailures(result.failures));
       setAppliedQuery(params);
       lastSuccessfulFilters.current = { range, customRange: { ...customRange }, search, salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter };
     } catch (error) {
@@ -18136,6 +18647,9 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     }
   };
   const appliedSearch = String(appliedQuery.search ?? search).trim();
+  // The dates and the search go with "Show report"; until it is pressed, the figures are the last
+  // report's, and the screen says so (local/backOfficeScreens.js).
+  const filtersPending = reportDraftPending({ range, customRange, search }, appliedQuery, resolveReportDateRange);
   const matchesSearch = (row) => !appliedSearch || Object.values(row || {}).some((value) => {
     const text = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value ?? "");
     return text.toLowerCase().includes(appliedSearch.toLowerCase());
@@ -18193,12 +18707,12 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   /**
    * Summary tiles for one order report, or a single tile naming the reason there are none.
    *
-   * Returning `[["Orders", "-"]]` rather than `[["Orders", 0]]` is the whole point. A zero here
+   * Returning `[["Orders", "—"]]` (MISSING_VALUE) rather than `[["Orders", 0]]` is the whole point. A zero here
    * would be a confident, wrong statement about the shop's day.
    */
   const orderReportSummary = (key, build) => {
     const report = orderReportsState.reports?.[key];
-    if (!report?.ok) return [["Orders", "-", true], ["Status", orderReportsState.notice || "Unavailable"]];
+    if (!report?.ok) return [["Orders", MISSING_VALUE, true], ["Status", orderReportsState.notice || "Unavailable"]];
     return build(report.summary);
   };
   const money = (value) => currency.format(Number(value || 0));
@@ -18271,7 +18785,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       })
       .sort((left, right) => toDateKey(right.date).localeCompare(toDateKey(left.date)) || String(right.voucher_no || "").localeCompare(String(left.voucher_no || "")));
   };
-  const ledgerNarration = (row) => ledgerPrintNarration || ledgerPrintNarrationRef.current ? row.narration || row.remarks || "-" : row.remarks || row.narration || "-";
+  const ledgerNarration = (row) => ledgerPrintNarration || ledgerPrintNarrationRef.current ? row.narration || row.remarks || MISSING_VALUE : row.remarks || row.narration || MISSING_VALUE;
   const customerLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "CUSTOMER")));
   // The Supplier Ledger runs on from the balance brought forward to the range's first day (UI-10);
   // when that could not be read its balances are unknown, not counted from 0.
@@ -18495,7 +19009,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const formatSaleQuantityGroups = (groups) => {
     const entries = groups instanceof Map ? [...groups.entries()] : Object.entries(groups || {});
-    if (!entries.length) return "-";
+    if (!entries.length) return MISSING_VALUE;
     return entries
       .sort(([unitA], [unitB]) => unitA.localeCompare(unitB))
       .map(([unit, quantity]) => {
@@ -18841,8 +19355,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           <td>{money(row.value)}</td>
           <td>{number(row.orders)}</td>
           <td>{number(row.customers)}</td>
-          <td>{row.cancelledQuantity > 0 ? number(row.cancelledQuantity) : "-"}</td>
-          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+          <td>{row.cancelledQuantity > 0 ? number(row.cancelledQuantity) : MISSING_VALUE}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : MISSING_VALUE}</td>
         </tr>
       ),
     },
@@ -18864,12 +19378,12 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                 allowed without one. Saying so beats showing a name that looks like an account. */}
             {row.identified ? null : <small className="cell-note">Not a saved customer</small>}
           </td>
-          <td>{row.customerMobile || "-"}</td>
+          <td>{row.customerMobile || MISSING_VALUE}</td>
           <td>{number(row.orders)}</td>
           <td>{money(row.value)}</td>
           <td>{money(row.averageOrderValue)}</td>
-          <td>{row.cancelled > 0 ? number(row.cancelled) : "-"}</td>
-          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+          <td>{row.cancelled > 0 ? number(row.cancelled) : MISSING_VALUE}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : MISSING_VALUE}</td>
         </tr>
       ),
     },
@@ -18898,8 +19412,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             {row.warning ? <small className="cell-note">{row.warning}</small> : null}
           </td>
           <td>{row.ageHours < 24 ? `${row.ageHours} h` : `${Math.floor(row.ageHours / 24)} d`}</td>
-          <td>{row.carrier || "-"}</td>
-          <td>{row.invoiceNo || (row.billed ? "Billed" : "-")}</td>
+          <td>{row.carrier || MISSING_VALUE}</td>
+          <td>{row.invoiceNo || (row.billed ? "Billed" : MISSING_VALUE)}</td>
           <td>{money(row.value)}</td>
         </tr>
       ),
@@ -18909,21 +19423,21 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.salesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Cash", money(totalOf(rows, "cash_sales"))], ["UPI", money(totalOf(rows, "upi_sales"))], ["Profit", money(totalOf(rows, "total_profit"))]],
       headers: ["Date", "Transactions", "Sales", "Cash", "UPI", "Bank/Card", "Cost", "Profit"],
-      render: (row) => <tr key={row.sale_date}><td>{formatDisplayDate(row.sale_date)}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+      render: (row) => <tr key={row.sale_date}><td>{formatDisplayDate(row.sale_date)}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(row.total_cost)}</td><ProfitCell format={money} value={row.total_profit} /></tr>,
     },
     salesByProduct: {
       title: "Sales by Product",
       rows: filterRows(data.salesProductReport),
       summary: (rows) => [["Revenue", money(totalOf(rows, "revenue")), true], ["Quantity Sold", number(totalOf(rows, "quantity_sold"))], ["Profit", money(totalOf(rows, "profit"))]],
       headers: ["Product", "Lot", "Quantity", "Rate", "Revenue", "Cost", "Profit"],
-      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || "-"}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || MISSING_VALUE}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><ProfitCell format={money} value={row.profit} /></tr>,
     },
     salesByCustomer: {
       title: "Sales by Customer",
       rows: filterRows(data.salesCustomerReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Invoices", number(totalOf(rows, "invoice_count"))], ["Profit", money(totalOf(rows, "total_profit"))]],
       headers: ["Customer", "Mobile", "Invoices", "Sales", "Profit"],
-      render: (row) => <tr key={`${row.customer_name}-${row.customer_mobile}`}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_mobile || "-"}</td><td>{row.invoice_count}</td><td>{money(row.total_sales)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+      render: (row) => <tr key={`${row.customer_name}-${row.customer_mobile}`}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_mobile || MISSING_VALUE}</td><td>{row.invoice_count}</td><td>{money(row.total_sales)}</td><ProfitCell format={money} value={row.total_profit} /></tr>,
     },
     salesHistory: {
       title: "Sales History",
@@ -18958,7 +19472,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                   <strong>{row.customer_name}</strong>
                   <span>{row.invoice_count} invoice{row.invoice_count === 1 ? "" : "s"}</span>
                   <span>{row.item_lines} item line{row.item_lines === 1 ? "" : "s"}</span>
-                  <span>{row.quantity_summary || "-"}</span>
+                  <span>{row.quantity_summary || MISSING_VALUE}</span>
                   <span>Gross {money(row.gross_total)}</span>
                   <span>Net {money(row.net_total)}</span>
                   <span>Cash {money(row.cash_total)}</span>
@@ -18973,7 +19487,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           const expanded = Boolean(expandedSalesRows[row.display_key]);
           return (
             <React.Fragment key={row.display_key}>
-              <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} onClick={openInvoice}>
+              <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} onClick={openInvoice} tabIndex={0} onKeyDown={activateOnEnter(openInvoice)}>
                 <td className="primary-cell date-cell">
                   {formatDisplayDate(row.sale_date)}
                 </td>
@@ -18989,10 +19503,10 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                   <span>{salesNarrationDisplay(row)}</span>
                   <small className="cell-note">{row.item_rows?.length || 0} item line{(row.item_rows?.length || 0) === 1 ? "" : "s"}</small>
                 </td>
-                <td className="status-cell">{row.quantity_summary || "-"}</td>
+                <td className="status-cell">{row.quantity_summary || MISSING_VALUE}</td>
                 <td className="amount-cell">{money(row.gross_total)}</td>
-                {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
-                {salesHasBillDiscount && <td className="amount-cell">{Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
+                {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : MISSING_VALUE}</td>}
+                {salesHasBillDiscount && <td className="amount-cell">{Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : MISSING_VALUE}</td>}
                 <td className="amount-cell">{money(row.net_total)}</td>
                 <td className="status-cell">{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="status-cell">{row.status_label}</td>
@@ -19002,18 +19516,18 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                   <td colSpan={salesHistoryHeaders.length}>
                     <DataTable headers={["Item", "Lot", "Qty", "Unit", "Rate", "Gross", ...(salesHasItemDiscount ? ["Item Disc."] : []), ...(salesHasBillDiscount ? ["Bill Disc."] : []), "Net", "Cost Rate", "Profit"]}>
                       {(row.item_rows || []).map((item) => (
-                        <tr className="report-row-clickable" key={item.display_key} onClick={openInvoice}>
+                        <tr className="report-row-clickable" key={item.display_key} onClick={openInvoice} tabIndex={0} onKeyDown={activateOnEnter(openInvoice)}>
                           <td className="primary-cell">{item.item_name}</td>
                           <td>{item.lot_name || "No Lot Number"}</td>
                           <td>{number(item.quantity)}</td>
                           <td>{labelFor("unit", item.unit)}</td>
                           <td>{money(item.rate)}</td>
                           <td>{money(item.gross_total)}</td>
-                          {salesHasItemDiscount && <td>{Number(item.item_discount_total || 0) ? money(item.item_discount_total) : "-"}</td>}
-                          {salesHasBillDiscount && <td>{Number(item.bill_discount_total || 0) ? money(item.bill_discount_total) : "-"}</td>}
+                          {salesHasItemDiscount && <td>{Number(item.item_discount_total || 0) ? money(item.item_discount_total) : MISSING_VALUE}</td>}
+                          {salesHasBillDiscount && <td>{Number(item.bill_discount_total || 0) ? money(item.bill_discount_total) : MISSING_VALUE}</td>}
                           <td>{money(item.net_total)}</td>
                           <td>{money(item.cost_rate)}</td>
-                          <td className="profit-cell">{money(item.profit)}</td>
+                          <ProfitCell format={money} value={item.profit} />
                         </tr>
                       ))}
                     </DataTable>
@@ -19024,7 +19538,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           );
         }
         return (
-          <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} key={row.display_key} onClick={openInvoice}>
+          <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} key={row.display_key} onClick={openInvoice} tabIndex={0} onKeyDown={activateOnEnter(openInvoice)}>
             <td className="date-cell">{row.row_type === "CUSTOMER_ITEM" ? new Date(row.bill_datetime || row.created_at || row.sale_date).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : formatDisplayDate(row.sale_date)}</td>
             <td className="primary-cell">{row.invoice_no || `#${row.sale_id}`}{row.showing_matched_only && <small className="cell-note warning-note">Matched item</small>}</td>
             {salesFilters.viewMode !== "CUSTOMER" && <td className="primary-cell">{row.customer_name || "Walk-in Customer"}</td>}
@@ -19034,11 +19548,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             <td>{labelFor("unit", row.unit)}</td>
             <td>{money(row.rate)}</td>
             {salesFilters.viewMode !== "CUSTOMER" && <td className="amount-cell">{money(row.gross_total)}</td>}
-            {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
-            {salesHasBillDiscount && <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
-            <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : money(row.net_total)}</td>
-            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : labelFor("paymentMode", row.payment_mode)}</td>
-            <td>{row.row_type === "CUSTOMER_ITEM" ? (row.invoice_first_line ? row.status_label : "-") : (row.created_by_name || row.sold_by || "-")}</td>
+            {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : MISSING_VALUE}</td>}
+            {salesHasBillDiscount && <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? MISSING_VALUE : Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : MISSING_VALUE}</td>}
+            <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? MISSING_VALUE : money(row.net_total)}</td>
+            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? MISSING_VALUE : labelFor("paymentMode", row.payment_mode)}</td>
+            <td>{row.row_type === "CUSTOMER_ITEM" ? (row.invoice_first_line ? row.status_label : MISSING_VALUE) : (row.created_by_name || row.sold_by || MISSING_VALUE)}</td>
           </tr>
         );
       },
@@ -19048,21 +19562,21 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: editedBills,
       summary: (rows) => [["Edited Bills", rows.length, true], ["Total Amount", money(totalOf(rows, "total_amount"))]],
       headers: ["Invoice", "Date", "Amount", "Edited By", ...(editedBillsShowApprover ? ["Approved By"] : []), "Edited At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td>{editedBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td><td>{row.edit_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || MISSING_VALUE}</td>{editedBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}</td><td>{row.edit_reason || MISSING_VALUE}</td></tr>,
     },
     cancelledBills: {
       title: "Cancelled Bills",
       rows: cancelledBills,
       summary: (rows) => [["Cancelled Bills", rows.length, true], ["Cancelled Amount", money(totalOf(rows, "total_amount"))]],
       headers: ["Invoice", "Date", "Amount", "Cancelled By", ...(cancelledBillsShowApprover ? ["Approved By"] : []), "Cancelled At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td>{cancelledBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || MISSING_VALUE}</td>{cancelledBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.cancelled_at ? formatKolkataDateTime(row.cancelled_at) : MISSING_VALUE}</td><td>{row.cancellation_reason || MISSING_VALUE}</td></tr>,
     },
     provisionalProfitSales: {
       title: "Provisional Profit Sales",
       rows: filterRows(data.provisionalProfitSalesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_amount")), true], ["Provisional Profit", money(totalOf(rows, "profit"))], ["Invoices", rows.length]],
       headers: ["Invoice", "Date", "Customer", "Payment", "Products", "Amount", "Cost", "Provisional Profit"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.products || MISSING_VALUE}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><ProfitCell format={money} value={row.profit} /></tr>,
     },
     discountReport: {
       title: "Discount Report",
@@ -19079,7 +19593,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           : Number(row.bill_discount_share || 0) > 0
             ? (row.bill_discount_rule_name ? `Bill: ${row.bill_discount_rule_name}` : "Bill discount")
             : "Manual";
-        return <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{kind}</td><td>{!row.discount_type ? MISSING_VALUE : row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{known(row.item_discount_amount)}</td><td>{known(row.bill_discount_share)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>;
+        return <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || MISSING_VALUE}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{kind}</td><td>{!row.discount_type ? MISSING_VALUE : row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{known(row.item_discount_amount)}</td><td>{known(row.bill_discount_share)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>;
       },
     },
     purchasesByDate: {
@@ -19121,7 +19635,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       ],
       headers: ["Date", "Supplier", "Narration", "Gross Total", "Net Total", "Status"],
       render: (row) => (
-        <tr className="report-row-clickable" key={row.display_key} onClick={() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row)}>
+        <tr className="report-row-clickable" key={row.display_key} onClick={() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row)} tabIndex={0} onKeyDown={activateOnEnter(() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row))}>
           <td className="primary-cell date-cell">{formatDisplayDate(row.purchase_date)}</td>
           <td className="primary-cell">{row.supplier_name}{row.firm_name && <small className="cell-note">{row.firm_name}</small>}</td>
           <td className="primary-cell purchase-items-cell">
@@ -19139,14 +19653,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: purchaseChanges,
       summary: (rows) => [["Changed Purchases", rows.length, true], ["Cancelled", rows.filter((row) => row.purchase_status === "CANCELLED").length], ["Edited", rows.filter((row) => row.purchase_status === "EDITED").length]],
       headers: ["Purchase", "Date", "Supplier", "Status", "Amount", "Changed By", "Reason"],
-      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td>{row.purchase_status}</td><td>{money(row.net_payable)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancellation_reason || row.edit_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td>{row.purchase_status}</td><td>{money(row.net_payable)}</td><td>{row.changed_by_name || MISSING_VALUE}</td><td>{row.cancellation_reason || row.edit_reason || MISSING_VALUE}</td></tr>,
     },
     pendingPurchaseBills: {
       title: "Pending Purchase Bills",
       rows: filterRows(data.pendingPurchaseBillsReport),
       summary: (rows) => [["Pending Bills", purchaseItemCounts(rows).size, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
       headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Remarks"],
-      render: (row, index) => <tr key={`${row.id}-${row.batch_no || index}`}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(pendingItemRate(row))}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.id}-${row.batch_no || index}`}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(pendingItemRate(row))}</td><td>{row.remarks || MISSING_VALUE}</td></tr>,
     },
     stockWithoutBill: {
       title: "Stock Received Without Bill",
@@ -19160,7 +19674,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: customerLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || MISSING_VALUE}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     supplierLedger: {
       title: "Supplier Ledger",
@@ -19170,14 +19684,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         return [["Opening b/f", supplierOpeningTile], ["Debits", money(totalOf(periodRows, "debit")), true], ["Credits", money(totalOf(periodRows, "credit"))], ["Rows", periodRows.length]];
       },
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{row.running_balance === null ? MISSING_VALUE : `${money(Math.abs(Number(row.running_balance || 0)))} ${Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}`}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || MISSING_VALUE}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{row.running_balance === null ? MISSING_VALUE : `${money(Math.abs(Number(row.running_balance || 0)))} ${Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}`}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
       rows: accountStatementRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {labelFor("accountType", row.account_type)}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {labelFor("accountType", row.account_type)}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || MISSING_VALUE}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     paymentReport: {
       title: "Payment Report",
@@ -19188,7 +19702,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         return [["Payments", money(totals.payments), true], ["Rebates", money(totals.rebates)], ["Cancelled", money(totals.cancelled)], ["Entries", totals.entries]];
       },
       headers: ["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"],
-      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{labelFor("transactionType", row.payment_type)}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{labelFor("transactionType", row.payment_type)}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || MISSING_VALUE}</td></tr>,
     },
     paymentModeSummary: {
       title: "Payment Mode Summary",
@@ -19216,7 +19730,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.returnHistoryReport),
       summary: (rows) => [["Return Value", money(totalOf(rows, "total_return_amount")), true], ["Returns", rows.length]],
       headers: ["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"],
-      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || "-"}</td><td>{row.customer_name}</td><td>{labelFor("refundType", row.refund_type)}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || "-"}</td></tr>,
+      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || MISSING_VALUE}</td><td>{row.customer_name}</td><td>{labelFor("refundType", row.refund_type)}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || MISSING_VALUE}</td></tr>,
     },
     returnValue: {
       title: "Return Value Report",
@@ -19293,7 +19807,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       rows: filterRows(data.stockMovementReport),
       summary: (rows) => [["Quantity", number(totalOf(rows, "quantity")), true], ["Movements", number(totalOf(rows, "movement_count"))]],
       headers: ["Date", "Product", "Type", "Quantity", "Count", "Remarks"],
-      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{labelFor("transactionType", row.transaction_type)}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{labelFor("transactionType", row.transaction_type)}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || MISSING_VALUE}</td></tr>,
     },
     stockValuation: {
       title: "Stock Valuation",
@@ -19311,7 +19825,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         const status = String(row.batch_status || "ACTIVE").toUpperCase();
         const balance = Number(row.remaining_qty ?? row.balance_qty ?? 0);
         const statusLabel = status === "CANCELLED" ? "Cancelled" : status === "INACTIVE" ? "Inactive" : balance <= 0 ? "Sold Out" : "Active";
-        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{labelFor("stockSource", row.stock_source || "PURCHASE")}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
+        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{labelFor("stockSource", row.stock_source || "PURCHASE")}</span></td><td>{row.supplier_name || MISSING_VALUE}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
       },
     },
     profitLoss: {
@@ -19375,14 +19889,14 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         ["Total Closing", money(cashBookData.total_closing), true],
       ],
       headers: ["Date", "Particulars / Account", "Narration", "Receipt Cash", "Receipt Bank/UPI/Card", "Payment Cash", "Payment Bank/UPI/Card", "Cash Balance", "Bank Balance", "Total Balance", "Reference / Bill No"],
-      render: (row, index) => <tr className="report-row-clickable" onClick={() => setCashBookDetail(row)} key={`${row.date}-${row.reference_no}-${index}`}><td className="date-cell">{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.account_name || row.party_name}</td><td className="purchase-items-cell"><span title={row.narration}>{row.narration || "-"}</span></td><td className="amount-cell">{money(row.receipt_cash)}</td><td className="amount-cell">{money(row.receipt_bank)}</td><td className="amount-cell">{money(row.payment_cash)}</td><td className="amount-cell">{money(row.payment_bank)}</td><td className="amount-cell">{money(row.cash_balance)}</td><td className="amount-cell">{money(row.bank_balance)}</td><td className="profit-cell amount-cell">{money(row.total_balance)}</td><td>{row.reference_no || "-"}</td></tr>,
+      render: (row, index) => <tr className="report-row-clickable" onClick={() => setCashBookDetail(row)} tabIndex={0} onKeyDown={activateOnEnter(() => setCashBookDetail(row))} key={`${row.date}-${row.reference_no}-${index}`}><td className="date-cell">{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.account_name || row.party_name}</td><td className="purchase-items-cell"><span title={row.narration}>{row.narration || MISSING_VALUE}</span></td><td className="amount-cell">{money(row.receipt_cash)}</td><td className="amount-cell">{money(row.receipt_bank)}</td><td className="amount-cell">{money(row.payment_cash)}</td><td className="amount-cell">{money(row.payment_bank)}</td><td className="amount-cell">{money(row.cash_balance)}</td><td className="amount-cell">{money(row.bank_balance)}</td><ProfitCell className="amount-cell" format={money} value={row.total_balance} /><td>{row.reference_no || MISSING_VALUE}</td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
       rows: filterRows(data.expenseReport),
       summary: (rows) => [["Total Expenses", money(totalOf(rows.filter((row) => row.status !== "CANCELLED"), "amount")), true], ["Cash", money(totalOf(rows.filter((row) => row.payment_mode === "CASH" && row.status !== "CANCELLED"), "amount"))], ["UPI", money(totalOf(rows.filter((row) => row.payment_mode === "UPI" && row.status !== "CANCELLED"), "amount"))], ["Cancelled", money(totalOf(rows.filter((row) => row.status === "CANCELLED"), "amount"))]],
       headers: ["Date", "Category", "Paid To", "Payment Mode", "Amount", "Reference", "Remarks", "Status"],
-      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{labelFor("recordStatus", row.status || "ACTIVE")}</span></td></tr>,
+      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || MISSING_VALUE}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{money(row.amount)}</td><td>{row.reference_number || MISSING_VALUE}</td><td>{row.remarks || row.cancellation_reason || MISSING_VALUE}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{labelFor("recordStatus", row.status || "ACTIVE")}</span></td></tr>,
     },
   };
   const categories = [
@@ -19455,8 +19969,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       expenseRows.push({ category: "Other Expenses", amount: otherExpenses });
     }
     const hasTransactions = [salesRevenue, otherIncome, purchaseCost, mandiTax, freightCharges, labourCharges, otherPurchaseCharges, supplierRebateReceived, totalExpenses].some((value) => Math.abs(Number(value || 0)) > 0);
-    const periodFrom = data.dateFrom || customRange.date_from || "-";
-    const periodTo = data.dateTo || customRange.date_to || "-";
+    const periodFrom = data.dateFrom || customRange.date_from || MISSING_VALUE;
+    const periodTo = data.dateTo || customRange.date_to || MISSING_VALUE;
     return (
       <div className="profit-loss-statement">
         <div className="pl-title-block">
@@ -19496,9 +20010,16 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       </div>
     );
   };
+  // Stock on hand has no dates or search of its own, so it never says its filters changed.
+  const showReportButton = (label = "Show report", { tracksFilters = true } = {}) => (
+    <div className="report-apply-row">
+      <button className="primary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Loading…" : label}</button>
+      {tracksFilters && filtersPending && !refreshBusy && <span className="warning-note report-apply-note" role="status">Filters changed — press {label}</span>}
+    </div>
+  );
   const renderFilters = () => selectedReport === "stockInventory" ? (
     <div className="ledger-toolbar">
-      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh Inventory"}</button>
+      {showReportButton("Refresh stock", { tracksFilters: false })}
       {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   ) : (
@@ -19801,7 +20322,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
           <button className="secondary-button" onClick={() => setPurchaseFilters({ supplier: "", product: "", status: "ACTIVE", paymentType: "", date: "" })}>Clear Purchase Filters</button>
         </>
       )}
-      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh"}</button>
+      {showReportButton()}
       {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   );
@@ -19841,7 +20362,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     }
     if (column === "Date") return formatDisplayDate(value);
     if (column === "Qty") return number(value);
-    return value || "-";
+    return value || MISSING_VALUE;
   };
   const renderBalanceSheetDetailModal = () => {
     if (!balanceSheetDetail && !balanceSheetDetailLoading && !balanceSheetDetailError) return null;
@@ -19854,7 +20375,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             <div>
               <span className="eyebrow">Balance Sheet Drilldown</span>
               <h2>{balanceSheetDetail?.title || "Loading Detail"}</h2>
-              <p>{balanceSheetDetail ? `${formatDisplayDate(balanceSheetDetail.dateFrom)} to ${formatDisplayDate(balanceSheetDetail.dateTo)} | Closing as at ${formatDisplayDate(balanceSheetDetail.asAtDate || balanceSheetDetail.dateTo)}` : "Fetching source transactions..."}</p>
+              <p>{balanceSheetDetail ? `${formatDisplayDate(balanceSheetDetail.dateFrom)} to ${formatDisplayDate(balanceSheetDetail.dateTo)} | Closing as at ${formatDisplayDate(balanceSheetDetail.asAtDate || balanceSheetDetail.dateTo)}` : "Fetching source transactions…"}</p>
             </div>
             <button className="secondary-button" onClick={() => { setBalanceSheetDetail(null); setBalanceSheetDetailError(""); }}>Close</button>
           </div>
@@ -19913,18 +20434,18 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             <SummaryMetric label="Payment Cash" value={money(totalPaymentCash)} />
             <SummaryMetric featured label="Payment Bank" value={money(totalPaymentBank)} />
           </div>
-          <DataTable headers={["Date & Time", "Voucher / Invoice", "Type", "Party", "Mode", "Cash", "Bank", "Remarks", "Created By", "Source"]}>
+          <DataTable headers={markNumericColumns(["Date & Time", "Voucher / Invoice", "Type", "Party", "Mode", "Cash", "Bank", "Remarks", "Created By", "Source"])}>
             {sourceRows.map((row, index) => (
               <tr key={`${row.source_type}-${row.source_id}-${index}`}>
                 <td>{formatDisplayDate(row.date)}<small className="cell-note">{row.entry_time ? new Date(row.entry_time).toLocaleTimeString("en-IN") : ""}</small></td>
-                <td className="primary-cell">{row.reference_no || "-"}</td>
+                <td className="primary-cell">{row.reference_no || MISSING_VALUE}</td>
                 <td>{labelFor("transactionType", row.source_type)}</td>
-                <td>{row.party_name || row.account_name || "-"}</td>
+                <td>{row.party_name || row.account_name || MISSING_VALUE}</td>
                 <td>{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="amount-cell">{money(Number(row.receipt_cash || 0) || Number(row.payment_cash || 0))}</td>
                 <td className="amount-cell">{money(Number(row.receipt_bank || 0) || Number(row.payment_bank || 0))}</td>
-                <td className="purchase-items-cell">{row.narration || "-"}</td>
-                <td>{row.created_by_name || "-"}</td>
+                <td className="purchase-items-cell">{row.narration || MISSING_VALUE}</td>
+                <td>{row.created_by_name || MISSING_VALUE}</td>
                 <td>{labelFor("transactionType", row.source_type)}</td>
               </tr>
             ))}
@@ -19951,7 +20472,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     };
     const groupCashBookRows = (rows) => {
       if (cashBookViewMode === "ENTRY") {
-        return rows.map((row) => ({ ...row, source_rows: [row], group_label: cashBookGroupLabel(row), ledger_folio: row.reference_no || "-" }));
+        return rows.map((row) => ({ ...row, source_rows: [row], group_label: cashBookGroupLabel(row), ledger_folio: row.reference_no || MISSING_VALUE }));
       }
       return [...rows.reduce((groups, row) => {
         const side = Number(row.receipt_cash || 0) || Number(row.receipt_bank || 0) ? "RECEIPT" : "PAYMENT";
@@ -19959,7 +20480,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         const key = [periodKey, side, row.account_type || "", row.account_name || row.party_name || "", row.mode_group || ""].join("|");
         const current = groups.get(key) || {
           date: cashBookGroupBy === "PERIOD" ? (cashBookData.dateFrom || data.dateFrom) : periodKey,
-          account_name: row.account_name || row.party_name || "-",
+          account_name: row.account_name || row.party_name || MISSING_VALUE,
           account_type: row.account_type,
           party_name: row.party_name,
           mode_group: row.mode_group,
@@ -19991,11 +20512,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     const paymentSideCashTotal = cashBookPaymentsCash + cashBookClosingCash;
     const paymentSideBankTotal = cashBookPaymentsBank + cashBookClosingBank;
     const renderBookRow = (row, side) => (
-      <tr className="report-row-clickable" key={`${side}-${row.group_label}-${row.account_name}-${row.mode_group || ""}-${row.source_id || row.reference_no}`} onClick={() => setCashBookDetail(row)}>
+      <tr className="report-row-clickable" key={`${side}-${row.group_label}-${row.account_name}-${row.mode_group || ""}-${row.source_id || row.reference_no}`} onClick={() => setCashBookDetail(row)} tabIndex={0} onKeyDown={activateOnEnter(() => setCashBookDetail(row))}>
         <td className="date-cell">{cashBookViewMode === "ENTRY" ? formatDisplayDate(row.date) : row.group_label}</td>
         <td className="primary-cell">
-          {side === "RECEIPT" ? "To " : "By "}{row.account_name || row.party_name || "-"} A/c
-          {cashBookViewMode === "ENTRY" && showCashBookRemarks && <small className="cell-note">{row.narration || "-"}</small>}
+          {side === "RECEIPT" ? "To " : "By "}{row.account_name || row.party_name || MISSING_VALUE} A/c
+          {cashBookViewMode === "ENTRY" && showCashBookRemarks && <small className="cell-note">{row.narration || MISSING_VALUE}</small>}
           {cashBookViewMode === "SUMMARY" && <small className="cell-note">{row.source_rows.length} entr{row.source_rows.length === 1 ? "y" : "ies"}</small>}
         </td>
         <td className="status-cell">{row.ledger_folio || "—"}</td>
@@ -20005,10 +20526,10 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     );
     return (
       <section className="cash-book-statement">
+        {/* What this book covers, in one line. The report's name is already the card's (and the
+            printed page's) heading; "Traditional Double-Sided Format / CASH BOOK" said it twice more. */}
         <div className="pl-title-block cash-book-title">
-          <span>Traditional Double-Sided Format</span>
-          <h2>CASH BOOK</h2>
-          <p>{cashBookAccountLabel} | {cashBookViewMode === "SUMMARY" ? "Account Summary" : "Entry-wise"} | {cashBookGroupBy === "PERIOD" ? "Entire Selected Period" : cashBookGroupBy === "DATE" ? "Date-wise" : "Month-wise"} | {formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to {formatDisplayDate(cashBookData.dateTo || data.dateTo)}</p>
+          <p>{cashBookAccountLabel} · {cashBookViewMode === "SUMMARY" ? "Account summary" : "Entry by entry"} · {cashBookGroupBy === "PERIOD" ? "Whole period" : cashBookGroupBy === "DATE" ? "Day by day" : "Month by month"} · {formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to {formatDisplayDate(cashBookData.dateTo || data.dateTo)}</p>
         </div>
         {(cashBookClosingCash < 0 || cashBookClosingBank < 0) && (
           <div className="cash-book-warning">
@@ -20055,33 +20576,42 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             </DataTable>
           </section>
         </div>
-        <div className="cash-book-closing">
-          <span>Total Cash Receipts: <strong>{money(cashBookReceiptsCash)}</strong></span>
-          <span>Total Bank Receipts: <strong>{money(cashBookReceiptsBank)}</strong></span>
-          <span>Total Cash Payments: <strong>{money(cashBookPaymentsCash)}</strong></span>
-          <span>Total Bank Payments: <strong>{money(cashBookPaymentsBank)}</strong></span>
-          <span>Closing Cash: <strong>{money(cashBookClosingCash)}</strong></span>
-          <span>Closing Bank: <strong>{money(cashBookClosingBank)}</strong></span>
-          <span>Total Cash + Bank: <strong>{money(cashBookData.total_closing)}</strong></span>
-        </div>
+        {/* The receipts, payments and closing totals are the tiles above the book; the line of
+            "Closing Cash:" figures that repeated them here is gone. */}
       </section>
     );
   };
   if (currentReport) {
     const rows = currentReport.rows || [];
-    const handleReportPrintOption = () => {
+    // The results card is named after the report, with its row count small beside it (it was titled
+    // "0 rows"), and says which dates and search it shows, or that new ones are waiting.
+    const resultsHeading = reportResultsHeading({ title: currentReport.title, selectedReport, rowCount: rows.length });
+    const resultsSubtitle = selectedReport === "stockInventory"
+      ? "Stock as it is now. The filters are just below."
+      : filtersPending
+        ? "Still showing the last report. Press Show report for the new dates or search."
+        : `${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}${appliedSearch ? `, search "${appliedSearch}"` : ""}.`;
+    // Asked in the app, not a browser box. Either answer goes on to print; "Leave it out" is what
+    // the old Cancel did.
+    const askIncludeNarration = (title) => askNarration({
+      title,
+      message: "Narration is the notes and item details under each entry.",
+      confirmLabel: "Include narration",
+      cancelLabel: "Leave it out",
+    });
+    const handleReportPrintOption = async () => {
       if (selectedReport === "purchaseHistory") {
-        const includeNarration = window.confirm("Print narration/details?");
+        const includeNarration = await askIncludeNarration("Print narration and details?");
         purchasePrintNarrationRef.current = includeNarration;
         setPurchasePrintNarration(includeNarration);
       }
       if (selectedReport === "salesHistory") {
-        const includeNarration = window.confirm("Print narration/details?");
+        const includeNarration = await askIncludeNarration("Print narration and details?");
         salesPrintNarrationRef.current = includeNarration;
         setSalesPrintNarration(includeNarration);
       }
       if (["customerLedger", "supplierLedger", "accountStatement"].includes(selectedReport)) {
-        const includeNarration = window.confirm("Print narration/details also?");
+        const includeNarration = await askIncludeNarration("Print narration and details too?");
         ledgerPrintNarrationRef.current = includeNarration;
         setLedgerPrintNarration(includeNarration);
       }
@@ -20134,10 +20664,10 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       if (isOrderReport && orderReportsState.notice) parts.push(orderReportsState.notice);
       if (selectedReport === "salesHistory") {
         parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
-        parts.push(`Status: ${salesFilters.status}`);
-        if (salesFilters.customerMode !== "ALL") parts.push(`Customer: ${salesFilters.customerMode.replaceAll("_", " ")}`);
-        if (salesFilters.userMode !== "ALL") parts.push(`Users: ${salesFilters.userMode.replaceAll("_", " ")}`);
-        if (salesFilters.paymentMode) parts.push(`Payment: ${salesFilters.paymentMode}`);
+        parts.push(`Status: ${labelFor("status", salesFilters.status)}`);
+        if (salesFilters.customerMode !== "ALL") parts.push(`Customer: ${labelFor("filterMode", salesFilters.customerMode)}`);
+        if (salesFilters.userMode !== "ALL") parts.push(`Users: ${labelFor("filterMode", salesFilters.userMode)}`);
+        if (salesFilters.paymentMode) parts.push(`Payment: ${labelFor("paymentMode", salesFilters.paymentMode)}`);
         if (salesFilters.product) parts.push(`Product filter active`);
         if (salesFilters.lot) parts.push(`Lot filter active`);
       }
@@ -20153,11 +20683,17 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
             </div>
             {renderFilters()}
           </ModuleCard>
-          <ModuleCard eyebrow="Results" title={selectedReport === "stockInventory" ? "Stock on hand" : ["profitLoss", "balanceSheet", "cashBook"].includes(selectedReport) ? "Statement" : `${rows.length} row${rows.length === 1 ? "" : "s"}`} subtitle={selectedReport === "stockInventory" ? "Uses the filters shown below." : "Matching the filters above."}>
+          <ModuleCard
+            eyebrow="Results"
+            title={<>{resultsHeading.title}{resultsHeading.count && <small className="report-result-count">{resultsHeading.count}</small>}</>}
+            subtitle={resultsSubtitle}
+          >
             <PrintableReport
               beforePdfExport={handleReportPrintOption}
               beforePrint={handleReportPrintOption}
               canWhatsappSend={canWhatsappSend}
+              emptyReason={reportHasContent({ selectedReport, rowCount: rows.length, available: reportAvailability.available }) ? "" : "Nothing to print or export: this report has no rows for these filters."}
+              showToolbarTitle={false}
               fileName={reportFileName}
               reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : selectedReport === "cashBook" ? "cash-book-print-report" : ""}
               title={currentReport.title}
@@ -20195,7 +20731,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
               {selectedReport === "stockInventory" && loadPackingStock && <PackingStockPanel loadPacking={loadPackingStock} />}
               {selectedReport === "stockInventory" ? null : selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
                 <>
-                  <DataTable headers={currentReport.headers}>
+                  <DataTable headers={markNumericColumns(currentReport.headers, { also: ["Value"] })}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
                   </DataTable>
                   {rows.length === 0 && (
@@ -20250,13 +20786,11 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     <section className="settings-layout">
       {/* The range every report opens with. Named here because it is an effective filter: an
           unnamed "today" once made a month of sales look missing. */}
-      <section className="content-card">
-        <p className="form-note">
-          Reports open for <strong>{REPORT_RANGE_LABELS[appliedQuery.range] || "the chosen dates"}</strong>
-          {` (${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}). `}
-          Change the dates inside any report.
-        </p>
-      </section>
+      <ModuleCard
+        eyebrow="Report Center"
+        title="Choose a report"
+        subtitle={<>Reports open for <strong>{REPORT_RANGE_LABELS[appliedQuery.range] || "the chosen dates"}</strong>{` (${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}). `}Change the dates inside any report.</>}
+      />
       <section className="report-center-grid">
         {categories.map((category) => (
           <button className="report-category-card" key={category.id} onClick={() => setSelectedCategory(category.id)}>
@@ -20285,7 +20819,8 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const [auditFocus, setAuditFocus] = useState(null);
   const [selectedLotDetail, setSelectedLotDetail] = useState(null);
   const money = (value) => currency.format(Number(value || 0));
-  const qty = (value) => Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
+  // Quantities carry three decimals everywhere else in the app; this screen showed "71.5".
+  const qty = (value) => Number(value || 0).toLocaleString("en-IN", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
   const lotBalance = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
   const lotOpening = (lot) => Number(lot.purchase_qty || 0);
   const lotUsed = (lot) => Number(lot.sold_qty ?? Math.max(lotOpening(lot) - Number(lot.remaining_qty || 0), 0));
@@ -20312,8 +20847,8 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const statusClass = (status) => status === "Active" ? "stock-ok" : status === "Sold Out" ? "origin-rate" : "stock-low";
   const formatUnitGroups = (groups) => [...groups.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([unit, value]) => `${qty(value)} ${unit}`)
-    .join(" • ") || "-";
+    .map(([unit, value]) => `${qty(value)} ${unitDisplayName(unit)}`)
+    .join(" • ") || MISSING_VALUE;
   const addUnitValue = (groups, unit, value) => {
     const key = normalizeUnit(unit);
     groups.set(key, (groups.get(key) || 0) + Number(value || 0));
@@ -20375,12 +20910,12 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const lotOptions = selectedProductLots.map((lot) => [
     String(lot.id),
     [
-      lot.lot_name || lot.batch_no || "No Lot Number",
+      stockLotName(lot, formatDisplayDate),
       lot.lot_size,
       lot.supplier_name,
-      `${qty(lotBalance(lot))} ${normalizeUnit(lot.unit)}`,
+      `${qty(lotBalance(lot))} ${unitDisplayName(normalizeUnit(lot.unit))}`,
       money(lotSaleRate(lot)),
-    ].filter(Boolean).join(" / "),
+    ].filter(Boolean).join(" · "),
   ]);
   const updateProductFilter = (productId) => {
     setFilters((current) => ({ ...current, product: productId, lot: "", lotSearch: "" }));
@@ -20537,10 +21072,10 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const auditChangeSummary = (row) => {
     const oldValue = row.old_value || {};
     const newValue = row.new_value || {};
-    const beforeQty = oldValue.remaining_qty ?? oldValue.purchase_qty ?? "-";
-    const afterQty = newValue.remaining_qty ?? newValue.purchase_qty ?? "-";
-    const beforeRate = oldValue.purchase_rate ?? oldValue.effective_cost_per_unit ?? "-";
-    const afterRate = newValue.purchase_rate ?? newValue.effective_cost_per_unit ?? "-";
+    const beforeQty = oldValue.remaining_qty ?? oldValue.purchase_qty ?? MISSING_VALUE;
+    const afterQty = newValue.remaining_qty ?? newValue.purchase_qty ?? MISSING_VALUE;
+    const beforeRate = oldValue.purchase_rate ?? oldValue.effective_cost_per_unit ?? MISSING_VALUE;
+    const afterRate = newValue.purchase_rate ?? newValue.effective_cost_per_unit ?? MISSING_VALUE;
     return `Qty ${beforeQty} -> ${afterQty} | Cost ${beforeRate} -> ${afterRate}`;
   };
   const clearFilters = () => {
@@ -20590,12 +21125,12 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const renderLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
-      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
+      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)} tabIndex={0} onKeyDown={activateOnEnter(() => openLotDetail(lot))}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{labelFor("unit", lot.unit)}</small></td>
         <td>{lot.category || "Fruit"}</td>
-        <td>{lot.supplier_name || "-"}</td>
+        <td>{lot.supplier_name || MISSING_VALUE}</td>
         <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}</td>
-        <td>{lot.lot_size || "-"}</td>
+        <td>{lot.lot_size || MISSING_VALUE}</td>
         <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
         <td>{qty(lotOpening(lot))}</td>
         <td>{qty(lotUsed(lot))}</td>
@@ -20605,22 +21140,22 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         <td>{money(lotSaleRate(lot))}</td>
         {canManageStock && <td>{money(lotBalance(lot) * lotCost(lot))}</td>}
         <td><span className={statusClass(status)}>{displayStockStatus(status)}</span></td>
-        <td className="purchase-items-cell"><span title={lot.remarks || "-"}>{lot.remarks || "-"}</span></td>
-        <td>{lot.created_at ? new Date(lot.created_at).toLocaleString("en-IN") : "-"}</td>
-        <td>{lot.last_edited_at ? new Date(lot.last_edited_at).toLocaleString("en-IN") : "-"}</td>
+        <td className="purchase-items-cell"><span title={lot.remarks || MISSING_VALUE}>{lot.remarks || MISSING_VALUE}</span></td>
+        <td>{lot.created_at ? formatKolkataDateTime(lot.created_at) : MISSING_VALUE}</td>
+        <td>{lot.last_edited_at ? formatKolkataDateTime(lot.last_edited_at) : MISSING_VALUE}</td>
       </tr>
     );
   });
-  const compactLotHeaders = ["Product", "Lot Number", "Supplier", "Stock", "Unit", "Arrival Date", ...(canManageStock ? ["Purchase / Expected Rate"] : []), "Sale Rate", ...(canManageStock ? ["Stock Value"] : []), "Status"];
+  const compactLotHeaders = markNumericColumns(["Product", "Lot", "Supplier", "In stock", "Unit", "Arrived", ...(canManageStock ? ["Cost price"] : []), "Sale rate", ...(canManageStock ? ["Stock value"] : []), "Status"], { also: ["In stock", "Cost price"] });
   const renderCompactLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
-      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
+      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)} tabIndex={0} onKeyDown={activateOnEnter(() => openLotDetail(lot))}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.category || ""}</small></td>
-        <td className="primary-cell">{lot.lot_name || lot.batch_no || "No Lot Number"}<small className="cell-note">{lot.lot_size || ""}</small></td>
-        <td>{lot.supplier_name || "-"}</td>
+        <td className="primary-cell">{stockLotName(lot, formatDisplayDate)}<small className="cell-note">{lot.lot_size || ""}</small></td>
+        <td>{lot.supplier_name || MISSING_VALUE}</td>
         <td><span className={lotBalance(lot) <= 0 ? "origin-rate" : "stock-ok"}>{qty(lotBalance(lot))}</span></td>
-        <td>{normalizeUnit(lot.unit)}</td>
+        <td>{unitDisplayName(normalizeUnit(lot.unit))}</td>
         <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
         {canManageStock && <td>{money(lotCost(lot))}</td>}
         <td>{money(lotSaleRate(lot))}</td>
@@ -20633,13 +21168,14 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   return (
     <section className="stock-inventory-report">
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric featured label="Total Stock Value" value={canManageStock ? money(totalStockValue) : "Restricted"} />
+        {/* A failed load is not an empty shop: every figure reads "—" beside the error, never ₹0.00 or 0. */}
+        <SummaryMetric featured label="Total stock value" value={!canManageStock ? "Restricted" : inventoryUnavailable ? MISSING_VALUE : money(totalStockValue)} />
         <SummaryMetric label="Products" value={inventoryPresentation.countLabel} />
-        <SummaryMetric label="Active Lots" value={filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
-        <SummaryMetric label="Stock" value={formatUnitGroups(filteredUnitGroups)} />
-        <SummaryMetric label="Out-of-Stock Lots" value={filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
-        <SummaryMetric label="Low Stock Items" value={lowStockItems} />
-        <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : auditError ? MISSING_VALUE : adjustmentCount} />
+        <SummaryMetric label="Active lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
+        <SummaryMetric label="Stock" value={inventoryUnavailable ? MISSING_VALUE : formatUnitGroups(filteredUnitGroups)} />
+        <SummaryMetric label="Sold-out lots" value={inventoryUnavailable ? MISSING_VALUE : filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
+        <SummaryMetric label="Low-stock items" value={inventoryUnavailable ? MISSING_VALUE : lowStockItems} />
+        <SummaryMetric label="Stock corrections" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : auditError ? MISSING_VALUE : adjustmentCount} />
       </div>
       {inventoryLoading && <div className="cart-empty">{inventoryPresentation.message}</div>}
       {inventoryUnavailable && <div className="error-banner" role="alert" data-report-note="">{inventoryPresentation.message}</div>}
@@ -20648,19 +21184,19 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
       {auditError && <div className="error-banner" role="alert" data-report-note="">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
-          <Field label="Product Search / Selector">
+          <Field label="Product">
             <div className="stacked-control">
-              <input placeholder="Search or select product..." value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} />
+              <input placeholder="Search products…" value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} />
               <select value={filters.product} onChange={(event) => updateProductFilter(event.target.value)}>
                 <option value="">All products</option>
                 {productOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
               </select>
             </div>
           </Field>
-          <Field label="View Mode">
+          <Field label="Show">
             <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
-              <option value="PRODUCT">Product View</option>
-              <option value="LOT">Lot View</option>
+              <option value="PRODUCT">By product</option>
+              <option value="LOT">By lot</option>
             </select>
           </Field>
           <div className="stock-filter-actions">
@@ -20678,26 +21214,26 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
             >
               More
             </button>
-            {activeFilterChips.length > 0 && <button className="secondary-button stock-clear-button" onClick={clearFilters}>Clear All Filters</button>}
+            {activeFilterChips.length > 0 && <button className="secondary-button stock-clear-button" onClick={clearFilters}>Clear filters</button>}
           </div>
         </div>
         <div className="quick-filter-row no-print">
-          <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Today&apos;s Arrivals</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Arrived today</button>
           <button className="filter-chip" onClick={() => {
             const date = new Date();
             date.setDate(date.getDate() - 6);
             setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
-          }}>Last 7 Days</button>
+          }}>Last 7 days</button>
           <button className="filter-chip" onClick={() => {
             const date = new Date();
             date.setDate(date.getDate() - 29);
             setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
-          }}>Last 30 Days</button>
-          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "LOW_STOCK" })}>Low Stock</button>
-          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "OUT_OF_STOCK", showEmpty: true })}>Out of Stock</button>
+          }}>Last 30 days</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "LOW_STOCK" })}>Low stock</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "OUT_OF_STOCK", showEmpty: true })}>Out of stock</button>
           <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "IMPORTED" })}>Imported</button>
           <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "LOCAL" })}>Local</button>
-          <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently Updated</button>
+          <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently updated</button>
         </div>
         {/* Every effective filter stays named here even while the panel below is collapsed. */}
         <div className="active-filter-chip-row no-print">
@@ -20795,7 +21331,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         )}
       </div>
       {viewMode === "PRODUCT" && (
-        <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"]}>
+        <DataTable className="stock-inventory-products" headers={markNumericColumns(["Product", "Category", "In stock", "Lots", "Average cost", "Sale rate", "Stock value", "Low-stock alert", "Status"], { also: ["In stock", "Lots", "Low-stock alert"] })}>
           {filteredProductRows.map((product) => {
             const visibleBalance = product.visible_lots.reduce((sum, lot) => sum + lotBalance(lot), 0);
             const visibleValue = product.filtered_stock_value;
@@ -20804,8 +21340,8 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
             const toggleProduct = () => setExpandedProductId(expandedProductId === String(product.product_id) ? "" : String(product.product_id));
             return (
               <React.Fragment key={product.product_id}>
-                <tr className="report-row-clickable" data-inventory-product-row={String(product.product_id)} onClick={toggleProduct}>
-                  <td className="primary-cell">{product.product_name}<small className="cell-note">Click to view lots</small></td>
+                <tr className="report-row-clickable" data-inventory-product-row={String(product.product_id)} onClick={toggleProduct} tabIndex={0} onKeyDown={activateOnEnter(toggleProduct)}>
+                  <td className="primary-cell">{product.product_name}<small className="cell-note">{expandedProductId === String(product.product_id) ? "Hide lots" : "Show lots"}</small></td>
                   <td>{product.category}</td>
                   <td>{product.total_stock_summary}</td>
                   <td>{product.filtered_active_lots}</td>
@@ -20813,7 +21349,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
                   <td>{money(product.sale_rate)}</td>
                   <td>{canManageStock ? money(visibleValue) : "Restricted"}</td>
                   <td>{qty(product.minimum_stock)}</td>
-                  <td><span className={low ? "stock-low" : "stock-ok"}>{low ? "Low Stock" : "OK"}</span></td>
+                  <td><span className={low ? "stock-low" : "stock-ok"}>{low ? "Low stock" : "In stock"}</span></td>
                 </tr>
                 {expandedProductId === String(product.product_id) && (
                   <tr className="sales-history-drilldown-row">
@@ -20843,9 +21379,9 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         </p>
       )}
       {viewMode === "CATEGORY" && (
-        <DataTable headers={["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count"]}>
+        <DataTable headers={markNumericColumns(["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count"])}>
           {filteredCategoryRows.map((category) => (
-            <tr className="report-row-clickable" key={category.category} onClick={() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); }}>
+            <tr className="report-row-clickable" key={category.category} onClick={() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); }} tabIndex={0} onKeyDown={activateOnEnter(() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); })}>
               <td className="primary-cell">{category.category}</td>
               <td>{category.product_rows.length}</td>
               <td>{qty(category.product_rows.reduce((sum, product) => sum + product.total_stock, 0))}</td>
@@ -20875,12 +21411,12 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
               <DataTable headers={["Field", "Value"]}>
                 <tr><td>Product</td><td className="primary-cell">{selectedLotDetail.product_name}</td></tr>
                 <tr><td>Category</td><td>{selectedLotDetail.category || "Fruit"}</td></tr>
-                <tr><td>Supplier</td><td>{selectedLotDetail.supplier_name || "-"}</td></tr>
+                <tr><td>Supplier</td><td>{selectedLotDetail.supplier_name || MISSING_VALUE}</td></tr>
                 <tr><td>Lot / Size</td><td>{[selectedLotDetail.lot_name || selectedLotDetail.batch_no || `Lot #${selectedLotDetail.id}`, selectedLotDetail.lot_size].filter(Boolean).join(" / ")}</td></tr>
                 <tr><td>Opening / Sold / Adjusted</td><td>{qty(lotOpening(selectedLotDetail))} / {qty(lotUsed(selectedLotDetail))} / {qty(selectedLotDetail.adjusted_qty)}</td></tr>
                 <tr><td>Cost / Sale Rate</td><td>{money(lotCost(selectedLotDetail))} / {money(lotSaleRate(selectedLotDetail))}</td></tr>
                 <tr><td>Opening Date</td><td>{formatDisplayDate(selectedLotDetail.purchase_date || selectedLotDetail.created_at)}</td></tr>
-                <tr><td>Remarks</td><td>{selectedLotDetail.remarks || "-"}</td></tr>
+                <tr><td>Remarks</td><td>{selectedLotDetail.remarks || MISSING_VALUE}</td></tr>
               </DataTable>
               <div className="detail-action-bar no-print">
                 {renderLotActions(selectedLotDetail)}
@@ -20903,13 +21439,13 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
               <DataTable headers={["Date", "Product", "Lot", "Action", "Qty / Rate Change", "Reason", "Edited By"]}>
                 {focusedAuditRows.map((row) => (
                   <tr key={row.id}>
-                    <td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td>
+                    <td>{row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}</td>
                     <td className="primary-cell">{row.product_name}</td>
-                    <td>{row.lot_name || row.lot_id || "-"}</td>
+                    <td>{row.lot_name || row.lot_id || MISSING_VALUE}</td>
                     <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                     <td>{auditChangeSummary(row)}</td>
-                    <td>{row.reason || "-"}</td>
-                    <td>{row.edited_by_name || "-"}</td>
+                    <td>{row.reason || MISSING_VALUE}</td>
+                    <td>{row.edited_by_name || MISSING_VALUE}</td>
                   </tr>
                 ))}
                 {focusedAuditRows.length === 0 && <tr><td colSpan="7" className="empty-cell">No audit entries found.</td></tr>}
@@ -21030,7 +21566,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
         });
       } catch (error) {
         setSaving(false);
-        setOutcome({ tone: "error", text: describeApprovalError(error) });
+        setOutcome(errorNotice(describeApprovalError(error)));
         return;
       }
     }
@@ -21048,7 +21584,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
       // A refused or spent approval cannot be reused; the next try asks again.
       if (String(error?.response?.data?.code || "").includes("APPROVAL")) pendingWrite.current.approvalId = "";
       setSaving(false);
-      setOutcome({ tone: "error", text: getErrorMessage(error, "The return was not saved.") });
+      setOutcome(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The return was not saved.")));
       return;
     }
     pendingWrite.current = { fingerprint: "", operationId: "", approvalId: "" };
@@ -21070,13 +21606,14 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
       refreshNote = `The lists on this screen could not refresh (${getErrorMessage(error, "unknown error")}). Reopen Sale Returns to see it.`;
     }
     setSaving(false);
-    setOutcome({ tone: refreshNote ? "warning" : "ok", text: refreshNote ? `${savedText} ${refreshNote}` : savedText });
+    // Said as a banner, green when all went through: the cashier looks up from the customer to it.
+    setOutcome(refreshNote ? warningNotice(`${savedText} ${refreshNote}`) : successNotice(savedText));
   };
 
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Sale Return / Refund" title="Return Entry" subtitle="Create a separate return record without editing the original invoice.">
-        <div className="form-grid supplier-form-grid">
+        <div className="form-grid supplier-form-grid return-entry-grid">
           <Field label="Find Invoice">
             <input
               placeholder="Invoice no, customer or mobile"
@@ -21087,7 +21624,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
           </Field>
           <Field label="Select Invoice">
             <select disabled={invoiceList.status !== "ready" || saving} value={invoiceId} onChange={(event) => loadReturnOptions(event.target.value)}>
-              <option value="">{invoiceList.status === "loading" ? "Loading bills..." : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : invoiceSearch.trim() ? "No bill matches" : allBills ? "No bills yet" : `No bills in the last ${RETURN_INVOICE_DEFAULT_DAYS} days`}</option>
+              <option value="">{invoiceList.status === "loading" ? "Loading bills…" : invoiceList.status === "error" ? "Bills could not be loaded" : invoices.length ? "Select invoice" : invoiceSearch.trim() ? "No bill matches" : allBills ? "No bills yet" : `No bills in the last ${RETURN_INVOICE_DEFAULT_DAYS} days`}</option>
               {!selectedInvoiceListed && selectedInvoice && (
                 <option value={invoiceId}>{returnInvoiceLabel(selectedInvoice)}</option>
               )}
@@ -21121,9 +21658,9 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
             <button className="table-action" disabled={saving} onClick={() => { setAllBills(true); loadInvoices({ older: true }); }} type="button">Load older bills</button>
           </p>
         )}
-        {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items...</p>}
+        {returnOptions.status === "loading" && <p className="return-note">Loading this invoice's items…</p>}
         {returnOptions.status === "error" && <p className="return-note return-note-error" role="alert">{returnOptions.message}</p>}
-        <DataTable headers={["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Refund per unit", "Return Value"]}>
+        <DataTable className="return-items-table" headers={markNumericColumns(["Product", "Sold", "Returned", "Returnable", "Return Qty", "Refund / unit", "Return Value"], { also: ["Return Qty", "Refund / unit"] })}>
           {returnOptions.items.map((item, index) => {
             const key = canonicalInventoryId(item.sale_item_id);
             const line = draft.lines.find((entry) => canonicalInventoryId(entry.sale_item_id) === key);
@@ -21146,7 +21683,7 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
                   {lineProblem && <small className="cell-note return-line-problem">{lineProblem}</small>}
                 </td>
                 <td>{perUnit === null ? "Unknown" : currency.format(perUnit)}</td>
-                <td>{line ? (line.value === null ? "Unknown" : currency.format(line.value)) : "-"}</td>
+                <td>{line ? (line.value === null ? "Unknown" : currency.format(line.value)) : MISSING_VALUE}</td>
               </tr>
               {endsCombo && (
                 <tr className="return-combo-note">
@@ -21158,6 +21695,9 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
           })}
           {returnOptions.status === "ready" && returnOptions.items.length === 0 && (
             <tr><td className="empty-cell" colSpan="7">This invoice has no items left to return.</td></tr>
+          )}
+          {returnOptions.status === "idle" && (
+            <tr><td className="empty-cell" colSpan="7">Pick an invoice above to see what can be returned.</td></tr>
           )}
         </DataTable>
         <div className="purchase-summary-grid supplier-payment-preview">
@@ -21176,21 +21716,23 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
             {blockers.map((problem) => <li key={problem}>{problem}</li>)}
           </ul>
         )}
-        {outcome && <p className={`return-note return-note-${outcome.tone}`} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</p>}
-        <button className="primary-button" disabled={saving || !canSave} onClick={saveReturn} type="button">{saving ? "Saving..." : "Save Return / Refund"}</button>
+        <SaveNotice className="return-outcome" notice={outcome} />
+        <div className="button-row">
+          <button className="primary-button" disabled={saving || !canSave} onClick={saveReturn} type="button">{saving ? "Saving…" : "Save Return / Refund"}</button>
+        </div>
       </ModuleCard>
       <ModuleCard eyebrow="Return History" title="Sale Return History" subtitle="Returned goods, refund modes and reasons remain separate from original invoices.">
-        <DataTable headers={["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"]}>
+        <DataTable className="return-history-table" headers={markNumericColumns(["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"], { also: ["Value"] })}>
           {returns.map((entry) => (
             <tr key={entry.id}>
               <td><span className="batch-id">{entry.return_no}</span></td>
-              <td>{toDateKey(entry.return_date)}</td>
+              <td>{formatDisplayDate(entry.return_date)}</td>
               <td>{entry.invoice_no}</td>
               <td className="primary-cell">{entry.customer_name || "Walk-in"}</td>
               <td><span className="tag">{labelFor("refundType", entry.refund_type)}</span></td>
               <td>{currency.format(Number(entry.total_return_amount || 0))}</td>
-              <td>{entry.return_reason}</td>
-              <td>{(entry.items || []).map((item) => `${item.product_name} x ${Number(item.return_quantity).toLocaleString("en-IN", { maximumFractionDigits: 3 })}`).join(", ")}</td>
+              <td className="return-wrap-cell">{entry.return_reason}</td>
+              <td className="return-wrap-cell">{returnItemsText(entry.items)}</td>
             </tr>
           ))}
           {returns.length === 0 && <tr><td className="empty-cell" colSpan="8">No returns recorded yet.</td></tr>}
@@ -21200,15 +21742,11 @@ function SaleReturnModule({ approvalRoute, onSaved, returns, user }) {
   );
 }
 
-const returnInvoiceLabel = (sale) => {
-  const amount = Number(sale.amount);
-  return [
-    sale.invoice_no || `Invoice #${sale.id}`,
-    sale.sale_date ? toDateKey(sale.sale_date) : "",
-    sale.customer_name || "Walk-in",
-    Number.isFinite(amount) ? currency.format(amount) : "",
-  ].filter(Boolean).join(" - ");
-};
+// One bill in the picker, its date read the Indian way: local/counterScreens.js.
+const returnInvoiceLabel = (sale) => returnInvoiceOptionLabel(sale, {
+  formatDate: formatDisplayDate,
+  formatMoney: (amount) => currency.format(amount),
+});
 
 function WasteManagementModule({ entries, inventory, loadState = { status: "idle", message: "" }, onReload, products, user }) {
   const loadFailed = loadState.status === "failed";
@@ -21233,14 +21771,33 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
     return stock;
   }, new Map());
   const mostWasted = [...entries].reduce((map, entry) => {
-    const current = map.get(entry.product_name) || { product_name: entry.product_name, quantity: 0, cost: 0 };
+    const current = map.get(entry.product_name) || { product_name: entry.product_name, quantity: 0, cost: 0, unit: entry.unit };
     current.quantity += Number(entry.quantity || 0);
     current.cost += Number(entry.cost_amount || 0);
     map.set(entry.product_name, current);
     return map;
   }, new Map());
   const mostWastedProducts = [...mostWasted.values()].sort((left, right) => right.quantity - left.quantity).slice(0, 5);
-  const saveWaste = async () => {
+  const [wasteNotice, showWasteNotice, clearWasteNotice] = useSaveNotice();
+  const wasteProducts = products.filter((product) => product.active !== false);
+  const draftProduct = wasteProducts.find((product) => String(product.id) === String(draft.product_id)) || null;
+  // One save at a time: a double click used to record the same waste twice and take the stock twice.
+  const [wasteSaving, runWasteSave] = useSaveInFlight();
+  const saveWaste = () => runWasteSave(async () => {
+    clearWasteNotice();
+    // The server refuses these too; asked here first so the cursor lands where the gap is.
+    if (!draft.product_id) {
+      showWasteNotice(errorNotice("Choose the product that was wasted.", "waste-product"));
+      focusField("waste-product", { scroll: false });
+      return;
+    }
+    if (!(Number(draft.quantity) > 0)) {
+      showWasteNotice(errorNotice("Enter the quantity wasted.", "waste-quantity"));
+      focusField("waste-quantity", { scroll: false });
+      return;
+    }
+    const savedWords = `${formatQuantityWithUnit(draft.quantity, draftProduct?.unit)} of ${draftProduct?.product_name || "the product"}`;
+    const savedType = labelFor("wasteType", draft.waste_type);
     try {
       const wasteWrite = createOperationalWrite(user, {
         ...draft,
@@ -21253,65 +21810,68 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
       });
       await axios.post(`${API_URL}/api/v3/waste-entries`, wasteWrite.body, wasteWrite.config);
       setDraft({ product_id: "", quantity: "", waste_type: "DAAGI", waste_date: toDateKey(new Date()), remarks: "" });
-      await onReload();
-      alert("Waste entry saved and stock reduced");
+      // Saved; a list that does not refresh afterwards is a warning, not a failed save.
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const saved = `${savedWords} recorded as ${savedType}. The stock is reduced.`;
+      showWasteNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Try again on the register.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save waste entry"));
+      showWasteNotice(errorNotice(getErrorMessage(error, "The waste entry could not be saved. Nothing was taken off the stock.")));
     }
-  };
+  });
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Record waste" title="Fruit taken off the shelf" subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
+      <ModuleCard eyebrow="Record waste" title="Fruit taken off the shelf" onChange={clearWasteNotice} subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
         <div className="form-grid supplier-form-grid">
-          <Field label="Product">
-            <select value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
-              <option value="">Select product</option>
-              {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} - Stock {(stockByProduct.get(canonicalInventoryId(product.id)) || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</option>)}
+          <Field label={<RequiredLabel>Product</RequiredLabel>}>
+            <select autoFocus id="waste-product" value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
+              <option value="">Choose a product</option>
+              {/* "—" when this product's stock is not known here, never "Stock 0" (logic E). */}
+              {wasteProducts.map((product) => <option key={product.id} value={product.id}>{wasteProductOptionLabel(product, stockByProduct.get(canonicalInventoryId(product.id)))}</option>)}
             </select>
           </Field>
-          <Field label="Quantity"><input min="0" step="0.001" type="number" value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: event.target.value })} /></Field>
-          <Field label="Waste Type">
+          <Field label={<RequiredLabel>{draftProduct ? `Quantity (${unitDisplayName(draftProduct.unit)})` : "Quantity"}</RequiredLabel>}><input id="waste-quantity" min="0" step="0.001" type="number" value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: event.target.value })} /></Field>
+          <Field label="Type of waste">
             <select value={draft.waste_type} onChange={(event) => setDraft({ ...draft, waste_type: event.target.value })}>
-              <option value="DAAGI">Daagi</option>
-              <option value="SAMPLING">Sampling</option>
-              <option value="PERSONAL_USE">Personal Use</option>
-              <option value="OTHER">Other</option>
+              {["DAAGI", "SAMPLING", "PERSONAL_USE", "OTHER"].map((type) => <option key={type} value={type}>{labelFor("wasteType", type)}</option>)}
             </select>
           </Field>
           <Field label="Date"><input type="date" value={draft.waste_date} onChange={(event) => setDraft({ ...draft, waste_date: event.target.value })} /></Field>
-          <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
-        <button className="primary-button" onClick={saveWaste}>Save Waste Entry</button>
+        <Field label="Notes"><textarea rows={2} value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
+        <div className="button-row">
+          <button className="primary-button" disabled={wasteSaving} onClick={saveWaste}>{wasteSaving ? "Saving…" : "Save waste entry"}</button>
+        </div>
+        <SaveNotice notice={wasteNotice} />
       </ModuleCard>
       <ModuleCard eyebrow="Top five" title="Most wasted products" subtitle="The products lost most, by quantity.">
         <div className="top-product-list">
           {mostWastedProducts.length ? mostWastedProducts.map((item) => (
             <article className="top-product-row" key={item.product_name}>
-              <div><strong>{item.product_name}</strong><span>{item.quantity.toLocaleString("en-IN")} quantity wasted</span></div>
+              <div><strong>{item.product_name}</strong><span>{`${formatQuantityWithUnit(item.quantity, item.unit)} wasted`}</span></div>
               <strong>{currency.format(item.cost)}</strong>
             </article>
           )) : loadFailed ? <div className="empty-inline">{MISSING_VALUE}</div> : <div className="empty-inline">No waste entries yet.</div>}
         </div>
       </ModuleCard>
-      <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Each entry's quantity and what that fruit cost to buy. The waste reports are built from these.">
+      <ModuleCard eyebrow="History" title="Waste register" subtitle="Each entry's quantity and what that fruit cost to buy. The waste reports are built from these.">
         {loadFailed && (
           <div className="error-banner" role="alert">
             {loadState.message || "The waste entries could not be loaded."}{" "}
             <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Try again</button>
           </div>
         )}
-        <DataTable headers={["Date", "Product", "Type", "Quantity", "Cost", "Remarks"]}>
+        <DataTable headers={markNumericColumns(["Date", "Product", "Type", "Quantity", "Cost", "Notes"])}>
           {entries.map((entry) => (
             <tr key={entry.id}>
-              <td>{toDateKey(entry.waste_date)}</td>
-              <td className="primary-cell">{entry.product_name}<small className="cell-note">{labelFor("unit", entry.unit)}</small></td>
+              <td>{formatDisplayDate(entry.waste_date)}</td>
+              <td className="primary-cell">{entry.product_name}</td>
               <td><span className="tag">{labelFor("wasteType", entry.waste_type)}</span></td>
-              <td>{Number(entry.quantity || 0).toLocaleString("en-IN")}</td>
+              <td>{formatQuantityWithUnit(entry.quantity, entry.unit)}</td>
               <td>{currency.format(Number(entry.cost_amount || 0))}</td>
-              <td>{entry.remarks || "-"}</td>
+              <td>{entry.remarks || MISSING_VALUE}</td>
             </tr>
           ))}
-          {entries.length === 0 && !loadFailed && <tr><td className="empty-cell" colSpan={6}>No waste entries yet.</td></tr>}
+          {entries.length === 0 && !loadFailed && <tr><td className="empty-cell" colSpan={6}>No waste entries yet. Record one above.</td></tr>}
         </DataTable>
       </ModuleCard>
     </section>
@@ -21349,7 +21909,7 @@ function WasteManagementModule({ entries, inventory, loadState = { status: "idle
  * same screen and want opposite halves of it, and "what is waiting for me" is the only question
  * that answers both.
  */
-function DistributionModule({ busy = false, destinations = [], inventory = [], onAction, onNothingToReceive, onReload, onRequest, onSend, products = [], scope, state }) {
+function DistributionModule({ busy = false, destinations = [], inventory = [], notice = null, onAction, onNothingToReceive, onReload, onRequest, onSend, products = [], scope, state }) {
   const [composing, setComposing] = useState(false);
   // "SEND" moves this counter's own stock out; "ASK" requests somebody else's. They are the same
   // form with the crate column removed, because a request cannot name crates it cannot see.
@@ -21431,7 +21991,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       const lot = sendableLots.find((row) => inventoryIdsEqual(row?.id, entry.source_lot_id)) || null;
       return {
         ...entry,
-        lot_label: lot ? `${productName(lot)} ${lot.lot_no || lot.id}` : "",
+        lot_label: lot ? `${productName(lot)} ${stockLotName(lot, formatDisplayDate)}` : "",
         available_quantity: lot ? lotAvailableQuantity(lot) : null,
       };
     });
@@ -21484,126 +22044,56 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
     setAllocations({});
   };
 
+  const lotOptionArgs = {
+    available: (lot) => lotAvailableQuantity(lot),
+    productName,
+    unitFor: (lot) => lot?.unit || products.find((product) => inventoryIdsEqual(product?.id, lot?.product_id))?.unit || "",
+    formatDate: formatDisplayDate,
+  };
+  // Lot name, date in and what is left with its unit, oldest first per product; never a raw id
+  // (local/stockScreens.js).
+  const sendLotOptions = distributionLotOptions(sendableLots, lotOptionArgs);
+  const boardReady = board.status === DISTRIBUTION_BOARD_STATUS.READY;
+  const closeCompose = () => {
+    setComposing(false);
+    setDraftLines([]);
+  };
+
   return (
-    <section className="content-card">
-      <div className="card-heading">
-        <div>
-          <h2>Consignments between shops</h2>
-          <p className="muted-note">
-            Fruit moving between the warehouse and the shops. Stock leaves the sender when it is
-            dispatched and joins the receiver when it is received.
-          </p>
-        </div>
-        <div className="button-row">
-          {/* The count is `countLabel`, never `transfers.length`: an unanswerable board must not
-              report a total of zero. */}
-          <span className="pill">{board.countLabel} total</span>
-          {board.counts.waitingOnYou > 0 && <span className="pill stock-low">{board.counts.waitingOnYou} need you</span>}
-          <button className="secondary-button" disabled={busy} onClick={onReload}>Refresh</button>
-          {board.status === DISTRIBUTION_BOARD_STATUS.READY && destinations.length > 0 && (
-            <button className="primary-button" disabled={busy} onClick={() => setComposing((open) => !open)}>
-              {composing ? "Close" : "Send stock"}
-            </button>
-          )}
-        </div>
-      </div>
+    <section className="settings-layout distribution-page">
+      <ModuleCard
+        actions={(
+          <>
+            {/* The count is `countLabel`, never `transfers.length`, and only when the board was read:
+                an unanswerable board must not report a total, not even "Unavailable total". */}
+            {boardReady && <span className="pill">{board.countLabel} in all</span>}
+            {boardReady && board.counts.waitingOnYou > 0 && <span className="pill origin-rate">{board.counts.waitingOnYou} need you</span>}
+            <button className="secondary-button" disabled={busy} onClick={onReload} type="button"><Icon name="refresh" size={15} />Refresh</button>
+            {boardReady && destinations.length > 0 && !composing && (
+              <button className="primary-button" disabled={busy} onClick={() => setComposing(true)} type="button"><Icon name="add" size={16} />Send or ask for stock</button>
+            )}
+          </>
+        )}
+        eyebrow="Stock distribution"
+        subtitle="Fruit moving between the warehouse and the shops. Stock leaves the sender when it is dispatched and joins the receiver when it is received."
+        title="Consignments between shops"
+      >
+        {boardReady && destinations.length === 0 && (
+          <p className="form-note">Sending stock needs a second shop or a warehouse to send it to. Add one in Branches &amp; Counters; if there is one already, press Refresh.</p>
+        )}
 
-      {board.status === DISTRIBUTION_BOARD_STATUS.READY && destinations.length === 0 && (
-        <p className="form-note">Sending stock needs a second shop or a warehouse to send it to. Add one in Branches &amp; Counters; if there is one already, press Refresh.</p>
-      )}
-
-      {board.message && (
-        <div className="startup-status-panel startup-status-error" role="alert">
-          <p><strong>{board.status === DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN ? "This counter has no shop set" : "Consignments unavailable"}</strong></p>
-          <p>{board.message}</p>
-        </div>
-      )}
-
-      {composing && (
-        <div className="content-card">
-          <h3>{asking ? "Ask another shop for stock" : "Send stock to another shop"}</h3>
-          <div className="button-row">
-            <button
-              className={asking ? "secondary-button" : "primary-button"}
-              onClick={() => { setDirection("SEND"); setDraftLines([]); }}
-            >
-              Send my stock
-            </button>
-            <button
-              className={asking ? "primary-button" : "secondary-button"}
-              onClick={() => { setDirection("ASK"); setDraftLines([]); }}
-            >
-              Ask for stock
-            </button>
+        {board.message && (
+          <div className="error-banner" role="alert">
+            <strong>{board.status === DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN ? "This counter has no shop set. " : "Consignments could not be loaded. "}</strong>
+            {board.message}{" "}
+            {board.status !== DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN && <button className="secondary-button compact-button" disabled={busy} onClick={onReload} type="button">Try again</button>}
           </div>
-          <p className="muted-note">
-            {asking
-              ? "Say what you need. The other shop chooses which lots to send, and can refuse."
-              : "You choose the lots. The receiving shop confirms what actually arrives."}
-          </p>
+        )}
 
-          <Field label={asking ? "Ask" : "Send to"}>
-            <select value={destinationId} onChange={(event) => setDestinationId(event.target.value)}>
-              <option value="">Choose a shop</option>
-              {destinations.map((row) => (
-                <option key={row.operational_location_id} value={row.operational_location_id}>
-                  {row.branch_name} — {row.location_name}
-                </option>
-              ))}
-            </select>
-          </Field>
+        <SaveNotice notice={notice} />
 
-          {(asking ? draftLines : resolvedLines).map((line) => (
-            <div className="button-row" key={line.key}>
-              {asking ? (
-                // A request names the product only. There is no lot column, because the crates
-                // belong to the other shop and this counter cannot see them -- offering an empty
-                // dropdown would look like a fault rather than a rule.
-                <select value={line.product_id || ""} onChange={(event) => updateLine(line.key, { product_id: event.target.value })}>
-                  <option value="">Choose a product</option>
-                  {products.filter((product) => product.active !== false).map((product) => (
-                    <option key={product.id} value={product.id}>{product.product_name}</option>
-                  ))}
-                </select>
-              ) : (
-                <select value={line.source_lot_id} onChange={(event) => updateLine(line.key, { source_lot_id: event.target.value })}>
-                  <option value="">Choose a lot</option>
-                  {sendableLots.map((lot) => (
-                    <option key={lot.id} value={lot.id}>
-                      {productName(lot)} — {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
-                    </option>
-                  ))}
-                </select>
-              )}
-              <input
-                inputMode="decimal"
-                placeholder="Quantity"
-                value={line.requested_quantity}
-                onChange={(event) => updateLine(line.key, { requested_quantity: event.target.value })}
-              />
-              <button className="remove-button" onClick={() => removeLine(line.key)}>Remove</button>
-            </div>
-          ))}
-
-          <div className="button-row">
-            <button className="secondary-button" onClick={addLine}>Add a product</button>
-            <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={submitDraft}>
-              {busy ? "Sending..." : (asking ? "Send request" : "Create consignment")}
-            </button>
-          </div>
-
-          {/* Every problem, named, while it can still be fixed. The server checks all of this again;
-              this exists so a person is not told "no" after a round trip with no reason. */}
-          {!checkedDraft.ok && draftLines.length > 0 && (
-            <ul className="form-note">
-              {checkedDraft.problems.map((problem) => <li key={problem}>{problem}</li>)}
-            </ul>
-          )}
-        </div>
-      )}
-
-      {board.status === DISTRIBUTION_BOARD_STATUS.READY && (
-        <DataTable headers={["Number", "From", "To", "Status", "What you can do"]}>
+        {boardReady && (
+          <DataTable className="distribution-board" headers={["Number", "From", "To", "Status", "What you can do"]}>
             {board.transfers.map((entry) => {
               // The board's entries are the *described* form; the crates need the raw lines. Looked
               // up by the same canonical id `describeTransfer` derived, never by `Number()`.
@@ -21615,15 +22105,19 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
               // "Receive part" and "Take back in" need a quantity per line that this screen has no
               // box for; drawn, they could only come back 422 (local/distributionWrites.js).
               const { drawn: drawnActions, heldBack } = drawableTransferActions(entry.actions);
+              const allocating = canApprove && toAllocate.length > 0;
               return (
-              <tr key={entry.id}>
-                <td className="primary-cell">
+              <React.Fragment key={entry.id}>
+              <tr>
+                <td className="primary-cell distribution-number">
                   {entry.number}
-                  {entry.waitingOnYou && <small className="cell-note stock-low">Waiting for you</small>}
+                  {entry.waitingOnYou && <small className="cell-note"><span className="origin-rate">Waiting for you</span></small>}
                 </td>
                 <td>{entry.from}</td>
                 <td>{entry.to}</td>
-                <td><span className={entry.tone === "done" ? "stock-ok" : "stock-low"}>{entry.label}</span></td>
+                {/* Waiting and on the way are warnings, done is success, cancelled is neutral and
+                    refused is danger (local/stockScreens.js). */}
+                <td><span className={distributionStatusClass(entry.status)}>{entry.label}</span></td>
                 <td>
                   <div className="table-actions">
                     {drawnActions.map((option) => (
@@ -21636,6 +22130,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                           disabled={busy}
                           key={option.action}
                           title={option.detail}
+                          type="button"
                           onClick={() => (option.action === "receive"
                             ? receiveInFull(entry, raw)
                             : onAction?.(transferActionId(entry), option.action))}
@@ -21647,43 +22142,52 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                     {/* Not blank. "Nothing for you to do here" and "this screen forgot to draw the
                         buttons" look identical when the cell is empty. */}
                     {entry.actions.length === 0 && <small className="cell-note">Nothing for you to do</small>}
+                    {allocating && <small className="cell-note">Choose what to send below.</small>}
                     {heldBack && <small className="cell-note">{UNDRAWN_TRANSFER_ACTION_NOTE}</small>}
                   </div>
-
-                  {canApprove && toAllocate.length > 0 && (
-                    <div className="content-card">
-                      <strong>Choose what to send</strong>
+                </td>
+              </tr>
+              {/* The crate choice gets its own full-width row under the consignment: inside the
+                  "What you can do" cell it pushed the whole board sideways at 1366. */}
+              {allocating && (
+                <tr className="distribution-allocation-row">
+                  <td colSpan={5}>
+                    <div className="distribution-allocation">
+                      <strong>{`Choose what to send for ${entry.number}`}</strong>
                       {toAllocate.map((line) => {
                         const { chosen, checked } = allocationFor(line);
+                        const lineLots = distributionLotOptions(
+                          sendableLots.filter((lot) => inventoryIdsEqual(lot?.product_id, line.productId)),
+                          lotOptionArgs,
+                        );
                         return (
-                          <div key={line.id}>
+                          <div className="distribution-allocation-line" key={line.id}>
                             <p className="muted-note">
-                              {line.productName}: {line.requested === null ? "quantity not recorded" : `${line.requested} ${line.unit || ""}`.trim()} asked for
+                              {`${line.productName}: ${line.requested === null ? "quantity not recorded" : formatQuantityWithUnit(line.requested, line.unit)} asked for`}
                             </p>
                             {chosen.map((choice, index) => (
-                              <div className="button-row" key={`${line.id}-${index}`}>
-                                <select
-                                  value={choice.source_lot_id}
-                                  onChange={(event) => setAllocation(line.id, index, { source_lot_id: event.target.value })}
-                                >
-                                  <option value="">Choose a lot</option>
-                                  {sendableLots
-                                    .filter((lot) => inventoryIdsEqual(lot?.product_id, line.productId))
-                                    .map((lot) => (
-                                      <option key={lot.id} value={lot.id}>
-                                        {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
-                                      </option>
-                                    ))}
-                                </select>
-                                <input
-                                  inputMode="decimal"
-                                  placeholder="Quantity"
-                                  value={choice.quantity}
-                                  onChange={(event) => setAllocation(line.id, index, { quantity: event.target.value })}
-                                />
+                              <div className="distribution-line" key={`${line.id}-${index}`}>
+                                <Field label="Lot">
+                                  <select
+                                    value={choice.source_lot_id}
+                                    onChange={(event) => setAllocation(line.id, index, { source_lot_id: event.target.value })}
+                                  >
+                                    <option value="">Choose a lot</option>
+                                    {lineLots.map((option) => <option key={option.id} value={option.id}>{option.shortLabel}</option>)}
+                                  </select>
+                                </Field>
+                                <Field label={line.unit ? `Quantity (${unitDisplayName(line.unit)})` : "Quantity"}>
+                                  <input
+                                    inputMode="decimal"
+                                    value={choice.quantity}
+                                    onChange={(event) => setAllocation(line.id, index, { quantity: event.target.value })}
+                                  />
+                                </Field>
                               </div>
                             ))}
-                            <button className="secondary-button" onClick={() => addAllocation(line.id)}>Add a lot</button>
+                            <div className="button-row">
+                              <button className="secondary-button compact-button" onClick={() => addAllocation(line.id)} type="button"><Icon name="add" size={15} />Add a lot</button>
+                            </div>
                             {!checked.ok && chosen.length > 0 && (
                               <ul className="form-note">
                                 {checked.problems.map((problem) => <li key={problem}>{problem}</li>)}
@@ -21692,23 +22196,112 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                           </div>
                         );
                       })}
-                      <button
-                        className="primary-button"
-                        disabled={busy || !toAllocate.every((line) => allocationFor(line).checked.ok)}
-                        onClick={() => approveWithCrates(entry, toAllocate)}
-                      >
-                        Approve and hold this stock
-                      </button>
+                      <div className="button-row">
+                        <button
+                          className="primary-button"
+                          disabled={busy || !toAllocate.every((line) => allocationFor(line).checked.ok)}
+                          onClick={() => approveWithCrates(entry, toAllocate)}
+                          type="button"
+                        >
+                          Approve and hold this stock
+                        </button>
+                      </div>
                     </div>
-                  )}
-                </td>
-              </tr>
+                  </td>
+                </tr>
+              )}
+              </React.Fragment>
               );
             })}
             {board.transfers.length === 0 && (
               <tr><td className="empty-cell" colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
             )}
-        </DataTable>
+          </DataTable>
+        )}
+      </ModuleCard>
+
+      {composing && (
+        <ModuleCard
+          actions={<button className="secondary-button" onClick={closeCompose} type="button">Close</button>}
+          eyebrow="New consignment"
+          subtitle={asking
+            ? "Say what you need. The other shop chooses which lots to send, and can refuse."
+            : "You choose the lots. The receiving shop confirms what actually arrives."}
+          title={asking ? "Ask another shop for stock" : "Send stock to another shop"}
+        >
+          <div aria-label="Send or ask" className="account-tabs" role="tablist">
+            <button aria-selected={!asking} className={asking ? "account-tab" : "account-tab account-tab-active"} onClick={() => { setDirection("SEND"); setDraftLines([]); }} role="tab" type="button">Send my stock</button>
+            <button aria-selected={asking} className={asking ? "account-tab account-tab-active" : "account-tab"} onClick={() => { setDirection("ASK"); setDraftLines([]); }} role="tab" type="button">Ask for stock</button>
+          </div>
+
+          <div className="form-grid supplier-form-grid">
+            <Field label={<RequiredLabel>{asking ? "Ask which shop" : "Send to"}</RequiredLabel>}>
+              <select value={destinationId} onChange={(event) => setDestinationId(event.target.value)}>
+                <option value="">Choose a shop</option>
+                {destinations.map((row) => (
+                  <option key={row.operational_location_id} value={row.operational_location_id}>
+                    {row.branch_name} — {row.location_name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </div>
+
+          {(asking ? draftLines : resolvedLines).map((line, index) => {
+            // A send line knows its product through the lot it names; a request names it directly.
+            const lineProduct = products.find((product) => inventoryIdsEqual(product?.id, line.product_id));
+            const lineUnit = lineProduct?.unit
+              || sendableLots.find((row) => inventoryIdsEqual(row?.id, line.source_lot_id))?.unit
+              || "";
+            return (
+            <div className="distribution-line" key={line.key}>
+              {asking ? (
+                // A request names the product only. There is no lot column, because the crates
+                // belong to the other shop and this counter cannot see them -- offering an empty
+                // dropdown would look like a fault rather than a rule.
+                <Field label={`Product ${index + 1}`}>
+                  <select value={line.product_id || ""} onChange={(event) => updateLine(line.key, { product_id: event.target.value })}>
+                    <option value="">Choose a product</option>
+                    {products.filter((product) => product.active !== false).map((product) => (
+                      <option key={product.id} value={product.id}>{product.product_name} ({unitDisplayName(product.unit)})</option>
+                    ))}
+                  </select>
+                </Field>
+              ) : (
+                <Field label={`Lot ${index + 1}`}>
+                  <select value={line.source_lot_id} onChange={(event) => updateLine(line.key, { source_lot_id: event.target.value })}>
+                    <option value="">Choose a lot</option>
+                    {sendLotOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+                  </select>
+                </Field>
+              )}
+              <Field label={lineUnit ? `Quantity (${unitDisplayName(lineUnit)})` : "Quantity"}>
+                <input
+                  inputMode="decimal"
+                  value={line.requested_quantity}
+                  onChange={(event) => updateLine(line.key, { requested_quantity: event.target.value })}
+                />
+              </Field>
+              <button className="danger-text-button" onClick={() => removeLine(line.key)} type="button">Remove</button>
+            </div>
+            );
+          })}
+
+          <div className="button-row">
+            <button className="secondary-button" onClick={addLine} type="button"><Icon name="add" size={15} />{asking ? "Add a product" : "Add a lot"}</button>
+            <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={submitDraft} type="button">
+              {busy ? "Sending…" : (asking ? "Send request" : "Create consignment")}
+            </button>
+          </div>
+
+          {/* Every problem, named, while it can still be fixed. The server checks all of this again;
+              this exists so a person is not told "no" after a round trip with no reason. */}
+          {!checkedDraft.ok && draftLines.length > 0 && (
+            <ul className="form-note">
+              {checkedDraft.problems.map((problem) => <li key={problem}>{problem}</li>)}
+            </ul>
+          )}
+        </ModuleCard>
       )}
     </section>
   );
@@ -21725,10 +22318,14 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     permitted: canRoute,
   });
   const [carrierDraft, setCarrierDraft] = useState({});
-  const [reasonDraft, setReasonDraft] = useState({});
   const emptyLine = { product_id: "", quantity: "", agreed_rate: "" };
   const [draft, setDraft] = useState({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
   const [draftError, setDraftError] = useState("");
+  // "Order ORD-… for Sunita is saved." after Save order, which used to clear the form in silence.
+  const [orderNotice, showOrderNotice, clearOrderNotice] = useSaveNotice();
+  // Cancelling asks why in a box of its own, at the moment of cancelling, instead of a "Reason (if
+  // cancelling)" field on every open order. The reason is still required (validateOrderAction).
+  const askCancelReason = useAskReason();
 
   const setLine = (index, patch) => setDraft((current) => ({
     ...current,
@@ -21745,6 +22342,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     if (!built.ok) return setDraftError(built.message);
     const lines = built.lines;
     setDraftError("");
+    clearOrderNotice();
     // Only clear the form once the order is actually saved. It used to reset unconditionally while
     // `takeOrder` swallowed the failure into a toast, so a rejected order wiped the customer, the
     // address and every line the operator had just taken down the phone.
@@ -21753,13 +22351,14 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       setDraftError(`${saved?.message || "That order was not saved."} Your details are still here.`);
       return;
     }
+    showOrderNotice(successNotice(orderSavedText({ orderNo: saved.orderNo, customerName: draft.customer_name })));
     setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
   };
 
   if (state.loadState === "loading") {
     return (
       <ModuleCard eyebrow="Open orders" title="Loading orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
-        <p className="form-note">Reading orders from this device...</p>
+        <p className="form-note">Reading orders from this device…</p>
       </ModuleCard>
     );
   }
@@ -21771,7 +22370,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     return (
       <ModuleCard eyebrow="Open orders" title="Orders not loaded yet" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <div className="cart-empty">Orders have not been loaded yet.</div>
-        <p><button className="table-action" type="button" onClick={onReload}>Load orders</button></p>
+        <div className="button-row"><button className="table-action" type="button" onClick={onReload}>Load orders</button></div>
       </ModuleCard>
     );
   }
@@ -21781,12 +22380,35 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     return (
       <ModuleCard eyebrow="Open orders" title="Orders could not be loaded" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <div className="error-banner" role="alert">{state.loadError}</div>
-        <p><button className="table-action" type="button" onClick={onReload}>Try again</button></p>
+        <div className="button-row"><button className="table-action" type="button" onClick={onReload}>Try again</button></div>
       </ModuleCard>
     );
   }
 
   const board = buildOrdersBoard(state.orders);
+
+  /** Cancel asks why first; closing the box leaves the order as it is. */
+  const runOrderAction = async (order, action) => {
+    let cancellationReason = "";
+    if (action.needsReason) {
+      const reason = await askCancelReason({
+        title: `Cancel ${order.orderNo || "this order"}?`,
+        message: `${order.customerName || "The customer"} will need to be told why. The stock set aside for it is released.`,
+        label: "Why is it being cancelled?",
+        placeholder: "Customer changed their mind, stock finished…",
+        confirmLabel: "Cancel order",
+        cancelLabel: "Keep order",
+        tone: "danger",
+      });
+      if (reason === null) return;
+      cancellationReason = reason;
+    }
+    onAdvance(order, action.to, {
+      carrier: carrierDraft[order.id] || "",
+      cancellation_reason: cancellationReason,
+      created_by: user?.full_name || "",
+    });
+  };
 
   /** Hand one waiting order to a shop. */
   const handOver = async (orderId) => {
@@ -21813,10 +22435,10 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
           title="Unassigned orders"
           subtitle="These arrived without a shop. Until one is chosen, no counter can see them and no stock is set aside."
         >
-          <p className="button-row">
+          <div className="button-row orders-toolbar">
             <span className="pill">{waiting.countLabel}</span>
             <button className="table-action" type="button" onClick={onReload}>Refresh</button>
-          </p>
+          </div>
 
           {/* Never a bare empty list: "none waiting", "could not load" and "not allowed" look the
               same as rows, and only one of them means a customer is not waiting. */}
@@ -21860,7 +22482,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                         disabled={routingBusy || !assignDraft[order.id]}
                         onClick={() => handOver(order.id)}
                       >
-                        {routingBusy ? "Sending..." : "Hand over"}
+                        {routingBusy ? "Sending…" : "Hand over"}
                       </button>
                     </div>
                   </td>
@@ -21876,13 +22498,13 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
         title="Open orders"
         subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Kept on this computer, so it works without internet."
       >
-        <p><button className="table-action" type="button" onClick={onReload}>Refresh</button></p>
+        <div className="button-row orders-toolbar"><button className="table-action" type="button" onClick={onReload}>Refresh</button></div>
 
         {board.needsAttention.length > 0 && (
           // Above the board, not a badge on a card. A lapsed order looks exactly like a healthy one
           // and the difference is that its fruit may already have been sold to somebody else.
           <div className="warning-note" role="alert">
-            <strong>{board.needsAttention.length} order{board.needsAttention.length === 1 ? "" : "s"} need checking.</strong>{" "}
+            <strong>{ordersNeedCheckingText(board.needsAttention.length)}</strong>{" "}
             {board.needsAttention.map((order) => `${order.orderNo || "Order"} (${order.customerName})`).join(", ")}
             {" — "}the stock held for these went back on the shelf after six hours. Check it is still in the shop before packing.
           </div>
@@ -21898,6 +22520,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
 
       <ModuleCard eyebrow="New" title="Take an order" subtitle="Rings the phone? Write it here. Stock is set aside the moment you save.">
         {draftError && <div className="error-banner" role="alert">{draftError}</div>}
+        <SaveNotice className="orders-saved-notice" notice={orderNotice} />
         {products.length === 0 && (
           // An empty dropdown with no explanation reads as a broken screen. This says which of the
           // two it is: nothing to sell yet, or a list that did not arrive.
@@ -21927,7 +22550,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
           <input onChange={(event) => setDraft({ ...draft, delivery_address: event.target.value })} placeholder="Where it is going" value={draft.delivery_address} />
         </Field>
 
-        <DataTable headers={["Item", "Quantity", "Rate agreed", ""]}>
+        <DataTable className="order-draft-table" headers={markNumericColumns(["Item", "Quantity", "Rate agreed", { label: <span className="pm-sr-only">Remove</span> }])}>
           {draft.items.map((line, index) => (
             <tr key={index}>
               <td>
@@ -21950,10 +22573,10 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                   ))}
                 </select>
               </td>
-              <td><input onChange={(event) => setLine(index, { quantity: event.target.value })} placeholder="0.000" step="0.001" type="number" value={line.quantity} /></td>
+              <td><input aria-label="Quantity" className="numeric-input" onChange={(event) => setLine(index, { quantity: event.target.value })} placeholder="0.000" step="0.001" type="number" value={line.quantity} /></td>
               {/* The rate the customer is quoted today, kept for when the order ships. Produce
                   rates move daily and a customer quoted 80 on Monday is owed 80 on Thursday. */}
-              <td><input onChange={(event) => setLine(index, { agreed_rate: event.target.value })} placeholder="0.00" step="0.01" type="number" value={line.agreed_rate} /></td>
+              <td><input aria-label="Rate agreed" className="numeric-input" onChange={(event) => setLine(index, { agreed_rate: event.target.value })} placeholder="0.00" step="0.01" type="number" value={line.agreed_rate} /></td>
               <td>
                 <button
                   className="table-action"
@@ -21967,17 +22590,17 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
             </tr>
           ))}
         </DataTable>
-        <p>
+        <div className="button-row orders-form-actions">
           <button className="table-action" type="button" onClick={() => setDraft({ ...draft, items: [...draft.items, { ...emptyLine }] })}>Add item</button>
-          <button className="primary-button" disabled={busy} type="button" onClick={submitOrder}>Save order</button>
-        </p>
+          <button className="primary-button" disabled={busy} type="button" onClick={submitOrder}>{busy ? "Saving…" : "Save order"}</button>
+        </div>
       </ModuleCard>
 
       {board.columns.map((column) => (
         <ModuleCard eyebrow={column.hint} key={column.key} title={`${column.label} (${column.orders.length})`}>
           {column.orders.length === 0 && <p className="form-note">Nothing here right now.</p>}
           {column.orders.map((order) => (
-            <div className="content-card" key={order.id}>
+            <div className="content-card order-card" key={order.id}>
               <div className="carrier-top">
                 <strong>{order.orderNo} · {order.customerName}</strong>
                 <span>{money(order.value)}</span>
@@ -22022,14 +22645,14 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                 )}
               </div>
 
-              <DataTable headers={["Item", "Quantity", "Rate agreed", "Amount"]}>
+              <DataTable headers={markNumericColumns(["Item", "Quantity", "Rate agreed", "Amount"])}>
                 {order.items.map((line) => (
                   <tr key={line.id || `${order.id}-${line.line_index}`}>
                     <td>{line.product_name}</td>
                     {/* Quantities carry three decimals and rates always carry their unit: a produce
                         price with no unit beside it is the commonest confusion in this trade. */}
-                    <td>{Number(line.quantity || 0).toFixed(3)} {line.unit || ""}</td>
-                    <td>{money(line.agreed_rate)} / {line.unit || "unit"}</td>
+                    <td>{counterQuantityWithUnit(line.quantity, line.unit)}</td>
+                    <td>{money(line.agreed_rate)} / {unitDisplayName(line.unit) === MISSING_VALUE ? "unit" : unitDisplayName(line.unit)}</td>
                     <td>{money(Number(line.quantity || 0) * Number(line.agreed_rate || 0))}</td>
                   </tr>
                 ))}
@@ -22054,33 +22677,19 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                   />
                 </Field>
               )}
-              {order.actions.some((action) => action.needsReason) && (
-                <Field label="Reason (if cancelling)">
-                  <input
-                    onChange={(event) => setReasonDraft({ ...reasonDraft, [order.id]: event.target.value })}
-                    placeholder="Customer changed their mind, stock finished..."
-                    value={reasonDraft[order.id] || ""}
-                  />
-                </Field>
-              )}
-
-              <p>
+              <div className="button-row order-actions">
                 {order.actions.map((action) => (
                   <button
-                    className={action.tone === "primary" ? "primary-button" : "table-action"}
+                    className={action.tone === "primary" ? "primary-button" : action.tone === "danger" ? "danger-text-button" : "table-action"}
                     disabled={busy}
                     key={action.to}
                     type="button"
-                    onClick={() => onAdvance(order, action.to, {
-                      carrier: carrierDraft[order.id] || "",
-                      cancellation_reason: reasonDraft[order.id] || "",
-                      created_by: user?.full_name || "",
-                    })}
+                    onClick={() => runOrderAction(order, action)}
                   >
                     {action.label}
                   </button>
                 ))}
-              </p>
+              </div>
             </div>
           ))}
         </ModuleCard>
@@ -22088,13 +22697,13 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
 
       {board.finished.length > 0 && (
         <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Delivered, returned and cancelled orders, so you can check what went out.">
-          <DataTable headers={["Order", "Customer", "Status", "Carrier", "Value"]}>
+          <DataTable headers={markNumericColumns(["Order", "Customer", "Status", "Carrier", "Value"], { also: ["Value"] })}>
             {board.finished.map((order) => (
               <tr key={order.id}>
                 <td>{order.orderNo}</td>
                 <td>{order.customerName}</td>
                 <td>{labelFor("orderStatus", order.status)}</td>
-                <td>{order.carrier || "-"}</td>
+                <td>{order.carrier || MISSING_VALUE}</td>
                 <td>{money(order.value)}</td>
               </tr>
             ))}
@@ -22120,7 +22729,7 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
     <ModuleCard
       eyebrow="Owner View"
       title="Company position"
-      subtitle={asAt ? `Company position as at ${asAt}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
+      subtitle={asAt ? `Company position as at ${formatDisplayDate(asAt)}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
     >
       <p className="form-row">
         <label>
@@ -22128,13 +22737,14 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
           <input
             max={toDateKey(new Date())}
             type="date"
-            value={state.dateTo || ""}
+            // The date in force: the one picked, or the one the server answered for (today).
+            value={state.dateTo || asAt || ""}
             onChange={(event) => onReload(event.target.value)}
           />
         </label>{" "}
-        <button className="table-action" type="button" onClick={() => onReload(state.dateTo || "")}>Refresh</button>
+        <button className="secondary-button" type="button" onClick={() => onReload(state.dateTo || "")}>Refresh</button>
         {state.dateTo && (
-          <button className="table-action" type="button" onClick={() => onReload("")}>Today</button>
+          <button className="secondary-button" type="button" onClick={() => onReload("")}>Today</button>
         )}
       </p>
 
@@ -22163,18 +22773,18 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
       )}
 
       {presentation.shops.length > 0 && (
-        <DataTable headers={["Shop", "Cash", "Bank", "Stock Value", "Customers Owe", "We Owe", "Net Profit"]}>
+        <DataTable headers={markNumericColumns(["Shop", "Cash", "Bank", "Stock Value", "Customers Owe", "We Owe", "Net Profit"])}>
           {presentation.shops.map((shop) => (
             <tr key={shop.branchId ?? shop.branchName}>
-              <td>{shop.branchName}</td>
+              <td className="primary-cell">{shop.branchName}</td>
               {shop.ok ? (
                 <>
-                  <td>{money(shop.cash)}</td>
-                  <td>{money(shop.bank)}</td>
+                  <SignedAmountCell format={money} value={shop.cash} />
+                  <SignedAmountCell format={money} value={shop.bank} />
                   <td>{money(shop.inventory)}</td>
                   <td>{money(shop.customerReceivable)}</td>
                   <td>{money(shop.supplierPayable)}</td>
-                  <td className="profit-cell">{money(shop.netProfit)}</td>
+                  <ProfitCell format={money} value={shop.netProfit} />
                 </>
               ) : (
                 // Deliberately one spanning cell rather than six blanks or six zeros: a row of
@@ -22196,6 +22806,8 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
     </ModuleCard>
   );
 }
+
+const EXPENSE_PAYMENT_MODES = Object.freeze(["CASH", "UPI", "BANK_TRANSFER"]);
 
 function ExpensesModule({ canCancel = false, expenses, loadState = { status: "idle", message: "" }, onReload, user }) {
   const expenseCategories = ["Rent", "Staff Salary", "Electricity", "Transport", "Loading / Hamali", "Packing Material", "Repair & Maintenance", "Food / Tea / Misc", "Other"];
@@ -22225,7 +22837,15 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
   });
   const totalActiveExpenses = expenseTotalExcludingCancelled(filteredExpenses);
 
-  const saveExpense = async () => {
+  const askReason = useAskReason();
+  const [expenseNotice, showExpenseNotice, clearExpenseNotice] = useSaveNotice();
+  const [registerNotice, showRegisterNotice, clearRegisterNotice] = useSaveNotice();
+  // One save at a time: a double click used to record the same expense twice.
+  const [expenseSaving, runExpenseSave] = useSaveInFlight();
+  const saveExpense = () => runExpenseSave(async () => {
+    clearExpenseNotice();
+    const wasEditing = Boolean(editingId);
+    const savedWords = `${draft.category || "Expense"} of ${currency.format(Number(draft.amount || 0))}`;
     try {
       const payload = {
         ...draft,
@@ -22236,20 +22856,30 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
         edited_by: user.id,
       };
       if (editingId) {
-        const reason = window.prompt("Enter reason for editing this expense", "Expense updated");
+        // No ready-made reason: "Expense updated" said nothing a later reader could use.
+        const reason = await askReason({
+          title: "Why is this expense being changed?",
+          message: "The reason is kept with the expense.",
+          label: "Reason for the change",
+          placeholder: "Example: wrong amount typed",
+          confirmLabel: "Save change",
+        });
         if (!reason) return;
         await axios.put(`${API_URL}/expenses/${editingId}`, { ...payload, reason });
       }
       else await axios.post(`${API_URL}/expenses`, payload);
       setDraft(emptyExpense);
       setEditingId(null);
-      await onReload();
-      alert(editingId ? "Expense updated" : "Expense saved");
+      // Saved; a register that does not refresh afterwards is a warning, not a failed save.
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the register did not refresh"));
+      const saved = `${savedWords} ${wasEditing ? "updated" : "saved"}.`;
+      showExpenseNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Refresh on the register.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save expense"));
+      showExpenseNotice(errorNotice(getErrorMessage(error, "The expense could not be saved. Nothing was recorded; try again.")));
     }
-  };
+  });
   const editExpense = (expense) => {
+    clearExpenseNotice();
     setEditingId(expense.id);
     setDraft({
       expense_date: toDateKey(expense.expense_date),
@@ -22260,61 +22890,73 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
       vendor_name: expense.vendor_name || expense.paid_to || "",
       remarks: expense.remarks || "",
     });
+    // The form is at the top of the screen and the register below it: take the person to the form,
+    // with the cursor in its first box.
+    window.requestAnimationFrame(() => {
+      document.getElementById("expense-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("expense-date")?.focus({ preventScroll: true });
+    });
   };
   const cancelExpense = async (expense) => {
-    const reason = window.prompt(`Enter cancellation reason for ${expense.category}`);
+    clearRegisterNotice();
+    const amountWords = currency.format(Number(expense.amount || 0));
+    const reason = await askReason({
+      title: `Cancel the ${expense.category} expense of ${amountWords}?`,
+      message: "It stays in the register, marked cancelled, and leaves the totals.",
+      label: "Reason for cancelling",
+      confirmLabel: "Cancel expense",
+      cancelLabel: "Keep it",
+      tone: "danger",
+    });
     if (!reason) return;
     try {
       await axios.post(`${API_URL}/expenses/${expense.id}/cancel`, { reason, cancelled_by: user.id });
-      await onReload();
-      alert("Expense cancelled");
+      await onReload().catch(() => null);
+      showRegisterNotice(successNotice(`${expense.category} expense of ${amountWords} cancelled.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to cancel expense"));
+      showRegisterNotice(errorNotice(getErrorMessage(error, "The expense could not be cancelled.")));
     }
   };
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow={editingId ? "Editing" : "New expense"} title={editingId ? "Edit expense" : "Record an expense"} subtitle="Rent, wages, transport and the other costs of running the shop.">
+      <ModuleCard eyebrow={editingId ? "Editing" : "New expense"} id="expense-form" onChange={clearExpenseNotice} title={editingId ? "Edit expense" : "Record an expense"} subtitle="Rent, wages, transport and the other costs of running the shop.">
         <div className="form-grid supplier-form-grid">
-          <Field label="Expense Date"><input type="date" value={draft.expense_date} onChange={(event) => setDraft({ ...draft, expense_date: event.target.value })} /></Field>
+          <Field label="Date"><input autoFocus id="expense-date" type="date" value={draft.expense_date} onChange={(event) => setDraft({ ...draft, expense_date: event.target.value })} /></Field>
           <Field label="Category">
             <select value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })}>
               {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
             </select>
           </Field>
-          <Field label="Amount"><input min="0" step="0.01" type="number" value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })} /></Field>
-          <Field label="Payment Mode">
+          <Field label={<RequiredLabel>Amount (₹)</RequiredLabel>}><input min="0" step="0.01" type="number" value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })} /></Field>
+          <Field label="Payment mode">
             <select value={draft.payment_mode} onChange={(event) => setDraft({ ...draft, payment_mode: event.target.value })}>
-              <option value="CASH">Cash</option>
-              <option value="UPI">UPI</option>
-              <option value="BANK_TRANSFER">Bank</option>
+              {EXPENSE_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{labelFor("paymentMode", mode)}</option>)}
             </select>
           </Field>
-          <Field label="Reference Number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
-          <Field label="Paid To / Vendor Name"><input value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
-          <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
+          <Field label="Reference number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
+          <Field label="Paid to"><input placeholder="Person or shop" value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
         </div>
+        <Field label="Notes"><textarea rows={2} value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         <div className="button-row">
-          <button className="primary-button" onClick={saveExpense}>{editingId ? "Update Expense" : "Save Expense"}</button>
-          {editingId && <button className="secondary-button" onClick={() => { setEditingId(null); setDraft(emptyExpense); }}>Cancel Edit</button>}
+          <button className="primary-button" disabled={expenseSaving} onClick={saveExpense}>{expenseSaving ? "Saving…" : editingId ? "Save changes" : "Save expense"}</button>
+          {editingId && <button className="secondary-button" onClick={() => { setEditingId(null); setDraft(emptyExpense); clearExpenseNotice(); }}>Cancel edit</button>}
         </div>
+        <SaveNotice notice={expenseNotice} />
       </ModuleCard>
-      <ModuleCard eyebrow="Expense Register" title="Recent Expenses" subtitle="Expense rows remain available for reporting and review.">
-        <div className="ledger-toolbar">
-          <Field label="Search"><input placeholder="Search category, paid to, reference" value={filters.search} onChange={(event) => setFilters({ ...filters, search: event.target.value })} /></Field>
+      <ModuleCard eyebrow="Register" title="Recent expenses" subtitle="Every expense stays here for the reports, cancelled ones included.">
+        <div className="ledger-toolbar expense-toolbar">
+          <Field label="Search"><input placeholder="Category, paid to or reference" value={filters.search} onChange={(event) => setFilters({ ...filters, search: event.target.value })} /></Field>
           <Field label="Category">
             <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
               <option value="">All categories</option>
               {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
             </select>
           </Field>
-          <Field label="Payment Mode">
+          <Field label="Payment mode">
             <select value={filters.payment_mode} onChange={(event) => setFilters({ ...filters, payment_mode: event.target.value })}>
               <option value="">All modes</option>
-              <option value="CASH">Cash</option>
-              <option value="UPI">UPI</option>
-              <option value="BANK_TRANSFER">Bank</option>
+              {EXPENSE_PAYMENT_MODES.map((mode) => <option key={mode} value={mode}>{labelFor("paymentMode", mode)}</option>)}
             </select>
           </Field>
           <Field label="Status">
@@ -22334,25 +22976,30 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
             <button className="secondary-button" onClick={() => onReload().catch(() => null)}>Try again</button>
           </div>
         )}
+        <SaveNotice notice={registerNotice} />
         {/* Both tiles count the rows the table below shows, so the summary and the list cannot
             disagree about which expenses are in view. */}
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Total (excluding cancelled)" value={loadFailed ? MISSING_VALUE : currency.format(totalActiveExpenses)} featured />
           <SummaryMetric label="Entries shown" value={loadFailed ? MISSING_VALUE : filteredExpenses.length} />
         </div>
-        <DataTable headers={["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""]}>
+        <DataTable className="expense-register" headers={markNumericColumns(["Date", "Category", "Paid to", "Mode", "Amount", "Status", "Notes", "Actions"])}>
           {filteredExpenses.map((expense) => {
             const status = expenseRecordStatus(expense);
+            const notes = expense.remarks || expense.cancellation_reason || "";
             return (
             <tr className={status === "CANCELLED" ? "muted-row" : ""} key={expense.id}>
-              <td>{expense.expense_date}</td>
+              <td>{formatDisplayDate(expense.expense_date)}</td>
               <td className="primary-cell">{expense.category}</td>
-              <td>{expense.paid_to || expense.vendor_name || "-"}</td>
+              <td>{expense.paid_to || expense.vendor_name || MISSING_VALUE}</td>
               <td><span className="tag">{labelFor("paymentMode", expense.payment_mode)}</span></td>
               <td>{currency.format(Number(expense.amount || 0))}</td>
               <td><span className={statusClass("recordStatus", status)}>{labelFor("recordStatus", status)}</span></td>
-              <td>{expense.reference_number || "-"}</td>
-              <td>{expense.remarks || expense.cancellation_reason || "-"}</td>
+              {/* The reference rides with the notes, so the register fits a 1366 screen. */}
+              <td className="expense-notes-cell" title={[notes, expense.reference_number ? `Ref. ${expense.reference_number}` : ""].filter(Boolean).join(" · ") || undefined}>
+                {notes || (expense.reference_number ? "" : MISSING_VALUE)}
+                {expense.reference_number && <small className="cell-note">{`Ref. ${expense.reference_number}`}</small>}
+              </td>
               <td>
                 <div className="button-row table-actions-row">
                   {expense.packing_purchase === true ? (
@@ -22368,7 +23015,7 @@ function ExpensesModule({ canCancel = false, expenses, loadState = { status: "id
             </tr>
           );})}
         </DataTable>
-        {filteredExpenses.length === 0 && !loadFailed && <div className="cart-empty">No records found for selected filters.</div>}
+        {filteredExpenses.length === 0 && !loadFailed && <div className="cart-empty">{expenses.length ? "No expenses match these filters." : "No expenses yet. Record one above."}</div>}
       </ModuleCard>
     </section>
   );
@@ -22422,6 +23069,16 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
   const [ledgerExporting, setLedgerExporting] = useState(false);
   const [ledgerWhatsappOpen, setLedgerWhatsappOpen] = useState(false);
   const ledgerPrintRef = useRef(null);
+  // The list comes first; "Add account" (or Edit on a row) opens the form above it.
+  const [accountFormOpen, setAccountFormOpen] = useState(false);
+  const askPaymentReason = useAskReason();
+  const [accountNotice, showAccountNotice, clearAccountNotice] = useSaveNotice();
+  const [accountListNotice, showAccountListNotice, clearAccountListNotice] = useSaveNotice();
+  const [paymentNotice, showPaymentNotice, clearPaymentNotice] = useSaveNotice();
+  const [paymentListNotice, showPaymentListNotice, clearPaymentListNotice] = useSaveNotice();
+  const [ledgerNotice, showLedgerNotice, clearLedgerNotice] = useSaveNotice();
+  const [accountSaving, runAccountSave] = useSaveInFlight();
+  const [paymentSaving, runPaymentSave] = useSaveInFlight();
   // From the role's permission map (Owner always), as the server decides them -- a Cashier whose
   // Customer Payments box is unticked no longer gets a form that can only be refused.
   const canUseSupplierPayments = accountPermissions.supplierPayments === true;
@@ -22483,9 +23140,18 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     (!ledgerDateRange.date_from || toDateKey(row.date) >= ledgerDateRange.date_from) &&
     (!ledgerDateRange.date_to || toDateKey(row.date) <= ledgerDateRange.date_to)
   );
+  // "—" with no account chosen, and the balance carried in when the range has no entries
+  // (local/financialStatements.js); both used to print ₹0.00.
+  const ledgerBounds = ledgerStatementBounds(accountLedger.ledger || [], {
+    dateFrom: ledgerDateRange.date_from,
+    dateTo: ledgerDateRange.date_to,
+    hasAccount: Boolean(accountLedger.account),
+    dateKey: toDateKey,
+  });
   const ledgerDocumentTitle = `${accountLedger.account?.account_name || accountLedger.account?.customer_name || accountLedger.account?.supplier_name || "Account"} - Ledger Statement`;
   const exportLedgerPdf = async () => {
     if (!ledgerPrintRef.current) return;
+    clearLedgerNotice();
     setLedgerExporting(true);
     try {
       await exportDocumentPdf({
@@ -22494,7 +23160,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
         title: ledgerDocumentTitle,
       });
     } catch (error) {
-      alert(`Unable to export ledger PDF: ${error.message}`);
+      showLedgerNotice(errorNotice(`The ledger PDF could not be made (${error?.message || String(error)}). Nothing was saved; try again.`));
     } finally {
       setLedgerExporting(false);
     }
@@ -22517,7 +23183,35 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     });
   };
 
-  const saveAccount = async () => {
+  const closeAccountForm = () => {
+    setDraft(emptyAccount);
+    setEditingKey("");
+    setAccountFormOpen(false);
+    clearAccountNotice();
+  };
+  const openNewAccountForm = () => {
+    setDraft(emptyAccount);
+    setEditingKey("");
+    clearAccountNotice();
+    clearAccountListNotice();
+    setAccountFormOpen(true);
+    focusField("account-name", { scroll: true });
+  };
+  const saveAccount = () => runAccountSave(async () => {
+    clearAccountNotice();
+    // The server refuses a nameless account ("Enter valid account details"); said here first, at the box.
+    if (!String(draft.account_name || "").trim()) {
+      showAccountNotice(errorNotice("Enter the account name.", "account-name"));
+      // The name box is at the top of a long form; take the person to it (it is marked red).
+      focusField("account-name");
+      return;
+    }
+    if (draft.opening_balance !== "" && !Number.isFinite(Number(draft.opening_balance))) {
+      showAccountNotice(errorNotice("Enter the opening balance as a number, or leave it blank.", "account-opening"));
+      focusField("account-opening");
+      return;
+    }
+    const wasEditing = Boolean(editingKey);
     try {
       const payload = { ...draft, opening_balance: Number(draft.opening_balance || 0) };
       const normalizedName = payload.account_name.trim().toLowerCase();
@@ -22538,7 +23232,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
         return false;
       });
       if (duplicate) {
-        alert(payload.account_type === "CUSTOMER" ? "This customer already exists." : "This supplier already exists.");
+        showAccountNotice(errorNotice(payload.account_type === "CUSTOMER"
+          ? `${duplicate.account_name} is already a customer with this mobile number. Search the list and press Edit on it instead.`
+          : `${duplicate.account_name} is already a supplier with this name or firm. Search the list and press Edit on it instead.`, "account-name"));
+        focusField("account-name");
         return;
       }
       const supplierAccount = ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(payload.account_type);
@@ -22558,15 +23255,23 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       } else {
         await axios.post(`${API_URL}/accounts`, payload);
       }
+      const savedName = payload.account_name.trim();
       setDraft(emptyAccount);
       setEditingKey("");
-      await onReload();
-      alert(editingKey ? "Account updated" : "Account saved");
+      setAccountFormOpen(false);
+      // Saved; a list that does not refresh afterwards is a warning, not a failed save.
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const saved = `${savedName} ${wasEditing ? "updated" : "added"}.`;
+      showAccountListNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Refresh.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save account"));
+      showAccountNotice(errorNotice(getErrorMessage(error, "The account could not be saved. Nothing was changed; try again.")));
     }
-  };
+  });
   const editAccount = (account) => {
+    clearAccountNotice();
+    clearAccountListNotice();
+    setAccountFormOpen(true);
+    focusField("account-name", { scroll: true });
     setEditingKey(account.account_key);
     setDraft({
       account_name: account.account_name || "",
@@ -22600,7 +23305,26 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     setLedgerMode(ledgerFocusKey.startsWith("SUPPLIER-") ? "SUPPLIER" : "ANY");
     setLedgerAccountKey(ledgerFocusKey);
   }, [ledgerFocusKey]);
-  const savePayment = async () => {
+  const savePayment = () => runPaymentSave(async () => {
+    clearPaymentNotice();
+    // What the server refuses, asked here first so the cursor lands on the gap.
+    if (!payment.account_key) {
+      showPaymentNotice(errorNotice("Choose the account this payment is for.", "payment-account"));
+      focusField("payment-account", { scroll: false });
+      return;
+    }
+    if (!isSupplierPayment && !(Number(payment.amount) > 0)) {
+      showPaymentNotice(errorNotice("Enter the amount received.", "payment-amount"));
+      focusField("payment-amount", { scroll: false });
+      return;
+    }
+    if (isSupplierPayment && !(Number(payment.amount || 0) >= 0)) {
+      showPaymentNotice(errorNotice("Enter the amount paid.", "payment-amount"));
+      focusField("payment-amount", { scroll: false });
+      return;
+    }
+    const wasEditing = Boolean(editingPaymentKey);
+    const savedWords = `${currency.format(Number(payment.amount || 0))} ${isSupplierPayment ? "to" : "from"} ${selectedPaymentAccount?.account_name || "the account"}`;
     try {
       const payload = {
         ...payment,
@@ -22613,7 +23337,13 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       };
       let response;
       if (editingPaymentKey) {
-        const reason = window.prompt("Enter reason for editing this payment");
+        const reason = await askPaymentReason({
+          title: "Why is this payment being changed?",
+          message: "The reason is kept with the payment and shows in its history.",
+          label: "Reason for the change",
+          placeholder: "Example: wrong amount typed",
+          confirmLabel: "Save change",
+        });
         if (!reason) return;
         response = await axios.put(`${API_URL}/accounts/payments/${editingPaymentKey}`, { ...payload, reason });
       } else {
@@ -22634,13 +23364,16 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       });
       setEditingPaymentKey("");
       setPayment((current) => ({ ...current, amount: "", rebate_amount: "", reference_number: "", remarks: "" }));
-      await onReload();
-      alert(editingPaymentKey ? "Payment updated" : "Payment saved");
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const saved = `Payment of ${savedWords} ${wasEditing ? "updated" : "saved"}.`;
+      showPaymentNotice(refresh ? warningNotice(`${saved} But ${refresh}; press Refresh Payment History.`) : successNotice(saved));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save payment"));
+      showPaymentNotice(errorNotice(getErrorMessage(error, "The payment could not be saved. Nothing was recorded; try again.")));
     }
-  };
+  });
   const editPayment = (row) => {
+    clearPaymentNotice();
+    clearPaymentListNotice();
     setEditingPaymentKey(row.payment_key);
     setPayment({
       payment_action: row.payment_source === "CUSTOMER" ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER",
@@ -22655,22 +23388,32 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     setTab("payments");
   };
   const cancelPayment = async (row) => {
-    const reason = window.prompt(`Enter cancellation reason for ${row.account_name} payment`);
+    clearPaymentListNotice();
+    const reason = await askPaymentReason({
+      title: `Cancel the ${currency.format(Number(row.payment_amount || 0))} payment for ${row.account_name}?`,
+      message: "The payment stays in the history, marked cancelled, and the balance goes back to what it was.",
+      label: "Why is it being cancelled?",
+      confirmLabel: "Cancel payment",
+      cancelLabel: "Keep payment",
+      tone: "danger",
+    });
     if (!reason) return;
     try {
       await axios.post(`${API_URL}/accounts/payments/${row.payment_key}/cancel`, { reason, cancelled_by: user.id });
-      await onReload();
-      alert("Payment cancelled");
+      const refresh = await onReload().then(() => "", (error) => getErrorMessage(error, "the list did not refresh"));
+      const done = `Payment for ${row.account_name} cancelled.`;
+      showPaymentListNotice(refresh ? warningNotice(`${done} But ${refresh}; press Refresh Payment History.`) : successNotice(done));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to cancel payment"));
+      showPaymentListNotice(errorNotice(getErrorMessage(error, "The payment was not cancelled. Nothing was changed; try again.")));
     }
   };
   const viewPaymentHistory = async (row) => {
+    clearPaymentListNotice();
     try {
       const response = await axios.get(`${API_URL}/accounts/payments/${row.payment_key}/audit`);
       setPaymentAudit({ payment: row, rows: response.data });
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to load payment history"));
+      showPaymentListNotice(errorNotice(getErrorMessage(error, "The payment history could not be loaded. Try again.")));
     }
   };
   const refreshPaymentsForSelection = async (accountKey) => {
@@ -22688,7 +23431,8 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
 
       {tab === "master" && (
         <>
-          <ModuleCard eyebrow="Account details" title={editingKey ? "Edit account" : "Add an account"} subtitle="The account type decides where it shows up: purchases, POS bills, ledgers and payments.">
+          {accountFormOpen && (
+          <ModuleCard eyebrow="Account details" onChange={clearAccountNotice} title={editingKey ? `Edit ${draft.account_name || "account"}` : "Add an account"} subtitle="The account type decides where it shows up: purchases, POS bills, ledgers and payments.">
             <div className="pm-form-section">
               <h3>Account</h3>
               <div className="form-grid supplier-form-grid">
@@ -22697,13 +23441,15 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                     {masterTypeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                   </select>
                 </Field>
-                <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
+                <Field label={<RequiredLabel>Account Name</RequiredLabel>}><input aria-invalid={accountNotice?.field === "account-name" ? "true" : undefined} id="account-name" value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
                 <Field label="Firm Name"><input value={draft.firm_name} onChange={(event) => setDraft({ ...draft, firm_name: event.target.value })} /></Field>
                 <Field label="GST Number"><input value={draft.gst_number} onChange={(event) => setDraft({ ...draft, gst_number: event.target.value })} /></Field>
-                <Field label="Opening Balance"><input min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
+                <Field label="Opening Balance"><input aria-invalid={accountNotice?.field === "account-opening" ? "true" : undefined} id="account-opening" min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
                 <Field label="Notes"><textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
               </div>
               <label className="check-field pm-check"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
+              {/* A refusal about a box in this section is said here, beside the box, not under Save. */}
+              {accountNotice?.field && <SaveNotice notice={accountNotice} />}
             </div>
             <div className="pm-form-section">
               <h3>Contact</h3>
@@ -22726,16 +23472,24 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               </div>
             </div>
             <div className="button-row">
-              <button className="primary-button" onClick={saveAccount}>{editingKey ? "Update Account" : "Add Account"}</button>
-              {editingKey && <button className="secondary-button" onClick={() => { setDraft(emptyAccount); setEditingKey(""); }}>Cancel Edit</button>}
+              <button className="primary-button" disabled={accountSaving} onClick={saveAccount}>{accountSaving ? "Saving…" : editingKey ? "Save changes" : "Add account"}</button>
+              <button className="secondary-button" disabled={accountSaving} onClick={closeAccountForm}>Cancel</button>
             </div>
+            {!accountNotice?.field && <SaveNotice notice={accountNotice} />}
           </ModuleCard>
-          <ModuleCard eyebrow="Account List" title="All Accounts" subtitle="Inactive accounts remain in history and can be reactivated.">
+          )}
+          <ModuleCard
+            actions={!accountFormOpen && masterTypeOptions.length > 0 ? <button className="primary-button" onClick={openNewAccountForm}><Icon name="add" /> Add account</button> : null}
+            eyebrow="Account master"
+            title="All accounts"
+            subtitle="Customers, suppliers and other accounts. Inactive accounts stay in history and can be made active again."
+          >
             <div className="ledger-toolbar">
               <Field label="Search"><input placeholder="Search account or mobile" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
               <button className="secondary-button" onClick={onReload}>Refresh</button>
             </div>
-            <DataTable headers={["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", "Actions"]}>
+            <SaveNotice notice={accountListNotice} />
+            <DataTable headers={markNumericColumns(["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", "Actions"])}>
               {filteredAccounts.map((account) => (
                 <tr key={account.account_key}>
                   <td className="primary-cell">
@@ -22743,7 +23497,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                     {(account.system_account || account.firm_name || account.city || account.address) && <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address}</small>}
                   </td>
                   <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
-                  <td>{account.mobile_number || "-"}</td>
+                  <td>{account.mobile_number || MISSING_VALUE}</td>
                   <td>{currency.format(Number(account.opening_balance || 0))}</td>
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                   <td>{currency.format(Number(account.payable_balance || 0))}</td>
@@ -22751,6 +23505,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                   <td><button className="table-action" disabled={!canEditAccountRow(account, accountPermissions)} onClick={() => editAccount(account)} title={!account.system_account && !canEditAccountRow(account, accountPermissions) ? "Your role cannot change this type of account." : undefined}>{account.system_account ? "Protected" : "Edit"}</button></td>
                 </tr>
               ))}
+              {filteredAccounts.length === 0 && (
+                <tr><td className="empty-cell" colSpan={8}>{search ? "No account matches this search." : "No accounts yet. Press Add account to make the first one."}</td></tr>
+              )}
             </DataTable>
           </ModuleCard>
         </>
@@ -22772,13 +23529,14 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
             </Field>
             <button className="secondary-button" onClick={() => loadLedger(ledgerAccountKey)}>Refresh Ledger</button>
           </div>
-          <div className="ledger-toolbar">
+          <div className="ledger-toolbar ledger-dates-toolbar">
             <Field label="Statement From"><input type="date" value={ledgerDateRange.date_from} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_from: event.target.value })} /></Field>
             <Field label="Statement To"><input type="date" value={ledgerDateRange.date_to} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_to: event.target.value })} /></Field>
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Statement</button>
-            <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting..." : "PDF Export"}</button>
+            <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting…" : "PDF Export"}</button>
             <button className="whatsapp-button" disabled={!accountLedger.account || ledgerExporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setLedgerWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
           </div>
+          <SaveNotice notice={ledgerNotice} />
           <div ref={ledgerPrintRef} className="print-area report-paper">
             <header className="report-print-header">
               <BrandLogo invoice />
@@ -22788,23 +23546,26 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               </div>
             </header>
             <div className="purchase-summary-grid supplier-payment-preview">
-              <SummaryMetric label="Opening Balance" value={currency.format(Number(printableLedgerRows[0]?.balance || 0) - Number(printableLedgerRows[0]?.debit || 0) + Number(printableLedgerRows[0]?.credit || 0))} />
-              <SummaryMetric label="Closing Balance" value={currency.format(Number(printableLedgerRows.at(-1)?.balance || 0))} featured />
+              <SummaryMetric label="Opening Balance" value={formatKnownFigure(ledgerBounds.opening, (value) => currency.format(value))} />
+              <SummaryMetric label="Closing Balance" value={formatKnownFigure(ledgerBounds.closing, (value) => currency.format(value))} featured />
             </div>
-            <DataTable headers={["Date", "Invoice Number", "Transaction Type", "Sale Amount", "Payment Mode", "Debit", "Credit", "Balance", "Narration"]}>
+            <DataTable headers={markNumericColumns(["Date", "Invoice Number", "Transaction Type", "Sale Amount", "Payment Mode", "Debit", "Credit", "Balance", "Narration"])}>
               {printableLedgerRows.map((row, index) => (
                 <tr key={`${row.date}-${row.transaction_type}-${index}`}>
-                  <td>{row.date}</td>
-                  <td>{row.invoice_no || "-"}</td>
+                  <td>{formatDisplayDate(row.date)}</td>
+                  <td>{row.invoice_no || MISSING_VALUE}</td>
                   <td><span className="tag">{labelFor("transactionType", row.transaction_type)}</span></td>
-                  <td>{row.sale_amount ? currency.format(Number(row.sale_amount || 0)) : "-"}</td>
+                  <td>{row.sale_amount ? currency.format(Number(row.sale_amount || 0)) : MISSING_VALUE}</td>
                   <td>{labelFor("paymentMode", row.payment_mode)}</td>
                   <td>{currency.format(Number(row.debit || 0))}</td>
                   <td>{currency.format(Number(row.credit || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
-                  <td>{row.remarks || "-"}</td>
+                  <td className="wrap-cell">{row.remarks || MISSING_VALUE}</td>
                 </tr>
               ))}
+              {printableLedgerRows.length === 0 && (
+                <tr><td className="empty-cell" colSpan={9}>{accountLedger.account ? "No entries for this account in these dates." : "Choose an account above to see its ledger."}</td></tr>
+              )}
             </DataTable>
           </div>
           {ledgerWhatsappOpen && (
@@ -22824,31 +23585,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
       )}
 
       {tab === "payments" && (
-        <ModuleCard eyebrow="Payments" title="Account Payments" subtitle="Receive customer payments, pay suppliers, or record supplier rebates.">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            {selectedSupplierSummary ? (
-              <>
-                <SummaryMetric label="Total Purchase" value={currency.format(selectedSupplierSummary.totalPurchases)} />
-                <SummaryMetric label="Total Paid" value={currency.format(selectedSupplierSummary.totalPaid)} />
-                <SummaryMetric label="Total Rebate Received" value={currency.format(selectedSupplierSummary.totalRebate)} positive />
-                <SummaryMetric label="Outstanding Payable" value={currency.format(selectedSupplierSummary.outstanding)} featured />
-              </>
-            ) : selectedCustomerSummary ? (
-              <>
-                <SummaryMetric label="Total Sales" value={currency.format(selectedCustomerSummary.totalSales)} />
-                <SummaryMetric label="Total Received" value={currency.format(selectedCustomerSummary.totalPaid)} />
-                <SummaryMetric label="Outstanding Receivable" value={currency.format(selectedCustomerSummary.outstanding)} featured />
-                <SummaryMetric label="Account Type" value="Customer" />
-              </>
-            ) : (
-              <>
-                <SummaryMetric label="Selected Account" value="None" />
-                <SummaryMetric label="Outstanding Before" value={currency.format(0)} />
-                <SummaryMetric label="Payment Impact" value={currency.format(0)} />
-                <SummaryMetric label="Outstanding After" value={currency.format(0)} featured />
-              </>
-            )}
-          </div>
+        <ModuleCard eyebrow="Payments" onChange={clearPaymentNotice} title={editingPaymentKey ? "Edit payment" : "Record a payment"} subtitle="Receive customer payments, pay suppliers, or record supplier rebates.">
           <div className="form-grid">
             <Field label="Payment Action">
               <select value={payment.payment_action} onChange={(event) => setPayment({ ...payment, payment_action: event.target.value, account_key: "", rebate_amount: "" })}>
@@ -22856,13 +23593,16 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
               </select>
             </Field>
             <Field label="Account">
-              <select value={payment.account_key} onChange={(event) => refreshPaymentsForSelection(event.target.value)}>
+              <select aria-invalid={paymentNotice?.field === "payment-account" ? "true" : undefined} id="payment-account" value={payment.account_key} onChange={(event) => refreshPaymentsForSelection(event.target.value)}>
                 <option value="">Select account</option>
                 {paymentAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {labelFor("accountType", account.account_type)}</option>)}
               </select>
+              {/* The account's history in one line; the before and after figures are the tiles below. */}
+              {selectedSupplierSummary && <small className="cell-note">{`Purchases ${currency.format(selectedSupplierSummary.totalPurchases)} · Paid ${currency.format(selectedSupplierSummary.totalPaid)} · Rebate ${currency.format(selectedSupplierSummary.totalRebate)}`}</small>}
+              {selectedCustomerSummary && <small className="cell-note">{`Sales ${currency.format(selectedCustomerSummary.totalSales)} · Received ${currency.format(selectedCustomerSummary.totalPaid)}`}</small>}
             </Field>
             <Field label="Payment Date"><input type="date" value={payment.payment_date} onChange={(event) => setPayment({ ...payment, payment_date: event.target.value })} /></Field>
-            <Field label={isSupplierPayment ? "Payment Amount" : "Payment Amount / Receipt"}><input min="0" step="0.01" type="number" value={payment.amount} onChange={(event) => setPayment({ ...payment, amount: event.target.value })} /></Field>
+            <Field label={<RequiredLabel>{isSupplierPayment ? "Amount paid" : "Amount received"}</RequiredLabel>}><input aria-invalid={paymentNotice?.field === "payment-amount" ? "true" : undefined} id="payment-amount" min="0" step="0.01" type="number" value={payment.amount} onChange={(event) => setPayment({ ...payment, amount: event.target.value })} /></Field>
             {isSupplierPayment && <Field label="Rebate Received"><input min="0" step="0.01" type="number" value={payment.rebate_amount} onChange={(event) => setPayment({ ...payment, rebate_amount: event.target.value })} /></Field>}
             <Field label="Payment Mode">
               <select value={payment.payment_mode} onChange={(event) => setPayment({ ...payment, payment_mode: event.target.value })}>
@@ -22873,32 +23613,35 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
             <Field label="Remarks"><textarea value={payment.remarks} onChange={(event) => setPayment({ ...payment, remarks: event.target.value })} /></Field>
           </div>
           <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label={isSupplierPayment ? "Outstanding Payable Before" : "Outstanding Receivable Before"} value={currency.format(outstandingBefore)} />
-            <SummaryMetric label="Payment Amount" value={currency.format(paymentAmount)} />
+            <SummaryMetric label={isSupplierPayment ? "Outstanding Payable Before" : "Outstanding Receivable Before"} value={payment.account_key ? currency.format(outstandingBefore) : MISSING_VALUE} />
+            <SummaryMetric label={isSupplierPayment ? "This payment" : "This receipt"} value={currency.format(paymentAmount)} />
             {isSupplierPayment && <SummaryMetric label="Rebate Received" value={currency.format(rebateAmount)} positive />}
-            <SummaryMetric label={balancePreview.overpaid ? "Balance After Payment (advance)" : "Balance After Payment"} value={currency.format(outstandingAfter)} featured />
+            <SummaryMetric label={balancePreview.overpaid ? "Balance After Payment (advance)" : "Balance After Payment"} value={payment.account_key ? currency.format(outstandingAfter) : MISSING_VALUE} featured />
           </div>
           {overpaymentNote && <div className="warning-note" role="status">{overpaymentNote}</div>}
           <div className="button-row">
-            <button className="primary-button" onClick={savePayment}>{editingPaymentKey ? "Update Payment" : "Save Payment"}</button>
-            {editingPaymentKey && <button className="secondary-button" onClick={() => { setEditingPaymentKey(""); setPayment({ payment_action: canUseCustomerPayments ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER", account_key: "", payment_date: toDateKey(new Date()), amount: "", rebate_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" }); }}>Cancel Edit</button>}
+            <button className="primary-button" disabled={paymentSaving} onClick={savePayment}>{paymentSaving ? "Saving…" : editingPaymentKey ? "Save changes" : "Save payment"}</button>
+            {editingPaymentKey && <button className="secondary-button" onClick={() => { clearPaymentNotice(); setEditingPaymentKey(""); setPayment({ payment_action: canUseCustomerPayments ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER", account_key: "", payment_date: toDateKey(new Date()), amount: "", rebate_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" }); }}>Cancel Edit</button>}
           </div>
+          <SaveNotice notice={paymentNotice} />
+          <h3 className="section-subheading">Payment history</h3>
           <div className="ledger-toolbar">
             <button className="secondary-button" onClick={() => onPaymentsLoad(payment.account_key)}>Refresh Payment History</button>
             <button className="secondary-button" onClick={() => onPaymentsLoad()}>Show All Payments</button>
           </div>
-          <DataTable headers={["Date", "Party", "Type", "Payment", "Rebate", "Mode", "Status", "Reference", "Remarks", "Actions"]}>
+          <SaveNotice notice={paymentListNotice} />
+          <DataTable headers={markNumericColumns(["Date", "Party", "Type", "Payment", "Rebate", "Mode", "Status", "Reference", "Remarks", "Actions"], { also: ["Payment"] })}>
             {(accountPayments || []).map((row) => (
               <tr key={row.payment_key}>
-                <td>{toDateKey(row.payment_date)}</td>
+                <td>{formatDisplayDate(row.payment_date)}</td>
                 <td className="primary-cell">{row.account_name}</td>
                 <td><span className="tag">{labelFor("payment_source", row.payment_source)}</span></td>
                 <td>{currency.format(Number(row.payment_amount || 0))}</td>
-                <td>{Number(row.rebate_amount || 0) ? currency.format(Number(row.rebate_amount || 0)) : "-"}</td>
+                <td>{Number(row.rebate_amount || 0) ? currency.format(Number(row.rebate_amount || 0)) : MISSING_VALUE}</td>
                 <td><span className="tag">{labelFor("paymentMode", row.payment_mode)}</span></td>
                 <td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td>
-                <td>{row.reference_number || "-"}</td>
-                <td>{row.cancellation_reason || row.edit_reason || row.remarks || "-"}</td>
+                <td>{row.reference_number || MISSING_VALUE}</td>
+                <td>{row.cancellation_reason || row.edit_reason || row.remarks || MISSING_VALUE}</td>
                 <td className="table-actions-row">
                   <button className="table-action" disabled={row.cancelled} onClick={() => editPayment(row)}>Edit</button>
                   <button className="remove-button" disabled={row.cancelled || !canCancel} title={canCancel ? undefined : "Cancelling a payment needs Invoice Cancellation permission."} onClick={() => cancelPayment(row)}>Cancel</button>
@@ -22907,6 +23650,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                 </td>
               </tr>
             ))}
+            {(accountPayments || []).length === 0 && (
+              <tr><td className="empty-cell" colSpan={10}>{payment.account_key ? "No payments recorded for this account yet." : "No payments to show. Choose an account, or press Show All Payments."}</td></tr>
+            )}
           </DataTable>
         </ModuleCard>
       )}
@@ -22923,7 +23669,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                 <SummaryMetric label="Customer Accounts" value={outstandingView.customerOutstanding.length} />
                 <SummaryMetric label="Supplier Accounts" value={outstandingView.supplierOutstanding.length} />
               </div>
-              <DataTable headers={["Account", "Type", "Receivable", "Payable", "Status"]}>
+              <DataTable headers={markNumericColumns(["Account", "Type", "Receivable", "Payable", "Status"])}>
                 {[...outstandingView.customerOutstanding, ...outstandingView.supplierOutstanding].map((account) => (
                   <tr key={account.account_key}>
                     <td className="primary-cell">{account.account_name}</td>
@@ -23015,6 +23761,9 @@ function SettingsModule({
    * screen they were last editing.
    */
   const [settingsGroup, setSettingsGroup] = useState(null);
+  // Kept here, not in the cards: both cards are remounted with fresh rows after each save.
+  const [permissionNotice, showPermissionNotice, clearPermissionNotice] = useSaveNotice();
+  const [userNotice, showUserNotice, clearUserNotice] = useSaveNotice();
   /**
    * Open the group that holds a searched-for section, then scroll to it.
    *
@@ -23088,8 +23837,8 @@ function SettingsModule({
     "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
     "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
     "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} onChanged={onDiscountRulesChanged} saleRateSettings={settingsData.saleRateSettings} unavailableReason={discountUnavailableReason} />,
-    "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
-    "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
+    "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} notice={permissionNotice} onClearNotice={clearPermissionNotice} onNotice={showPermissionNotice} onReload={onReload} roles={settingsData.roles} user={user} />,
+    "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} notice={userNotice} onClearNotice={clearUserNotice} onNotice={showUserNotice} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
@@ -23165,21 +23914,20 @@ function SettingsModule({
   return (
     <section className="settings-layout">
       {banner}
-      <section className="content-card">
-        <p className="form-note">Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.</p>
-        <section className="report-center-grid">
-          {SETTINGS_GROUPS.map((group) => {
-            const count = sectionsInGroup(group.id).length;
-            return (
-              <button className="report-menu-card" key={group.id} onClick={() => setSettingsGroup(group.id)} type="button">
-                <Icon name={group.icon} size={22} />
-                <strong>{group.label}</strong>
-                <span>{group.description}</span>
-                <span className="settings-group-count">{count} setting{count === 1 ? "" : "s"}</span>
-              </button>
-            );
-          })}
-        </section>
+      {/* The same cards as Report Center's, so the two choosers look like one app. */}
+      <ModuleCard eyebrow="Settings" title="What do you want to set up?" subtitle="Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting." />
+      <section className="report-center-grid settings-group-grid">
+        {SETTINGS_GROUPS.map((group) => {
+          const count = sectionsInGroup(group.id).length;
+          return (
+            <button className="report-category-card" key={group.id} onClick={() => setSettingsGroup(group.id)} type="button">
+              <span className="report-category-icon"><Icon name={group.icon} size={24} /></span>
+              <strong>{group.label}</strong>
+              <span>{group.description}</span>
+              <em className="settings-group-count">{count} setting{count === 1 ? "" : "s"}</em>
+            </button>
+          );
+        })}
       </section>
     </section>
   );
@@ -23197,8 +23945,8 @@ function AppearanceAccessibilitySettings({
   // nothing about what they are about to get, and the answer changes without them touching it.
   const resolved = resolveTheme(themeMode, systemPrefersDark);
   return (
-    <ModuleCard eyebrow="Appearance / Accessibility" title="Display Typography" subtitle="Device-local display preference. This changes the app UI only; invoices and report print typography stay on their own print profiles.">
-      <div className="form-grid supplier-form-grid">
+    <ModuleCard eyebrow="Appearance / Accessibility" title="Display Typography" subtitle="Light or dark, and how big the text is, on this computer only. Printed bills and reports keep their own sizes.">
+      <div className="form-grid supplier-form-grid display-settings-grid">
         <Field label="Display Mode">
           <select onChange={(event) => setThemeMode?.(event.target.value)} value={themeMode}>
             {THEME_MODES.map((mode) => (
@@ -23272,6 +24020,26 @@ const settleSettingsSave = async (onReload, resetDraft) => {
   return refreshed;
 };
 
+/**
+ * A settings card's Save: one save at a time, and what happened said under the button instead of a
+ * browser popup. `run(task, failure)`: the task returns the notice to show (or nothing); a thrown
+ * error is shown in the server's plain words, or `failure`.
+ */
+function useSettingsSave() {
+  const [notice, showNotice, clearNotice] = useSaveNotice();
+  const [saving, runSave] = useSaveInFlight();
+  const run = useCallback((task, failure) => runSave(async () => {
+    clearNotice();
+    try {
+      const outcome = await task();
+      if (outcome) showNotice(outcome);
+    } catch (error) {
+      showNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, failure)));
+    }
+  }), [clearNotice, runSave, showNotice]);
+  return { clearNotice, notice, run, saving, showNotice };
+}
+
 function BusinessSettingsSection({ businessSettings, canManage, onReload, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(businessSettings, defaultBusinessSettings);
   const [logoMessage, setLogoMessage] = useState("");
@@ -23284,7 +24052,7 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
       return;
     }
     try {
-      setLogoMessage("Preparing logo...");
+      setLogoMessage("Preparing logo…");
       const dataUrl = await shrinkBrandLogo(file, {
         createImageBitmap: (blob) => window.createImageBitmap(blob),
         createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
@@ -23307,19 +24075,15 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
     event.preventDefault();
     takeLogo(found.file, found.message);
   };
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
-      setLogoMessage("");
-      await settleSettingsSave(onReload, resetDraft);
-      alert("Business settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update business settings"));
-    }
-  };
+  const businessSave = useSettingsSave();
+  const save = () => businessSave.run(async () => {
+    await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
+    setLogoMessage("");
+    return settingsSavedNotice("Business identity", await settleSettingsSave(onReload, resetDraft));
+  }, "The business details could not be saved. Nothing was changed; try again.");
 
   return (
-    <ModuleCard eyebrow="Business Settings" title="Business Identity" subtitle="The name and logo at the top of every screen and on bills, and the shop's invoice details.">
+    <ModuleCard eyebrow="Business Settings" title="Business Identity" onChange={businessSave.clearNotice} subtitle="The name and logo at the top of every screen and on bills, and the shop's invoice details.">
       <div className="brand-identity-editor">
         <div className="brand-identity-preview">
           <span className="product-photo-label">How the top of the app will look</span>
@@ -23405,7 +24169,10 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
         <Field label="Address"><textarea disabled={!canManage} value={draft.address || ""} onChange={(event) => updateDraft("address", event.target.value)} /></Field>
         <Field label="Invoice Footer Text"><textarea disabled={!canManage} value={draft.invoice_footer_text || ""} onChange={(event) => updateDraft("invoice_footer_text", event.target.value)} /></Field>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Business Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || businessSave.saving} onClick={save}>{businessSave.saving ? "Saving…" : "Save Business Settings"}</button>
+      </div>
+      <SaveNotice notice={businessSave.notice} />
     </ModuleCard>
   );
 }
@@ -23588,12 +24355,15 @@ function ScaleConnectionPanel() {
           </select>
         </Field>
       </div>
-      {ports.status === "ready" && ports.rows.length === 0 && <p className="form-note">No ports on this computer yet. Pair the scale first (below).</p>}
+      {/* When the list itself could not be read, the error below says so; "No ports" beside it would
+          claim the computer has none. */}
+      {ports.status === "ready" && ports.rows.length === 0 && !ports.message && <p className="form-note">No ports on this computer yet. Pair the scale first (below).</p>}
       {ports.message && <div className="inline-error" role="alert">{ports.message}</div>}
       <div className="button-row">
         <button className="primary-button" disabled={work.busy} type="button" onClick={find}>{work.busy ? "Working…" : "Find scale"}</button>
         <button className="secondary-button" disabled={work.busy || !port} type="button" onClick={connect}>Connect</button>
-        <button className="secondary-button" disabled={work.busy} type="button" onClick={disconnect}>Disconnect</button>
+        {/* Nothing to disconnect while no scale is connected or being connected. */}
+        <button className="secondary-button" disabled={work.busy || [SCALE_STATES.OFF, SCALE_STATES.UNAVAILABLE].includes(view.state)} type="button" onClick={disconnect}>Disconnect</button>
         <button className="secondary-button" disabled={work.busy || ports.status === "loading"} type="button" onClick={loadPorts}>Refresh ports</button>
       </div>
       {work.message && <p className={work.tone === "error" ? "inline-error" : work.tone === "warning" ? "stock-low" : "form-note"} role={work.tone === "error" ? "alert" : "status"}>{work.message}</p>}
@@ -23607,40 +24377,39 @@ function ScaleConnectionPanel() {
 
 function PosSettingsSection({ canManage, onReload, posSettings, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(posSettings, defaultPosSettings);
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/pos`, { ...draft, updated_by: user.id });
-      await settleSettingsSave(onReload, resetDraft);
-      alert("POS settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update POS settings"));
-    }
-  };
+  const posSave = useSettingsSave();
+  const save = () => posSave.run(async () => {
+    await axios.put(`${API_URL}/settings/pos`, { ...draft, updated_by: user.id });
+    return settingsSavedNotice("Scale setting", await settleSettingsSave(onReload, resetDraft));
+  }, "The scale setting could not be saved. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="A scale on the counter puts the weight straight into the bill. Weights can always be typed in by hand.">
+    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" onChange={posSave.clearNotice} subtitle="A scale on the counter puts the weight straight into the bill. Weights can always be typed in by hand.">
       <div className="form-grid supplier-form-grid">
         <label className="check-field"><input checked={draft.enable_weighing_scale === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_weighing_scale", event.target.checked)} /><span>Use the weighing scale in POS (all counters)</span></label>
       </div>
       <p className="form-note">In POS, put the fruit on the scale and add the item: its steady weight becomes the quantity (kg items only). F6 reads the weight again into the item being edited.</p>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save POS Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || posSave.saving} onClick={save}>{posSave.saving ? "Saving…" : "Save POS Settings"}</button>
+      </div>
+      <SaveNotice notice={posSave.notice} />
       <ScaleConnectionPanel />
     </ModuleCard>
   );
 }
 
-function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) {
+function PaymentSettingsSection({ canManage, onReload, paymentSettings: storedPaymentSettings, user }) {
+  // The saved rate reads "0" or "2.5", not the database's "0.000"; what is typed is left alone.
+  const paymentSettings = useMemo(() => (storedPaymentSettings
+    ? { ...storedPaymentSettings, sales_mandi_tax_percent: tidyStoredDecimal(storedPaymentSettings.sales_mandi_tax_percent) }
+    : storedPaymentSettings), [storedPaymentSettings]);
   const { draft, updateDraft, resetDraft } = useSettingsDraft(paymentSettings, defaultPaymentSettings);
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/payment`, { ...draft, updated_by: user.id });
-      await settleSettingsSave(onReload, resetDraft);
-      alert("Payment settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update payment settings"));
-    }
-  };
+  const paymentSave = useSettingsSave();
+  const save = () => paymentSave.run(async () => {
+    await axios.put(`${API_URL}/settings/payment`, { ...draft, updated_by: user.id });
+    return settingsSavedNotice("Payment and tax settings", await settleSettingsSave(onReload, resetDraft));
+  }, "The payment settings could not be saved. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Payment & Tax Settings" title="UPI, Payment QR and Sales Mandi Tax" subtitle="Configure invoice payment QR and registered-customer Mandi Tax rules used by POS, print, PDF and WhatsApp exports.">
+    <ModuleCard eyebrow="Payment & Tax Settings" title="UPI, Payment QR and Sales Mandi Tax" onChange={paymentSave.clearNotice} subtitle="Configure invoice payment QR and registered-customer Mandi Tax rules used by POS, print, PDF and WhatsApp exports.">
       <div className="form-grid supplier-form-grid">
         <Field label="Business UPI ID"><input disabled={!canManage} placeholder="name@bank" value={draft.business_upi_id || ""} onChange={(event) => updateDraft("business_upi_id", event.target.value)} /></Field>
         <Field label="Payee Name"><input disabled={!canManage} value={draft.upi_payee_name || ""} onChange={(event) => updateDraft("upi_payee_name", event.target.value)} /></Field>
@@ -23654,7 +24423,7 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         <label className="check-field"><input checked={draft.enable_upi_qr_on_invoice === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_upi_qr_on_invoice", event.target.checked)} /><span>Enable UPI QR on Invoice</span></label>
         <label className="check-field"><input checked={draft.show_upi_qr_on_all_bills === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_upi_qr_on_all_bills", event.target.checked)} /><span>Show UPI QR on all bills</span></label>
         <label className="check-field"><input checked={draft.enable_sales_mandi_tax === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_sales_mandi_tax", event.target.checked)} /><span>Enable Mandi Tax on registered-customer sales</span></label>
-        <Field label="Sales Mandi Tax Rate (%)"><input disabled={!canManage} min="0" step="0.001" type="number" value={draft.sales_mandi_tax_percent || 0} onChange={(event) => updateDraft("sales_mandi_tax_percent", event.target.value)} /></Field>
+        <Field label="Sales Mandi Tax Rate (%)"><input disabled={!canManage} min="0" step="0.001" type="number" value={draft.sales_mandi_tax_percent ?? ""} onChange={(event) => updateDraft("sales_mandi_tax_percent", event.target.value)} /></Field>
         <Field label="Customer Applicability">
           <select disabled={!canManage} value={draft.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS"} onChange={(event) => updateDraft("sales_mandi_tax_customer_scope", event.target.value)}>
             <option value="REGISTERED_CUSTOMERS">Registered/Saved Customer Accounts</option>
@@ -23682,7 +24451,10 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         {draft.enable_sales_mandi_tax === true && Number(draft.sales_mandi_tax_percent || 0) <= 0 && <p className="form-note stock-low">Enter a Mandi Tax rate before saving registered-customer sales with tax.</p>}
         {draft.enable_sales_mandi_tax !== true && <p className="form-note">Mandi Tax warnings stay disabled in POS while this setting is off. Use the reason field to document why it is not applicable.</p>}
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || paymentSave.saving} onClick={save}>{paymentSave.saving ? "Saving…" : "Save Payment Settings"}</button>
+      </div>
+      <SaveNotice notice={paymentSave.notice} />
     </ModuleCard>
   );
 }
@@ -23744,25 +24516,29 @@ function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }
 
 function MandiTaxSettings({ canManage, onReload, rules, user }) {
   const [newRule, setNewRule] = useState({ origin_type: "", tax_percent: "", active: true });
-  const addRule = async () => {
-    try {
-      await axios.post(`${API_URL}/settings/mandi-tax-rules`, { ...newRule, updated_by: user.id });
-      setNewRule({ origin_type: "", tax_percent: "", active: true });
-      await onReload();
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to add mandi tax rule"));
-    }
-  };
+  // One notice for the card: adding a rule, and saving or removing one in the table.
+  const mandiSave = useSettingsSave();
+  const addRule = () => mandiSave.run(async () => {
+    await axios.post(`${API_URL}/settings/mandi-tax-rules`, { ...newRule, updated_by: user.id });
+    const added = `${labelFor("origin", newRule.origin_type) || newRule.origin_type || "The"} mandi tax rule added.`;
+    setNewRule({ origin_type: "", tax_percent: "", active: true });
+    await onReload();
+    return successNotice(added);
+  }, "The mandi tax rule could not be added. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Mandi Tax Settings" title="Origin-Based Mandi Tax" subtitle="Database-backed tax percentages for local and imported fruit purchases.">
+    <ModuleCard eyebrow="Mandi Tax Settings" title="Origin-Based Mandi Tax" onChange={mandiSave.clearNotice} subtitle="The mandi tax percentage on purchases, by where the fruit comes from (local or imported).">
       <div className="form-grid settings-add-grid">
         <Field label="Origin Type"><input disabled={!canManage} placeholder="LOCAL or IMPORTED" value={newRule.origin_type} onChange={(event) => setNewRule({ ...newRule, origin_type: event.target.value.toUpperCase() })} /></Field>
         <Field label="Tax Percentage"><input disabled={!canManage} min="0" step="0.001" type="number" value={newRule.tax_percent} onChange={(event) => setNewRule({ ...newRule, tax_percent: event.target.value })} /></Field>
         <label className="check-field"><input disabled={!canManage} checked={newRule.active} type="checkbox" onChange={(event) => setNewRule({ ...newRule, active: event.target.checked })} /><span>Active</span></label>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={addRule}>Add Mandi Tax Rule</button>
-      <DataTable headers={["Origin Type", "Tax Percentage", "Status", ""]}>
-        {rules.map((rule) => <MandiRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || mandiSave.saving} onClick={addRule}>{mandiSave.saving ? "Adding…" : "Add Mandi Tax Rule"}</button>
+      </div>
+      <SaveNotice notice={mandiSave.notice} />
+      <DataTable headers={["Origin Type", { label: "Tax Percentage", numeric: true }, "Status", ""]}>
+        {rules.map((rule) => <MandiRuleRow canManage={canManage} key={rule.id} onNotice={mandiSave.showNotice} onReload={onReload} rule={rule} user={user} />)}
+        {rules.length === 0 && <tr><td className="empty-cell" colSpan={4}>No mandi tax rules yet.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -23785,8 +24561,10 @@ function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
   const blank = { charge_name: "", basis: "FLAT", measure_unit: "", flat_rate: "" };
   const [draft, setDraft] = useState(blank);
   const slabbed = draft.basis === "SLAB";
+  const chargeSave = useSettingsSave();
 
-  const addChargeType = async () => {
+  const addChargeType = () => chargeSave.run(async () => {
+    const added = draft.charge_name.trim() || "The charge";
     try {
       await axios.post(`${API_URL}/settings/charge-types`, {
         charge_name: draft.charge_name,
@@ -23799,15 +24577,17 @@ function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
       });
       setDraft(blank);
       await onReload();
+      return successNotice(`${added} added.${slabbed ? " Add its rates in the table below." : ""}`);
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to add this charge"));
+      return errorNotice(getSettingsWriteErrorMessage(error, "This charge could not be added. Nothing was changed; try again."));
     }
-  };
+  }, "This charge could not be added. Nothing was changed; try again.");
 
   return (
     <ModuleCard
       eyebrow="Charge Settings"
       title="Other Charges"
+      onChange={chargeSave.clearNotice}
       subtitle="Crate, labour, delivery, or anything else you charge for. Set one rate, or a rate that depends on a measurement."
     >
       <div className="form-grid settings-add-grid">
@@ -23849,21 +24629,25 @@ function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
             </Field>
           )}
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={addChargeType}>Add Charge</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || chargeSave.saving} onClick={addChargeType}>{chargeSave.saving ? "Adding…" : "Add Charge"}</button>
+      </div>
       {slabbed && <p className="form-note">Add the charge first, then add its rates below — 10 kg costs 40, 20 kg costs 50, and so on.</p>}
+      <SaveNotice notice={chargeSave.notice} />
 
       <DataTable headers={["Charge", "Priced By", "Rates", "Status", ""]}>
         {chargeTypes.map((chargeType) => (
-          <ChargeTypeRow canManage={canManage} chargeType={chargeType} key={chargeType.id} onReload={onReload} user={user} />
+          <ChargeTypeRow canManage={canManage} chargeType={chargeType} key={chargeType.id} onNotice={chargeSave.showNotice} onReload={onReload} user={user} />
         ))}
+        {!chargeTypes.length && <tr><td className="empty-cell" colSpan={5}>No charges set up yet.</td></tr>}
       </DataTable>
-      {!chargeTypes.length && <p className="form-note">No charges set up yet.</p>}
     </ModuleCard>
   );
 }
 
 /** One charge and its rates. Slabs are edited here because a slab means nothing on its own. */
-function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
+function ChargeTypeRow({ canManage, chargeType, onNotice = () => {}, onReload, user }) {
+  const confirmTurnOff = useConfirm();
   const [slabDraft, setSlabDraft] = useState({ upto_value: "", rate: "" });
   const slabs = [...(chargeType.slabs || [])].sort((first, second) => Number(first.upto_value) - Number(second.upto_value));
   const unit = chargeType.measure_unit || "";
@@ -23878,8 +24662,9 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
       });
       setSlabDraft({ upto_value: "", rate: "" });
       await onReload();
+      onNotice(successNotice(`Rate added to ${chargeType.charge_name}.`));
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to add this rate"));
+      onNotice(errorNotice(getSettingsWriteErrorMessage(error, `The rate could not be added to ${chargeType.charge_name}. Nothing was changed; try again.`)));
     }
   };
 
@@ -23887,18 +24672,27 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
     try {
       await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/slabs/${slabId}/deactivate`, { updated_by: user.id });
       await onReload();
+      onNotice(successNotice(`Rate removed from ${chargeType.charge_name}.`));
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to remove this rate"));
+      onNotice(errorNotice(getSettingsWriteErrorMessage(error, `The rate could not be removed from ${chargeType.charge_name}. Nothing was changed; try again.`)));
     }
   };
 
   const retireCharge = async () => {
-    if (!window.confirm(`Turn off "${chargeType.charge_name}"? It will stop appearing on new bills. Bills that already carry it keep it.`)) return;
+    const sure = await confirmTurnOff({
+      title: `Turn off "${chargeType.charge_name}"?`,
+      message: "It will stop appearing on new bills. Bills that already carry it keep it.",
+      confirmLabel: "Turn off",
+      cancelLabel: "Keep it on",
+      tone: "danger",
+    });
+    if (!sure) return;
     try {
       await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/deactivate`, { updated_by: user.id });
       await onReload();
+      onNotice(successNotice(`${chargeType.charge_name} turned off. New bills no longer offer it.`));
     } catch (error) {
-      alert(getSettingsWriteErrorMessage(error, "Unable to turn off this charge"));
+      onNotice(errorNotice(getSettingsWriteErrorMessage(error, `${chargeType.charge_name} could not be turned off. Nothing was changed; try again.`)));
     }
   };
 
@@ -23913,7 +24707,7 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
               {slabs.filter((slab) => slab.active !== false).map((slab) => (
                 <div className="charge-slab-row" key={slab.id}>
                   <span>up to {slab.upto_value} {unit} — {currency.format(Number(slab.rate || 0))}</span>
-                  <button className="remove-button" disabled={!canManage} onClick={() => retireSlab(slab.id)}><Icon name="trash" size={14} /></button>
+                  <button aria-label={`Remove the rate up to ${slab.upto_value} ${unit}`} className="remove-button" disabled={!canManage} onClick={() => retireSlab(slab.id)} title="Remove rate"><Icon name="trash" size={14} /></button>
                 </div>
               ))}
               {!slabs.some((slab) => slab.active !== false) && <p className="form-note stock-low">No rates yet — this charge cannot be billed until one is added.</p>}
@@ -23938,25 +24732,28 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
 
 function RebateSettings({ canManage, onReload, rules, user }) {
   const [newRule, setNewRule] = useState({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
-  const addRebateRule = async () => {
-    try {
-      await axios.post(`${API_URL}/settings/rebate-rules`, { ...newRule, updated_by: user.id });
-      setNewRule({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
-      await onReload();
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to add rebate rule"));
-    }
-  };
+  const rebateSave = useSettingsSave();
+  const addRebateRule = () => rebateSave.run(async () => {
+    await axios.post(`${API_URL}/settings/rebate-rules`, { ...newRule, updated_by: user.id });
+    const added = `Rebate rule ${newRule.rule_name ? `"${newRule.rule_name}" ` : ""}added.`;
+    setNewRule({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+    await onReload();
+    return successNotice(added);
+  }, "The rebate rule could not be added. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Supplier Rebate Settings" title="Payment-Speed Rebate Slabs" subtitle="Owner/Admin can change payment days, rebate percentages and active status from software.">
+    <ModuleCard eyebrow="Supplier Rebate Settings" title="Payment-Speed Rebate Slabs" onChange={rebateSave.clearNotice} subtitle="The rebate a supplier gives when paid within so many days.">
       <div className="form-grid settings-add-grid">
         <Field label="Rule Name"><input disabled={!canManage} value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
         <Field label="Pay Within Days"><input disabled={!canManage} min="0" type="number" value={newRule.pay_within_days} onChange={(event) => setNewRule({ ...newRule, pay_within_days: event.target.value })} /></Field>
         <Field label="Rebate Percentage"><input disabled={!canManage} min="0" step="0.001" type="number" value={newRule.rebate_percent} onChange={(event) => setNewRule({ ...newRule, rebate_percent: event.target.value })} /></Field>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={addRebateRule}>Add Rebate Rule</button>
-      <DataTable headers={["Rule", "Pay Within Days", "Rebate Percentage", "Status", ""]}>
-        {rules.map((rule) => <RebateRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || rebateSave.saving} onClick={addRebateRule}>{rebateSave.saving ? "Adding…" : "Add Rebate Rule"}</button>
+      </div>
+      <SaveNotice notice={rebateSave.notice} />
+      <DataTable headers={["Rule", { label: "Pay Within Days", numeric: true }, { label: "Rebate Percentage", numeric: true }, "Status", ""]}>
+        {rules.map((rule) => <RebateRuleRow canManage={canManage} key={rule.id} onNotice={rebateSave.showNotice} onReload={onReload} rule={rule} user={user} />)}
+        {rules.length === 0 && <tr><td className="empty-cell" colSpan={5}>No rebate rules yet.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -23964,17 +24761,13 @@ function RebateSettings({ canManage, onReload, rules, user }) {
 
 function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }) {
   const { draft, updateDraft, resetDraft } = useSettingsDraft(saleRateSettings, defaultSaleRateSettings);
-  const save = async () => {
-    try {
-      await axios.put(`${API_URL}/settings/sale-rate`, { ...draft, updated_by: user.id });
-      await settleSettingsSave(onReload, resetDraft);
-      alert("Sale rate settings updated");
-    } catch (error) {
-      alert(getErrorMessage(error, "Unable to update sale rate settings"));
-    }
-  };
+  const saleRateSave = useSettingsSave();
+  const save = () => saleRateSave.run(async () => {
+    await axios.put(`${API_URL}/settings/sale-rate`, { ...draft, updated_by: user.id });
+    return settingsSavedNotice("Sale rate settings", await settleSettingsSave(onReload, resetDraft));
+  }, "The sale rate settings could not be saved. Nothing was changed; try again.");
   return (
-    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="How Sale Rate Update suggests a rate from each lot's cost. A suggestion is only filled in when you choose it.">
+    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" onChange={saleRateSave.clearNotice} subtitle="How Sale Rate Update suggests a rate from each lot's cost. A suggestion is only filled in when you choose it.">
       <p className="form-note">The margin is on cost: a ₹100 cost at 25% suggests ₹125. Sale Rate Update starts at this margin; changing it on that screen does not change this setting.</p>
       <div className="form-grid settings-add-grid">
         <Field label="Target margin on cost %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent ?? ""} onChange={(event) => updateDraft("desired_margin_percent", event.target.value)} /></Field>
@@ -23993,7 +24786,10 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
         <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => updateDraft("suggestion_enabled", event.target.checked)} /><span>Show suggested rates</span></label>
         <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Sale Rate Settings</button>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || saleRateSave.saving} onClick={save}>{saleRateSave.saving ? "Saving…" : "Save Sale Rate Settings"}</button>
+      </div>
+      <SaveNotice notice={saleRateSave.notice} />
     </ModuleCard>
   );
 }
@@ -24275,9 +25071,11 @@ function DiscountSettings({ canManage, onChanged, saleRateSettings = {}, unavail
   );
 }
 
-function MandiRuleRow({ canManage, onReload, rule, user }) {
-  const [taxPercent, setTaxPercent] = useState(rule.tax_percent);
+function MandiRuleRow({ canManage, onNotice = () => {}, onReload, rule, user }) {
+  const [taxPercent, setTaxPercent] = useState(() => tidyStoredDecimal(rule.tax_percent));
   const [active, setActive] = useState(rule.active);
+  const confirmRemove = useConfirm();
+  const ruleName = labelFor("origin", rule.origin_type);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/mandi-tax-rules/${rule.id}`, {
@@ -24286,16 +25084,27 @@ function MandiRuleRow({ canManage, onReload, rule, user }) {
         updated_by: user.id,
       });
       await onReload();
+      onNotice(successNotice(`${ruleName} mandi tax saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update mandi tax rule"));
+      onNotice(errorNotice(getErrorMessage(error, `The ${ruleName} rule could not be saved. Nothing was changed; try again.`)));
     }
   };
   const remove = async () => {
+    // It used to go on one click of the bin.
+    const sure = await confirmRemove({
+      title: `Remove the ${ruleName} mandi tax rule?`,
+      message: "New purchases from this origin will carry no mandi tax until a rule is added again. Bills already saved keep theirs.",
+      confirmLabel: "Remove rule",
+      cancelLabel: "Keep rule",
+      tone: "danger",
+    });
+    if (!sure) return;
     try {
       await axios.delete(`${API_URL}/settings/mandi-tax-rules/${rule.id}`, { data: { updated_by: user.id } });
       await onReload();
+      onNotice(successNotice(`${ruleName} mandi tax rule removed.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to delete mandi tax rule"));
+      onNotice(errorNotice(getErrorMessage(error, `The ${ruleName} rule could not be removed. Nothing was changed; try again.`)));
     }
   };
   return (
@@ -24303,27 +25112,40 @@ function MandiRuleRow({ canManage, onReload, rule, user }) {
       <td className="primary-cell">{labelFor("origin", rule.origin_type)}</td>
       <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={taxPercent} onChange={(event) => setTaxPercent(event.target.value)} /></td>
       <td><label className="check-field"><input checked={active} disabled={!canManage} type="checkbox" onChange={(event) => setActive(event.target.checked)} /><span>{active ? "Active" : "Inactive"}</span></label></td>
-      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
+      <td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button aria-label={`Remove the ${ruleName} rule`} className="remove-button" disabled={!canManage} onClick={remove} title="Remove rule"><Icon name="trash" size={15} /></button></div></td>
     </tr>
   );
 }
 
-function RebateRuleRow({ canManage, onReload, rule, user }) {
-  const [draft, setDraft] = useState(rule);
+function RebateRuleRow({ canManage, onNotice = () => {}, onReload, rule, user }) {
+  const [draft, setDraft] = useState(() => ({ ...rule, rebate_percent: tidyStoredDecimal(rule.rebate_percent) }));
+  const confirmRemove = useConfirm();
+  const ruleName = rule.rule_name || "this";
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/rebate-rules/${rule.id}`, { ...draft, updated_by: user.id });
       await onReload();
+      onNotice(successNotice(`Rebate rule "${draft.rule_name || ruleName}" saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update rebate rule"));
+      onNotice(errorNotice(getErrorMessage(error, "The rebate rule could not be saved. Nothing was changed; try again.")));
     }
   };
   const remove = async () => {
+    // It used to go on one click of the bin.
+    const sure = await confirmRemove({
+      title: `Remove the rebate rule "${ruleName}"?`,
+      message: "Payments already recorded keep the rebate they had.",
+      confirmLabel: "Remove rule",
+      cancelLabel: "Keep rule",
+      tone: "danger",
+    });
+    if (!sure) return;
     try {
       await axios.delete(`${API_URL}/settings/rebate-rules/${rule.id}`, { data: { updated_by: user.id } });
       await onReload();
+      onNotice(successNotice(`Rebate rule "${ruleName}" removed.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to delete rebate rule"));
+      onNotice(errorNotice(getErrorMessage(error, "The rebate rule could not be removed. Nothing was changed; try again.")));
     }
   };
   return (
@@ -24332,7 +25154,7 @@ function RebateRuleRow({ canManage, onReload, rule, user }) {
       <td><input className="table-input" disabled={!canManage} min="0" type="number" value={draft.pay_within_days} onChange={(event) => setDraft({ ...draft, pay_within_days: event.target.value })} /></td>
       <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={draft.rebate_percent} onChange={(event) => setDraft({ ...draft, rebate_percent: event.target.value })} /></td>
       <td><label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
-      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
+      <td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button aria-label={`Remove the rebate rule ${ruleName}`} className="remove-button" disabled={!canManage} onClick={remove} title="Remove rule"><Icon name="trash" size={15} /></button></div></td>
     </tr>
   );
 }
@@ -24378,43 +25200,72 @@ const permissionLabels = [
   ["ai_settings_manage", "AI Settings"],
 ];
 
-function PermissionSettings({ canManage, onReload, roles, user }) {
+// Roles across the top, permissions down the side: 35 permissions used to be 35 columns, which put
+// each role's Save about 5000px to the right at 1366. Each role's Save sits under its name in the
+// table's (sticky) heading, so it is in view wherever the list is scrolled. The notice is kept by
+// Settings: this card is remounted with fresh rows after every save.
+function PermissionSettings({ canManage, notice = null, onClearNotice = () => {}, onNotice = () => {}, onReload, roles, user }) {
   const [drafts, setDrafts] = useState(() => {
     const next = {};
     for (const role of roles || []) next[role.role_name] = role.permissions || {};
     return next;
   });
+  const [savingRole, setSavingRole] = useState("");
+  const roleRows = roles || [];
+  const changedRoles = new Set(roleRows
+    .filter((role) => permissionLabels.some(([key]) => Boolean(drafts[role.role_name]?.[key]) !== Boolean(role.permissions?.[key])))
+    .map((role) => role.role_name));
   const toggle = (roleName, key) => {
+    onClearNotice();
     setDrafts((current) => ({
       ...current,
       [roleName]: { ...(current[roleName] || {}), [key]: !current[roleName]?.[key] },
     }));
   };
   const saveRole = async (roleName) => {
+    if (savingRole) return;
+    onClearNotice();
+    setSavingRole(roleName);
     try {
       await axios.put(`${API_URL}/settings/role-permissions/${encodeURIComponent(roleName)}`, {
         permissions: drafts[roleName] || {},
         updated_by: user.id,
       });
+      onNotice(successNotice(`${roleName} permissions saved. They apply from that person's next screen change.`));
       await onReload();
-      alert("Role permissions updated");
     } catch (error) {
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to update role permissions"));
+      onNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, `${roleName} permissions could not be saved. Nothing was changed; try again.`)));
+    } finally {
+      setSavingRole("");
     }
   };
+  const roleHeader = (role) => {
+    const locked = !canManage || role.role_name === "Owner";
+    const changed = changedRoles.has(role.role_name);
+    return {
+      label: (
+        <span className="permission-role-head">
+          <strong>{role.role_name}</strong>
+          {role.role_name === "Owner"
+            ? <small>Always everything</small>
+            : <button className={changed ? "table-action permission-save-changed" : "table-action"} disabled={locked || Boolean(savingRole)} onClick={() => saveRole(role.role_name)} type="button">{savingRole === role.role_name ? "Saving…" : changed ? "Save changes" : "Save"}</button>}
+        </span>
+      ),
+    };
+  };
   return (
-    <ModuleCard eyebrow="Role Management" title="Permission Matrix" subtitle="Owner/Admin can control access to billing, settings, tax, rebates, payments, reports and inventory functions.">
-      <p className="form-note">{`${permissionLabels.length} permissions, one column each: scroll the table sideways to see them all. The role stays in view.`}</p>
-      <DataTable className="permission-matrix-table" headers={["Role", ...permissionLabels.map(([, label]) => label), ""]}>
-        {(roles || []).map((role) => (
-          <tr key={role.role_name}>
-            <td className="primary-cell">{role.role_name}</td>
-            {permissionLabels.map(([key]) => (
-              <td key={key}>
-                <input checked={Boolean(drafts[role.role_name]?.[key])} disabled={!canManage || role.role_name === "Owner"} type="checkbox" onChange={() => toggle(role.role_name, key)} />
+    <ModuleCard eyebrow="Role Management" title="Permission Matrix" subtitle="What each role may open and change. Tick or untick, then press Save under the role's name.">
+      <SaveNotice notice={notice} />
+      {changedRoles.size > 0 && <p className="warning-note" role="status">{`Not saved yet: ${[...changedRoles].join(", ")}. Press Save changes under the role's name.`}</p>}
+      <DataTable className="permission-matrix-table" headers={["Permission", ...roleRows.map(roleHeader)]}>
+        {permissionLabels.map(([key, label]) => (
+          <tr key={key}>
+            <td className="primary-cell">{label}</td>
+            {roleRows.map((role) => (
+              <td className="permission-cell" key={role.role_name}>
+                <input aria-label={`${label} for ${role.role_name}`} checked={Boolean(drafts[role.role_name]?.[key])} disabled={!canManage || role.role_name === "Owner"} type="checkbox" onChange={() => toggle(role.role_name, key)} />
               </td>
             ))}
-            <td><button className="table-action" disabled={!canManage || role.role_name === "Owner"} onClick={() => saveRole(role.role_name)}>Save</button></td>
           </tr>
         ))}
       </DataTable>
@@ -24464,8 +25315,8 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
           <input checked={draft.require_exit_code_to_close !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("require_exit_code_to_close", event.target.checked)} />
           <span>Require Exit Code to Close App</span>
         </label>
-        <Field label="Current Owner/Admin Password"><PasswordInput disabled={!canManage} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Required only when changing exit code" /></Field>
-        <Field label="New Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={exitCode} onChange={(event) => setExitCode(event.target.value.replace(/\D/g, ""))} placeholder="Minimum 4 digits, recommended 6" /></Field>
+        <Field label="Current Owner/Admin Password"><PasswordInput disabled={!canManage} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Only to change the code" /></Field>
+        <Field label="New Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={exitCode} onChange={(event) => setExitCode(event.target.value.replace(/\D/g, ""))} placeholder="4+ digits, 6 is best" /></Field>
         <Field label="Confirm Exit Code"><PasswordInput disabled={!canManage} inputMode="numeric" value={confirmExitCode} onChange={(event) => setConfirmExitCode(event.target.value.replace(/\D/g, ""))} /></Field>
       </div>
       <div className="button-row">
@@ -24475,11 +25326,11 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
       <DataTable headers={["Attempted At", "User", "Device", "Result", "Reason"]}>
         {exitAttemptLogs.map((row) => (
           <tr key={row.id}>
-            <td>{row.attempted_at ? new Date(row.attempted_at).toLocaleString("en-IN") : "-"}</td>
-            <td>{row.user_name || row.user_id || "-"}</td>
-            <td>{row.device_id || "-"}</td>
+            <td>{row.attempted_at ? formatKolkataDateTime(row.attempted_at) : MISSING_VALUE}</td>
+            <td>{row.user_name || row.user_id || MISSING_VALUE}</td>
+            <td>{row.device_id || MISSING_VALUE}</td>
             <td><span className={row.success ? "stock-ok" : "stock-low"}>{row.success ? "Allowed" : "Blocked"}</span></td>
-            <td>{row.failure_reason || "-"}</td>
+            <td>{row.failure_reason || MISSING_VALUE}</td>
           </tr>
         ))}
         {exitAttemptLogs.length === 0 && <tr><td colSpan="5" className="empty-cell">No exit attempts logged yet.</td></tr>}
@@ -24488,7 +25339,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
   );
 }
 
-function UserManagementSection({ canManage, onReload, roles = [], user, users = [] }) {
+function UserManagementSection({ canManage, notice = null, onClearNotice = () => {}, onNotice = () => {}, onReload, roles = [], user, users = [] }) {
   const emptyForm = {
     title: "",
     full_name: "",
@@ -24537,7 +25388,16 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
     setEditingId(null);
     setDraft(emptyForm);
   };
-  const saveUser = async () => {
+  const [userSaving, runUserSave] = useSaveInFlight();
+  // Said under Save, at the box it is about (the card is remounted after a save, so the notice is
+  // kept by Settings).
+  const refuse = (message, field) => {
+    onNotice(errorNotice(message, field));
+    if (field) focusField(field, { scroll: false });
+  };
+  const saveUser = () => runUserSave(async () => {
+    onClearNotice();
+    const wasEditing = Boolean(editingId);
     try {
       const duplicate = users.find((item) =>
         Number(item.id) !== Number(editingId || 0) &&
@@ -24548,30 +25408,29 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
         )
       );
       if (duplicate) {
-        if (duplicate.username?.trim().toLowerCase() === draft.username.trim().toLowerCase()) alert("This username already exists.");
-        else if (draft.mobile_number && duplicate.mobile_number === draft.mobile_number) alert("This mobile number already exists.");
-        else alert("This email already exists.");
+        const owner = duplicate.full_name || duplicate.username;
+        if (duplicate.username?.trim().toLowerCase() === draft.username.trim().toLowerCase()) refuse(`The username "${draft.username.trim()}" is already ${owner}'s. Choose another.`, "user-username");
+        else if (draft.mobile_number && duplicate.mobile_number === draft.mobile_number) refuse(`This mobile number is already ${owner}'s.`, "user-mobile");
+        else refuse(`This email is already ${owner}'s.`, "user-email");
         return;
       }
-      if (!draft.full_name.trim() || !draft.username.trim() || !draft.role) {
-        alert("Enter full name, username and role.");
-        return;
-      }
-      if (!editingId && (draft.password.length < 4 || draft.password !== draft.confirm_password)) {
-        alert("Enter matching password with at least 4 characters.");
-        return;
-      }
+      if (!draft.full_name.trim()) return refuse("Enter the person's name.", "user-name");
+      if (!draft.username.trim()) return refuse("Enter a username to sign in with.", "user-username");
+      if (!draft.role) return refuse("Choose a role.", "user-role");
+      if (!editingId && draft.password.length < 4) return refuse("Enter a password of at least 4 characters.", "user-password");
+      if (!editingId && draft.password !== draft.confirm_password) return refuse("The two passwords do not match. Type the same password in both boxes.", "user-confirm-password");
       const { title, ...rest } = draft;
       const payload = { ...rest, full_name: joinPersonName(title, draft.full_name), updated_by: user.id };
       if (editingId) await axios.put(`${API_URL}/users/${editingId}`, payload);
       else await axios.post(`${API_URL}/users`, payload);
+      const savedName = joinPersonName(title, draft.full_name) || draft.username;
       resetForm();
+      onNotice(successNotice(`${savedName} ${wasEditing ? "updated" : "added"}.`));
       await onReload();
-      alert(editingId ? "User updated" : "User added");
     } catch (error) {
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to save user"));
+      onNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The user could not be saved. Nothing was changed; try again.")));
     }
-  };
+  });
   const changePassword = async () => {
     if (!passwordTarget) return;
     try {
@@ -24631,11 +25490,12 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
       await onReload();
     } catch (error) {
       if (action === "delete") setDeleteTarget(null);
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to update user status"));
+      onNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, `${item.full_name || item.username} could not be changed. Nothing was changed; try again.`)));
     }
   };
   return (
-    <ModuleCard eyebrow="User Management" title="Owner User Administration" subtitle="Add, edit, reset password, deactivate and protect user records with transaction history.">
+    <ModuleCard eyebrow="User Management" title="Users" onChange={onClearNotice} subtitle="Add staff, change their role or password, and switch off anyone who has left. People with bills are switched off, never deleted.">
+      {editingId && <p className="form-note">{`Editing ${draft.full_name || draft.username || "this user"}. Press Save changes, or Cancel Edit to leave them as they were.`}</p>}
       <div className="form-grid supplier-form-grid">
         <Field label="Title">
           <select disabled={!canManage} value={draft.title} onChange={(event) => updateDraft("title", event.target.value)}>
@@ -24647,29 +25507,30 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
             ))}
           </select>
         </Field>
-        <Field label="Name"><input disabled={!canManage} value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
-        <Field label="Username"><input disabled={!canManage} value={draft.username} onChange={(event) => updateDraft("username", event.target.value)} /></Field>
-        <Field label="Mobile"><input disabled={!canManage} value={draft.mobile_number} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
-        <Field label="Email"><input disabled={!canManage} type="email" value={draft.email} onChange={(event) => updateDraft("email", event.target.value)} /></Field>
-        <Field label="Role">
-          <select disabled={!canManage} value={draft.role} onChange={(event) => updateDraft("role", event.target.value)}>
+        <Field label={<RequiredLabel>Name</RequiredLabel>}><input aria-invalid={notice?.field === "user-name" ? "true" : undefined} disabled={!canManage} id="user-name" value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
+        <Field label={<RequiredLabel>Username</RequiredLabel>}><input aria-invalid={notice?.field === "user-username" ? "true" : undefined} disabled={!canManage} id="user-username" value={draft.username} onChange={(event) => updateDraft("username", event.target.value)} /></Field>
+        <Field label="Mobile"><input aria-invalid={notice?.field === "user-mobile" ? "true" : undefined} disabled={!canManage} id="user-mobile" value={draft.mobile_number} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
+        <Field label="Email"><input aria-invalid={notice?.field === "user-email" ? "true" : undefined} disabled={!canManage} id="user-email" type="email" value={draft.email} onChange={(event) => updateDraft("email", event.target.value)} /></Field>
+        <Field label={<RequiredLabel>Role</RequiredLabel>}>
+          <select disabled={!canManage} id="user-role" value={draft.role} onChange={(event) => updateDraft("role", event.target.value)}>
             {(roleNames.length ? roleNames : ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"]).map((role) => <option key={role} value={role}>{role}</option>)}
           </select>
         </Field>
         <Field label="Joining Date"><input disabled={!canManage} type="date" value={draft.joining_date} onChange={(event) => updateDraft("joining_date", event.target.value)} /></Field>
-        {!editingId && <Field label="Password"><PasswordInput disabled={!canManage} value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
-        {!editingId && <Field label="Confirm Password"><PasswordInput disabled={!canManage} value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
+        {!editingId && <Field label={<RequiredLabel>Password</RequiredLabel>}><PasswordInput aria-invalid={notice?.field === "user-password" ? "true" : undefined} disabled={!canManage} id="user-password" value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
+        {!editingId && <Field label={<RequiredLabel>Confirm Password</RequiredLabel>}><PasswordInput aria-invalid={notice?.field === "user-confirm-password" ? "true" : undefined} disabled={!canManage} id="user-confirm-password" value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
         <label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} /><span>Active user</span></label>
         <label className="check-field"><input checked={draft.recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("recovery_enabled", event.target.checked)} /><span>Recovery enabled</span></label>
         <label className="check-field"><input checked={draft.staff_self_recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("staff_self_recovery_enabled", event.target.checked)} /><span>Allow staff self-recovery</span></label>
         <Field label="Notes"><textarea disabled={!canManage} value={draft.notes} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
       </div>
-      {recoveryMessage && <div className="startup-status-panel"><p>{recoveryMessage}</p></div>}
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage} onClick={saveUser}>{editingId ? "Update User" : "Add User"}</button>
-        {editingId && <button className="secondary-button" onClick={resetForm}>Cancel Edit</button>}
+        <button className="primary-button" disabled={!canManage || userSaving} onClick={saveUser}>{userSaving ? "Saving…" : editingId ? "Save changes" : "Add User"}</button>
+        {editingId && <button className="secondary-button" onClick={() => { onClearNotice(); resetForm(); }}>Cancel Edit</button>}
       </div>
-      <DataTable headers={["Name", "Username", "Role", "Mobile", "Last Login", "Status", "Actions"]}>
+      <SaveNotice notice={notice} />
+      {recoveryMessage && <p className="form-note stock-ok save-notice" role="status">{recoveryMessage}</p>}
+      <DataTable className="users-table" headers={["Name", "Username", "Role", "Mobile", "Last Login", "Status", "Actions"]}>
         {users.map((item) => (
           <tr key={item.id}>
             <td className="primary-cell">
@@ -24681,19 +25542,25 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
             </td>
             <td>{item.username}</td>
             <td><span className="tag">{item.role}</span></td>
-            <td>{item.mobile_number || "-"}</td>
-            <td>{item.last_login_at ? new Date(item.last_login_at).toLocaleString("en-IN") : "Not recorded"}</td>
+            <td>{item.mobile_number || MISSING_VALUE}</td>
+            <td className="users-login-cell">{item.last_login_at ? formatKolkataDateTime(item.last_login_at) : "Not recorded"}</td>
             <td><span className={item.active ? "stock-ok" : "stock-low"}>{item.active ? "Active" : "Inactive"}</span></td>
             <td>
               <div className="button-row table-actions-row">
-                <button className="table-action" disabled={!canManage} onClick={() => startEdit(item)}>Edit</button>
+                <button className="table-action" disabled={!canManage} onClick={() => { onClearNotice(); startEdit(item); focusField("user-name"); }}>Edit</button>
                 <button className="table-action" disabled={!canManage} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "" })}>Password</button>
-                <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "", recoveryAction: true })}>Reset Staff Password</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "UNLOCK_ACCOUNT")}>Unlock</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "RESEND_USERNAME")}>Resend Username</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REVOKE_SESSIONS")}>Revoke Sessions</button>
-                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REQUIRE_PASSWORD_CHANGE")}>Require Change</button>
-                {item.active ? <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "deactivate")}>Deactivate</button> : <button className="secondary-button" disabled={!canManage} onClick={() => userAction(item, "reactivate")}>Reactivate</button>}
+                {item.active ? <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "deactivate")}>Deactivate</button> : <button className="table-action" disabled={!canManage} onClick={() => userAction(item, "reactivate")}>Reactivate</button>}
+                {/* The rarer account-recovery jobs fold under More, so the row fits at 1366. */}
+                <details className="row-more-actions">
+                  <summary className="table-action">More</summary>
+                  <div className="row-more-menu">
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "", recoveryAction: true })}>Reset Staff Password</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "UNLOCK_ACCOUNT")}>Unlock</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "RESEND_USERNAME")}>Resend Username</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REVOKE_SESSIONS")}>Revoke Sessions</button>
+                    <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REQUIRE_PASSWORD_CHANGE")}>Require Change</button>
+                  </div>
+                </details>
                 <button className="remove-button" disabled={!canManage || item.id === user.id} aria-label={`Delete ${item.full_name || item.username}`} onClick={() => setDeleteTarget({ item, saving: false })}><Icon name="trash" size={15} /></button>
               </div>
             </td>
@@ -24981,15 +25848,15 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, holdbackDays = 0,
         <strong>FroozERP update</strong>
         <span>{notice.text}</span>
         {notice.nextWindowAt && (
-          <span>Next update time: {new Date(notice.nextWindowAt).toLocaleString("en-IN")}</span>
+          <span>Next update time: {formatKolkataDateTime(notice.nextWindowAt)}</span>
         )}
         {notice.releasesAt && (
-          <span>This counter takes it after {new Date(notice.releasesAt).toLocaleString("en-IN")}</span>
+          <span>This counter takes it after {formatKolkataDateTime(notice.releasesAt)}</span>
         )}
       </div>
       {notice.actionLabel === "Install now" && (
         <button className="primary-button" disabled={state.phase === "installing"} onClick={() => install(true)}>
-          {state.phase === "installing" ? "Installing..." : "Install now"}
+          {state.phase === "installing" ? "Installing…" : "Install now"}
         </button>
       )}
     </div>
@@ -24997,6 +25864,8 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, holdbackDays = 0,
 }
 
 function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceControlSettings, onReload }) {
+  // In-app questions before installing and before cleaning old installs (were browser boxes).
+  const confirmUpdateStep = useConfirm();
   /**
    * When this particular counter is allowed to update itself.
    *
@@ -25402,9 +26271,12 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
       }));
       return;
     }
-    const confirmed = window.confirm(
-      "Install the downloaded FroozERP update and restart now?\n\nConfirm only after POS billing, purchase saving and sync activity are idle. Local SQLite data, device identity and settings remain in the app data folder."
-    );
+    const confirmed = await confirmUpdateStep({
+      title: "Install the update and restart FroozERP now?",
+      message: "Do this only when no bill, purchase or sync is in progress on this computer. Your data, this computer's identity and settings stay as they are.",
+      confirmLabel: "Install and restart",
+      cancelLabel: "Not now",
+    });
     if (!confirmed) {
       setUpdaterState((current) => ({ ...current, errorMessage: "Install postponed by owner." }));
       return;
@@ -25447,9 +26319,13 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
   const cleanOldVersions = async () => {
     if (!canManage || cleanupBusy) return;
     const count = cleanupResult?.candidates?.length || 0;
-    const confirmed = window.confirm(
-      `Clean ${count} old FroozERP shortcut/install item(s)?\n\nBusiness data will be preserved:\n${cleanupResult?.data_path || "%APPDATA%\\com.srtcompany.froozerp"}`
-    );
+    const confirmed = await confirmUpdateStep({
+      title: `Clean ${count} old FroozERP ${count === 1 ? "shortcut or install folder" : "shortcuts and install folders"}?`,
+      message: `Business data is kept, in ${cleanupResult?.data_path || "%APPDATA%\\com.srtcompany.froozerp"}.`,
+      confirmLabel: "Clean old versions",
+      cancelLabel: "Keep them",
+      tone: "danger",
+    });
     if (!confirmed) return;
     try {
       setCleanupBusy(true);
@@ -25472,33 +26348,40 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
   const versionsMatch = normalizeVersion(desktopVersion) && normalizeVersion(desktopVersion) === normalizeVersion(backendVersion);
   const compatibilityStatus = versionsMatch ? "Compatible" : "Mixed installation detected";
   return (
-    <ModuleCard eyebrow="Software Updates" title="FroozERP Windows Updates" subtitle="Signed in-app updates with owner confirmation and local data preservation checks.">
+    <ModuleCard eyebrow="Software Updates" title="FroozERP Updates" subtitle="New versions are checked, downloaded and installed from here. Your data stays where it is.">
+      {/* Three facts for the owner; everything a technician needs is folded under Technical details. */}
       <div className={updateAvailable ? "update-available-panel" : "update-foundation-panel"}>
         <strong>{updateStatusText}</strong>
-        <div className="cleanup-result-grid">
+        <div className="cleanup-result-grid update-owner-facts">
           <SummaryMetric label="Desktop App Version" value={desktopVersion} featured />
-          <SummaryMetric label="Local Backend Version" value={backendVersion} />
           <SummaryMetric label="Latest Available Version" value={displayLatestVersion} />
+          <SummaryMetric label="Last Checked" value={updaterState.lastCheckedAt ? formatKolkataDateTime(updaterState.lastCheckedAt) : "Not checked"} />
+        </div>
+        {updaterState.releaseNotes && <span>{updaterState.releaseNotes}</span>}
+        {!versionsMatch && <small className="stock-low">The app and its background service are on different versions. Install the update (or reinstall) to bring them together.</small>}
+      </div>
+      {updaterState.errorMessage && <p className={updaterState.phase === "error" ? "error-banner" : "form-note"} role={updaterState.phase === "error" ? "alert" : "status"}>{updaterState.errorMessage}</p>}
+      <details className="update-technical-details">
+        <summary>Technical details</summary>
+        <div className="cleanup-result-grid">
+          <SummaryMetric label="Local Backend Version" value={backendVersion} />
           <SummaryMetric label="Compatibility" value={compatibilityStatus} />
-          <SummaryMetric label="Status" value={updateStatusText} />
-          <SummaryMetric label="Published" value={updaterState.publishedAt ? new Date(updaterState.publishedAt).toLocaleString("en-IN") : "Not available"} />
+          <SummaryMetric label="Published" value={updaterState.publishedAt ? formatKolkataDateTime(updaterState.publishedAt) : "Not available"} />
           <SummaryMetric label="Download Status" value={downloadStatus} />
           <SummaryMetric label="Signature Status" value={signatureStatus} />
-          <SummaryMetric label="Last Checked" value={updaterState.lastCheckedAt ? new Date(updaterState.lastCheckedAt).toLocaleString("en-IN") : "Not checked"} />
           <SummaryMetric label="Download Size" value={formatBytes(updaterState.downloadProgress.total)} />
           <SummaryMetric label="Current Executable" value={installDiagnostics?.current_executable || "Desktop diagnostic pending"} />
           <SummaryMetric label="Backend PID" value={backendVersionDiagnostics?.pid || "Unknown"} />
           <SummaryMetric label="Backend Executable" value={backendVersionDiagnostics?.executablePath || "Unknown"} />
         </div>
-        {updaterState.releaseNotes && <span>{updaterState.releaseNotes}</span>}
         <small>Update Feed: {updaterState.feedUrl || "Not Configured"}</small>
         {installDiagnostics?.stale_installations?.map((path) => (
           <small key={path}>Another FroozERP installation was detected at {path}.</small>
         ))}
         {!versionsMatch && <small>Mixed installation detected: desktop {desktopVersion}, backend {backendVersion}.</small>}
         {updaterState.errorCode && <small>Error Code: {updaterState.errorCode}</small>}
-      </div>
-      <p className="form-note">{updaterState.errorMessage || "Tauri updater is authoritative for availability, signature verification, download and installation. Backend manifest is diagnostics only."}</p>
+        <small>Tauri updater is authoritative for availability, signature verification, download and installation. Backend manifest is diagnostics only.</small>
+      </details>
       {updaterState.phase === "downloading" && (
         <div className="update-download-progress">
           <div className="update-download-progress-bar" style={{ width: `${progressPercent}%` }} />
@@ -25548,7 +26431,7 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
         <small>Zero means this counter takes a release as soon as it is published, at the hours above. Set it to one or two and this counter waits while the Owner&apos;s own machine runs the release first. A machine the Owner is signed in on never waits.</small>
         {scheduleMessage && <small>{scheduleMessage}</small>}
         <div className="button-row">
-          <button className="primary-button" disabled={!canManage || scheduleBusy} onClick={saveSchedule}>{scheduleBusy ? "Saving..." : "Save Update Hours"}</button>
+          <button className="primary-button" disabled={!canManage || scheduleBusy} onClick={saveSchedule}>{scheduleBusy ? "Saving…" : "Save Update Hours"}</button>
         </div>
       </div>
       )}
@@ -25630,7 +26513,9 @@ function SyncSettingsSection({
   // machine, what "connected" meant -- and the machine's real behaviour then depended on all of
   // them agreeing. Nothing here is drafted now, because nothing here is chosen.
   const [configMessage, setConfigMessage] = useState("");
-  const save = async () => {
+  const deviceNameSave = useSettingsSave();
+  const save = () => deviceNameSave.run(async () => {
+    setStatusMessage("");
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
         device_display_name: draft.device_display_name || "Main Counter Device",
@@ -25638,14 +26523,11 @@ function SyncSettingsSection({
       });
       // What the server saved stands on screen until the reload brings it back as the live value.
       if (response.data?.device_display_name !== undefined) updateDraft("device_display_name", response.data.device_display_name);
-      await settleSettingsSave(onReload, resetDraft);
-      setStatusMessage("Device display name saved");
-      alert("Device display name saved");
+      return settingsSavedNotice("Device display name", await settleSettingsSave(onReload, resetDraft));
     } catch (error) {
-      setStatusMessage(getErrorMessage(error, "Unable to save device display name"));
-      alert(getErrorMessage(error, "Unable to save device display name"));
+      return errorNotice(getErrorMessage(error, "The device display name could not be saved. Nothing was changed; try again."));
     }
-  };
+  }, "The device display name could not be saved. Nothing was changed; try again.");
   const testApiUrl = async (url, label = "API") => {
     const apiUrl = normalizeApiBase(url);
     if (!isValidHttpApiUrl(apiUrl)) {
@@ -25745,7 +26627,7 @@ function SyncSettingsSection({
   const runRegisterDevice = async () => {
     if (!onRegisterCloudDevice) return;
     setCloudActionBusy("register");
-    setConfigMessage("Registering this device with FroozERP cloud...");
+    setConfigMessage("Registering this device with FroozERP cloud…");
     try {
       const result = await onRegisterCloudDevice(user, localDbStatus?.deviceIdentity || {
         device_id: localStorage.getItem("froozerp_device_id"),
@@ -25759,7 +26641,7 @@ function SyncSettingsSection({
   const runApproveDevice = async () => {
     if (!onApproveCloudDevice) return;
     setCloudActionBusy("approve");
-    setConfigMessage("Approving this device for FroozERP cloud sync...");
+    setConfigMessage("Approving this device for FroozERP cloud sync…");
     try {
       const result = await onApproveCloudDevice(user, localDbStatus?.deviceIdentity || {
         device_id: localStorage.getItem("froozerp_device_id"),
@@ -25873,8 +26755,8 @@ function SyncSettingsSection({
           </div>
           <div className="toolbar-actions">
             <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Run Cloud Diagnostics</button>
-            <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering..." : "Register This Device"}</button>
-            <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving..." : "Approve This Device"}</button>
+            <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering…" : "Register This Device"}</button>
+            <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving…" : "Approve This Device"}</button>
             <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
             <button className="secondary-button" onClick={copySafeDiagnostics}>Copy Safe Diagnostics</button>
           </div>
@@ -25961,9 +26843,10 @@ function SyncSettingsSection({
                 what the app is actually talking to is a diagnosis, not a setting -- and it now
                 names the one address there is instead of whichever box was on screen. */}
             <button className="secondary-button" disabled={!canManage} onClick={() => testApiUrl(API_CONFIG.apiUrl, "This app's server")}>Test Connection</button>
-            <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
-            <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
+            <button className="primary-button" disabled={!canManage || deviceNameSave.saving} onClick={save}>{deviceNameSave.saving ? "Saving…" : "Save Device Name"}</button>
+            <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud…" : "Cloud Readiness Check"}</button>
           </div>
+          <SaveNotice notice={deviceNameSave.notice} />
           {cloudDiagnostics?.results?.length > 0 && (
             <DataTable headers={["Check", "Result", "URL", "HTTP", "Message"]}>
               {cloudDiagnostics.results.map((row) => (
@@ -25971,7 +26854,7 @@ function SyncSettingsSection({
                   <td>{row.label}</td>
                   <td><span className={row.ok ? "stock-ok" : "stock-low"}>{row.ok ? "Passed" : "Failed"}</span></td>
                   <td><small>{row.url}</small></td>
-                  <td>{row.httpStatus || "-"}</td>
+                  <td>{row.httpStatus || MISSING_VALUE}</td>
                   <td>{row.message}</td>
                 </tr>
               ))}
@@ -26027,6 +26910,9 @@ function OperationalScopeManagement({
   const [locationDraft, setLocationDraft] = useState({ branch_id: "", location_code: "", location_name: "", location_type: "STORE", address: "", is_default: false });
   const [staffDraft, setStaffDraft] = useState({ user_id: "", branch_id: "", operational_location_id: "", role_id: "", is_default: true, effective_from: "", effective_to: "" });
   const [approvalDrafts, setApprovalDrafts] = useState({});
+  // In-app boxes: a rename asks for the new name and the reason in one box, not two prompts in a row.
+  const askScopeReason = useAskReason();
+  const confirmScope = useConfirm();
   // Read once when the screen opens, after each save, and when the signed-in session itself changes
   // -- not whenever the user object is rebuilt. The full-page loading card is for the first read
   // only: a later reload keeps the page (and where it is scrolled to) and refreshes in place.
@@ -26100,11 +26986,17 @@ function OperationalScopeManagement({
       setBranchDraft({ branch_name: "", address: "", phone_number: "", gst_number: "" });
     } catch (requestError) { report("branches", "error", getErrorMessage(requestError, "The branch could not be added.")); }
   };
+  // A rename answers { name, reason }; a close answers the reason. Cancel answers null.
+  const askScopeChange = async (kind, name, closing) => {
+    const answer = await askScopeReason(scopeChangeDialog({ kind, name, closing }));
+    if (!answer) return null;
+    return closing ? { name, reason: answer } : answer;
+  };
   const updateBranch = async (branch, active = branch.active !== false) => {
-    const branchName = active ? window.prompt("New name for this branch", branch.branch_name) : branch.branch_name;
-    if (!branchName?.trim()) return;
-    const reason = window.prompt(active ? "Reason for the change" : `Why is branch "${branch.branch_name}" being closed?`);
-    if (!reason?.trim()) return;
+    const change = await askScopeChange("branch", branch.branch_name, !active);
+    if (!change) return;
+    const branchName = active ? change.name : branch.branch_name;
+    const { reason } = change;
     try {
       await saveWrite("put", `/api/v3/admin/branches/${branch.id}`, {
         ...branch,
@@ -26128,10 +27020,10 @@ function OperationalScopeManagement({
     } catch (requestError) { report("counters", "error", getErrorMessage(requestError, "The counter could not be added.")); }
   };
   const updateLocation = async (location, active = location.active !== false) => {
-    const locationName = active ? window.prompt("New name for this counter", location.location_name) : location.location_name;
-    if (!locationName?.trim()) return;
-    const reason = window.prompt(active ? "Reason for the change" : `Why is counter "${location.location_name}" being closed?`);
-    if (!reason?.trim()) return;
+    const change = await askScopeChange("counter", location.location_name, !active);
+    if (!change) return;
+    const locationName = active ? change.name : location.location_name;
+    const { reason } = change;
     try {
       await saveWrite("put", `/api/v3/admin/operational-locations/${location.id}`, {
         target_branch_id: location.branch_id,
@@ -26165,7 +27057,14 @@ function OperationalScopeManagement({
     } catch (requestError) { report("staff", "error", getErrorMessage(requestError, "The staff member could not be placed at the counter.")); }
   };
   const deactivateStaffAssignment = async (assignment) => {
-    const reason = window.prompt(`Why is ${assignment.full_name} being removed from ${assignment.location_name}?`);
+    const reason = await askScopeReason({
+      title: `Remove ${assignment.full_name} from ${assignment.location_name}?`,
+      message: "They can no longer sign in at this counter. Their bills stay in the books.",
+      label: "Why are they being removed?",
+      confirmLabel: "Remove from counter",
+      cancelLabel: "Keep them here",
+      tone: "danger",
+    });
     if (!reason?.trim()) return;
     try {
       await saveWrite("put", `/api/v3/admin/staff-assignments/${assignment.user_id}`, {
@@ -26231,7 +27130,15 @@ function OperationalScopeManagement({
   // An id a machine no longer uses (an install from before one-machine-one-id). Kept in the books --
   // old bills name it -- but no longer drawn as a box. The server refuses this computer's own id.
   const retireDevice = async (device) => {
-    if (!window.confirm(retireDeviceConfirmText(device))) return;
+    const [question, ...detail] = retireDeviceConfirmText(device).split("\n\n");
+    const retire = await confirmScope({
+      title: question,
+      message: detail.join(" "),
+      confirmLabel: "Remove old id",
+      cancelLabel: "Keep it",
+      tone: "danger",
+    });
+    if (!retire) return;
     try {
       await saveWrite("post", `/api/v3/admin/devices/${encodeURIComponent(device.device_id)}/retire`, {
         reason: "Owner removed an id this machine no longer uses",
@@ -26241,7 +27148,7 @@ function OperationalScopeManagement({
     } catch (requestError) { report("computers", "error", getErrorMessage(requestError, "The old id could not be removed.")); }
   };
 
-  if (loading && !loadedOnce) return <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters"><p>Loading branches and counters...</p></ModuleCard>;
+  if (loading && !loadedOnce) return <ModuleCard title="Branches & Counters"><p className="form-note">Loading branches and counters…</p></ModuleCard>;
   const stepMessage = (step) => {
     const status = stepStatus[step];
     if (!status?.text) return null;
@@ -26251,7 +27158,7 @@ function OperationalScopeManagement({
   const locationTypeLabel = (type) => ({ STORE: "Shop counter", WAREHOUSE: "Store room / warehouse", MANDI_COUNTER: "Mandi counter", OFFICE: "Office" })[type] || type;
   return (
     <div className="scope-page">
-      <ModuleCard eyebrow="Setup" title="Branches & Counters" subtitle="Your shops, their counters, who works where, and which computers and phones may bill. Set them up in this order.">
+      <ModuleCard eyebrow="Setup" title="Your shops and counters" subtitle="Your shops, their counters, who works where, and which computers and phones may bill. Set them up in this order.">
         {error && <div className="startup-status-error" role="alert"><p>{error}</p></div>}
         {!scopePlan.readsScope && <p className="scope-locked-note">Branches, counters, staff and computers are the Owner's. As an Admin you can manage the Counter screen lock below.</p>}
         {scopePlan.readsScope && !canManage && !error && <p className="scope-locked-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
@@ -26281,7 +27188,7 @@ function OperationalScopeManagement({
         </div>
         {stepMessage("branches")}
         <DataTable headers={["Branch", "Address", "Counters", "Status", "Actions"]}>
-          {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || "-"}</td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id) && location.active !== false).length}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Close branch</button>}</div></td></tr>)}
+          {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || MISSING_VALUE}</td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id) && location.active !== false).length}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Close branch</button>}</div></td></tr>)}
         </DataTable>
       </ModuleCard>
 
@@ -26312,7 +27219,7 @@ function OperationalScopeManagement({
         </div>
         {stepMessage("staff")}
         <DataTable headers={["Person", "Role", "Branch", "Counter", "Main counter", "Status", "Actions"]}>
-          {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || "-"}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Can sign in" : "Removed"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Remove</button>}</td></tr>)}
+          {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || MISSING_VALUE}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Can sign in" : "Removed"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Remove</button>}</td></tr>)}
         </DataTable>
       </ModuleCard>
 
@@ -26402,6 +27309,8 @@ function _LegacySecurityDevicesSection(props) {
 function LegacySecurityDevicesSection({ activationCodes, branches, canManage, counters, devices, onReload, user }) {
   const [generatedCode, setGeneratedCode] = useState("");
   const [codeDraft, setCodeDraft] = useState({ code_label: "Counter device activation", expires_in_hours: 24, branch_id: "1", counter_id: "" });
+  // Not drawn any more (Branches & Counters replaced it); its outcomes go to one notice, not alerts.
+  const [legacyNotice, showLegacyNotice] = useSaveNotice();
   const deviceAction = async (device, action) => {
     try {
       await axios.put(`${API_URL}/settings/devices/${encodeURIComponent(device.device_id)}`, {
@@ -26412,9 +27321,9 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
         assigned_counter_id: device.assigned_counter_id || null,
       });
       await onReload();
-      alert(`Device ${action.toLowerCase()} saved`);
+      showLegacyNotice(successNotice(`${device.device_name || "Device"}: change saved.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update device"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The device could not be changed. Nothing was changed; try again.")));
     }
   };
   const generateCode = async () => {
@@ -26425,9 +27334,9 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
       });
       setGeneratedCode(response.data.code);
       await onReload();
-      alert("Activation code generated. Share it only with the device being approved.");
+      showLegacyNotice(successNotice("Activation code made. Share it only with the device being approved."));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to generate activation code"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The activation code could not be made. Try again.")));
     }
   };
   const revokeCode = async (code) => {
@@ -26435,7 +27344,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
       await axios.put(`${API_URL}/settings/activation-codes/${code.id}/revoke`, { updated_by: user.id });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to revoke activation code"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The activation code could not be revoked. Try again.")));
     }
   };
   return (
@@ -26452,8 +27361,8 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
             <td>{labelFor("deviceType", device.device_type || "Browser")}</td>
             <td>{device.branch_name || "Branch not known"}<small className="cell-note">{device.counter_name || "Counter: see Branches & Counters"}</small></td>
             <td><span className={statusClass("deviceStatus", device.status)}>{labelFor("deviceStatus", device.status)}</span></td>
-            <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
-            <td>{device.last_sync_at ? new Date(device.last_sync_at).toLocaleString("en-IN") : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
+            <td>{device.last_active_at ? formatKolkataDateTime(device.last_active_at) : "Not active yet"}</td>
+            <td>{device.last_sync_at ? formatKolkataDateTime(device.last_sync_at) : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
             <td>
               <div className="button-row table-actions-row">
                 <button className="table-action" disabled={!canManage || device.status === "APPROVED"} onClick={() => deviceAction(device, "APPROVE")}>Approve</button>
@@ -26484,15 +27393,16 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
         <button className="primary-button" disabled={!canManage} onClick={generateCode}>Generate Activation Code</button>
         {generatedCode && <span className="batch-id">New Code: {generatedCode}</span>}
       </div>
+      <SaveNotice notice={legacyNotice} />
       <DataTable headers={["Label", "Branch", "Counter", "Expires", "Status", "Used By", "Actions"]}>
         {activationCodes.map((code) => (
           <tr key={code.id}>
             <td className="primary-cell">{code.code_label || "Activation Code"}</td>
             <td>{code.branch_name || "Any"}</td>
             <td>{code.counter_name || "Any"}</td>
-            <td>{code.expires_at ? new Date(code.expires_at).toLocaleString("en-IN") : "-"}</td>
+            <td>{code.expires_at ? formatKolkataDateTime(code.expires_at) : MISSING_VALUE}</td>
             <td><span className={statusClass("activationCodeStatus", code.status)}>{labelFor("activationCodeStatus", code.status)}</span></td>
-            <td>{code.used_by_device_id || "-"}</td>
+            <td>{code.used_by_device_id || MISSING_VALUE}</td>
             <td><button className="remove-button" disabled={!canManage || code.status !== "ACTIVE"} onClick={() => revokeCode(code)}>Revoke</button></td>
           </tr>
         ))}
@@ -26508,13 +27418,14 @@ function _LegacyBranchCounterSettings(props) {
 function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, user }) {
   const [branchDraft, setBranchDraft] = useState({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
   const [counterDraft, setCounterDraft] = useState({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
+  const [legacyNotice, showLegacyNotice] = useSaveNotice();
   const addBranch = async () => {
     try {
       await axios.post(`${API_URL}/settings/branches`, { ...branchDraft, updated_by: user.id });
       setBranchDraft({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save branch"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The branch could not be saved. Try again.")));
     }
   };
   const addCounter = async () => {
@@ -26523,11 +27434,12 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
       setCounterDraft({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save counter"));
+      showLegacyNotice(errorNotice(getErrorMessage(error, "The counter could not be saved. Try again.")));
     }
   };
   return (
     <ModuleCard eyebrow="Multi-Branch Foundation" title="Branch & Counter Master" subtitle="Future-ready branch/counter structure. Current store remains Main Branch unless more branches are added.">
+      <SaveNotice notice={legacyNotice} />
       <div className="form-grid supplier-form-grid">
         <Field label="Branch Name"><input disabled={!canManage} value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
         <Field label="Phone"><input disabled={!canManage} value={branchDraft.phone_number} onChange={(event) => setBranchDraft({ ...branchDraft, phone_number: event.target.value })} /></Field>
@@ -26536,7 +27448,7 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
         <button className="primary-button" disabled={!canManage || !branchDraft.branch_name.trim()} onClick={addBranch}>Add Branch</button>
       </div>
       <DataTable headers={["Branch", "Address", "Phone", "GST", "Status"]}>
-        {branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || branch.location || "-"}</td><td>{branch.phone_number || "-"}</td><td>{branch.gst_number || "-"}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+        {branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || branch.location || MISSING_VALUE}</td><td>{branch.phone_number || MISSING_VALUE}</td><td>{branch.gst_number || MISSING_VALUE}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
       </DataTable>
       <div className="form-grid supplier-form-grid">
         <Field label="Branch">
@@ -26555,7 +27467,7 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
         <button className="primary-button" disabled={!canManage || !counterDraft.counter_name.trim()} onClick={addCounter}>Add Counter</button>
       </div>
       <DataTable headers={["Counter", "Branch", "Type", "Status"]}>
-        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || "-"}</td><td>{labelFor("counterType", counter.counter_type)}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || MISSING_VALUE}</td><td>{labelFor("counterType", counter.counter_type)}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
       </DataTable>
     </ModuleCard>
   );
@@ -26575,74 +27487,93 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
   useEffect(() => {
     onBusyChange?.(busy);
   }, [busy, onBusyChange]);
+  const [backupNotice, showBackupNotice, clearBackupNotice] = useSaveNotice();
+  const confirmClosingBackup = useConfirm();
   const save = async () => {
+    clearBackupNotice();
     try {
       await axios.put(`${API_URL}/settings/backup`, { ...draft, updated_by: user.id });
       await onReload();
-      alert("Backup settings saved");
+      showBackupNotice(successNotice("Backup settings saved."));
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to save backup settings"));
+      showBackupNotice(errorNotice(getErrorMessage(error, "The backup settings could not be saved. Nothing was changed; try again.")));
     }
   };
   const backupNow = async (backupType = "Manual") => {
+    clearBackupNotice();
     setBusy(true);
     try {
       const response = await axios.post(`${API_URL}/settings/backup-now`, { created_by: user.id, backup_type: backupType });
       await onReload();
-      alert(`Backup created: ${response.data.backup_file_name}`);
+      showBackupNotice(successNotice(`Backup made: ${response.data.backup_file_name}${response.data.backup_size ? ` (${formatFileSize(response.data.backup_size)})` : ""}.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Backup failed"));
+      showBackupNotice(errorNotice(getErrorMessage(error, "The backup could not be made. Try again, or call FroozERP support.")));
     } finally {
       setBusy(false);
     }
   };
+  // This makes a backup marked "Shutdown"; it closes nothing. The old wording sent people looking
+  // for a "server window" the desktop app does not have.
   const safeShutdown = async () => {
-    if (!window.confirm("Run shutdown backup now? After success, close the server window manually.")) return;
+    clearBackupNotice();
+    const sure = await confirmClosingBackup({
+      title: "Make a closing backup now?",
+      message: "FroozERP makes a backup marked Shutdown. When it says the backup is done, close FroozERP as you normally do.",
+      confirmLabel: "Make closing backup",
+      cancelLabel: "Not now",
+    });
+    if (!sure) return;
     setBusy(true);
     try {
       const response = await axios.post(`${API_URL}/settings/safe-shutdown`, { created_by: user.id });
       await onReload();
-      alert(response.data.message || "Backup completed. You may now close the server window.");
+      showBackupNotice(successNotice(`Closing backup done${response.data?.backup_file_name ? `: ${response.data.backup_file_name}` : ""}. You can close FroozERP now.`));
     } catch (error) {
-      alert(getErrorMessage(error, "Safe shutdown backup failed"));
+      showBackupNotice(errorNotice(getErrorMessage(error, "The closing backup could not be made. Keep FroozERP open and try again.")));
     } finally {
       setBusy(false);
     }
   };
+  const latestBackup = backupLogs[0] || null;
+  // The folder is said once, above the list; each row names its file (the whole path is on hover).
+  const backupFolder = String(draft.backup_location || "").trim()
+    || String(latestBackup?.backup_path || "").replace(/[\\/][^\\/]*$/, "");
   return (
-    <ModuleCard eyebrow="Backup & Restore" title="Auto Backup and Safe Shutdown" subtitle="Manual, scheduled and shutdown backup workflow. Restore is prepared but kept disabled until verified.">
-      <div className="purchase-summary-grid">
-        <SummaryMetric label="Auto Backup" value={draft.auto_backup_enabled ? "ON" : "OFF"} featured />
-        <SummaryMetric label="Backup on Shutdown" value={draft.backup_on_shutdown ? "ON" : "OFF"} />
-        <SummaryMetric label="Daily Backup Time" value={draft.daily_backup_time} />
-        <SummaryMetric label="Keep Backups" value={draft.keep_last_backups} />
-      </div>
-      <div className="form-grid supplier-form-grid">
-        <label className="check-field"><input checked={draft.auto_backup_enabled} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, auto_backup_enabled: event.target.checked })} /><span>Auto Backup ON/OFF</span></label>
+    <ModuleCard eyebrow="Backup & Restore" title="Backups" onChange={clearBackupNotice} subtitle="Backups are made by themselves at the time below, and whenever you press Backup Now.">
+      {latestBackup && (
+        <p className="form-note">
+          {`Last backup: ${latestBackup.completed_at || latestBackup.started_at ? formatKolkataDateTime(latestBackup.completed_at || latestBackup.started_at) : MISSING_VALUE}, ${formatFileSize(latestBackup.backup_size)}, ${labelFor("backupStatus", latestBackup.status)}.`}
+        </p>
+      )}
+      <div className="form-grid supplier-form-grid backup-settings-grid">
+        <label className="check-field"><input checked={draft.auto_backup_enabled} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, auto_backup_enabled: event.target.checked })} /><span>Make a backup every day by itself</span></label>
         <label className="check-field"><input checked={draft.backup_on_shutdown} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, backup_on_shutdown: event.target.checked })} /><span>Backup on Shutdown</span></label>
         <Field label="Daily Backup Time"><input disabled={!canManage} type="time" value={draft.daily_backup_time} onChange={(event) => setDraft({ ...draft, daily_backup_time: event.target.value })} /></Field>
         <Field label="Keep Last X Backups"><input disabled={!canManage} min="1" type="number" value={draft.keep_last_backups} onChange={(event) => setDraft({ ...draft, keep_last_backups: event.target.value })} /></Field>
         <Field label="Backup Location"><input disabled={!canManage} value={draft.backup_location} onChange={(event) => setDraft({ ...draft, backup_location: event.target.value })} /></Field>
       </div>
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage || busy} onClick={() => backupNow("Manual")}>Backup Now</button>
+        <button className="primary-button" disabled={!canManage || busy} onClick={() => backupNow("Manual")}>{busy ? "Backing up…" : "Backup Now"}</button>
         <button className="secondary-button" disabled={!canManage || busy} onClick={save}>Save Backup Settings</button>
-        <button className="secondary-button" disabled={!canManage || busy} onClick={safeShutdown}>Close Software Safely</button>
+        <button className="secondary-button" disabled={!canManage || busy} onClick={safeShutdown}>Backup Before Closing</button>
       </div>
+      <SaveNotice notice={backupNotice} />
       <p className="form-note">A backup is restored by FroozERP support, not from this screen. If you need one back, contact support and name the file from the list below.</p>
-      <DataTable headers={["File", "Type", "Size", "Started", "Completed", "Status", "Error"]}>
+      {/* The Backup Location box already shows the folder; it is said here only when that box is empty. */}
+      {backupFolder && !String(draft.backup_location || "").trim() && <p className="form-note">Saved in <code className="backup-folder">{backupFolder}</code></p>}
+      <DataTable headers={["File", "Type", { label: "Size", numeric: true }, "Made at", "Status", "Error"]}>
         {backupLogs.map((log) => (
           <tr key={log.id}>
-            <td className="primary-cell">{log.backup_file_name || "-"}<small className="cell-note">{log.backup_path || "-"}</small></td>
+            <td className="primary-cell" title={log.backup_path || undefined}>{log.backup_file_name || MISSING_VALUE}</td>
             <td>{labelFor("backupType", log.backup_type)}</td>
-            <td>{Number(log.backup_size || 0).toLocaleString("en-IN")} bytes</td>
-            <td>{log.started_at ? new Date(log.started_at).toLocaleString("en-IN") : "-"}</td>
-            <td>{log.completed_at ? new Date(log.completed_at).toLocaleString("en-IN") : "-"}</td>
+            <td>{formatFileSize(log.backup_size)}</td>
+            {/* Started and finished are seconds apart: one time, the finish, with the start on hover. */}
+            <td title={log.started_at ? `Started ${formatKolkataDateTime(log.started_at)}` : undefined}>{log.completed_at || log.started_at ? formatKolkataDateTime(log.completed_at || log.started_at) : MISSING_VALUE}</td>
             <td><span className={statusClass("backupStatus", log.status)}>{labelFor("backupStatus", log.status)}</span></td>
-            <td>{log.error_message || "-"}</td>
+            <td>{errorOrDash(log.error_message)}</td>
           </tr>
         ))}
-        {backupLogs.length === 0 && <tr><td className="empty-cell" colSpan={7}>No backups recorded yet. Backup Now makes the first one.</td></tr>}
+        {backupLogs.length === 0 && <tr><td className="empty-cell" colSpan={6}>No backups recorded yet. Backup Now makes the first one.</td></tr>}
       </DataTable>
     </ModuleCard>
   );
@@ -26652,7 +27583,7 @@ function SystemInfoSection({ systemInfo }) {
   const device = systemInfo.currentDevice || {};
   const branch = systemInfo.currentBranch || {};
   const backup = systemInfo.lastBackup || {};
-  const androidUrl = systemInfo.lanFrontendUrl || (systemInfo.serverIp ? `http://${systemInfo.serverIp}:5173` : "-");
+  const androidUrl = systemInfo.lanFrontendUrl || (systemInfo.serverIp ? `http://${systemInfo.serverIp}:5173` : MISSING_VALUE);
   return (
     <ModuleCard eyebrow="System Info" title="Server, Network and Device Status" subtitle="Use the LAN URL from another device on the same shop network.">
       <section className="about-frooz-panel">
@@ -26667,24 +27598,24 @@ function SystemInfoSection({ systemInfo }) {
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric featured label="Server" value={systemInfo.backendStatus || "Unknown"} />
         <SummaryMetric label="Database" value={systemInfo.databaseStatus || "Unknown"} />
-        <SummaryMetric label="Server IP" value={systemInfo.serverIp || "-"} />
+        <SummaryMetric label="Server IP" value={systemInfo.serverIp || MISSING_VALUE} />
         <SummaryMetric label="Device Status" value={device.status ? labelFor("deviceStatus", device.status) : "Not registered"} />
       </div>
       <DataTable headers={["Item", "Value"]}>
         <tr><td>Software Version</td><td>{systemInfo.softwareVersion || APP_VERSION}</td></tr>
         <tr><td>Display Branding</td><td>{APP_DISPLAY_NAME}</td></tr>
         <tr><td>Company</td><td>{APP_COMPANY}</td></tr>
-        <tr><td>LAN API URL</td><td>{systemInfo.lanApiUrl || "-"}</td></tr>
-        <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || "-"}</td></tr>
+        <tr><td>LAN API URL</td><td>{systemInfo.lanApiUrl || MISSING_VALUE}</td></tr>
+        <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || MISSING_VALUE}</td></tr>
         <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>
-        <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
+        <tr><td>Current Device</td><td>{device.device_name || MISSING_VALUE} ({device.device_id || MISSING_VALUE})</td></tr>
         <tr><td>Current Device Type</td><td>{labelFor("deviceType", device.device_type || "Browser")}</td></tr>
         {/* This reads the older device record, which a computer approved in Branches & Counters
             (Step 4) leaves empty: say where to look rather than "Not assigned" or a made-up branch. */}
         <tr><td>Current Branch</td><td>{branch.branch_name || "Not known here"}</td></tr>
         <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "See Branches & Counters, Step 4"}</td></tr>
-        <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
-        <tr><td>Backup Location</td><td>{systemInfo.backupLocation || "-"}</td></tr>
+        <tr><td>Last Backup</td><td>{backup.completed_at ? formatKolkataDateTime(backup.completed_at) : "Not recorded"}</td></tr>
+        <tr><td>Backup Location</td><td>{systemInfo.backupLocation || MISSING_VALUE}</td></tr>
       </DataTable>
       <section className="android-help-card">
         <span className="eyebrow">Android Connection Guide</span>
@@ -26941,7 +27872,7 @@ function SaleRateManager({ desiredMargin, history, loadState = {}, onLoad, onSav
             {history.length === 0 && !loadState.historyMessage && <tr><td className="empty-cell" colSpan={6}>No rate changes yet.</td></tr>}
             {history.map((item) => (
               <tr key={item.id}>
-                <td>{item.changed_at ? new Date(item.changed_at).toLocaleString("en-IN") : MISSING_VALUE}</td>
+                <td>{item.changed_at ? formatKolkataDateTime(item.changed_at) : MISSING_VALUE}</td>
                 <td className="primary-cell">{item.product_name || MISSING_VALUE}</td>
                 <td className="pm-num">{formatOptionalMoney(item.old_selling_rate, currency)}</td>
                 <td className="pm-num">{formatOptionalMoney(item.new_selling_rate, currency)}</td>
@@ -27134,6 +28065,25 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    */
   const [chargeSelections, setChargeSelections] = useState([]);
   const [search, setSearch] = useState("");
+  // The app's own question boxes (feedbackDialogs.jsx) for checkout's gates, and the notices that
+  // replaced the browser's alert boxes: one where items are added (the search card, or the lot
+  // picker while it is open), one on the cart, and one beside the checkout buttons.
+  const confirmGate = useConfirm();
+  const askGateReason = useAskReason();
+  const [addNotice, showAddNotice, clearAddNotice] = useSaveNotice();
+  const [cartNotice, showCartNotice, clearCartNotice] = useSaveNotice();
+  const [checkoutNotice, showCheckoutNotice, clearCheckoutNotice] = useSaveNotice();
+  // True while checkout waits on one of its questions. The in-app box does not freeze the page the
+  // way the browser's did, so a second F4 or click must not start a second checkout behind it.
+  const checkoutAskingRef = useRef(false);
+  const askCheckout = async (ask) => {
+    checkoutAskingRef.current = true;
+    try {
+      return await ask();
+    } finally {
+      checkoutAskingRef.current = false;
+    }
+  };
   // Combos are sold where the app hands POS a combo list (the counter app); `null` is the browser,
   // which shows no combo tabs at all (v1).
   const combosEnabled = combos !== null && combos !== undefined;
@@ -27638,9 +28588,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return isSelectableLot(lot);
     });
     if (productLots.length === 0) {
-      alert(`No available stock lots found for ${product.product_name}.`);
+      showAddNotice(warningNotice(`${product.product_name} has no lot with stock to sell right now.`));
       return;
     }
+    clearAddNotice();
     setLotSelectorProduct(product);
     setLotSelectorSearch("");
     setLotFilter("AVAILABLE");
@@ -27667,14 +28618,16 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }
     const lot = selectedLot;
     if (!lot || !isSelectableLot(lot)) {
-      alert("Please select an active lot with available stock.");
+      showAddNotice(warningNotice("Choose a lot that is active and has stock."));
       return;
     }
     const availableStock = lotBalance(lot);
     // In scale mode a kg item takes the scale's steady weight, once; otherwise one unit as before.
     const saleUnit = lot.unit || product.unit;
     const weighed = effectiveQuantityMode === "SCALE" ? scaleQuantityFor(saleUnit, scale, takenScaleReading) : null;
-    const addQuantity = weighed ?? 1;
+    // A tap adds one unit, or the rest of a lot holding less than one (local/posCheckout.js), so the
+    // last 0.75 kg of a lot can be sold. The lot check below then sees the real quantity.
+    const addQuantity = weighed ?? lotTapQuantity({ available: availableStock, inCart: getCartQuantityForLot(lot.id) });
     const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
     // While a customer's-choice combo is open, the product joins it (local/combos.js): priced by the
@@ -27704,15 +28657,16 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       unit: lot.unit || product.unit || "",
     });
     if (counterStock.status !== COUNTER_STOCK.FREE) {
-      alert(counterStock.message);
+      showAddNotice(warningNotice(counterStock.message));
       return;
     }
     const nextLotQuantity = getCartQuantityForLot(lot.id) + quantityChange;
     if (availableStock < nextLotQuantity) {
       const moreAvailable = Math.max(availableStock - getCartQuantityForLot(lot.id), 0);
-      alert(`Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${lotStableName(lot) || lot.id}.`);
+      showAddNotice(warningNotice(lotShortMessage({ more: moreAvailable, unit: lot.unit || product.unit, lotName: lotStableName(lot) || lot.id })));
       return;
     }
+    clearAddNotice();
     const lineId = currentItem?.line_id || newCartLineId();
     const nextDiscounted = applyLotDiscount(defaultRate, nextQuantity, lotDiscount);
 
@@ -27772,7 +28726,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // Quantities carry 3 decimals and money 2: a fourth decimal is not taken (local/posCheckout.js).
     if (!cartEntryFits(field, value)) return false;
     if (field === "selling_rate" && !canManualRateOverride) {
-      alert("You do not have permission to change sale rate.");
+      showCartNotice(warningNotice("You do not have permission to change the sale rate."));
       return false;
     }
     const currentItem = cart.find((item) => item.line_id === lineId);
@@ -27787,15 +28741,18 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         unit: currentItem.unit || "",
       });
       if (counterStock.status !== COUNTER_STOCK.FREE) {
-        alert(counterStock.message);
+        showCartNotice(warningNotice(counterStock.message));
         return false;
       }
     }
     if (field === "quantity" && currentItem && number + getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id) > Number(currentItem.available_qty || 0)) {
       const moreAvailable = Math.max(Number(currentItem.available_qty || 0) - getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id), 0);
-      alert(currentItem.inventory_batch_id ? `Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${currentItem.lot_name || currentItem.inventory_batch_id}.` : `Only ${currentItem.available_qty || 0} units are available.`);
+      showCartNotice(warningNotice(currentItem.inventory_batch_id
+        ? lotShortMessage({ more: moreAvailable, unit: currentItem.unit, lotName: currentItem.lot_name || currentItem.inventory_batch_id })
+        : `Only ${counterQuantityWithUnit(currentItem.available_qty || 0, currentItem.unit)} is available.`));
       return false;
     }
+    clearCartNotice();
     const repriceAfter = (items) => (isComboLine(comboLine) ? repriceCustomCombo(items, comboLine.combo_line_key) : items);
     setCart((items) => repriceAfter(items.map((item) => {
       if (item.line_id !== lineId) return item;
@@ -27917,7 +28874,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // two, because nobody reads a barcode before it beeps.
     const product = filterSellableProducts(products, inventory, new Date(), counterScope).find((item) => item.barcode === code);
     if (!product) {
-      alert(`No sellable stock is available for barcode ${code}`);
+      showAddNotice(warningNotice(`No product with stock to sell has barcode ${code}.`));
       barcodeRef.current?.focus();
     } else {
       openLotSelector(product);
@@ -28246,10 +29203,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
 
   const checkout = async (printAfterSave = false, confirmations = {}) => {
     if (saving && !confirmations.retry) return;
+    // A checkout question is on screen: its answer carries this checkout on; a second press waits.
+    if (checkoutAskingRef.current) return;
     // The approval dialog is open (F4 pressed behind it): it finishes checkout itself.
     if (discountApproval && !confirmations.discount_approval_id && !confirmations.discount_approval_not_needed) return;
+    clearCheckoutNotice();
     if (cart.length === 0) {
-      alert("Add at least one product before checkout.");
+      showCheckoutNotice(warningNotice("Add at least one product before checkout."));
       return;
     }
     const today = toDateKey(new Date());
@@ -28257,35 +29217,40 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     const effectiveBillDateTime = resolvePosBillDateTime({ typed: billDateTime, edited: billDateEdited, now: currentDateTimeLocal() });
     const selectedBillDate = effectiveBillDateTime ? effectiveBillDateTime.slice(0, 10) : today;
     if (!canPosDateOverride && selectedBillDate !== today) {
-      alert("You do not have permission to change bill date.");
+      showCheckoutNotice(errorNotice("You do not have permission to change the bill date."));
       return;
     }
     const dateConfirmations = {};
     let dateOverrideReason = confirmations.date_override_reason || "";
+    // Gate 1: a back-dated bill. "Go back" stops checkout, as Cancel did; the reason after it is
+    // optional and its Skip keeps the default reason, as the old prompt's Cancel did.
     if (selectedBillDate < today && !confirmations.backdate_confirmed) {
-      if (!window.confirm(`You are creating a backdated POS bill for ${selectedBillDate}. Continue?`)) return;
-      dateOverrideReason = window.prompt("Reason for backdated bill (optional)", "Backdated POS bill created") || "Backdated POS bill created";
+      if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BACKDATE, { billDate: formatDisplayDate(selectedBillDate) }))))) return;
+      dateOverrideReason = resolveDateOverrideReason(CHECKOUT_GATE.BACKDATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.BACKDATE))));
       dateConfirmations.backdate_confirmed = true;
     }
+    // Gate 2: a future-dated bill, Owner/Admin only.
     if (selectedBillDate > today && !confirmations.future_date_confirmed) {
       if (!["Owner", "Admin"].includes(user.role)) {
-        alert("Only Owner/Admin can confirm a future bill date.");
+        showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.FUTURE_DATE)));
         return;
       }
-      if (!window.confirm(`You are creating a future-dated POS bill for ${selectedBillDate}. Continue?`)) return;
-      dateOverrideReason = window.prompt("Reason for future bill date (optional)", "Future-dated POS bill created") || "Future-dated POS bill created";
+      if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.FUTURE_DATE, { billDate: formatDisplayDate(selectedBillDate) }))))) return;
+      dateOverrideReason = resolveDateOverrideReason(CHECKOUT_GATE.FUTURE_DATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.FUTURE_DATE))));
       dateConfirmations.future_date_confirmed = true;
     }
+    // Gate 3: the customer's mobile number.
     if (customer.mobile && !/^\d{10,15}$/.test(customer.mobile)) {
-      alert("Enter a valid customer mobile number.");
+      showCheckoutNotice(errorNotice("Enter a valid customer mobile number (10 to 15 digits)."));
       return;
     }
+    // Gate 4: credit with no saved customer, Owner/Admin only, and asked.
     if (paymentMode === "CREDIT" && !customer.account_id) {
       if (!["Owner", "Admin"].includes(user.role)) {
-        alert("Select a saved customer account for credit sale.");
+        showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.WALK_IN_CREDIT)));
         return;
       }
-      if (!window.confirm("No saved customer selected. Assign this credit sale to Walk-in Customer Credit?")) return;
+      if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.WALK_IN_CREDIT))))) return;
     }
     // A customer's-choice combo still open would take the next product into it; and every combo must
     // still add up to its price.
@@ -28302,7 +29267,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // product's name, before the device refuses it in words that do not name it.
     const lineProblem = cartLineProblem(cart);
     if (lineProblem) {
-      alert(lineProblem);
+      showCheckoutNotice(errorNotice(lineProblem));
       return;
     }
     let zeroRateConfirmed = confirmations.zero_rate_confirmed === true;
@@ -28316,20 +29281,30 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       const rateChanged = roundUi(rate) !== roundUi(defaultRate);
       const discountControlledRate = item.lot_discount_type === "SPECIAL_RATE";
       if (!Number.isFinite(rate) || rate < 0) {
-        alert(`Enter a valid sale rate for ${item.product_name}.`);
+        showCheckoutNotice(errorNotice(`Enter a valid sale rate for ${item.product_name}.`));
         return;
       }
       if (rateChanged && !discountControlledRate && !canManualRateOverride) {
-        alert("You do not have permission to change sale rate.");
+        showCheckoutNotice(errorNotice("You do not have permission to change the sale rate."));
         return;
       }
+      // Gate 5: a zero rate, Owner/Admin only, and asked once per checkout.
       if (rateChanged && !discountControlledRate && rate === 0 && !zeroRateConfirmed) {
-        if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`Sale rate for ${item.product_name} is zero. Continue?`)) return;
+        if (!["Owner", "Admin"].includes(user.role)) {
+          showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.ZERO_RATE)));
+          return;
+        }
+        if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.ZERO_RATE, { productName: item.product_name }))))) return;
         zeroRateConfirmed = true;
       }
       const estimatedCost = Number(costByProduct.get(item.product_id) || 0);
+      // Gate 6: a rate below cost, Owner/Admin only, and asked once per checkout.
       if (rateChanged && !discountControlledRate && estimatedCost > 0 && rate < estimatedCost && !belowCostConfirmed) {
-        if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`This rate is below cost for ${item.product_name}. Continue?`)) return;
+        if (!["Owner", "Admin"].includes(user.role)) {
+          showCheckoutNotice(errorNotice(checkoutGateRefusal(CHECKOUT_GATE.BELOW_COST)));
+          return;
+        }
+        if (!(await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BELOW_COST, { productName: item.product_name }))))) return;
         belowCostConfirmed = true;
       }
     }
@@ -28347,17 +29322,17 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       return;
     }
     if (totals.invoiceDiscount > totals.gross - totals.itemDiscount) {
-      alert("Invoice discount cannot exceed the cart subtotal.");
+      showCheckoutNotice(errorNotice("The bill discount cannot be more than the cart subtotal."));
       return;
     }
     if (hasInvalidMixedPayment) {
-      alert("Mixed payment amounts cannot be negative.");
+      showCheckoutNotice(errorNotice("Mixed payment amounts cannot be negative."));
       return;
     }
 
     const { payments, error: paymentError } = buildPosPayments({ paymentMode, mixedPayments, total: totals.total });
     if (paymentError) {
-      alert(paymentError);
+      showCheckoutNotice(errorNotice(paymentError));
       return;
     }
 
@@ -28419,12 +29394,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     try {
       if (isTauriRuntime()) {
         if (cart.some((item) => !item.inventory_batch_id)) {
-          alert("Desktop local-first POS requires a selected stock lot for every item.");
+          showCheckoutNotice(errorNotice("Every item needs its stock lot on this computer. Remove the item without a lot and add it again from its lot."));
           return;
         }
         // One computer, one device id, forever: a bill is never stamped with a made-up one.
         if (!String(deviceInfo.device_id || "").trim()) {
-          alert("This computer's device id has not loaded yet. Wait a moment and try again.");
+          showCheckoutNotice(errorNotice("This computer's device id has not loaded yet. Wait a moment and try again."));
           return;
         }
         const billNo = await nextLocalBillNo(selectedBillDate);
@@ -28634,31 +29609,33 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         });
         return;
       }
+      // The server asks for a confirmation (HTTP 409): the same four questions, in the same order,
+      // in the app's box. "Go back" falls through to the refusal below, as Cancel did.
       if (error.response?.status === 409) {
-        if (responseData.requires_below_cost_confirmation && window.confirm(responseData.message || "This rate is below cost. Continue?")) {
+        if (responseData.requires_below_cost_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BELOW_COST, { serverMessage: responseData.message || "This rate is below cost." })))) {
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, below_cost_confirmed: true, retry: true }), 0);
           return;
         }
-        if (responseData.requires_zero_rate_confirmation && window.confirm(responseData.message || "Zero sale rate requires confirmation. Continue?")) {
+        if (responseData.requires_zero_rate_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.ZERO_RATE, { serverMessage: responseData.message || "Zero sale rate requires confirmation." })))) {
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, zero_rate_confirmed: true, retry: true }), 0);
           return;
         }
-        if (responseData.requires_backdate_confirmation && window.confirm(responseData.message || "Backdated bill requires confirmation. Continue?")) {
-          const reason = window.prompt("Reason for backdated bill (optional)", "Backdated POS bill created") || "Backdated POS bill created";
+        if (responseData.requires_backdate_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.BACKDATE, { serverMessage: responseData.message || "Backdated bill requires confirmation." })))) {
+          const reason = resolveDateOverrideReason(CHECKOUT_GATE.BACKDATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.BACKDATE))));
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, backdate_confirmed: true, date_override_reason: reason, retry: true }), 0);
           return;
         }
-        if (responseData.requires_future_date_confirmation && window.confirm(responseData.message || "Future bill date requires confirmation. Continue?")) {
-          const reason = window.prompt("Reason for future bill date (optional)", "Future-dated POS bill created") || "Future-dated POS bill created";
+        if (responseData.requires_future_date_confirmation && await askCheckout(() => confirmGate(checkoutGateDialog(CHECKOUT_GATE.FUTURE_DATE, { serverMessage: responseData.message || "Future bill date requires confirmation." })))) {
+          const reason = resolveDateOverrideReason(CHECKOUT_GATE.FUTURE_DATE, await askCheckout(() => askGateReason(checkoutDateReasonDialog(CHECKOUT_GATE.FUTURE_DATE))));
           setSaving(false);
           setTimeout(() => checkout(printAfterSave, { ...confirmations, future_date_confirmed: true, date_override_reason: reason, retry: true }), 0);
           return;
         }
       }
-      alert(plainRefusalMessage(error) || getErrorMessage(error, "Unable to complete checkout"));
+      showCheckoutNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The bill was not saved. Nothing was billed; try again.")));
     } finally {
       setSaving(false);
     }
@@ -28732,6 +29709,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     if (!lotSelectorProduct) return [];
     return [...new Set((lotsByProduct.get(lotSelectorProduct.id) || []).map((lot) => String(lot.unit || lotSelectorProduct.unit || "").trim()).filter(Boolean))].sort();
   }, [lotSelectorProduct, lotsByProduct]);
+  // Size, unit and rate filters only when there is a choice to make (local/counterScreens.js). A
+  // filter already set stays on screen so it can be cleared.
+  const showLotFilters = shouldShowLotFilters({ sizes: lotSelectorSizeOptions, units: lotSelectorUnitOptions })
+    || Boolean(lotSizeFilter || lotUnitFilter || lotRateMin || lotRateMax);
 
   const confirmPayment = () => {
     const draft = paymentConfirm;
@@ -28748,6 +29729,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    */
   const handleShortcuts = (event) => {
     if (event.defaultPrevented || shortcutsPaused) return;
+    // An in-app question (a checkout gate) is open: its keys are its own.
+    if (appDialogQueue.current()) return;
     if (paymentConfirm || discountApproval || comboAsk || lotSelectorProduct) return;
     if (event.key === "F2") {
       event.preventDefault();
@@ -28777,7 +29760,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
 
   const printLastInvoice = () => {
     if (!lastInvoice) {
-      alert("Save a bill before printing.");
+      showCheckoutNotice(warningNotice("Save a bill before printing."));
       return;
     }
     // Through the invoice's own print path: its PDF name, page profile and drawn UPI QR.
@@ -28826,6 +29809,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     );
   };
 
+  // A unit as the counter reads it ("Kg", "Piece"); a blank unit stays blank.
+  const cartUnitName = (unit) => {
+    const name = unitDisplayName(unit);
+    return name === MISSING_VALUE ? "" : name;
+  };
+
   // What is left in the line's lot once the cart has taken its share, to 3 decimals.
   const describeCartLotLeft = (item) => {
     const left = lotLeftAfterCart({
@@ -28834,7 +29823,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       quantity: item.quantity,
     });
     if (left === null) return "";
-    return `${left.toLocaleString("en-IN", { maximumFractionDigits: 3 })} ${item.unit || ""} left in this lot`.replace(/\s+/g, " ");
+    return `${counterQuantityWithUnit(left, item.unit)} left in this lot`;
   };
 
   const renderCartRow = (item) => {
@@ -28846,11 +29835,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           <small className="cell-note">{describeCartLotLeft(item)}</small>
           {/* Said before the operator tries, not only when they are refused. A
               refusal at the till happens with a customer standing there. */}
-          {reservedNote(reservedIndex, item.product_id, item.unit) && (
-            <small className="cell-note">{reservedNote(reservedIndex, item.product_id, item.unit)}</small>
+          {reservedNote(reservedIndex, item.product_id, cartUnitName(item.unit)) && (
+            <small className="cell-note">{reservedNote(reservedIndex, item.product_id, cartUnitName(item.unit))}</small>
           )}
         </td>
-        <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
+        <td><span className="batch-id" title={[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
         <td>
           <input
             className="table-input"
@@ -28870,12 +29859,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           <td>
             <input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} />
             {discountApprovalCheck.lines.some((entry) => entry.lineId === item.line_id) && (
-              <small className="cell-note stock-low pos-discount-over-note">Over 5%: needs Owner/Admin approval</small>
+              <small className="cell-note stock-low pos-discount-over-note" title="More than 5% off this item: the Owner or an Admin approves it at checkout.">Over 5%: needs approval</small>
             )}
           </td>
         )}
         {/* Line by line to the paisa, as Gross Total adds it up (`lineGross`). */}
-        <td className="primary-cell">{currency.format(lineGross(item) - Number(item.discount_amount || 0))}</td>
+        <td className="primary-cell amount-cell">{currency.format(lineGross(item) - Number(item.discount_amount || 0))}</td>
         <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
       </tr>
     );
@@ -28894,25 +29883,29 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <h2>Add items</h2>
               <p>Search for a product or scan its barcode.</p>
             </div>
-            <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout & Print{effectiveQuantityMode === "SCALE" ? " - F6 Weight" : ""}</span>
+            <span className="shortcut-hint">F2 Search · F3 Barcode · F4 Checkout & Print{effectiveQuantityMode === "SCALE" ? " · F6 Weight" : ""}</span>
           </div>
-          <div className="pos-mode-panel">
-            <Field label="Quantity Mode">
-              <select value={effectiveQuantityMode} onChange={(event) => { quantityModeChosenRef.current = true; setQuantityMode(event.target.value); }}>
-                <option value="MANUAL">Manual</option>
-                <option disabled={!posSettings.enable_weighing_scale} value="SCALE">Weighing Scale Mode</option>
-              </select>
-            </Field>
-            <button className="secondary-button" disabled={effectiveQuantityMode !== "SCALE"} onClick={readScaleWeight}>Read Weight (F6)</button>
-            {effectiveQuantityMode === "SCALE" ? (
-              <span className="scale-readout">
-                <span className={SCALE_VIEW_TONE[scale.state] || "inline-error"} role="status">{scale.message}</span>
-                {scaleMessage && <small className="cell-note">{scaleMessage}</small>}
-              </span>
-            ) : (
-              <span className="stock-ok">Manual quantity entry</span>
-            )}
-          </div>
+          {/* Only where a weighing scale is switched on in Settings. Without one there is nothing to
+              choose: quantities are typed, and a disabled Read Weight button only took a row. */}
+          {posSettings.enable_weighing_scale && (
+            <div className="pos-mode-panel">
+              <Field label="Quantity Mode">
+                <select value={effectiveQuantityMode} onChange={(event) => { quantityModeChosenRef.current = true; setQuantityMode(event.target.value); }}>
+                  <option value="MANUAL">Manual</option>
+                  <option value="SCALE">Weighing Scale Mode</option>
+                </select>
+              </Field>
+              <button className="secondary-button" disabled={effectiveQuantityMode !== "SCALE"} onClick={readScaleWeight}>Read Weight (F6)</button>
+              {effectiveQuantityMode === "SCALE" ? (
+                <span className="scale-readout">
+                  <span className={SCALE_VIEW_TONE[scale.state] || "inline-error"} role="status">{scale.message}</span>
+                  {scaleMessage && <small className="cell-note">{scaleMessage}</small>}
+                </span>
+              ) : (
+                <span className="stock-ok">Manual quantity entry</span>
+              )}
+            </div>
+          )}
           <div className="pos-inputs">
             <label className="icon-input">
               <Icon name="search" />
@@ -28935,6 +29928,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               />
             </label>
           </div>
+          {!lotSelectorProduct && <SaveNotice className="pos-add-notice" notice={addNotice} />}
           <div className="pos-sections" role="tablist" aria-label="POS sections">
             {posTabs.map((section) => (
               <button
@@ -29047,9 +30041,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               const minRate = rates.length ? Math.min(...rates) : Number(product.selling_rate || 0);
               const maxRate = rates.length ? Math.max(...rates) : minRate;
               const discountedCount = activeLots.filter((lot) => lotDiscountFor(lot.id)).length;
-              const rateLabel = minRate === maxRate
-                ? `${currency.format(minRate)}/${product.unit || "Unit"}`
-                : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
+              const rateLabel = posRateLabel({ min: minRate, max: maxRate, unit: product.unit, format: (value) => currency.format(value) });
               // The owner's photo when there is one; otherwise the product's colour and first letter.
               const photo = photoForProduct(productPhotoIndex, product);
               const badge = posTileBadge(product.product_name);
@@ -29065,15 +30057,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     : <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>}
                   <span className="product-result-main">
                     <strong>{product.product_name}</strong>
-                    <span className="product-result-meta">
-                      <span>{activeLots.length} available lot{activeLots.length === 1 ? "" : "s"}</span>
-                      <span>Stock: {stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span>
-                      <span>Unit: {product.unit || "Unit"}</span>
-                      {posSearching && posTabs.length > 1 && <span className="product-result-section">{posTabFor("retail").label}</span>}
-                    </span>
-                    <small>Rate: {rateLabel}{discountedCount ? ` - ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
+                    {/* The stock once, with its unit and the lots it sits in: "68 Kg · 4 lots". */}
+                    <span className={stock <= 5 ? "product-result-stock stock-low" : "product-result-stock"}>{posTileStockLine({ stock, unit: product.unit, lotCount: activeLots.length })}</span>
+                    {posSearching && posTabs.length > 1 && (
+                      <span className="product-result-meta"><span className="product-result-section">{posTabFor("retail").label}</span></span>
+                    )}
+                    <small>{rateLabel}{discountedCount ? ` · ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
                   </span>
-                  <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })} in stock</em>
                 </button>
               );
             })}
@@ -29112,6 +30102,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             </div>
             <span className="cart-count">{totals.itemCount === 1 ? "1 item" : `${totals.itemCount} items`}</span>
           </div>
+          <SaveNotice className="pos-cart-notice" notice={cartNotice} />
           {packingShort.length > 0 && (
             // Warning only (owner, 22 Oct 2026): the bill still goes through, and the bell is told.
             <p className="warning-note pos-packing-short" role="status">
@@ -29128,7 +30119,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           ) : (
             <div className="table-wrap cart-table">
               <table>
-                <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount{!discountExempt && <small className="cell-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}</small>}</th>}<th>Total</th><th /></tr></thead>
+                <thead><tr><th>Product</th><th>Lot</th><th className="amount-cell">Rate</th><th className="amount-cell">Qty</th>{printSettings.show_item_discount_column_pos !== false && <th className="amount-cell cart-discount-head" title="Discount in ₹ on this line">Discount{!discountExempt && <small className="cell-note pos-discount-limit-note">{DISCOUNT_APPROVAL_NOTE}</small>}</th>}<th className="amount-cell">Total</th><th><span className="pm-sr-only">Remove</span></th></tr></thead>
                 <tbody>
                   {groupComboLines(cart).map((group) => (group.kind === "line"
                     ? renderCartRow(group.line)
@@ -29182,7 +30173,14 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               onChange={(event) => { setBillDateTime(event.target.value); setBillDateEdited(true); }}
             />
           </Field>
-          <p className="form-note">{canPosDateOverride ? "Owner/Admin can select a previous or custom bill date." : "Bill date is locked for your role."}</p>
+          {billDateHint({ canChange: canPosDateOverride, edited: billDateEdited }) && (
+            <p className="form-note pos-bill-date-hint">
+              {billDateHint({ canChange: canPosDateOverride, edited: billDateEdited })}
+              {canPosDateOverride && billDateEdited && (
+                <button className="table-action" type="button" onClick={resetBillDate}>Back to now</button>
+              )}
+            </p>
+          )}
           <Field label="Saved Customer Account">
             <select value={customer.account_id || ""} onChange={(event) => selectCustomer(event.target.value)}>
               <option value="">Walk-in Customer</option>
@@ -29224,12 +30222,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             <strong>{saleRateSettings.bill_level_slab_discount_enabled === false ? MISSING_VALUE : currency.format(totals.slabDiscount)}</strong>
             <small>{describeBillDiscountPreview({ enabled: saleRateSettings.bill_level_slab_discount_enabled !== false, rule: totals.discountRule })}</small>
           </div>
-          {discountNotice && (
-            <div className="warning-note pos-discount-notice" role="alert">
-              {discountNotice}
-              <button className="secondary-button compact-button" type="button" onClick={() => setDiscountNotice("")}>OK</button>
-            </div>
-          )}
           <Field label="Payment Mode">
             <select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value)}>
               <option value="CASH">Cash</option>
@@ -29315,14 +30307,24 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           {totals.mandiTaxAmount > 0 && <TotalLine label={`Mandi Tax (${totals.mandiTaxRate}%)`} value={totals.mandiTaxAmount} />}
           {totals.mandiTaxAmount === 0 && <TotalLine label="Tax" value={0} muted />}
           {totals.otherChargesAmount > 0 && <TotalLine label="Other Charges" value={totals.otherChargesAmount} />}
+          {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
+        </div>
+        {/* Pinned to the foot of the panel: the amount to collect, why checkout stopped (if it did)
+            and the buttons stay in sight however far the customer fields above are scrolled. */}
+        <div className="checkout-footer">
           {totals.manualBillError
             ? <div className="total-line total-line-main total-line-error"><span>Net Payable</span><strong>{MISSING_VALUE}</strong></div>
             : <TotalLine label="Net Payable" value={totals.total} total />}
-          {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
-        </div>
+          {discountNotice && (
+            <div className="warning-note pos-discount-notice" role="alert">
+              {discountNotice}
+              <button className="secondary-button compact-button" type="button" onClick={() => setDiscountNotice("")}>OK</button>
+            </div>
+          )}
+          <SaveNotice className="pos-checkout-notice" notice={checkoutNotice} />
         <div className="button-row checkout-actions">
           <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError) || totals.chargeRefusals.length > 0} onClick={() => checkout(false)}>
-            <Icon name="receipt" /> {saving ? "Saving..." : "Checkout"}
+            <Icon name="receipt" /> {saving ? "Saving…" : "Checkout"}
           </button>
           <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
             <Icon name="print" /> Print Bill
@@ -29337,6 +30339,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             <button className="secondary-button compact-button" type="button" onClick={() => setSaveNotice("")}>OK</button>
           </div>
         )}
+        </div>
       </aside>
       {lotSelectorProduct && (
         <div className="modal-backdrop lot-selector-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeLotSelector()}>
@@ -29356,18 +30359,18 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           >
             <div className="invoice-toolbar lot-selector-toolbar">
               <div>
-                <span className="eyebrow">Lot Selection</span>
+                <span className="eyebrow">Choose a lot</span>
                 <h2>{lotSelectorProduct.product_name}</h2>
-                <p>Select the exact lot being sold. Different lots stay as separate cart rows.</p>
+                <p>Pick the lot being sold. Each lot is its own line on the bill.</p>
               </div>
               <button className="secondary-button" onClick={closeLotSelector}>Close</button>
             </div>
-            <div className="lot-selector-controls">
+            <div className={showLotFilters ? "lot-selector-controls" : "lot-selector-controls lot-selector-controls-simple"}>
               <label className="icon-input lot-selector-search">
                 <Icon name="search" />
                 <input
                   autoFocus
-                  placeholder="Search lot, size, rate or stock..."
+                  placeholder="Search lot, size, rate or stock…"
                   value={lotSelectorSearch}
                   onChange={(event) => setLotSelectorSearch(event.target.value)}
                   onKeyDown={(event) => {
@@ -29376,39 +30379,44 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                 />
                 {lotSelectorSearch && <button aria-label="Clear lot search" className="clear-search-button" type="button" onClick={() => setLotSelectorSearch("")}>×</button>}
               </label>
-              <Field label="Filter">
+              <Field label="Show">
                 <select value={lotFilter} onChange={(event) => setLotFilter(event.target.value)}>
-                  <option value="AVAILABLE">All Available Lots</option>
-                  <option value="DISCOUNTED">Discounted Lots</option>
+                  <option value="AVAILABLE">All lots</option>
+                  <option value="DISCOUNTED">Discounted lots</option>
                 </select>
               </Field>
-              <Field label="Size / Grade">
-                <select value={lotSizeFilter} onChange={(event) => setLotSizeFilter(event.target.value)}>
-                  <option value="">All sizes</option>
-                  {lotSelectorSizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
-                </select>
-              </Field>
-              <Field label="Unit">
-                <select value={lotUnitFilter} onChange={(event) => setLotUnitFilter(event.target.value)}>
-                  <option value="">All units</option>
-                  {lotSelectorUnitOptions.map((unit) => <option key={unit} value={unit}>{unit}</option>)}
-                </select>
-              </Field>
-              <Field label="Min Rate"><input min="0" step="0.01" type="number" value={lotRateMin} onChange={(event) => setLotRateMin(event.target.value)} /></Field>
-              <Field label="Max Rate"><input min="0" step="0.01" type="number" value={lotRateMax} onChange={(event) => setLotRateMax(event.target.value)} /></Field>
+              {/* Only when there is something to choose between: most fruit has one size and one unit. */}
+              {showLotFilters && (
+                <>
+                  <Field label="Size / Grade">
+                    <select value={lotSizeFilter} onChange={(event) => setLotSizeFilter(event.target.value)}>
+                      <option value="">All sizes</option>
+                      {lotSelectorSizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Unit">
+                    <select value={lotUnitFilter} onChange={(event) => setLotUnitFilter(event.target.value)}>
+                      <option value="">All units</option>
+                      {lotSelectorUnitOptions.map((unit) => <option key={unit} value={unit}>{unitDisplayName(unit)}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Min rate ₹"><input className="numeric-input" min="0" step="0.01" type="number" value={lotRateMin} onChange={(event) => setLotRateMin(event.target.value)} /></Field>
+                  <Field label="Max rate ₹"><input className="numeric-input" min="0" step="0.01" type="number" value={lotRateMax} onChange={(event) => setLotRateMax(event.target.value)} /></Field>
+                </>
+              )}
             </div>
+            <SaveNotice className="lot-selector-notice" notice={addNotice} />
             <div className="lot-selector-table-wrap">
               <table className="lot-selector-table">
                 <thead>
                   <tr>
-                    <th>Lot No.</th>
+                    <th>Lot</th>
                     <th>Size / Grade</th>
-                    <th>Unit</th>
-                    <th>Available Stock</th>
-                    <th>Rate</th>
+                    <th className="amount-cell">In stock</th>
+                    <th className="amount-cell">Rate</th>
                     <th>Discount</th>
                     <th>Date</th>
-                    <th>Select</th>
+                    <th><span className="pm-sr-only">Select</span></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -29419,13 +30427,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     return (
                       <tr key={lot.id} className={selectable ? "lot-selector-row" : "lot-selector-row lot-selector-row-disabled"} onDoubleClick={() => selectable && addProduct(lotSelectorProduct, lot)}>
                         <td>
-                          <strong>{getCompactLotName(lot)}</strong>
-                          <small>{lotSelectorProduct.product_name}</small>
+                          <strong title={lotStableName(lot)}>{getCompactLotName(lot)}</strong>
                         </td>
                         <td>{lot.lot_size || lot.size_grade || "Standard"}</td>
-                        <td>{lot.unit || lotSelectorProduct.unit || "Unit"}</td>
-                        <td className={lotBalance(lot) <= 5 ? "stock-low" : "stock-ok"}>{lotBalance(lot).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                        <td>{currency.format(rate)}</td>
+                        <td className={lotBalance(lot) <= 5 ? "amount-cell stock-low" : "amount-cell stock-ok"}>{counterQuantityWithUnit(lotBalance(lot), lot.unit || lotSelectorProduct.unit)}</td>
+                        <td className="amount-cell">{currency.format(rate)}<small>{`per ${unitDisplayName(lot.unit || lotSelectorProduct.unit).toLowerCase()}`}</small></td>
                         <td>{activeDiscount ? <span className="status-badge status-active">Discounted</span> : <span className="status-badge">None</span>}</td>
                         <td>{formatDisplayDate(lotDateKey(lot))}</td>
                         <td>
@@ -29437,12 +30443,12 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     );
                   })}
                   {lotSelectorLots.length === 0 && (
-                    <tr><td className="empty-cell" colSpan={8}>No matching lots found.</td></tr>
+                    <tr><td className="empty-cell" colSpan={7}>No lot matches. Clear the search to see every lot.</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <p className="form-note">Only lots with stock that can be sold are shown.</p>
+            <p className="form-note lot-selector-foot">Only lots with stock that can be sold are listed. Double-click a row, or press Enter in the search box for the first one.</p>
           </section>
         </div>
       )}
@@ -29646,7 +30652,9 @@ function DiscountApprovalModal({ draft, onChange, onClose, onConfirm }) {
               {draft.bill && <li key="bill">{describeBillApprovalLine(draft.bill)}</li>}
             </ul>
           )}
+          {/* The Owner or Admin is standing at the till to type their name: start there. */}
           <SaleChangeApprovalFields
+            autoFocus
             disabled={draft.saving}
             form={draft}
             onChange={onChange}
@@ -29779,7 +30787,7 @@ function SaleChangeReasonPicker({ disabled = false, form, label, onChange }) {
  * or Admin. When approval cannot happen here (offline, Local Only), the one line that says so and
  * no password box, so nobody types a password that could not be checked.
  */
-function SaleChangeApprovalFields({ disabled = false, form, onChange, route }) {
+function SaleChangeApprovalFields({ autoFocus = false, disabled = false, form, onChange, route }) {
   if (!route || route.mode === SALE_CHANGE_APPROVAL_MODE.NONE) return null;
   if (route.mode === SALE_CHANGE_APPROVAL_MODE.REFUSED) {
     return <div className="error-banner" role="alert">{route.message}</div>;
@@ -29789,7 +30797,7 @@ function SaleChangeApprovalFields({ disabled = false, form, onChange, route }) {
       <strong>Owner or Admin approval</strong>
       <div className="form-grid">
         <Field label="Username">
-          <input autoCapitalize="none" autoComplete="off" disabled={disabled} name="sale-change-approver" spellCheck={false} value={form.approverUsername || ""} onChange={(event) => onChange({ approverUsername: event.target.value })} />
+          <input autoCapitalize="none" autoComplete="off" autoFocus={autoFocus} disabled={disabled} name="sale-change-approver" spellCheck={false} value={form.approverUsername || ""} onChange={(event) => onChange({ approverUsername: event.target.value })} />
         </Field>
         <Field label="Password">
           <PasswordInput autoComplete="new-password" disabled={disabled} name="sale-change-approver-password" value={form.approverPassword || ""} onChange={(event) => onChange({ approverPassword: event.target.value })} />
@@ -29837,7 +30845,7 @@ function SaleCancelModal({ approvalRoute, draft, onChange, onClose, onConfirm })
             {items.map((item, index) => (
               <tr key={item.id || item.sale_item_id || `${item.product_id}-${index}`}>
                 <td className="primary-cell">{item.product_name}</td>
-                <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
+                <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || MISSING_VALUE}</td>
                 <td>{Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} {item.unit || ""}</td>
                 <td>{currency.format(Number(item.selling_rate || item.rate || 0))}</td>
                 <td>{currency.format(Number(item.net_amount || item.amount || 0))}</td>
@@ -29851,7 +30859,7 @@ function SaleCancelModal({ approvalRoute, draft, onChange, onClose, onConfirm })
           {draft.error && <div className="error-banner" role="alert">{draft.error}</div>}
           <p className="form-note stock-low">This will mark the invoice as CANCELLED, restore exact lot stock, and reverse cash/bank/customer ledger impact. The invoice will remain visible with a cancelled badge.</p>
           <div className="button-row">
-            <button className="remove-button" disabled={draft.saving || saleChangeFormProblem(draft, approvalRoute) !== ""} onClick={onConfirm}>{draft.saving ? "Cancelling..." : "Confirm Cancel Bill"}</button>
+            <button className="remove-button" disabled={draft.saving || saleChangeFormProblem(draft, approvalRoute) !== ""} onClick={onConfirm}>{draft.saving ? "Cancelling…" : "Confirm Cancel Bill"}</button>
             <button className="secondary-button" disabled={draft.saving} onClick={onClose}>Keep Bill</button>
           </div>
         </div>
@@ -29860,7 +30868,7 @@ function SaleCancelModal({ approvalRoute, draft, onChange, onClose, onConfirm })
   );
 }
 
-function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivityMode, customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onSaved, paymentSettings = {}, products, user }) {
+function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivityMode, customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onNotify = () => {}, onSaved, paymentSettings = {}, products, user }) {
   const activeCustomers = customers.filter((entry) => entry.active !== false);
   const walkInCustomer = activeCustomers.find((entry) => entry.system_account === true && String(entry.customer_name || "").toLowerCase().includes("walk-in")) || null;
   const customerFromAccount = (account) => account ? ({
@@ -30084,19 +31092,19 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
     }
     const reason = composed.reason;
     if (items.length === 0) {
-      alert("Invoice must contain at least one item.");
+      setChangeError("A bill needs at least one item. Add an item, or cancel the bill instead.");
       return;
     }
     if (customer.mobile && !/^\d{10,15}$/.test(customer.mobile)) {
-      alert("Enter a valid customer mobile number.");
+      setChangeError("The customer's mobile number needs 10 to 15 digits.");
       return;
     }
     if (Number(invoiceDiscount || 0) > subtotalAfterItemDiscounts) {
-      alert("Bill discount cannot exceed sale value after item discounts.");
+      setChangeError("The bill discount is more than the bill after item discounts. Lower it.");
       return;
     }
     if (hasInvalidMixedPayment) {
-      alert("Mixed payment amounts cannot be negative.");
+      setChangeError("A mixed payment amount cannot be below zero.");
       return;
     }
     const payments = paymentMode === "MIXED"
@@ -30106,7 +31114,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
       : [{ mode: paymentMode, amount: netPayable }];
     const paidAmount = roundUi(payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
     if (paymentMode === "MIXED" && (!isMixedPaymentBalanced || Math.abs(paidAmount - netPayable) > 0.01)) {
-      alert("Mixed payment split must exactly match Net Payable.");
+      setChangeError("The mixed payment split must add up to exactly the Net Payable.");
       return;
     }
     // Decided before anything is written or sent. REFUSED (offline, Local Only, cloud gate closed)
@@ -30216,11 +31224,12 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
         try {
           await onSaved({ localSale: localSnapshotToInvoice(result.invoice), pendingOperations: result.pending_operations });
         } catch (refreshError) {
-          alert(describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }));
+          // The window closes; the bell keeps the warning so it is not lost with it.
+          onNotify({ severity: "warning", title: `${invoice.invoice_no || "The bill"} is updated`, message: describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }), source: "Sales" });
           onClose?.();
           return;
         }
-        alert("Invoice updated locally. Pending sync.");
+        onNotify({ severity: "success", title: `${invoice.invoice_no || "The bill"} is updated on this computer`, message: "It goes to the cloud with the next sync.", source: "Sales" });
       } else {
         const saleEditWrite = createOperationalWrite(user, {
           ...payload,
@@ -30246,15 +31255,15 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
         try {
           await onSaved();
         } catch (refreshError) {
-          alert(describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }));
+          onNotify({ severity: "warning", title: `${invoice.invoice_no || "The bill"} is updated`, message: describeSavedBillRefreshFailure(invoice.invoice_no, refreshError, { edited: true }), source: "Sales" });
           onClose?.();
           return;
         }
-        alert("Invoice updated");
+        onNotify({ severity: "success", title: `${invoice.invoice_no || "The bill"} is updated`, source: "Sales" });
       }
     } catch (error) {
       if (approvalErrorCode(error) === "SALE_CHANGE_APPROVAL_REQUIRED") setChangeError(describeApprovalError(error));
-      else alert(getErrorMessage(error, "Unable to update invoice"));
+      else setChangeError(plainRefusalMessage(error) || getErrorMessage(error, "The bill was not updated. Nothing was changed; try again."));
     } finally {
       setSaving(false);
     }
@@ -30269,7 +31278,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivity
             <strong>{invoice.invoice_no}</strong>
           </div>
           <div className="invoice-actions">
-            <button className="primary-button" disabled={saving || hasInvalidMixedPayment || !isMixedPaymentBalanced || changeProblem !== ""} onClick={save}>{saving ? "Saving..." : "Save Edit"}</button>
+            <button className="primary-button" disabled={saving || hasInvalidMixedPayment || !isMixedPaymentBalanced || changeProblem !== ""} onClick={save}>{saving ? "Saving…" : "Save Edit"}</button>
             <button aria-label="Close editor" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
@@ -30413,9 +31422,9 @@ const formatSaleAuditLines = (row) => {
   if (row.action === "CANCEL") {
     return [
       "Invoice Cancelled",
-      `Reason: ${row.reason || "-"}`,
-      `Cancelled By: ${row.edited_by_name || "-"}`,
-      `Cancelled At: ${row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}`,
+      `Reason: ${row.reason || MISSING_VALUE}`,
+      `Cancelled By: ${row.edited_by_name || MISSING_VALUE}`,
+      `Cancelled At: ${row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}`,
     ];
   }
   const oldValue = row.old_value || {};
@@ -30430,7 +31439,7 @@ const formatSaleAuditLines = (row) => {
   };
   if ((oldSale.customer_name || "") !== (newSale.customer_name || "")) lines.push(`Customer: ${oldSale.customer_name || "Walk-in"} -> ${newSale.customer_name || "Walk-in"}`);
   if (toDateKey(oldSale.sale_date || "") !== toDateKey(newSale.sale_date || "")) lines.push(`Bill Date: ${formatDisplayDate(oldSale.sale_date)} -> ${formatDisplayDate(newSale.sale_date)}`);
-  if ((oldSale.payment_mode || "") !== (newSale.payment_mode || "")) lines.push(`Payment Mode: ${oldSale.payment_mode || "-"} -> ${newSale.payment_mode || "-"}`);
+  if ((oldSale.payment_mode || "") !== (newSale.payment_mode || "")) lines.push(`Payment Mode: ${oldSale.payment_mode || MISSING_VALUE} -> ${newSale.payment_mode || MISSING_VALUE}`);
   addMoneyChange("Gross Total", "gross_amount");
   addMoneyChange("Discount", "invoice_discount_amount");
   addMoneyChange("Net Amount", "total_amount");
@@ -30476,8 +31485,8 @@ function ChangeHistoryModal({ history, onClose }) {
             {history.rows.map((row) => (
               <tr key={row.id}>
                 <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
-                <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
-                <td>{row.edited_by_name || "-"}</td>
+                <td>{formatKolkataDateTime(row.edited_at)}</td>
+                <td>{row.edited_by_name || MISSING_VALUE}</td>
                 <td>{row.reason}</td>
                 <td><div className="audit-readable">{formatSaleAuditLines(row).map((line) => <span key={line}>{line}</span>)}</div></td>
               </tr>
@@ -30496,18 +31505,18 @@ const formatPaymentAuditLines = (row) => {
   if (row.action === "CANCEL") {
     return [
       "Payment Cancelled",
-      `Reason: ${row.reason || "-"}`,
-      `Cancelled By: ${row.edited_by_name || "-"}`,
-      `Cancelled At: ${row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}`,
+      `Reason: ${row.reason || MISSING_VALUE}`,
+      `Cancelled By: ${row.edited_by_name || MISSING_VALUE}`,
+      `Cancelled At: ${row.edited_at ? formatKolkataDateTime(row.edited_at) : MISSING_VALUE}`,
     ];
   }
   const fields = [
     ["payment_date", "Date", (value) => toDateKey(value || "")],
     ["payment_amount", "Payment Amount", (value) => currency.format(Number(value || 0))],
     ["rebate_amount", "Rebate Amount", (value) => currency.format(Number(value || 0))],
-    ["payment_mode", "Payment Mode", (value) => value || "-"],
-    ["reference_number", "Reference", (value) => value || "-"],
-    ["remarks", "Remarks", (value) => value || "-"],
+    ["payment_mode", "Payment Mode", (value) => value || MISSING_VALUE],
+    ["reference_number", "Reference", (value) => value || MISSING_VALUE],
+    ["remarks", "Remarks", (value) => value || MISSING_VALUE],
   ];
   const lines = fields
     .filter(([key]) => String(oldValue[key] ?? "") !== String(newValue[key] ?? ""))
@@ -30531,8 +31540,8 @@ function PaymentAuditModal({ audit, onClose }) {
             {audit.rows.map((row) => (
               <tr key={row.id}>
                 <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
-                <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
-                <td>{row.edited_by_name || "-"}</td>
+                <td>{formatKolkataDateTime(row.edited_at)}</td>
+                <td>{row.edited_by_name || MISSING_VALUE}</td>
                 <td>{row.reason}</td>
                 <td><div className="audit-readable">{formatPaymentAuditLines(row).map((line) => <span key={line}>{line}</span>)}</div></td>
               </tr>
@@ -30552,6 +31561,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
   const receiptRef = useRef(null);
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
+  const [receiptNotice, showReceiptNotice, clearReceiptNotice] = useSaveNotice();
   const receiptFileName = `FroozERP_Payment_Receipt_${payment.payment_key || payment.id || toDateKey(new Date())}.pdf`;
   const receiptRecipients = useMemo(() => buildWhatsappRecipients({
     accounts: [{
@@ -30566,6 +31576,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
   }), [payment]);
   const exportReceiptPdf = async () => {
     if (!receiptRef.current) return;
+    clearReceiptNotice();
     setExporting(true);
     try {
       await exportElementToPdf({
@@ -30574,7 +31585,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
         mode: "A4",
       });
     } catch (error) {
-      alert(`Unable to export receipt PDF: ${error.message}`);
+      showReceiptNotice(errorNotice(`The receipt PDF could not be made (${error?.message || String(error)}). Nothing was saved; try again.`));
     } finally {
       setExporting(false);
     }
@@ -30589,22 +31600,23 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
           </div>
           <div className="invoice-actions">
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Receipt</button>
-            <button className="secondary-button" disabled={exporting} onClick={exportReceiptPdf}>{exporting ? "Exporting..." : "Save PDF"}</button>
+            <button className="secondary-button" disabled={exporting} onClick={exportReceiptPdf}>{exporting ? "Exporting…" : "Save PDF"}</button>
             <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
             <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
+        <SaveNotice className="pdf-preview-notice no-print" notice={receiptNotice} />
         <article ref={receiptRef} className="invoice-paper print-area">
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">
               <strong>Payment Receipt</strong>
               <span>Receipt #{payment.payment_key || payment.id}</span>
-              <span>{payment.payment_date ? new Date(payment.payment_date).toLocaleDateString("en-IN") : toDateKey(new Date())}</span>
+              <span>{formatDisplayDate(payment.payment_date || new Date())}</span>
             </div>
           </header>
           <section className="invoice-customer">
-            <div><small>Party Name</small><strong>{payment.account_name || "-"}</strong><span>{payment.account_type || payment.payment_source || "-"}</span></div>
+            <div><small>Party Name</small><strong>{payment.account_name || MISSING_VALUE}</strong><span>{payment.account_type || payment.payment_source || MISSING_VALUE}</span></div>
             <div><small>Payment Mode</small><strong>{labelFor("paymentMode", payment.payment_mode)}</strong><span>{payment.reference_number || "No reference"}</span></div>
           </section>
           <section className="receipt-summary">
@@ -30769,7 +31781,7 @@ function InvoiceBill({ layout, stacked = false, upi = null }) {
   );
 }
 
-function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, editRefusal = null, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
+function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, closeLabel = "Close", editRefusal = null, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
@@ -30779,6 +31791,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
   const [pdfPreview, setPdfPreview] = useState(null);
+  // A PDF that could not be made is said inside the bill window, not in a browser alert.
+  const [pdfError, setPdfError] = useState("");
   const invoiceRef = useRef(null);
   const invoiceSectionRef = useRef(null);
   const autoPrintedRef = useRef(false);
@@ -30829,6 +31843,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
     [invoice, printSettings, invoiceDateKey, invoiceEntryTime],
   );
   const billVariant = activePrintMode === "A4" ? "a4" : printSettings.receipt_width === "58MM" ? "thermal-58" : "thermal-80";
+  // The shop's own default print, from Settings: that button is the primary one.
+  const defaultPrintMode = printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL";
   const printWithMode = (mode) => {
     setPrintMode(mode);
     const nextProfile = mode === "A4" ? "A4_PORTRAIT" : printSettings.receipt_width === "58MM" ? "THERMAL_58" : "THERMAL_80";
@@ -30847,6 +31863,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   }, [autoPrintMode, upiPayload, upiQrSettledFor]);
   const exportInvoicePdf = async (mode = activePrintMode, save = true) => {
     setPrintMode(mode);
+    setPdfError("");
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, upiPayload && !upiQrDataUrl ? 250 : 80));
@@ -30869,7 +31886,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       const result = await exportInvoicePdf(mode, false);
       setPdfPreview({ ...result });
     } catch (error) {
-      alert(`Unable to view invoice PDF: ${error.message}`);
+      setPdfError(`The PDF could not be made: ${getErrorMessage(error, "try again")}. The bill is saved; print it instead.`);
     } finally {
       setExporting(false);
     }
@@ -30913,16 +31930,20 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             </div>
             <button aria-label="Close invoice" className="remove-button invoice-close" onClick={onClose} title="Close" type="button"><Icon name="close" /></button>
           </div>
+          {/* Printing is what a saved bill is opened for, so the print in the shop's own default
+              mode leads; editing is a correction and sits beside the other secondary actions. */}
           <div className="invoice-actions invoice-actions-bill">
-            {canEdit && <button className="primary-button" onClick={onEdit}>Edit Bill</button>}
+            <button className={defaultPrintMode === "THERMAL" ? "primary-button" : "secondary-button"} type="button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> Thermal Print</button>
+            <button className={defaultPrintMode === "A4" ? "primary-button" : "secondary-button"} type="button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
+            {canEdit && <button className="secondary-button" type="button" onClick={onEdit}>Edit Bill</button>}
             {!canEdit && editRefusal && <span className="form-note invoice-edit-refusal" role="note">{editRefusal}</span>}
-            <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
-            <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
-            <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing..." : "View PDF"}</button>
-            <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "Save PDF"}</button>
-            <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
-            {canCancel && <button className="remove-button invoice-cancel-bill" onClick={onCancel}>Cancel Bill</button>}
+            <button className="secondary-button" disabled={exporting} type="button" onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing…" : "View PDF"}</button>
+            <button className="secondary-button" disabled={exporting} type="button" onClick={() => exportInvoicePdf(activePrintMode, true).catch((error) => setPdfError(`The PDF could not be saved: ${getErrorMessage(error, "try again")}. The bill is saved; print it instead.`))}>{exporting ? "Exporting…" : "Save PDF"}</button>
+            <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} type="button" onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
+            {canCancel && <button className="remove-button invoice-cancel-bill" type="button" onClick={onCancel}>Cancel Bill</button>}
+            <button className="secondary-button invoice-done-button" type="button" onClick={onClose}>{closeLabel}</button>
           </div>
+          {pdfError && <div className="error-banner invoice-pdf-error" role="alert">{pdfError}</div>}
         </div>
         {layout.issues.length > 0 && (
           <p className="bill-issue no-print" role="status">{layout.issues.join(" ")}</p>
@@ -30975,27 +31996,32 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
 }
 
 function PurchaseSummary({ summary }) {
+  // A bill whose items come from different origins is taxed per item ("Mixed"), not at one rate.
+  const mixedTax = summary.mandiTaxPercent === "Mixed";
+  const taxWords = mixedTax ? "by origin" : `${summary.mandiTaxPercent}%`;
+  const costPerUnit = summary.costPerUnit || { known: false, label: "Cost per unit" };
   return (
     <section className="purchase-summary">
       <div className="purchase-summary-heading">
         <div>
-          <span className="eyebrow">Landed Cost Preview</span>
-          <h3>Purchase Calculation</h3>
+          <span className="eyebrow">Landed cost preview</span>
+          <h3>Purchase calculation</h3>
         </div>
-        <span className="origin-rate">Mandi Tax {summary.mandiTaxPercent}%</span>
+        <span className="origin-rate">{mixedTax ? "Mandi tax by origin" : `Mandi tax ${summary.mandiTaxPercent}%`}</span>
       </div>
       <div className="purchase-summary-grid">
-        <SummaryMetric label="Basic Amount" value={currency.format(summary.basicAmount)} />
-        <SummaryMetric label={`Mandi Tax (${summary.mandiTaxPercent}%)`} value={currency.format(summary.mandiTaxAmount)} />
-        <SummaryMetric label="Freight Charges" value={currency.format(summary.freightCharges)} />
-        <SummaryMetric label="Labour Charges" value={currency.format(summary.labourCharges)} />
-        <SummaryMetric label="Other Charges" value={currency.format(summary.otherCharges)} />
-        <SummaryMetric label="Gross Amount" value={currency.format(summary.grossAmount)} />
-        <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={Number(summary.rebateAmount) > 0 ? `-${currency.format(summary.rebateAmount)}` : currency.format(0)} positive />
-        <SummaryMetric label="Net Payable" value={currency.format(summary.netPayable)} featured />
-        <SummaryMetric label="Pending Balance" value={currency.format(summary.balanceAmount)} />
-        <SummaryMetric label="Payment Status" value={summary.paymentStatus} />
-        <SummaryMetric label="Effective Cost / Unit" value={currency.format(summary.effectiveCostPerUnit)} featured />
+        <SummaryMetric label="Basic amount" value={currency.format(summary.basicAmount)} />
+        <SummaryMetric label={`Mandi tax (${taxWords})`} value={currency.format(summary.mandiTaxAmount)} />
+        <SummaryMetric label="Freight charges" value={currency.format(summary.freightCharges)} />
+        <SummaryMetric label="Labour charges" value={currency.format(summary.labourCharges)} />
+        <SummaryMetric label="Other charges" value={currency.format(summary.otherCharges)} />
+        <SummaryMetric label="Gross amount" value={currency.format(summary.grossAmount)} />
+        <SummaryMetric label={`Supplier rebate (${summary.rebatePercent}%)`} value={Number(summary.rebateAmount) > 0 ? `-${currency.format(summary.rebateAmount)}` : currency.format(0)} />
+        <SummaryMetric label="Net payable" value={currency.format(summary.netPayable)} featured />
+        <SummaryMetric label="Pending balance" value={currency.format(summary.balanceAmount)} />
+        <SummaryMetric label="Payment status" value={summary.paymentStatus} />
+        {/* Only for items in one unit: 10 kg and 4 boxes are not "14 units" (local/stockScreens.js). */}
+        <SummaryMetric label={costPerUnit.label} value={costPerUnit.known ? currency.format(costPerUnit.value) : MISSING_VALUE} featured />
       </div>
     </section>
   );
@@ -31147,7 +32173,9 @@ function DualLineChart({ data, firstKey, firstLabel, secondKey, secondLabel, sub
  * WhatsApp" turns the card into a picture: the system share sheet where the webview has one,
  * otherwise copied to the clipboard and saved to Downloads, ready to paste into the group.
  */
-const PRICE_LIST_PREVIEW_ROWS = 8;
+// Two rows of tiles at 1366 on the Dashboard; "Show all" and the shared picture carry every row. Eight
+// tiles and the reminder settings filled the whole first screen at 1366 before any figure showed.
+const PRICE_LIST_PREVIEW_ROWS = 6;
 
 function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedule = false, groupCode = "", inventoryLots, onGroupChange, loadError = "", loading = false, onScheduleChange, photoIndex, products, readyToday = false, schedule, scope }) {
   const built = useMemo(
@@ -31277,14 +32305,14 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
         <div className="button-row price-list-actions">
           {/* The device share sheet, not the server send route, so it needs no WhatsApp-send permission. */}
           <button className="whatsapp-button price-list-share" disabled={busy || list.rows.length === 0} onClick={share} type="button">
-            <Icon name="message" /> {busy ? "Preparing..." : "Share on WhatsApp"}
+            <Icon name="message" /> {busy ? "Preparing…" : "Share on WhatsApp"}
           </button>
           <button className="secondary-button" disabled={list.rows.length === 0} onClick={copyText} type="button">Copy as text</button>
         </div>
       </div>
       {/* Right under the button that caused it, so what to do next is the first thing read. */}
       {outcome && <div className={outcome.tone === "error" ? "error-banner" : "form-note price-list-outcome"} role={outcome.tone === "error" ? "alert" : "status"}>{outcome.text}</div>}
-      {list.status === "loading" && <div className="cart-empty" role="status">Reading today's stock on this computer...</div>}
+      {list.status === "loading" && <div className="cart-empty" role="status">Reading today's stock on this computer…</div>}
       {list.status === PRICE_LIST_STATUS.UNAVAILABLE && <div className="error-banner" role="alert">{list.message || "The price list could not be built."}</div>}
       {list.status === PRICE_LIST_STATUS.EMPTY && <div className="cart-empty">{list.message || "Nothing is in stock with a rate, so there is no price list today."}</div>}
       {list.status === PRICE_LIST_STATUS.READY && (
@@ -31325,6 +32353,12 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
         </>
       )}
       {canSchedule && (
+        // Set once and then left alone, so folded away under one line that still says the state.
+        <details className="price-list-schedule-details">
+          <summary>
+            Morning reminder and WhatsApp group
+            <span className="price-list-schedule-state">{schedule.enabled ? ` · reminder at ${schedule.time}` : " · reminder off"}{groupCode ? " · group set" : ""}</span>
+          </summary>
         <div className="price-list-schedule">
           <label className="check-field">
             <input
@@ -31367,7 +32401,7 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
                   setGroupDraft(event.target.value);
                   setGroupNote(null);
                 }}
-                placeholder="https://chat.whatsapp.com/..."
+                placeholder="https://chat.whatsapp.com/…"
                 value={groupDraft}
               />
             </label>
@@ -31375,6 +32409,7 @@ function DailyPriceListPanel({ businessSettings = {}, branchName = "", canSchedu
           </form>
           {groupNote && <p className={groupNote.tone === "error" ? "form-note stock-low" : "form-note"} role="status">{groupNote.text}</p>}
         </div>
+        </details>
       )}
     </section>
   );
@@ -31639,7 +32674,7 @@ function DashboardHighlights({ insights, lowStockItems, onNavigate, topProducts 
           </div>
         </div>
         <div className="insight-list">
-          {insights.length ? insights.map((insight) => <p key={insight}>{insight}</p>) : <p>No insights available yet.</p>}
+          {insights.length ? insights.map((insight) => <p key={insight}>{insight}</p>) : <div className="empty-inline">No insights for this period yet.</div>}
         </div>
       </section>
 
@@ -31688,15 +32723,37 @@ function DashboardHighlights({ insights, lowStockItems, onNavigate, topProducts 
 }
 
 function SummaryMetric({ featured = false, label, positive = false, value }) {
-  const displayValue = value ?? "-";
-  // A negative amount stays on one line, with a true minus, in the loss colour.
+  const displayValue = value ?? MISSING_VALUE;
+  // A negative amount stays on one line, with a true minus, in the loss colour -- even on a tile
+  // marked `positive`, which only means "green when this is good". A loss is never painted green.
   const signed = presentSignedFigure(displayValue);
+  // A zero is plain, not a green "₹0.00".
+  const gain = positive && !isZeroFigure(displayValue);
   return (
     <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"} title={`${label}: ${displayValue}`}>
       <span>{label}</span>
-      <strong className={positive ? "metric-value profit-cell" : signed.negative ? "metric-value metric-negative" : "metric-value"}>{signed.text}</strong>
+      <strong className={signed.negative ? "metric-value metric-negative" : gain ? "metric-value profit-cell" : "metric-value"}>{signed.text}</strong>
     </div>
   );
+}
+
+// A profit figure in a table: green when it is a profit, the loss colour with a true minus when it
+// is a loss. `profit-cell` alone painted "-₹1,900.00" green and bold, which reads as a gain.
+function ProfitCell({ className = "", format = (number) => currency.format(number), value }) {
+  const number = Number(value);
+  const loss = Number.isFinite(number) && number < 0;
+  const signed = presentSignedFigure(format(value));
+  // Zero is neither: plain, right-aligned, not green bold.
+  const zero = !loss && !signed.negative && (number === 0 || isZeroFigure(signed.text));
+  return <td className={`profit-cell ${loss || signed.negative ? "loss-cell" : ""} ${zero ? "profit-zero" : ""} ${className}`.replace(/\s+/g, " ").trim()}>{signed.text}</td>;
+}
+
+// A money cell that can go below zero (cash, bank): a true minus and the loss colour when it does,
+// plain otherwise. Never green: a cash balance is not a profit.
+function SignedAmountCell({ format = (number) => currency.format(number), value }) {
+  const signed = presentSignedFigure(format(value));
+  const negative = signed.negative || isNegativeFigure(Number(value));
+  return <td className={negative ? "amount-cell amount-negative" : "amount-cell"}>{signed.text}</td>;
 }
 
 // A password box with its own show/hide eye (4 Oct 2026). The eye Windows' WebView draws by itself
@@ -31743,14 +32800,16 @@ function RequiredLabel({ children }) {
   return <>{children}<span aria-hidden="true" className="pm-required"> *</span><span className="pm-sr-only"> (required)</span></>;
 }
 
-function ModuleCard({ actions = null, children, eyebrow, id, subtitle, title }) {
+// `onChange` hears every edit inside the card (React's change events bubble), so a card clears its
+// save notice on the next edit without each input having to.
+function ModuleCard({ actions = null, children, eyebrow, id, onChange, subtitle, title }) {
   return (
-    <section className="content-card" id={id}>
+    <section className="content-card" id={id} onChange={onChange}>
       <div className="card-heading">
         <div>
-          <span className="eyebrow">{eyebrow}</span>
+          {eyebrow && <span className="eyebrow">{eyebrow}</span>}
           <h2>{title}</h2>
-          <p>{subtitle}</p>
+          {subtitle && <p>{subtitle}</p>}
         </div>
         {actions && <div className="card-heading-actions">{actions}</div>}
       </div>
@@ -31780,14 +32839,38 @@ function DeviceIdentity({ children, deviceId, kind, name }) {
 
 // Branch on top, counter under it, for every device table.
 function DevicePlace({ branch, counter }) {
-  return <><span className="device-place">{branch || "-"}</span><small className="cell-note">{counter || "-"}</small></>;
+  return <><span className="device-place">{branch || MISSING_VALUE}</span><small className="cell-note">{counter || MISSING_VALUE}</small></>;
 }
 
+// A clickable table row opens with Enter as well as a click, so Tab and Enter reach every report
+// detail. Only the row itself: Enter on a button inside it keeps doing that button's job.
+const activateOnEnter = (handler) => (event) => {
+  if (event.key !== "Enter" || event.target !== event.currentTarget) return;
+  event.preventDefault();
+  handler(event);
+};
+
+// A header is a string, a node, or `{ label, numeric: true }` for a money or quantity column. A
+// numeric column is right-aligned, heading and cells alike, through a `num-col-N` class on the
+// table (App.css), so every row lines its figures up without each cell having to ask.
+const isColumnSpec = (header) => Boolean(header) && typeof header === "object" && !React.isValidElement(header) && "label" in header;
+
 function DataTable({ children, className = "", headers }) {
+  const numericColumns = headers
+    .map((header, index) => (isColumnSpec(header) && header.numeric ? index + 1 : 0))
+    .filter((column) => column > 0 && column <= 16);
+  const tableClass = numericColumns.map((column) => `num-col-${column}`).join(" ");
   return (
     <div className={`table-wrap ${className}`.trim()}>
-      <table>
-        <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? `${index}:${header}` : index}>{header}</th>)}</tr></thead>
+      <table className={tableClass || undefined}>
+        <thead>
+          <tr>
+            {headers.map((header, index) => {
+              const label = isColumnSpec(header) ? header.label : header;
+              return <th key={typeof label === "string" ? `${index}:${label}` : index}>{label}</th>;
+            })}
+          </tr>
+        </thead>
         <tbody>{children}</tbody>
       </table>
     </div>

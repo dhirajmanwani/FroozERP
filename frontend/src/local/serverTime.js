@@ -50,7 +50,7 @@ export const formatKolkataDateTime = (value) => {
     minute: "2-digit",
     second: "2-digit",
     hour12: true,
-  }).format(date).replace(",", "");
+  }).format(date).replace(",", "").replace(/\b(am|pm)$/i, (period) => period.toUpperCase());
 };
 
 export const formatKolkataHeaderClock = (value) => {

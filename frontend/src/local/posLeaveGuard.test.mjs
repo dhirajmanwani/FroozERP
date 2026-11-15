@@ -23,10 +23,12 @@ test("the question is the owner's wording, with Stay and Leave", () => {
 });
 
 test("navigate asks before it does anything else, and only an answered dialog skips the question", () => {
-  const start = app.indexOf("const navigate = async (view, { posLeaveConfirmed = false } = {}) => {");
+  // Back/Forward also skips it (`fromHistory`): the top bar's arrows asked before the page moved,
+  // and the popstate that follows now runs navigate so the screen's loaders run.
+  const start = app.indexOf("const navigate = async (view, { posLeaveConfirmed = false, fromHistory = false } = {}) => {");
   assert.ok(start > 0, "navigate takes the confirmation flag");
-  const head = app.slice(start, start + 700);
-  assert.match(head, /if \(!posLeaveConfirmed && shouldConfirmLeavingPos\(\{ activeView, nextView: view, cartLines: posWork\.cartLines \}\)\) \{/);
+  const head = app.slice(start, start + 1200);
+  assert.match(head, /if \(!posLeaveConfirmed && !fromHistory && shouldConfirmLeavingPos\(\{ activeView, nextView: view, cartLines: posWork\.cartLines \}\)\) \{/);
   assert.ok(head.indexOf("shouldConfirmLeavingPos(") < head.indexOf("hasModuleAccess(view)"), "asked first");
   assert.match(app, /navigateRef\.current\?\.\(target\.view, \{ posLeaveConfirmed: true \}\)/);
 });

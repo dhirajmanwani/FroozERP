@@ -174,3 +174,124 @@ export const lotLeftAfterCart = ({ available, inOtherLines = 0, quantity = 0 } =
   const left = balance - Number(inOtherLines || 0) - (Number(quantity) || 0);
   return Math.max(Math.round(left * 1000) / 1000, 0);
 };
+
+/**
+ * How much one tap on a fruit adds from a lot: one unit, or what is left of the lot when that is
+ * less than one. A lot holding 0.75 kg could not be sold at all, because the tap asked for a whole
+ * kilo and was refused ("Only 0.75 more units are available") before any line existed to type 0.75
+ * into. When nothing is left (or the lot's balance is unknown) it still asks for one unit, so the
+ * stock check that follows refuses with its usual message rather than adding an empty line.
+ */
+export const lotTapQuantity = ({ available, inCart = 0 } = {}) => {
+  const left = lotLeftAfterCart({ available, inOtherLines: inCart });
+  if (left === null || left <= 0) return 1;
+  return Math.min(1, left);
+};
+
+/**
+ * The questions checkout stops to ask, in the app's own dialog instead of a browser box.
+ *
+ * Checkout asks the same things in the same order as it always did: a back-dated or future-dated
+ * bill (then an optional reason), credit with no saved customer, a zero rate, a rate below cost, and
+ * the same four again when the server asks after a refusal (HTTP 409). Only the box changed. These
+ * are the words; App.jsx keeps every condition and the order. "Go back" is the safe choice and has
+ * the focus (ConfirmDialog), so an Enter pressed out of habit never bills a risky price, and going
+ * back stops checkout exactly where Cancel on the old box did.
+ */
+export const CHECKOUT_GATE = Object.freeze({
+  BACKDATE: "backdate",
+  FUTURE_DATE: "future-date",
+  WALK_IN_CREDIT: "walk-in-credit",
+  ZERO_RATE: "zero-rate",
+  BELOW_COST: "below-cost",
+});
+
+/** The reason a re-dated bill is saved with when none is typed, as before. */
+export const DEFAULT_DATE_OVERRIDE_REASON = Object.freeze({
+  [CHECKOUT_GATE.BACKDATE]: "Backdated POS bill created",
+  [CHECKOUT_GATE.FUTURE_DATE]: "Future-dated POS bill created",
+});
+
+/**
+ * The confirm box for one gate. `billDate` is the date as people read it; `productName` names the
+ * line; `serverMessage` is the server's own sentence when it is the server asking.
+ */
+export const checkoutGateDialog = (gate, { billDate = "", productName = "", serverMessage = "" } = {}) => {
+  const fromServer = text(serverMessage);
+  const date = text(billDate);
+  const product = text(productName);
+  switch (gate) {
+    case CHECKOUT_GATE.BACKDATE:
+      return {
+        title: "Save this bill with an earlier date?",
+        message: fromServer || `This bill will be dated ${date || "before today"}, not today.`,
+        confirmLabel: "Use this date",
+        cancelLabel: "Go back",
+        tone: "danger",
+      };
+    case CHECKOUT_GATE.FUTURE_DATE:
+      return {
+        title: "Save this bill with a future date?",
+        message: fromServer || `This bill will be dated ${date || "after today"}, not today.`,
+        confirmLabel: "Use this date",
+        cancelLabel: "Go back",
+        tone: "danger",
+      };
+    case CHECKOUT_GATE.WALK_IN_CREDIT:
+      return {
+        title: "Put this credit sale on Walk-in Customer Credit?",
+        message: "No saved customer is selected, so nobody by name will owe for this bill.",
+        confirmLabel: "Bill to Walk-in credit",
+        cancelLabel: "Go back",
+        tone: "danger",
+      };
+    case CHECKOUT_GATE.ZERO_RATE:
+      return {
+        title: product ? `Sell ${product} at a zero rate?` : "Sell at a zero rate?",
+        message: fromServer || "The sale rate is ₹0, so this item goes out free.",
+        confirmLabel: "Sell at ₹0",
+        cancelLabel: "Go back",
+        tone: "danger",
+      };
+    case CHECKOUT_GATE.BELOW_COST:
+      return {
+        title: product ? `Sell ${product} below cost?` : "Sell below cost?",
+        message: fromServer || "This rate is below what the stock cost the shop.",
+        confirmLabel: "Sell below cost",
+        cancelLabel: "Go back",
+        tone: "danger",
+      };
+    default:
+      return { title: "Continue with this bill?", message: fromServer, confirmLabel: "Continue", cancelLabel: "Go back", tone: "danger" };
+  }
+};
+
+/**
+ * The optional reason asked after a re-dated bill is confirmed. Its Cancel never stopped checkout:
+ * the old prompt's Cancel saved the bill with the default reason. So the button says what it does,
+ * "Skip", and skipping (or Esc, or an empty box) gives that same default.
+ */
+export const checkoutDateReasonDialog = (gate) => ({
+  title: gate === CHECKOUT_GATE.FUTURE_DATE ? "Why the future date?" : "Why the earlier date?",
+  message: "Optional. It is kept with the bill's history.",
+  label: "Reason",
+  defaultValue: DEFAULT_DATE_OVERRIDE_REASON[gate] || "",
+  required: false,
+  confirmLabel: "Save reason",
+  cancelLabel: "Skip",
+});
+
+/** The reason the bill carries: what was typed, or the default when skipped or left empty. */
+export const resolveDateOverrideReason = (gate, answer) => text(answer) || DEFAULT_DATE_OVERRIDE_REASON[gate] || "";
+
+/**
+ * Said when a gate stops a person who may not answer it. The zero-rate and below-cost gates used to
+ * stop a Manager's checkout without a word; they still stop it, now saying why.
+ */
+export const checkoutGateRefusal = (gate) => {
+  if (gate === CHECKOUT_GATE.ZERO_RATE) return "Only the Owner or an Admin can bill an item at a zero rate.";
+  if (gate === CHECKOUT_GATE.BELOW_COST) return "Only the Owner or an Admin can bill an item below cost.";
+  if (gate === CHECKOUT_GATE.FUTURE_DATE) return "Only the Owner or an Admin can save a bill with a future date.";
+  if (gate === CHECKOUT_GATE.WALK_IN_CREDIT) return "Choose a saved customer account for a credit sale.";
+  return "";
+};

@@ -611,3 +611,15 @@ test("a FIXED combo that does not add up to its price is said on screen, never r
   const layout = buildInvoiceLayout(sale, {}, {});
   assert.ok(layout.issues.some((issue) => /Mixed Juice on this bill does not add up to its combo price/.test(issue)));
 });
+
+test("a bill from an untouched seeded settings row prints THE PEP, not the old default name", () => {
+  const layout = buildInvoiceLayout(
+    localSale(),
+    { business_name: "FroozERP Retail", invoice_footer_text: "Thank you for shopping with FEEL THE FREAKIN' FROOZ." },
+  );
+  assert.equal(layout.header.shopName, "THE PEP");
+  assert.equal(layout.footer.message, "Thank you for shopping with THE PEP.");
+  const typed = buildInvoiceLayout(localSale(), { business_name: "Sardar Fruits", invoice_footer_text: "Visit again" });
+  assert.equal(typed.header.shopName, "Sardar Fruits");
+  assert.equal(typed.footer.message, "Visit again");
+});

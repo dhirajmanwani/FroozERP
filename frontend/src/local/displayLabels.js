@@ -538,6 +538,7 @@ export const resolveFamily = (family) => FAMILY_LOOKUP.get(familyKey(family)) ||
 /** Per-family spellings that mean an existing key. Only for spellings that really occur. */
 const VALUE_ALIASES = {
   recordStatus: { TRUE: "ACTIVE", FALSE: "INACTIVE" },
+  unit: { PCS: "PIECE", PC: "PIECE", PIECES: "PIECE", NOS: "PIECE", KGS: "KG", BOXES: "BOX", DOZ: "DOZEN" },
 };
 
 const lookupKey = (family, value) => {

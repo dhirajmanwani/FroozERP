@@ -546,3 +546,18 @@ test("allocation totals compare at 3 dp, not as raw floats", async () => {
   });
   assert.equal(over.ok, false, "a real excess of one gram is still refused");
 });
+
+test("a failed consignment action says what could not be done, in plain past tense", async () => {
+  const { transferActionFailureMessage } = await import("./stockDistribution.js");
+  assert.equal(transferActionFailureMessage("approve"), "The consignment could not be approved.");
+  assert.equal(transferActionFailureMessage("receive"), "The consignment could not be received.");
+  assert.equal(transferActionFailureMessage("submit"), "The consignment could not be sent for approval.");
+  assert.equal(transferActionFailureMessage("mystery"), "The consignment could not be updated.");
+  const actions = new Set(Object.values(TRANSFER_TRANSITIONS).flatMap((moves) => Object.keys(moves)));
+  for (const action of actions) {
+    const message = transferActionFailureMessage(action);
+    assert.doesNotMatch(message, /eed\.|submited|updated\./, `${action} has its own words: ${message}`);
+  }
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.doesNotMatch(app, /\$\{action\}ed/);
+});

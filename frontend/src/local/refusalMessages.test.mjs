@@ -31,6 +31,8 @@ test("App routes the refusals through it, and sends current_password on its own 
   assert.match(app, /\} else if \(plainRefusalMessage\(error\)\) \{\s*\n\s*\/\/ EXIT_CODE_ATTEMPTS_LOCKED/);
   assert.match(app, /const ownRow = inventoryIdsEqual\(passwordTarget\.id, user\.id\);/);
   assert.match(app, /\.\.\.\(ownRow \? \{ current_password: passwordTarget\.current_password \|\| "" \} : \{\}\),/);
-  assert.match(app, /alert\(plainRefusalMessage\(error\) \|\| getErrorMessage\(error, "Unable to complete checkout"\)\);/);
-  assert.match(app, /alert\(plainRefusalMessage\(error\) \|\| getErrorMessage\(error, "Purchase Error"\)\);/);
+  // POS says it under its Checkout button now (Phase 3 polish), still refusal-first.
+  assert.match(app, /showCheckoutNotice\(errorNotice\(plainRefusalMessage\(error\) \|\| getErrorMessage\(error, "The bill was not saved\./);
+  // Purchase Entry says it under its Save button now (Phase 2 polish), still refusal-first.
+  assert.match(app, /showPurchaseNotice\(errorNotice\(plainRefusalMessage\(error\) \|\| getErrorMessage\(error, "The purchase could not be saved\./);
 });

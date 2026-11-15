@@ -70,11 +70,16 @@ export const PRODUCT_UNITS = [
   ["DOZEN", "Dozen"],
 ];
 
+// Spellings older rows and imports carry for the same four units ("222.000 PCS" beside
+// "68.000 Kg" read as two different systems).
+const UNIT_SPELLINGS = Object.freeze({ PCS: "PIECE", PC: "PIECE", PIECES: "PIECE", NOS: "PIECE", KGS: "KG", BOXES: "BOX", DOZ: "DOZEN" });
+
 // The stored value stays as it is ("KG"); this is only the word on screen.
 export const unitDisplayName = (unit) => {
   const raw = String(unit ?? "").trim();
   if (!raw) return MISSING_VALUE;
-  const known = PRODUCT_UNITS.find(([value]) => value === raw.toUpperCase());
+  const code = UNIT_SPELLINGS[raw.toUpperCase()] || raw.toUpperCase();
+  const known = PRODUCT_UNITS.find(([value]) => value === code);
   return known ? known[1] : raw;
 };
 

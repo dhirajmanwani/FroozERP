@@ -442,3 +442,9 @@ test("Share opens the group only in the Windows app, through the app's own comma
   assert.match(body, /invokeTauriCommand\("open_whatsapp_group", \{ inviteCode: groupCode \}\)/);
   assert.doesNotMatch(body, /axios|whatsapp\/send/);
 });
+
+test("a price list from an untouched seeded settings row is headed THE PEP", () => {
+  const seeded = { business_name: "FroozERP Retail", brand_name: "FEEL THE FREAKIN' FROOZ", company_name: "SRT Company" };
+  assert.equal(buildPriceListHeader({ businessSettings: seeded, now: NOW }).title, "THE PEP");
+  assert.equal(buildPriceListHeader({ businessSettings: { business_name: "Sardar Fruits" }, now: NOW }).title, "Sardar Fruits");
+});

@@ -27,8 +27,8 @@ test("the Lot View pages say how many they show, and print or export carries eve
   assert.match(app, /<ReportExportContext\.Provider value=\{printTarget\}>\{children\}<\/ReportExportContext\.Provider>/);
 });
 
-test("the Inventory Adjustments tile is not 0 when the audit read failed (BO-11)", () => {
-  assert.match(app, /label="Inventory Adjustments" value=\{auditUnavailableMessage \? "Local only" : auditLoading \? "Loading" : auditError \? MISSING_VALUE : adjustmentCount\}/);
+test("the stock corrections tile (was \"Inventory Adjustments\") is not 0 when the audit read failed (BO-11)", () => {
+  assert.match(app, /label="Stock corrections" value=\{auditUnavailableMessage \? "Local only" : auditLoading \? "Loading" : auditError \? MISSING_VALUE : adjustmentCount\}/);
 });
 
 test("Product Master hands Add, Deactivate, categories and sale price only to the Owner and Admins (BO-4)", () => {

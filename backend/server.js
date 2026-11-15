@@ -5968,7 +5968,8 @@ const getSystemInfo = async (deviceId = "") => {
       : Promise.resolve({ rows: [] }),
   ]);
   return {
-    softwareVersion: "1.0.5",
+    // The running release, read the way /api/health reads it -- not a number typed in once.
+    softwareVersion: appVersion,
     backendStatus: "Online",
     databaseStatus: dbResult.rows[0]?.database_name ? "Connected" : "Unknown",
     databaseName: dbResult.rows[0]?.database_name || "",

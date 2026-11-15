@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  ledgerStatementBounds,
   INCLUDED_IN_COST_HEADING,
   balanceSheetAsAtInput,
   ledgerWithRunningBalance,
@@ -139,4 +140,23 @@ test("Balance Sheet filter has a single As at date input and names the server's 
   assert.match(sheet, /balanceSheetAsAtInput\(/);
   assert.doesNotMatch(sheet, /<select/);
   assert.match(appSource, /`As at \$\{formatIndianReportDate\(data\.balanceSheet\?\.asAtDate/);
+});
+
+test("ledger statement: opening is carried in, an empty range keeps the balance, no account is unknown", () => {
+  // As the server builds it: balance += debit − credit, opening row first.
+  const ledger = [
+    { date: "2026-10-01", transaction_type: "Opening Balance", debit: 1000, credit: 0, balance: 1000 },
+    { date: "2026-10-05", transaction_type: "Sale", debit: 500, credit: 200, balance: 1300 },
+    { date: "2026-10-09", transaction_type: "Customer Payment", debit: 0, credit: 300, balance: 1000 },
+  ];
+  assert.deepEqual(ledgerStatementBounds(ledger), { opening: 0, closing: 1000 }, "whole history: nothing before the opening row");
+  assert.deepEqual(ledgerStatementBounds(ledger, { dateFrom: "2026-10-05" }), { opening: 1000, closing: 1000 });
+  assert.deepEqual(ledgerStatementBounds(ledger, { dateFrom: "2026-10-06", dateTo: "2026-10-08" }), { opening: 1300, closing: 1300 },
+    "a quiet week shows the balance carried in, not ₹0.00");
+  assert.deepEqual(ledgerStatementBounds(ledger, { dateFrom: "2026-11-01" }), { opening: 1000, closing: 1000 });
+  assert.deepEqual(ledgerStatementBounds(ledger, { dateTo: "2026-09-30" }), { opening: 0, closing: 0 }, "before the account existed");
+  assert.deepEqual(ledgerStatementBounds([], { hasAccount: false }), { opening: null, closing: null }, "no account chosen: unknown, not zero");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.doesNotMatch(app, /printableLedgerRows\[0\]\?\.balance/);
+  assert.match(app, /label="Opening Balance" value=\{formatKnownFigure\(ledgerBounds\.opening/);
 });

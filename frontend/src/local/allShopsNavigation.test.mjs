@@ -196,7 +196,7 @@ test("Report Center loads orders itself rather than trusting another screen to h
 test("an order report with unread orders says so instead of showing zeros", () => {
   // The pair that keeps a failed read from reading as a quiet day: no summary figures at all, and
   // an empty table that names the reason rather than claiming no records were found.
-  assert.match(app, /return \[\["Orders", "-", true\], \["Status", orderReportsState\.notice/);
+  assert.match(app, /return \[\["Orders", MISSING_VALUE, true\], \["Status", orderReportsState\.notice/);
   assert.match(app, /isOrderReport && !orderReportsState\.ready\s*\n?\s*\? orderReportsState\.notice/);
 });
 
@@ -230,7 +230,8 @@ test("POS is given the orders it needs to check against", () => {
 
 test("promised stock is shown on the cart line, not only on refusal", () => {
   // A refusal at the till happens with a customer standing there.
-  assert.match(app, /reservedNote\(reservedIndex, item\.product_id, item\.unit\)/);
+  // The unit is read the counter's way ("Kg", "Piece") since Phase 3; the note itself is the same.
+  assert.match(app, /reservedNote\(reservedIndex, item\.product_id, cartUnitName\(item\.unit\)\)/);
 });
 
 test("sending an order builds a POS cart instead of writing a sale directly", () => {

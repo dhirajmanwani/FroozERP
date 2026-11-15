@@ -24,6 +24,44 @@ export const DEFAULT_BRAND_IDENTITY = Object.freeze({
   logo: null,
 });
 
+export const DEFAULT_BRAND_NAME = "Pulp Eat Up.";
+export const DEFAULT_INVOICE_FOOTER = "Thank you for shopping with THE PEP.";
+export const DEFAULT_COMPACT_LOGO_TEXT = "PEP";
+
+// What the server seeds into a business-settings row nobody has edited yet (backend/server.js,
+// the business_settings defaults). Those words belong to an earlier name of the shop, so a row
+// that still holds them is treated as "not set" when it is shown: the screen, the bill and the
+// price list fall back to THE PEP. The stored row is never rewritten; the owner's own words,
+// whatever they are, are always shown as typed.
+export const LEGACY_DEFAULT_BUSINESS_NAME = "FroozERP Retail";
+export const LEGACY_DEFAULT_BRAND_NAME = "FEEL THE FREAKIN' FROOZ";
+export const LEGACY_DEFAULT_INVOICE_FOOTER = "Thank you for shopping with FEEL THE FREAKIN' FROOZ.";
+export const LEGACY_DEFAULT_COMPACT_LOGO_TEXT = "FTF";
+
+const sameWords = (a, b) => a.toLowerCase() === b.toLowerCase();
+
+/** True when the setting still holds the old seeded default, word for word (case aside). */
+export function isLegacyDefault(value, legacyDefault) {
+  const typed = typeof value === "string" ? value.trim() : "";
+  return Boolean(typed && legacyDefault) && sameWords(typed, legacyDefault);
+}
+
+/** The setting as typed, or "" when it is blank or still the old seeded default. */
+export function displaySetting(value, legacyDefault) {
+  const typed = typeof value === "string" ? value.trim() : "";
+  return isLegacyDefault(typed, legacyDefault) ? "" : typed;
+}
+
+/** The shop's name for display: what the owner typed, else THE PEP. */
+export function displayBusinessName(settings) {
+  return displaySetting(settings?.business_name, LEGACY_DEFAULT_BUSINESS_NAME) || DEFAULT_BRAND_TITLE;
+}
+
+/** The bill's thank-you line for display: what the owner typed, else THE PEP's line. */
+export function displayInvoiceFooter(settings) {
+  return displaySetting(settings?.invoice_footer_text, LEGACY_DEFAULT_INVOICE_FOOTER) || DEFAULT_INVOICE_FOOTER;
+}
+
 /** The longest side a stored logo keeps. The top bar shows it at ~42px, a bill at ~64px. */
 export const BRAND_LOGO_EDGE = 256;
 /** What the app aims for, well under the server's 200 KB, since the logo rides in every settings load. */
@@ -49,8 +87,14 @@ export function hasUnusableLogo(settings) {
 /** `{ title, tagline, logo }` for business settings as the server returns them. */
 export function resolveBrandIdentity(settings) {
   const safe = settings && typeof settings === "object" ? settings : {};
-  const title = text(safe.business_name) || DEFAULT_BRAND_TITLE;
-  const brand = text(safe.brand_name);
+  const title = displayBusinessName(safe);
+  // An untouched seeded row (the old default name still in place) is shown as THE PEP, and its
+  // old default brand line becomes THE PEP's own. Once the owner has typed a name of their own,
+  // every field is shown exactly as typed.
+  const seededRow = isLegacyDefault(safe.business_name, LEGACY_DEFAULT_BUSINESS_NAME);
+  const brand = seededRow && isLegacyDefault(safe.brand_name, LEGACY_DEFAULT_BRAND_NAME)
+    ? DEFAULT_BRAND_NAME
+    : text(safe.brand_name);
   const company = text(safe.company_name);
   // A brand name that only repeats the big line would print the same words twice.
   const brandLine = brand && brand.toLowerCase() !== title.toLowerCase() ? brand : "";

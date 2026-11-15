@@ -902,6 +902,14 @@ test("every module on a screen shares one frame and one gap", () => {
   for (const selector of [".settings-layout", ".scope-page", ".dashboard-blocks", ".chart-grid", ".pos-layout", ".pos-main"]) {
     assert.match(ruleFor(selector), /gap: var\(--module-gap\)/, `${selector} spaces its modules by --module-gap`);
   }
+  // Screens whose cards sat outside any layout (0px between them) stack in one now: Sale Rate
+  // Update's Combos and website cards, and Stock Distribution, whose form was a card in a card.
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const saleRates = app.slice(app.indexOf('{activeView === "sale-rates" && canManageRates && ('), app.indexOf('{activeView === "settings" && ('));
+  assert.match(saleRates, /<section className="settings-layout sale-rate-page">[\s\S]*<SaleRateManager[\s\S]*<SaleRateCombos[\s\S]*<WebsiteCatalogueExport[\s\S]*<\/section>/);
+  const distribution = app.slice(app.indexOf("function DistributionModule("), app.indexOf("function OrdersModule("));
+  assert.match(distribution, /<section className="settings-layout distribution-page">/);
+  assert.doesNotMatch(distribution, /className="content-card"/, "no card drawn inside another card");
   // The sidebar's module list: a hairline between neighbours, in a colour that shows on the panel.
   // --line is the panel's own colour in light, which is why the first version drew nothing.
   assert.match(ruleFor(".nav-item + .nav-item::before"), /background: var\(--nav-rule\)/);

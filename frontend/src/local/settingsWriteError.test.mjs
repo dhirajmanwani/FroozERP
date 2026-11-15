@@ -170,7 +170,10 @@ test("every settings write that reloads inside its own try is covered by that gu
   // and each would otherwise need its own correction. If this number grows, the new handler has
   // the same shape and is protected by the same guarantee — which is why this asserts a floor and
   // not an exact number.
-  const pattern = /await onReload\(\);\s*\}\s*catch/g;
+  // Phase 4: most of these now say "saved" under the button after the reload, so the reload is
+  // followed by a line or two (the notice) before the catch. Still the same shape: a reload awaited
+  // inside the write's own try.
+  const pattern = /await onReload\(\);\s*(?:[^\n]*\n\s*){0,2}\}\s*catch/g;
   const count = (appSource.match(pattern) || []).length;
   assert.ok(count >= 15, `expected the shared shape to still be widespread, found ${count}`);
 });
