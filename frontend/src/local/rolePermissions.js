@@ -195,6 +195,33 @@ export const mayReadReports = ({ role, permissions } = {}) => {
  * and the role's permissions may load after that; a held action the role may not use is replaced by
  * the first one it may (receive from customers, else pay suppliers). `null` when it may use neither.
  */
+/**
+ * The one-press payment on an account's row: "Pay" a supplier who is owed, "Receive" from a
+ * customer who owes. The Payments tab was the only way in, and the owner could not find it (18 Nov
+ * 2026: "payment button kahi nhi dikh rha"). Null when nothing is owed or the role may not take
+ * that payment. `amount` is the whole balance, to the paisa, for the form to start from.
+ */
+export const SUPPLIER_PAYMENT_ACCOUNT_TYPES = Object.freeze(["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"]);
+
+export const accountPaymentShortcut = (account, permissions = {}) => {
+  if (!account || account.active === false) return null;
+  const owed = (value) => {
+    const amount = Math.round(Number(value) * 100) / 100;
+    return Number.isFinite(amount) && amount > 0.009 ? amount : 0;
+  };
+  if (account.account_type === "CUSTOMER") {
+    const amount = owed(account.receivable_balance);
+    if (!amount || permissions.customerPayments !== true) return null;
+    return { action: "RECEIVE_CUSTOMER", label: "Receive", amount: amount.toFixed(2) };
+  }
+  if (SUPPLIER_PAYMENT_ACCOUNT_TYPES.includes(account.account_type)) {
+    const amount = owed(account.payable_balance);
+    if (!amount || permissions.supplierPayments !== true) return null;
+    return { action: "PAY_SUPPLIER", label: "Pay", amount: amount.toFixed(2) };
+  }
+  return null;
+};
+
 export const allowedPaymentAction = (current, permissions = {}) => {
   const allowed = [
     ...(permissions.customerPayments === true ? ["RECEIVE_CUSTOMER"] : []),

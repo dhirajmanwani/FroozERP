@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import {
   OWNER_ONLY_VIEWS,
   accountMasterTypeOptions,
+  accountPaymentShortcut,
   accountTabsFor,
   allowedPaymentAction,
   branchesScreenPlan,
@@ -193,4 +194,22 @@ test("App's built-in Cashier defaults no longer list Pending Bills", () => {
   const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
   assert.match(app, /Cashier: \{ sales: true, accounts: true \},/);
   assert.match(app, /Cashier: \["sales", "accounts"\],/);
+});
+
+test("an account's row offers Pay or Receive for exactly what is owed, when the role may", () => {
+  const both = { customerPayments: true, supplierPayments: true };
+  assert.deepEqual(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 1020 }, both), { action: "PAY_SUPPLIER", label: "Pay", amount: "1020.00" });
+  assert.deepEqual(accountPaymentShortcut({ account_type: "TRANSPORT_VENDOR", payable_balance: "20.004" }, both), { action: "PAY_SUPPLIER", label: "Pay", amount: "20.00" });
+  assert.deepEqual(accountPaymentShortcut({ account_type: "CUSTOMER", receivable_balance: 400 }, both), { action: "RECEIVE_CUSTOMER", label: "Receive", amount: "400.00" });
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 0 }, both), null, "nothing owed");
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: -50 }, both), null, "an advance is not owed");
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 100 }, { customerPayments: true }), null, "the role may not pay suppliers");
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 100, active: false }, both), null);
+  assert.equal(accountPaymentShortcut({ account_type: "EXPENSE", payable_balance: 100 }, both), null);
+});
+
+test("Account Master and Outstanding rows carry the Pay / Receive button", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.equal((app.match(/\{accountPaymentButton\(account\)\}/g) || []).length, 2);
+  assert.match(app, /setTab\("payments"\);\n\s+focusField\("payment-amount"\);/);
 });

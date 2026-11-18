@@ -334,7 +334,7 @@ import {
 import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
 import { describeInitialPullFailure } from "./local/freshDeviceOnboarding";
 import { plainRefusalMessage } from "./local/refusalMessages";
-import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, accountTabsFor, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, isRateManagerRole, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
+import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, accountPaymentShortcut, accountTabsFor, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, isRateManagerRole, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
 import { findPurchaseSupplier, findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation, supplierLedgerKey } from "./local/accountsPresentation";
 import { productStockKeyResolver, wasteEntryProductId } from "./local/wasteStock";
 import { UNDRAWN_TRANSFER_ACTION_NOTE, crateAllocationsForApproval, drawableTransferActions, transferActionId, transferItemsForSend } from "./local/distributionWrites";
@@ -23473,6 +23473,32 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     setPayment({ ...payment, account_key: accountKey });
     await onPaymentsLoad(accountKey);
   };
+  // "Pay" / "Receive" on an account's row: the Payments form, opened on that account with its whole
+  // balance filled in (local/rolePermissions.js, accountPaymentShortcut).
+  const startAccountPayment = async (account, shortcut) => {
+    clearPaymentNotice();
+    setEditingPaymentKey("");
+    setPayment((current) => ({
+      ...current,
+      payment_action: shortcut.action,
+      account_key: account.account_key,
+      payment_date: toDateKey(new Date()),
+      amount: shortcut.amount,
+      rebate_amount: "",
+      reference_number: "",
+      remarks: "",
+    }));
+    setTab("payments");
+    focusField("payment-amount");
+    await onPaymentsLoad(account.account_key);
+  };
+  const accountPaymentButton = (account) => {
+    const shortcut = accountPaymentShortcut(account, accountPermissions);
+    if (!shortcut) return null;
+    return (
+      <button className="primary-button compact-button" onClick={() => startAccountPayment(account, shortcut)} title={`${shortcut.label} ${currency.format(Number(shortcut.amount))}`} type="button">{shortcut.label}</button>
+    );
+  };
 
   return (
     <section className="settings-layout">
@@ -23555,7 +23581,12 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                   <td>{currency.format(Number(account.payable_balance || 0))}</td>
                   <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
-                  <td><button className="table-action" disabled={!canEditAccountRow(account, accountPermissions)} onClick={() => editAccount(account)} title={!account.system_account && !canEditAccountRow(account, accountPermissions) ? "Your role cannot change this type of account." : undefined}>{account.system_account ? "Protected" : "Edit"}</button></td>
+                  <td>
+                    <div className="button-row table-actions-row">
+                      {accountPaymentButton(account)}
+                      <button className="table-action" disabled={!canEditAccountRow(account, accountPermissions)} onClick={() => editAccount(account)} title={!account.system_account && !canEditAccountRow(account, accountPermissions) ? "Your role cannot change this type of account." : undefined}>{account.system_account ? "Protected" : "Edit"}</button>
+                    </div>
+                  </td>
                 </tr>
               ))}
               {filteredAccounts.length === 0 && (
@@ -23722,7 +23753,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                 <SummaryMetric label="Customer Accounts" value={outstandingView.customerOutstanding.length} />
                 <SummaryMetric label="Supplier Accounts" value={outstandingView.supplierOutstanding.length} />
               </div>
-              <DataTable headers={markNumericColumns(["Account", "Type", "Receivable", "Payable", "Status"])}>
+              <DataTable headers={markNumericColumns(["Account", "Type", "Receivable", "Payable", "Status", ""])}>
                 {[...outstandingView.customerOutstanding, ...outstandingView.supplierOutstanding].map((account) => (
                   <tr key={account.account_key}>
                     <td className="primary-cell">{account.account_name}</td>
@@ -23730,6 +23761,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                     <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                     <td>{currency.format(Number(account.payable_balance || 0))}</td>
                     <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
+                    <td>{accountPaymentButton(account)}</td>
                   </tr>
                 ))}
               </DataTable>
