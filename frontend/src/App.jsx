@@ -186,7 +186,7 @@ import { FeedbackDialogHost, SaveNotice } from "./feedbackDialogs";
 import { appDialogQueue, useAskReason, useConfirm, useSaveInFlight, useSaveNotice } from "./feedbackContext";
 import { errorNotice, successNotice, warningNotice } from "./local/feedback";
 import { errorOrDash, formatFileSize, isNegativeFigure, isZeroFigure, reportDraftPending, reportHasContent, reportResultsHeading, scopeChangeDialog, settingsSavedNotice, tidyStoredDecimal } from "./local/backOfficeScreens";
-import { costPerUnitSummary, distributionLotOptions, distributionStatusClass, formatQuantityWithUnit, isPendingBillCompletion, pendingItemNarration, pendingPurchasesPresentation, purchaseEntryHeadings, purchaseSavedMessage, stockLotName, wasteProductOptionLabel } from "./local/stockScreens";
+import { completedBillOwedNote, paidNowDefault, paidNowShortfall, paidNowShortfallQuestion, costPerUnitSummary, distributionLotOptions, distributionStatusClass, formatQuantityWithUnit, isPendingBillCompletion, pendingItemNarration, pendingPurchasesPresentation, purchaseEntryHeadings, purchaseSavedMessage, stockLotName, wasteProductOptionLabel } from "./local/stockScreens";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
@@ -1907,7 +1907,7 @@ const accountPaymentActions = [
 const defaultRolePermissions = {
   Owner: { all: true },
   Admin: { all: true },
-  Cashier: { sales: true, accounts: true, "pending-bills": true },
+  Cashier: { sales: true, accounts: true },
   "Purchase Manager": { purchase: true, "pending-bills": true, accounts: true, reports: true },
   "Inventory Manager": { products: true, waste: true, reports: true },
 };
@@ -4566,7 +4566,7 @@ function App() {
     const preferredByRole = {
       Owner: ["dashboard", "sales", "reports"],
       Admin: ["dashboard", "reports", "sales"],
-      Cashier: ["sales", "pending-bills", "accounts"],
+      Cashier: ["sales", "accounts"],
       "Purchase Manager": ["purchase", "pending-bills", "reports"],
       "Inventory Manager": ["reports", "products", "waste"],
     };
@@ -8988,6 +8988,17 @@ function App() {
         if (validation.field) focusField(validation.field);
         return;
       }
+      // A "Paid now" bill paid short leaves the rest as supplier outstanding; say so before saving.
+      const savedSummary = editingPurchaseId && !completionLines ? purchaseSummary : purchaseCartSummary;
+      const shortfall = savedAsPending ? 0 : paidNowShortfall({ purchaseType, paidAmount: purchasePaidAmount, netPayable: savedSummary.netPayable });
+      if (shortfall > 0) {
+        const keepBalance = await confirmDialog(paidNowShortfallQuestion({ shortfall, supplierName: savedSupplierName, money: (value) => currency.format(value) }));
+        if (!keepBalance) {
+          focusField("purchase-paid");
+          return;
+        }
+      }
+      const owedAfterSave = purchaseType === "CASH" ? shortfall : Number(savedSummary.netPayable || 0);
       const reason = editingPurchaseId && !completing
         ? await askReason({
           title: "Why is this purchase being corrected?",
@@ -9144,7 +9155,7 @@ function App() {
         editing: wasEditing,
         pending: savedAsPending,
         supplierName: savedSupplierName,
-      })));
+      }) + (completing ? completedBillOwedNote({ owed: owedAfterSave, supplierName: savedSupplierName, money: (value) => currency.format(value) }) : "")));
       if (completing) setPurchaseCompletedFor(savedSupplierName || "the supplier");
     } catch (error) {
       showPurchaseNotice(errorNotice(plainRefusalMessage(error) || getErrorMessage(error, "The purchase could not be saved. Nothing was changed; try again.")));
@@ -11541,7 +11552,14 @@ function App() {
                       </select>
                     </Field>
                     <Field label="Payment type">
-                      <select value={purchaseType} onChange={(event) => setPurchaseType(event.target.value)}>
+                      <select value={purchaseType} onChange={(event) => {
+                        setPurchaseType(event.target.value);
+                        // "Paid now" starts at the whole bill, mandi tax and charges included, so a
+                        // hand-typed rate × quantity no longer leaves the difference owed by accident.
+                        if (event.target.value === "CASH" && !String(purchasePaidAmount || "").trim()) {
+                          setPurchasePaidAmount(paidNowDefault((editingPurchaseId && !completionLines ? purchaseSummary : purchaseCartSummary).netPayable));
+                        }
+                      }}>
                         <option value="CREDIT">Credit (pay later)</option>
                         <option value="CASH">Paid now</option>
                       </select>
@@ -16037,7 +16055,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
       payment_amount: invoice ? Number(invoice.balance_amount || 0).toFixed(2) : "",
       payment_mode: "CASH",
       reference_number: "",
-      remarks: invoice?.invoice_no ? `Against credit invoice ${invoice.invoice_no}` : "Against customer pending bills",
+      remarks: invoice?.is_opening_balance ? "Against opening balance" : invoice?.invoice_no ? `Against credit invoice ${invoice.invoice_no}` : "Against customer pending bills",
     });
     // The receipt form opens under the list; take the cursor to its amount.
     focusField("customer-payment-amount");
@@ -16106,7 +16124,7 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
 
       {activeTab === "customer" && (
         <>
-          <ModuleCard eyebrow="Customer credit" title="Credit bills, by customer" subtitle="Credit POS bills stay here until the customer pays.">
+          <ModuleCard eyebrow="Customer credit" title="Credit bills, by customer" subtitle="Every bill a customer still owes on, and any opening balance, stays here until it is paid.">
             {/* A failed read is said, not shown as "no customers owe anything". */}
             {customerPendingBillsError && <div className="error-banner" role="alert">{`Customer pending bills could not be loaded: ${customerPendingBillsError}. What is shown may be out of date.`}</div>}
             {!paymentDraft.customer_id && <SaveNotice notice={paymentNotice} />}
@@ -16157,7 +16175,8 @@ function PendingBillsModule({ canManagePending = false, canReceivePayment = fals
                     <td>
                       <div className="button-row table-actions-row">
                         <button className="primary-button compact-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)} type="button">Receive</button>
-                        <button className="table-action" onClick={() => onViewInvoice(invoice.id)} type="button">Invoice</button>
+                        {/* An opening balance is owed but is no bill: nothing to open. */}
+                        {!invoice.is_opening_balance && <button className="table-action" onClick={() => onViewInvoice(invoice.id)} type="button">Invoice</button>}
                       </div>
                     </td>
                   </tr>

@@ -38,19 +38,38 @@ const { issueDeviceSession } = require("./deviceSession");
 
 test("pending bills: receipts settle the opening balance before any bill", () => {
   const rows = [{ id: 1, customer_id: 5, customer_name: "Ravi", sale_date: "2026-09-01", total_amount: "1000", sale_paid: "0" }];
-  const { invoices } = rules.buildCustomerPendingBills(rows, {
+  const bill = (result) => result.invoices.find((row) => String(row.id) === "1");
+  const opening = (result) => result.invoices.find((row) => row.is_opening_balance);
+  const settled = rules.buildCustomerPendingBills(rows, {
     receiptsByCustomer: new Map([["5", 150]]),
     openingBalanceByCustomer: new Map([["5", 100]]),
   });
-  assert.equal(invoices[0].received_amount, 50, "100 of the 150 went to the opening balance");
-  assert.equal(invoices[0].balance_amount, 950);
+  assert.equal(bill(settled).received_amount, 50, "100 of the 150 went to the opening balance");
+  assert.equal(bill(settled).balance_amount, 950);
+  assert.equal(opening(settled).balance_amount, 0, "the opening balance row shows it settled");
+  assert.equal(settled.invoices[0].is_opening_balance, true, "the opening balance is the oldest row");
   const none = rules.buildCustomerPendingBills(rows, { receiptsByCustomer: new Map([["5", 150]]) });
-  assert.equal(none.invoices[0].balance_amount, 850, "no opening balance: the bill takes it all");
+  assert.equal(bill(none).balance_amount, 850, "no opening balance: the bill takes it all");
+  assert.equal(opening(none), undefined);
   const short = rules.buildCustomerPendingBills(rows, {
     receiptsByCustomer: new Map([["5", 60]]),
     openingBalanceByCustomer: new Map([["5", 100]]),
   });
-  assert.equal(short.invoices[0].received_amount, 0, "never negative");
+  assert.equal(bill(short).received_amount, 0, "never negative");
+  assert.equal(opening(short).balance_amount, 40, "what the receipts left of the opening balance is still owed");
+  assert.equal(short.summary[0].balance, 1040, "the customer owes the bill and the rest of the opening balance");
+});
+
+test("pending bills: an opening balance with no bill and no receipt is a row to clear", () => {
+  const { summary, invoices } = rules.buildCustomerPendingBills([], {
+    openingBalanceByCustomer: new Map([["9", 500]]),
+    customerNames: new Map([["9", "Mohan"]]),
+  });
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0].customer_name, "Mohan");
+  assert.equal(String(summary[0].customer_id), "9", "a customer account, so Receive works");
+  assert.equal(summary[0].balance, 500);
+  assert.equal(invoices[0].invoice_no, rules.OPENING_BALANCE_ROW);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -237,6 +256,26 @@ test("a 'CREDIT' payment line is not money received, anywhere a customer's balan
     assert.equal(bill.received_amount, 50);
     assert.equal(bill.returned_amount, 30);
     assert.equal(bill.balance_amount, 920);
+  });
+});
+
+test("pending bills: clearing every row brings each customer to what Accounts and the Dashboard say", async () => {
+  await withDatabase(async () => {
+    // Before 18 Nov 2026 Pending Bills showed Ravi owing 920 (credit bill 200 only) while Accounts
+    // said 1120: the 200 left unpaid on MIXED bill 201 was nowhere to clear. Sita's credit bill 203
+    // carries no customer id (matched by mobile), so it was listed with no account and could not be
+    // received, while Accounts put its 250 on Sita.
+    const pending = await get("/pending-bills/customer");
+    for (const customerId of [5, 6]) {
+      const summary = await get(`/customer-summary?customer_id=${customerId}`);
+      const row = pending.summary.find((entry) => String(entry.customer_id) === String(customerId));
+      assert.ok(row, `customer ${customerId} is on Pending Bills`);
+      assert.equal(row.balance, money(summary.customers[0].outstanding_balance), `customer ${customerId}: Pending Bills = Accounts`);
+    }
+    const mixed = pending.invoices.find((row) => String(row.id) === "201");
+    assert.equal(mixed.balance_amount, 200, "the unpaid part of a MIXED bill is listed");
+    const sita = pending.invoices.find((row) => String(row.id) === "203");
+    assert.equal(String(sita.customer_id), "6", "a bill matched by mobile is on the customer the balance uses");
   });
 });
 

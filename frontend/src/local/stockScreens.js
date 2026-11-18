@@ -111,6 +111,51 @@ export const purchaseSavedMessage = ({ completing = false, editing = false, pend
 };
 
 /**
+ * What a "Paid now" purchase leaves unpaid, in rupees (0 when nothing is left or the bill is on credit).
+ *
+ * A pending bill completed as "Paid now" with the amount typed by hand (often rate × quantity, without
+ * the mandi tax or charges) left the difference as supplier outstanding, so a bill the owner had
+ * "cleared" still showed on the Dashboard and in reports (18 Nov 2026). The figure is said before
+ * the save; it is never paid off silently.
+ */
+export const paidNowShortfall = ({ purchaseType, paidAmount, netPayable } = {}) => {
+  if (purchaseType !== "CASH") return 0;
+  const net = Number(netPayable);
+  const paid = Number(paidAmount);
+  if (!Number.isFinite(net) || !Number.isFinite(paid)) return 0;
+  const short = Math.round((net - paid) * 100) / 100;
+  return short > 0.009 ? short : 0;
+};
+
+/** The amount "Paid now" fills in by itself: the bill's net payable, to the paisa. */
+export const paidNowDefault = (netPayable) => {
+  const net = Number(netPayable);
+  return Number.isFinite(net) && net > 0 ? (Math.round(net * 100) / 100).toFixed(2) : "";
+};
+
+/** Asked before a "Paid now" save that leaves part of the bill unpaid. `money` formats rupees. */
+export const paidNowShortfallQuestion = ({ shortfall, supplierName = "", money = (value) => `₹${Number(value).toFixed(2)}` } = {}) => {
+  const supplier = text(supplierName) || "the supplier";
+  return {
+    title: "Part of this bill stays unpaid",
+    message: `${money(shortfall)} of this bill stays unpaid to ${supplier}. It shows as supplier outstanding on the Dashboard and in reports until it is paid in Accounts.`,
+    confirmLabel: "Save with balance",
+    cancelLabel: "Go back",
+  };
+};
+
+/**
+ * Added to the "Bill completed" message: what the supplier is still owed on this bill, and where it
+ * is paid. A bill completed on credit is owed in full, and that is what the outstanding figures show.
+ */
+export const completedBillOwedNote = ({ owed, supplierName = "", money = (value) => `₹${Number(value).toFixed(2)}` } = {}) => {
+  const amount = Number(owed);
+  if (!Number.isFinite(amount) || amount <= 0.009) return "";
+  const supplier = text(supplierName) || "the supplier";
+  return ` ${money(amount)} is still owed to ${supplier}; pay it in Accounts > Pay Supplier.`;
+};
+
+/**
  * How the supplier side of Pending Bills is drawn. The purchases list failing to load used to show
  * "Pending Suppliers 0 · ₹0.00 · No pending purchase bills" -- the screen claimed nothing was owed.
  */

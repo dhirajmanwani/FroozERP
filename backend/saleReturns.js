@@ -249,11 +249,20 @@ const idKey = (value) => (value === null || value === undefined ? "" : String(va
  * @param {object[]} returnCredits        { sale_id, customer_id, credit_amount } for CREDIT_NOTE /
  *                                        FUTURE_ADJUSTMENT returns of non-cancelled sales
  * @param {Map<string, number>} openingBalanceByCustomer  idKey(customer_id) -> opening balance
+ * @param {Map<string, string>} customerNames  idKey(customer_id) -> name, for a customer whose only
+ *                                        debt is the opening balance (no bill row carries the name)
+ *
+ * An opening balance the receipts have not settled is its own row ("Opening balance"), the first of
+ * the customer's: Accounts, the Dashboard and the outstanding reports count it, so leaving it off
+ * this list (18 Nov 2026) left a customer "owing" there after every bill here was cleared.
  */
+const OPENING_BALANCE_ROW = "Opening balance";
+
 const buildCustomerPendingBills = (rows, {
   receiptsByCustomer = new Map(),
   returnCredits = [],
   openingBalanceByCustomer = new Map(),
+  customerNames = new Map(),
 } = {}) => {
   const returnBySale = new Map();
   const creditSaleIds = new Set((rows || []).map((row) => idKey(row.id)));
@@ -292,6 +301,51 @@ const buildCustomerPendingBills = (rows, {
 
   const invoices = [];
   const summaries = new Map();
+  // Opening balances first: the oldest debt, settled first by receipts (above), then by any
+  // credit-note pool left once the bills have taken theirs (below, after the bill walk).
+  const openingRows = [];
+  for (const [key, amount] of openingBalanceByCustomer) {
+    const customerKey = idKey(key);
+    const opening = roundCurrency(Math.max(finiteOrNull(amount) ?? 0, 0));
+    if (!customerKey || !(opening > 0)) continue;
+    const receipts = finiteOrNull(receiptsByCustomer.get(customerKey)) ?? 0;
+    const received = roundCurrency(Math.min(Math.max(receipts, 0), opening));
+    const firstBill = (rows || []).find((row) => idKey(row.customer_id) === customerKey);
+    const name = firstBill?.customer_name || customerNames.get(customerKey) || "Customer";
+    const invoice = {
+      id: `opening-${customerKey}`,
+      is_opening_balance: true,
+      invoice_no: OPENING_BALANCE_ROW,
+      sale_date: null,
+      due_date: null,
+      customer_id: firstBill?.customer_id ?? key,
+      customer_name: name,
+      item_narration: "Balance brought forward",
+      gross_amount: opening,
+      item_discount_amount: 0,
+      invoice_discount_amount: 0,
+      total_amount: opening,
+      received_amount: received,
+      returned_amount: 0,
+      balance_amount: roundCurrency(opening - received),
+      credit_status: "Pending",
+    };
+    openingRows.push(invoice);
+    summaries.set(customerKey, {
+      key: customerKey,
+      customer_id: invoice.customer_id,
+      customer_name: name,
+      from: null,
+      to: null,
+      pending_bill_count: 0,
+      total_credit_amount: 0,
+      amount_received: 0,
+      amount_returned: 0,
+      balance: 0,
+      rows: [invoice],
+    });
+  }
+
   for (const row of rows || []) {
     const customerKey = idKey(row.customer_id);
     const key = customerKey || String(row.customer_name || "Walk-in Customer");
@@ -338,14 +392,31 @@ const buildCustomerPendingBills = (rows, {
     };
     invoices.push(invoice);
     if (balance > 0.01) summary.pending_bill_count += 1;
-    summary.from = row.sale_date < summary.from ? row.sale_date : summary.from;
-    summary.to = row.sale_date > summary.to ? row.sale_date : summary.to;
+    summary.from = summary.from === null || row.sale_date < summary.from ? row.sale_date : summary.from;
+    summary.to = summary.to === null || row.sale_date > summary.to ? row.sale_date : summary.to;
     summary.total_credit_amount = roundCurrency(summary.total_credit_amount + total);
     summary.amount_received = roundCurrency(summary.amount_received + received);
     summary.amount_returned = roundCurrency(summary.amount_returned + returned);
     summary.balance = roundCurrency(summary.balance + balance);
     summary.rows.push(invoice);
     summaries.set(key, summary);
+  }
+  // The opening-balance rows: what receipts left, less any credit-note pool the bills did not use.
+  for (const invoice of openingRows) {
+    const customerKey = idKey(invoice.customer_id);
+    const pool = returnPool.get(customerKey) || 0;
+    const fromPool = roundCurrency(Math.min(pool, invoice.balance_amount));
+    returnPool.set(customerKey, roundCurrency(pool - fromPool));
+    invoice.returned_amount = fromPool;
+    invoice.balance_amount = roundCurrency(Math.max(invoice.balance_amount - fromPool, 0));
+    invoice.credit_status = invoice.balance_amount <= 0.01 ? "Paid" : (invoice.received_amount > 0 || fromPool > 0) ? "Partially Paid" : "Pending";
+    invoices.unshift(invoice);
+    const summary = summaries.get(customerKey);
+    if (invoice.balance_amount > 0.01) summary.pending_bill_count += 1;
+    summary.total_credit_amount = roundCurrency(summary.total_credit_amount + invoice.total_amount);
+    summary.amount_received = roundCurrency(summary.amount_received + invoice.received_amount);
+    summary.amount_returned = roundCurrency(summary.amount_returned + fromPool);
+    summary.balance = roundCurrency(summary.balance + invoice.balance_amount);
   }
   const summary = [...summaries.values()]
     .filter((entry) => entry.balance > 0.01)
@@ -356,6 +427,7 @@ const buildCustomerPendingBills = (rows, {
 module.exports = {
   CUSTOMER_CREDIT_REFUND_TYPES,
   CUSTOMER_CREDIT_REFUND_TYPES_SQL,
+  OPENING_BALANCE_ROW,
   PAID_OUT_REFUND_TYPES,
   QUANTITY_SCALE,
   SALE_HAS_RETURNS,
