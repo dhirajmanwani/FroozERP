@@ -334,7 +334,7 @@ import {
 import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
 import { describeInitialPullFailure } from "./local/freshDeviceOnboarding";
 import { plainRefusalMessage } from "./local/refusalMessages";
-import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, accountTabsFor, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, isRateManagerRole, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
+import { PENDING_BILL_MANAGER_NOTE, accountMasterTypeOptions, accountPaymentShortcut, accountTabsFor, allowedPaymentAction, branchesScreenPlan, mayReadReports, canEditAccountRow, canManagePendingPurchaseBills, defaultAccountMasterType, isRateManagerRole, missingArrivalRateMessage, purchaseEntryPlan, resolveAccountPermissions, resolveModuleAccess } from "./local/rolePermissions";
 import { findPurchaseSupplier, findSaleCustomer, overpaymentWarning, paymentBalancePreview, resolveOutstandingPresentation, supplierLedgerKey } from "./local/accountsPresentation";
 import { productStockKeyResolver, wasteEntryProductId } from "./local/wasteStock";
 import { UNDRAWN_TRANSFER_ACTION_NOTE, crateAllocationsForApproval, drawableTransferActions, transferActionId, transferItemsForSend } from "./local/distributionWrites";
@@ -4651,6 +4651,24 @@ function App() {
     [products, purchaseProductId]
   );
 
+  // What Purchase Entry offers this person (local/rolePermissions.js): a role holding only Stock
+  // Arrival records arrivals and nothing else, and anyone but the Owner or an Admin sells arrived
+  // stock at the fruit's current rate, which the server reads from the product.
+  const purchasePlan = useMemo(
+    () => purchaseEntryPlan({ role: user?.role, permissions: rolePermissionMap.get(user?.role) }),
+    [rolePermissionMap, user?.role]
+  );
+  useEffect(() => {
+    if (purchasePlan.arrivalOnly && !editingPurchaseId && purchaseBillStatus !== "BILL_PENDING") {
+      setPurchaseBillStatus("BILL_PENDING");
+    }
+  }, [editingPurchaseId, purchaseBillStatus, purchasePlan.arrivalOnly]);
+  useEffect(() => {
+    if (!purchasePlan.saleRateFromProduct || purchaseBillStatus !== "BILL_PENDING" || completionLines) return;
+    const currentRate = Number(selectedPurchaseProduct?.selling_rate || 0);
+    setTemporarySaleRate(currentRate > 0 ? String(currentRate) : "");
+  }, [completionLines, purchaseBillStatus, purchasePlan.saleRateFromProduct, selectedPurchaseProduct]);
+
   const amendmentSuppliers = useMemo(() => {
     const rows = purchases.filter((purchase) => !amendmentDate || toDateKey(purchase.purchase_date) === amendmentDate);
     return [...new Map(rows.map((purchase) => [String(purchase.supplier_id || purchase.supplier_name), purchase])).values()];
@@ -8837,7 +8855,12 @@ function App() {
       return;
     }
     if (purchaseBillStatus === "BILL_PENDING" && temporaryRate <= 0) {
-      refuse("Stock waiting for its bill needs a temporary sale rate.", "purchase-temp-rate");
+      refuse(
+        purchasePlan.saleRateFromProduct
+          ? missingArrivalRateMessage(product?.product_name)
+          : "Stock waiting for its bill needs a temporary sale rate.",
+        purchasePlan.saleRateFromProduct ? "purchase-product" : "purchase-temp-rate",
+      );
       return;
     }
     if (purchaseBillStatus === "BILL_COMPLETED" && purchaseRate <= 0) {
@@ -8952,7 +8975,11 @@ function App() {
         if (!purchaseRebateRuleId) return problem("Choose the payment timing and rebate.", "purchase-rebate");
         if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return problem("Enter the amount paid.", "purchase-paid");
       }
-      if (purchaseBillStatus === "BILL_PENDING" && Number(temporarySaleRate || 0) <= 0) return problem(`Enter a temporary sale rate for ${productName}.`, "purchase-temp-rate");
+      if (purchaseBillStatus === "BILL_PENDING" && Number(temporarySaleRate || 0) <= 0) {
+        return purchasePlan.saleRateFromProduct
+          ? problem(missingArrivalRateMessage(productName), "purchase-product")
+          : problem(`Enter a temporary sale rate for ${productName}.`, "purchase-temp-rate");
+      }
       return null;
     }
     if (purchaseCart.length === 0) return problem("Add at least one item to the bill.", "purchase-product");
@@ -11416,7 +11443,7 @@ function App() {
               <ModuleCard eyebrow={purchaseHeadings.eyebrow} onChange={() => { if (purchaseItemNotice?.field === "purchase-supplier") clearPurchaseItemNotice(); }} title={purchaseHeadings.title} subtitle={purchaseHeadings.subtitle}>
                 <div className="form-grid supplier-form-grid">
                   <Field label="Entry type">
-                    <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(completionLines) || Boolean(editingPurchaseId && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
+                    <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={purchasePlan.arrivalOnly || Boolean(completionLines) || Boolean(editingPurchaseId && purchases.find((purchase) => inventoryIdsEqual(purchase.id, editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
                       <option value="BILL_COMPLETED">Bill in hand</option>
                       <option value="BILL_PENDING">Stock arrived, bill to follow</option>
                     </select>
@@ -11488,8 +11515,8 @@ function App() {
                   <Field label={<RequiredLabel>{purchaseUnitLabel("Quantity")}</RequiredLabel>}><input id="purchase-quantity" type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
                   {purchaseBillStatus === "BILL_PENDING" ? (
                     <>
-                      <Field label={<RequiredLabel>{purchaseRateLabel("Temporary sale rate")}</RequiredLabel>}><input id="purchase-temp-rate" type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
-                      <Field label={purchaseRateLabel("Expected purchase rate")}><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
+                      <Field label={<RequiredLabel>{purchaseRateLabel("Temporary sale rate")}</RequiredLabel>}><input id="purchase-temp-rate" type="number" min="0" step="0.01" readOnly={purchasePlan.saleRateFromProduct} tabIndex={purchasePlan.saleRateFromProduct ? -1 : undefined} value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} />{purchasePlan.saleRateFromProduct && <small className="cell-note">Today's sale rate. Only the Owner or an Admin changes it.</small>}</Field>
+                      {!purchasePlan.arrivalOnly && <Field label={purchaseRateLabel("Expected purchase rate")}><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>}
                     </>
                   ) : (
                     <Field label={<RequiredLabel>{purchaseRateLabel("Purchase rate")}</RequiredLabel>}><input id="purchase-rate" type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} onKeyDown={addPurchaseLineOnEnter} /></Field>
@@ -11581,7 +11608,8 @@ function App() {
                 <Field label="Bill notes"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
                 {activeSuppliers.length === 0 && <p className="form-note">No suppliers yet. Add one with Add supplier before saving a purchase.</p>}
                 {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">The stock goes into the shop now. Profit on it stays provisional until the bill is completed in Pending Bills.</p>}
-                <PurchaseSummary summary={editingPurchaseId && !completionLines ? purchaseSummary : purchaseCartSummary} />
+                {/* Totals are the purchase's money; a role recording arrivals only does not see them. */}
+                {!purchasePlan.arrivalOnly && <PurchaseSummary summary={editingPurchaseId && !completionLines ? purchaseSummary : purchaseCartSummary} />}
                 <div className="button-row">
                   <button className="primary-button" disabled={purchaseSaveBusy} onClick={savePurchase}>
                     {purchaseSaveBusy
@@ -23473,6 +23501,32 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
     setPayment({ ...payment, account_key: accountKey });
     await onPaymentsLoad(accountKey);
   };
+  // "Pay" / "Receive" on an account's row: the Payments form, opened on that account with its whole
+  // balance filled in (local/rolePermissions.js, accountPaymentShortcut).
+  const startAccountPayment = async (account, shortcut) => {
+    clearPaymentNotice();
+    setEditingPaymentKey("");
+    setPayment((current) => ({
+      ...current,
+      payment_action: shortcut.action,
+      account_key: account.account_key,
+      payment_date: toDateKey(new Date()),
+      amount: shortcut.amount,
+      rebate_amount: "",
+      reference_number: "",
+      remarks: "",
+    }));
+    setTab("payments");
+    focusField("payment-amount");
+    await onPaymentsLoad(account.account_key);
+  };
+  const accountPaymentButton = (account) => {
+    const shortcut = accountPaymentShortcut(account, accountPermissions);
+    if (!shortcut) return null;
+    return (
+      <button className="primary-button compact-button" onClick={() => startAccountPayment(account, shortcut)} title={`${shortcut.label} ${currency.format(Number(shortcut.amount))}`} type="button">{shortcut.label}</button>
+    );
+  };
 
   return (
     <section className="settings-layout">
@@ -23555,7 +23609,12 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                   <td>{currency.format(Number(account.payable_balance || 0))}</td>
                   <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
-                  <td><button className="table-action" disabled={!canEditAccountRow(account, accountPermissions)} onClick={() => editAccount(account)} title={!account.system_account && !canEditAccountRow(account, accountPermissions) ? "Your role cannot change this type of account." : undefined}>{account.system_account ? "Protected" : "Edit"}</button></td>
+                  <td>
+                    <div className="button-row table-actions-row">
+                      {accountPaymentButton(account)}
+                      <button className="table-action" disabled={!canEditAccountRow(account, accountPermissions)} onClick={() => editAccount(account)} title={!account.system_account && !canEditAccountRow(account, accountPermissions) ? "Your role cannot change this type of account." : undefined}>{account.system_account ? "Protected" : "Edit"}</button>
+                    </div>
+                  </td>
                 </tr>
               ))}
               {filteredAccounts.length === 0 && (
@@ -23722,7 +23781,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                 <SummaryMetric label="Customer Accounts" value={outstandingView.customerOutstanding.length} />
                 <SummaryMetric label="Supplier Accounts" value={outstandingView.supplierOutstanding.length} />
               </div>
-              <DataTable headers={markNumericColumns(["Account", "Type", "Receivable", "Payable", "Status"])}>
+              <DataTable headers={markNumericColumns(["Account", "Type", "Receivable", "Payable", "Status", ""])}>
                 {[...outstandingView.customerOutstanding, ...outstandingView.supplierOutstanding].map((account) => (
                   <tr key={account.account_key}>
                     <td className="primary-cell">{account.account_name}</td>
@@ -23730,6 +23789,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding = null, ac
                     <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                     <td>{currency.format(Number(account.payable_balance || 0))}</td>
                     <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
+                    <td>{accountPaymentButton(account)}</td>
                   </tr>
                 ))}
               </DataTable>
@@ -25228,6 +25288,8 @@ const permissionLabels = [
   ["invoice_cancellation", "Invoice Cancellation"],
   ["reports", "Reports"],
   ["purchases", "Purchases"],
+  // Records a stock arrival (bill to follow) and no other purchase; the stock sells at today's rate.
+  ["stock_arrival", "Stock Arrival (bill to follow)"],
   ["supplier_accounts", "Supplier Accounts"],
   // A-4d. Kept adjacent to Supplier Accounts because the pair is the whole point: the two sides of
   // the account master are now separately grantable, so revoking one does not revoke the other.

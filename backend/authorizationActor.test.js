@@ -569,6 +569,26 @@ test("purchases and checkout ask their permission first; reports ask theirs", as
   }
 });
 
+test("stock_arrival lets a role record a stock arrival and nothing else", () => {
+  // Driven end to end on a Postgres rig (18 Nov 2026): a Cashier holding only stock_arrival saved
+  // a BILL_PENDING arrival through /api/v3/purchase-bills and was refused a bill in hand. The v3
+  // route needs a posted device and location before the handler runs, which this scripted harness
+  // does not build, so here the gate is pinned in the source.
+  const code = backendCode;
+  const start = code.indexOf("const createPurchaseBillHandler = async (req, res) => {");
+  const head = code.slice(start, start + 1600);
+  const gate = head.slice(head.indexOf('getStaffPermissionUser(req.auth.userId, "purchases", client)'));
+  assert.match(gate, /purchase_bill_status \|\| ""\)\.trim\(\)\.toUpperCase\(\) === "BILL_PENDING"/,
+    "only an explicit BILL_PENDING counts as an arrival; a missing status is a bill in hand");
+  assert.match(gate, /getPermissionUser\(req\.auth\.userId, "stock_arrival", \[\], client\)/,
+    "the key is read from the verified session, and no role holds it by default");
+  assert.ok(
+    gate.indexOf('"stock_arrival"') < gate.indexOf("readPurchaseEntryPayload("),
+    "the gate runs before anything is read or opened",
+  );
+  assert.match(code, /const PERMISSION_KEYS = \[[\s\S]*?"stock_arrival",[\s\S]*?\];/, "the role screen can save the key");
+});
+
 test("the device, counter, backup and system-info routes read their toggles", async () => {
   for (const [method, url] of [
     ["PUT", "/settings/devices/FZDEV-X"],

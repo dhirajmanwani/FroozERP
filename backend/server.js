@@ -1313,6 +1313,10 @@ const PERMISSION_KEYS = [
   "invoice_cancellation",
   "reports",
   "purchases",
+  // Stock arrival only (18 Nov 2026): record goods that came in with their bill to follow, and no
+  // other purchase. Lets a counter with only a Cashier put new stock on sale while the Owner, who
+  // holds `purchases`, enters the rate later in Pending Bills.
+  "stock_arrival",
   "supplier_accounts",
   "customer_accounts",
   "expenses",
@@ -23785,7 +23789,18 @@ const createPurchaseBillHandler = async (req, res) => {
     // Recording a purchase is the `purchases` permission. Owner and Admin always hold it; anyone
     // else by their role's stored row. Checked before anything is read or opened.
     if (!(await getStaffPermissionUser(req.auth.userId, "purchases", client))) {
-      return res.status(403).json({ code: "PURCHASE_PERMISSION_REQUIRED", message: "You do not have permission to record purchases." });
+      // A role without `purchases` may still record a stock arrival (bill to follow) when it holds
+      // `stock_arrival`. Nothing else: no completed bill, no rate, no payment. Owner and Admin
+      // already passed above; no role holds this key by default.
+      const arrival = String(req.body?.purchase_bill_status || "").trim().toUpperCase() === "BILL_PENDING";
+      if (!arrival || !(await getPermissionUser(req.auth.userId, "stock_arrival", [], client))) {
+        return res.status(403).json({
+          code: "PURCHASE_PERMISSION_REQUIRED",
+          message: arrival
+            ? "You do not have permission to record a stock arrival."
+            : "You do not have permission to record purchases.",
+        });
+      }
     }
     const baseEntry = readPurchaseEntryPayload(req.body, req.auth.userId);
     const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
@@ -23942,7 +23957,11 @@ const createPurchaseBillHandler = async (req, res) => {
 
     if (baseEntry.purchaseBillStatus === "BILL_PENDING") {
       const manager = await requireRateManager(req.auth.userId, client);
-      if (!manager) {
+      // A sale rate is the Owner's or an Admin's to set. Anyone else may record an arrival only
+      // with `stock_arrival`, and then the stock sells at the fruit's current rate, read here from
+      // the product, whatever the request says; the product's rate is not touched.
+      const sellsAtCurrentRate = !manager;
+      if (sellsAtCurrentRate && !(await getPermissionUser(req.auth.userId, "stock_arrival", [], client))) {
         await client.query("ROLLBACK");
         return res.status(403).json({ message: "Only Owner or Admin can set temporary sale rates for pending stock" });
       }
@@ -23953,6 +23972,17 @@ const createPurchaseBillHandler = async (req, res) => {
         if (arrival.error) {
           await client.query("ROLLBACK");
           return res.status(arrival.status || 400).json({ message: arrival.error });
+        }
+        if (sellsAtCurrentRate) {
+          const currentRate = Number(arrival.product.selling_rate || 0);
+          if (!(currentRate > 0)) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              code: "STOCK_ARRIVAL_RATE_MISSING",
+              message: `${arrival.product.product_name} has no sale rate yet. Ask the Owner to set it in Sale Rate Update, then save the arrival.`,
+            });
+          }
+          entry.temporarySaleRate = currentRate;
         }
         const existingRate = productRates.get(entry.productId);
         if (existingRate !== undefined && existingRate !== entry.temporarySaleRate) {
@@ -24049,7 +24079,7 @@ const createPurchaseBillHandler = async (req, res) => {
         createdLots.push(lotResult.rows[0]);
       }
 
-      for (const [productId, temporaryRate] of productRates.entries()) {
+      for (const [productId, temporaryRate] of (sellsAtCurrentRate ? [] : productRates.entries())) {
         const arrival = arrivals.find((candidate) => Number(candidate.product.id) === Number(productId));
         const productRateResult = await client.query(
           `UPDATE products

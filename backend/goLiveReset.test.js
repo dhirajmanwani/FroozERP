@@ -337,10 +337,30 @@ test("the pure pieces of the command", async () => {
   assert.deepEqual(script.clientConfig("postgres://p@db.example/x").ssl, { rejectUnauthorized: false });
 });
 
+test("--zero-opening-balances: parsed, and its UPDATE touches only party opening balances", async () => {
+  const script = await loadScript();
+  const plan = await loadPlan();
+  assert.equal(script.parseArgs([]).zeroOpeningBalances, false, "opening balances are kept by default");
+  const args = script.parseArgs(["--apply", "--confirm", "neondb", "--zero-opening-balances"]);
+  assert.deepEqual(args.errors, []);
+  assert.equal(args.zeroOpeningBalances, true);
+
+  assert.deepEqual([...plan.OPENING_BALANCE_TABLES], ["customers", "suppliers", "accounts"]);
+  for (const table of plan.OPENING_BALANCE_TABLES) {
+    assert.equal(plan.bucketOf(table), "KEEP", `${table} keeps its rows; only the balance is zeroed`);
+    assert.equal(
+      plan.buildZeroOpeningBalanceSql(table),
+      `UPDATE "${table}" SET opening_balance = 0 WHERE COALESCE(opening_balance, 0) <> 0`,
+    );
+  }
+  assert.throws(() => plan.buildZeroOpeningBalanceSql("products"), /not a party table/);
+});
+
 test("the runbook exists and covers the order that matters", () => {
   const doc = fs.readFileSync(path.join(ROOT, "docs", "production", "GO_LIVE_RESET.md"), "utf8");
   for (const needle of [
     "backup-cloud.mjs", "go-live-reset.mjs", "--confirm", "froozerp-local.sqlite3", "device-anchor.json",
+    "--zero-opening-balances",
   ]) assert.ok(doc.includes(needle), `GO_LIVE_RESET.md must mention ${needle}`);
   assert.ok(doc.indexOf("backup-cloud.mjs") < doc.indexOf("--apply"), "the backup must come before the apply");
 });

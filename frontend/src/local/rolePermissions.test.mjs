@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import {
   OWNER_ONLY_VIEWS,
   accountMasterTypeOptions,
+  accountPaymentShortcut,
   accountTabsFor,
   allowedPaymentAction,
   branchesScreenPlan,
@@ -193,4 +194,49 @@ test("App's built-in Cashier defaults no longer list Pending Bills", () => {
   const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
   assert.match(app, /Cashier: \{ sales: true, accounts: true \},/);
   assert.match(app, /Cashier: \["sales", "accounts"\],/);
+});
+
+test("an account's row offers Pay or Receive for exactly what is owed, when the role may", () => {
+  const both = { customerPayments: true, supplierPayments: true };
+  assert.deepEqual(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 1020 }, both), { action: "PAY_SUPPLIER", label: "Pay", amount: "1020.00" });
+  assert.deepEqual(accountPaymentShortcut({ account_type: "TRANSPORT_VENDOR", payable_balance: "20.004" }, both), { action: "PAY_SUPPLIER", label: "Pay", amount: "20.00" });
+  assert.deepEqual(accountPaymentShortcut({ account_type: "CUSTOMER", receivable_balance: 400 }, both), { action: "RECEIVE_CUSTOMER", label: "Receive", amount: "400.00" });
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 0 }, both), null, "nothing owed");
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: -50 }, both), null, "an advance is not owed");
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 100 }, { customerPayments: true }), null, "the role may not pay suppliers");
+  assert.equal(accountPaymentShortcut({ account_type: "SUPPLIER", payable_balance: 100, active: false }, both), null);
+  assert.equal(accountPaymentShortcut({ account_type: "EXPENSE", payable_balance: 100 }, both), null);
+});
+
+test("Account Master and Outstanding rows carry the Pay / Receive button", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.equal((app.match(/\{accountPaymentButton\(account\)\}/g) || []).length, 2);
+  assert.match(app, /setTab\("payments"\);\n\s+focusField\("payment-amount"\);/);
+});
+
+test("stock_arrival: Purchase Entry opens for an arrival only, priced from the product", async () => {
+  const { purchaseEntryPlan, resolveModuleAccess, missingArrivalRateMessage } = await import("./rolePermissions.js");
+  const cashier = { billing: true, purchases: false, stock_arrival: true };
+  assert.deepEqual(purchaseEntryPlan({ role: "Cashier", permissions: cashier }), { arrivalOnly: true, saleRateFromProduct: true });
+  assert.equal(resolveModuleAccess({ view: "purchase", role: "Cashier", permissions: cashier }), true);
+
+  // A Cashier without the key does not get the screen; no role holds it by default.
+  assert.equal(resolveModuleAccess({ view: "purchase", role: "Cashier", permissions: { billing: true, purchases: false } }), false);
+  assert.equal(purchaseEntryPlan({ role: "Cashier", permissions: { purchases: false } }).arrivalOnly, false);
+
+  // Owner and Admin keep the full screen and set rates, whatever the stored row says.
+  assert.deepEqual(purchaseEntryPlan({ role: "Owner", permissions: {} }), { arrivalOnly: false, saleRateFromProduct: false });
+  assert.deepEqual(purchaseEntryPlan({ role: "Admin", permissions: { purchases: false, stock_arrival: true } }), { arrivalOnly: false, saleRateFromProduct: false });
+
+  // A Purchase Manager records full purchases; an arrival it records sells at the current rate.
+  assert.deepEqual(purchaseEntryPlan({ role: "Purchase Manager", permissions: { purchases: true } }), { arrivalOnly: false, saleRateFromProduct: true });
+  assert.match(missingArrivalRateMessage("Kiwi"), /^Kiwi has no sale rate yet\. Ask the Owner/);
+});
+
+test("Purchase Entry draws the arrival-only plan", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /\["stock_arrival", "Stock Arrival \(bill to follow\)"\]/, "the key can be granted in Settings");
+  assert.match(app, /purchaseEntryPlan\(\{ role: user\?\.role, permissions: rolePermissionMap\.get\(user\?\.role\) \}\)/);
+  assert.match(app, /disabled=\{purchasePlan\.arrivalOnly \|\| Boolean\(completionLines\)/, "the entry type is fixed for an arrival-only role");
+  assert.match(app, /readOnly=\{purchasePlan\.saleRateFromProduct\}/, "the sale rate is the product's, shown read-only");
 });
