@@ -1907,7 +1907,7 @@ const accountPaymentActions = [
 const defaultRolePermissions = {
   Owner: { all: true },
   Admin: { all: true },
-  Cashier: { sales: true, accounts: true, "pending-bills": true },
+  Cashier: { sales: true, accounts: true },
   "Purchase Manager": { purchase: true, "pending-bills": true, accounts: true, reports: true },
   "Inventory Manager": { products: true, waste: true, reports: true },
 };
@@ -4566,7 +4566,7 @@ function App() {
     const preferredByRole = {
       Owner: ["dashboard", "sales", "reports"],
       Admin: ["dashboard", "reports", "sales"],
-      Cashier: ["sales", "pending-bills", "accounts"],
+      Cashier: ["sales", "accounts"],
       "Purchase Manager": ["purchase", "pending-bills", "reports"],
       "Inventory Manager": ["reports", "products", "waste"],
     };

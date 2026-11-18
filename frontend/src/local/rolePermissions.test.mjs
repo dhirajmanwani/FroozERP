@@ -24,7 +24,7 @@ const modulePermissionMap = {
 const defaults = {
   Owner: { all: true },
   Admin: { all: true },
-  Cashier: { sales: true, accounts: true, "pending-bills": true },
+  Cashier: { sales: true, accounts: true },
   "Purchase Manager": { purchase: true, "pending-bills": true, accounts: true, reports: true },
 };
 const access = (role, view, permissions = null) => resolveModuleAccess({
@@ -174,4 +174,23 @@ test("Accounts tabs follow the account authorities, not role names (BO-13)", () 
   assert.equal(pm.initial, "payments");
   assert.deepEqual(ids(accountTabsFor(resolveAccountPermissions({ role: "Owner" }))), ["master", "ledger", "payments", "outstanding"]);
   assert.deepEqual(ids(accountTabsFor()), ["ledger", "payments"]);
+});
+
+test("a Cashier never opens Pending Bills, even holding billing and customer payments", () => {
+  // The seeded Cashier row: billing and customer_payments true, purchases false.
+  assert.equal(access("Cashier", "pending-bills", { billing: true, customer_payments: true, purchases: false }), false);
+  assert.equal(access("Cashier", "pending-bills", { billing: true, purchases: true }), false);
+  assert.equal(access("Cashier", "pending-bills", {}), false);
+  // Customer payments still reach a Cashier through Accounts.
+  assert.equal(access("Cashier", "accounts", { customer_payments: true }), true);
+  // Other roles keep their keys.
+  assert.equal(access("Purchase Manager", "pending-bills", { purchases: true }), true);
+  assert.equal(access("Admin", "pending-bills", { billing: true }), true);
+  assert.equal(access("Owner", "pending-bills", {}), true);
+});
+
+test("App's built-in Cashier defaults no longer list Pending Bills", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /Cashier: \{ sales: true, accounts: true \},/);
+  assert.match(app, /Cashier: \["sales", "accounts"\],/);
 });

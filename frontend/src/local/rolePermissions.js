@@ -70,6 +70,14 @@ export const branchesScreenPlan = (role) => {
   };
 };
 
+// Screens a Cashier never opens, whatever the role map says (owner's rule, 18 Nov 2026: "cashier ko
+// vo module nahi dikhna chahiye"). Pending Bills opened for a Cashier because its customer half
+// reads on `billing`, which every Cashier holds for POS. A Cashier still takes a customer's money
+// in Accounts when the role has Customer Payments.
+export const CASHIER_HIDDEN_VIEWS = Object.freeze(["pending-bills"]);
+
+export const isCashierRole = (role) => roleKey(role) === "CASHIER";
+
 // Screens only an Owner or Admin opens, whatever a role's module permissions say: prices are theirs
 // (the server's `requireRateManager`). Decided here so the sidebar, Ctrl K, the Alt shortcuts and
 // `navigate` refuse alike: a role holding Discounts used to reach a blank Sale Rate Update on Alt+4.
@@ -97,6 +105,7 @@ export const resolveModuleAccess = ({
   if (view === "branches") return branchesScreenPlan(role).open;
   if (isOwnerRole(role)) return true;
   if (RATE_MANAGER_VIEWS.includes(view) && !isRateManagerRole(role)) return false;
+  if (CASHIER_HIDDEN_VIEWS.includes(view) && isCashierRole(role)) return false;
   if (view === "dashboard") {
     if (defines(permissions, "dashboard")) return permissions.dashboard === true;
     return roleKey(role) === "ADMIN";
