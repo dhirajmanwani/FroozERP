@@ -20262,8 +20262,23 @@ app.get("/stock-inventory", async (req, res) => {
   }
 });
 
+/**
+ * Customer Pending Bills: every bill a customer still owes on, read on the same terms as the
+ * customer's balance in Accounts, the Dashboard and the outstanding reports
+ * (`getCustomerSummaryRows`), so clearing everything here brings those to zero too.
+ *
+ * Until 18 Nov 2026 this read only bills saved as CREDIT, by `sales.customer_id`, and opening
+ * balances only for customers with a receipt. Three kinds of debt therefore showed as outstanding
+ * with nothing here to clear: the unpaid part of a bill saved another way (a MIXED bill whose edit
+ * left part unpaid), a bill matched to its customer by mobile or name rather than by id (listed,
+ * but with no account, so "Receive" refused), and an opening balance. Bills are now matched with
+ * the balance's own `SALE_CUSTOMER_MATCH_LATERAL_SQL`, every bill with money open is listed, and an
+ * opening balance is its own row. A bill matched to no customer at all is still listed (as before)
+ * under the name on the bill, with no account.
+ */
 app.get("/pending-bills/customer", async (req, res) => {
   try {
+    const matchLateral = SALE_CUSTOMER_MATCH_LATERAL_SQL.replace(/^JOIN LATERAL/, "LEFT JOIN LATERAL");
     const creditSalesResult = await pool.query(
       `
       SELECT
@@ -20271,9 +20286,10 @@ app.get("/pending-bills/customer", async (req, res) => {
         s.invoice_no,
         s.sale_date,
         s.due_date,
-        s.customer_id,
+        matched.customer_id,
         COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') AS customer_name,
         s.customer_mobile,
+        s.payment_mode,
         s.gross_amount,
         s.item_discount_amount,
         s.invoice_discount_amount,
@@ -20291,7 +20307,8 @@ app.get("/pending-bills/customer", async (req, res) => {
           'No items'
         ) AS item_narration
       FROM sales s
-      LEFT JOIN customers c ON c.id = s.customer_id
+      ${matchLateral}
+      LEFT JOIN customers c ON c.id = matched.customer_id
       LEFT JOIN sale_items si ON si.sale_id = s.id
       LEFT JOIN products p ON p.id = si.product_id
       LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
@@ -20303,16 +20320,16 @@ app.get("/pending-bills/customer", async (req, res) => {
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
       WHERE s.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
-        AND s.payment_mode = 'CREDIT'
         AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
-      GROUP BY s.id, c.customer_name, pay.sale_paid
-      ORDER BY s.customer_id NULLS LAST, s.sale_date, s.id
+        AND (s.payment_mode = 'CREDIT' OR s.total_amount - COALESCE(pay.sale_paid, 0) > 0.005)
+      GROUP BY s.id, matched.customer_id, c.customer_name, pay.sale_paid
+      ORDER BY matched.customer_id NULLS LAST, s.sale_date, s.id
       `,
       // The company, not the branch: the predicate is `company_id = $1`. This passed the branch id
       // until 3 Oct 2026, which only worked where the two happen to be the same number.
       [req.auth.companyId]
     );
-    const [paymentsResult, returnCreditsResult, openingBalancesResult] = await Promise.all([
+    const [paymentsResult, overpaidResult, returnCreditsResult, openingBalancesResult] = await Promise.all([
       pool.query(
         `
         SELECT
@@ -20325,32 +20342,50 @@ app.get("/pending-bills/customer", async (req, res) => {
         `,
         [req.auth.companyId]
       ),
-      // Credit-note and future-adjustment returns settle the customer's bills; cash and UPI refunds
-      // paid the money back and settle nothing. Per bill, so a return lands on its own bill first.
+      // Money paid on a bill beyond its total is the customer's, as Accounts counts it (the balance
+      // takes every bill's total less every bill's payments), so it settles their other bills.
       pool.query(
         `
-        SELECT sr.sale_id, s.customer_id, SUM(sr.total_return_amount) AS credit_amount
-        FROM sale_returns sr
-        JOIN sales s ON s.id = sr.sale_id
+        SELECT matched.customer_id, SUM(COALESCE(pay.sale_paid, 0) - s.total_amount) AS overpaid
+        FROM sales s
+        ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+        JOIN (
+          SELECT sale_id, SUM(amount) AS sale_paid
+          FROM sale_payments
+          WHERE payment_mode IS DISTINCT FROM 'CREDIT'
+          GROUP BY sale_id
+        ) pay ON pay.sale_id = s.id
         WHERE s.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
           AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
-          AND sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL}
-        GROUP BY sr.sale_id, s.customer_id
+          AND COALESCE(pay.sale_paid, 0) - s.total_amount > 0.005
+        GROUP BY matched.customer_id
         `,
         [req.auth.companyId]
       ),
-      // Receipts settle the opening balance first, as Accounts counts it. Only customers with a
-      // receipt in this company matter, since an opening balance only ever absorbs receipts.
+      // Credit-note and future-adjustment returns settle the customer's bills; cash and UPI refunds
+      // paid the money back and settle nothing. Per bill, so a return lands on its own bill first.
+      // The customer is the bill's matched customer, as the balance takes it.
       pool.query(
         `
-        SELECT c.id AS customer_id, c.opening_balance
+        SELECT sr.sale_id, matched.customer_id, SUM(sr.total_return_amount) AS credit_amount
+        FROM sale_returns sr
+        JOIN sales s ON s.id = sr.sale_id
+        ${SALE_CUSTOMER_MATCH_LATERAL_SQL}
+        WHERE s.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
+          AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+          AND sr.refund_type IN ${saleReturnRules.CUSTOMER_CREDIT_REFUND_TYPES_SQL}
+        GROUP BY sr.sale_id, matched.customer_id
+        `,
+        [req.auth.companyId]
+      ),
+      // Every opening balance of this company's customers: receipts settle it first, as Accounts
+      // counts it, and what they leave is a row of its own.
+      pool.query(
+        `
+        SELECT c.id AS customer_id, c.customer_name, c.opening_balance
         FROM customers c
         WHERE COALESCE(c.opening_balance, 0) > 0
           AND (c.company_id IS NULL OR c.company_id = $1)
-          AND c.id IN (
-            SELECT cp.customer_id FROM customer_payments cp
-            WHERE cp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
-          )
         `,
         [req.auth.companyId]
       ),
@@ -20359,13 +20394,21 @@ app.get("/pending-bills/customer", async (req, res) => {
     const receiptsByCustomer = new Map(
       paymentsResult.rows.map((row) => [customerKey(row.customer_id), Number(row.total_received || 0)])
     );
+    for (const row of overpaidResult.rows) {
+      const key = customerKey(row.customer_id);
+      receiptsByCustomer.set(key, roundCurrency((receiptsByCustomer.get(key) || 0) + Number(row.overpaid || 0)));
+    }
     const openingBalanceByCustomer = new Map(
       openingBalancesResult.rows.map((row) => [customerKey(row.customer_id), Number(row.opening_balance || 0)])
+    );
+    const customerNames = new Map(
+      openingBalancesResult.rows.map((row) => [customerKey(row.customer_id), row.customer_name])
     );
     const { summary: summaryRows, invoices } = saleReturnRules.buildCustomerPendingBills(creditSalesResult.rows, {
       receiptsByCustomer,
       returnCredits: returnCreditsResult.rows,
       openingBalanceByCustomer,
+      customerNames,
     });
     return res.json({ summary: summaryRows, invoices });
   } catch (error) {

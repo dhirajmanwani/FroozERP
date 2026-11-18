@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  completedBillOwedNote,
+  paidNowDefault,
+  paidNowShortfall,
+  paidNowShortfallQuestion,
   costPerUnitSummary,
   distributionLotOptions,
   distributionStatusClass,
@@ -129,4 +133,35 @@ test("Waste's product list says a dash, not 'Stock 0', when the stock is not kno
   assert.equal(wasteProductOptionLabel({ product_name: "Apple", unit: "KG" }, 12.5), "Apple (in stock: 12.500 Kg)");
   assert.equal(wasteProductOptionLabel({ product_name: "Apple", unit: "KG" }, undefined), "Apple (in stock: —)");
   assert.equal(wasteProductOptionLabel({ product_name: "Apple", unit: "KG" }, 0), "Apple (in stock: 0.000 Kg)");
+});
+
+test("a 'Paid now' bill paid short leaves a shortfall that is named before the save", () => {
+  // 10 kg at ₹100 with 2% mandi tax: ₹1,020 payable, ₹1,000 typed.
+  assert.equal(paidNowShortfall({ purchaseType: "CASH", paidAmount: "1000", netPayable: 1020 }), 20);
+  assert.equal(paidNowShortfall({ purchaseType: "CASH", paidAmount: "1020", netPayable: 1020 }), 0);
+  assert.equal(paidNowShortfall({ purchaseType: "CASH", paidAmount: "989.40", netPayable: 989.4000001 }), 0, "paisa rounding is not a balance");
+  assert.equal(paidNowShortfall({ purchaseType: "CREDIT", paidAmount: 0, netPayable: 1020 }), 0, "a credit bill is owed in full, not short");
+  assert.equal(paidNowShortfall({ purchaseType: "CASH", paidAmount: "", netPayable: Number.NaN }), 0);
+  const question = paidNowShortfallQuestion({ shortfall: 20, supplierName: "Rig Mandi" });
+  assert.match(question.message, /₹20\.00 of this bill stays unpaid to Rig Mandi/);
+  assert.equal(question.cancelLabel, "Go back");
+});
+
+test("'Paid now' fills in the whole net payable, to the paisa", () => {
+  assert.equal(paidNowDefault(989.4000001), "989.40");
+  assert.equal(paidNowDefault(0), "");
+  assert.equal(paidNowDefault(Number.NaN), "");
+});
+
+test("a completed bill still owed says how much and where it is paid", () => {
+  assert.equal(completedBillOwedNote({ owed: 1020, supplierName: "Rig Mandi" }), " ₹1020.00 is still owed to Rig Mandi; pay it in Accounts > Pay Supplier.");
+  assert.equal(completedBillOwedNote({ owed: 0, supplierName: "Rig Mandi" }), "");
+});
+
+test("Purchase Entry asks before a short 'Paid now' save and names what is still owed", async () => {
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /await confirmDialog\(paidNowShortfallQuestion\(/);
+  assert.match(app, /setPurchasePaidAmount\(paidNowDefault\(/);
+  assert.match(app, /completedBillOwedNote\(\{ owed: owedAfterSave/);
 });
