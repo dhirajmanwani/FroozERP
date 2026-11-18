@@ -78,6 +78,11 @@ example `--also-clear auth_audit_log,product_audit_trail:lot-events`.
 (`product_audit_trail:lot-events` removes only the test lot events from the stock audit list and
 keeps product edit history.)
 
+Optional: to also start every customer, supplier and account at a balance of 0, add
+`--zero-opening-balances` to both the dry run and the apply. The parties stay; only their
+**Opening Balance** becomes 0. The dry run prints how many have a balance today and what it will
+do with them. Without the flag, opening balances are kept.
+
 ## 6. Apply
 
 Use the database name the dry run printed after **DATABASE**:
@@ -137,7 +142,8 @@ On each device, one at a time:
   one entry per lot.
 - **Opening balances:** open each customer and supplier in **Accounts**, check **Opening Balance**,
   and correct it to today's real figure. Balances are worked out from the opening balance plus
-  transactions, so after the reset every balance equals its opening balance.
+  transactions, so after the reset every balance equals its opening balance (0 for every party
+  if you used `--zero-opening-balances`).
 - **Packing (PEP Pack):** packing stock is zero. Record what is on the shelf as a packing stock
   adjustment; a packing purchase would also book an expense.
 - Check **selling rates** in Product Master. They were kept as the last rate set during testing.

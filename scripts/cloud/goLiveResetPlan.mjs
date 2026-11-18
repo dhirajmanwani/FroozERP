@@ -271,7 +271,7 @@ export const CACHED_COLUMNS = Object.freeze([
   },
   {
     column: "customers.opening_balance / suppliers.opening_balance / accounts.opening_balance",
-    decision: "kept: balances are opening_balance + ledger, computed on read, so with the ledger empty every balance is back to its opening balance",
+    decision: "kept unless --zero-opening-balances: balances are opening_balance + ledger, computed on read, so with the ledger empty every balance is back to its opening balance. With the flag every one is set to 0 in the same transaction",
     reset: null,
   },
   {
@@ -334,6 +334,22 @@ export const buildPruneSql = () => ({
 /** Deletes only the inventory-lot rows of product_audit_trail. */
 export const buildProductAuditLotEventSql = () =>
   `DELETE FROM product_audit_trail WHERE ${PRODUCT_AUDIT_LOT_ACTIONS_SQL}`;
+
+/**
+ * The party tables whose `opening_balance` `--zero-opening-balances` sets to 0. The owner chose
+ * this on 18 Nov 2026 for the second reset ("masters rakho, opening balance zero"): the parties
+ * stay, every customer and supplier starts owing nothing, and real balances are typed in after.
+ * Devices hold no opening balance (local_db.rs keeps the column out of SQLite), so the cloud
+ * UPDATE is the whole change.
+ */
+export const OPENING_BALANCE_TABLES = Object.freeze(["customers", "suppliers", "accounts"]);
+
+/** The UPDATE `--zero-opening-balances` runs on one of OPENING_BALANCE_TABLES. */
+export const buildZeroOpeningBalanceSql = (table) => {
+  if (!OPENING_BALANCE_TABLES.includes(table)) throw new Error(`${table} is not a party table with an opening balance`);
+  if (bucketOf(table) !== "KEEP") throw new Error(`${table} must be a kept table to have its opening balance zeroed`);
+  return `UPDATE ${quote(table)} SET opening_balance = 0 WHERE COALESCE(opening_balance, 0) <> 0`;
+};
 
 /**
  * The judgement over a live catalogue, pure so it can be tested without a database.

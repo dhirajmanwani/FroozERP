@@ -38,6 +38,10 @@
  *     node scripts/cloud/go-live-reset.mjs --apply --confirm <database-name>
  *     node scripts/cloud/go-live-reset.mjs --apply --confirm <database-name> --also-clear auth_audit_log,product_audit_trail:lot-events
  *
+ *     node scripts/cloud/go-live-reset.mjs --apply --confirm <database-name> --zero-opening-balances
+ *
+ *     --zero-opening-balances  also set every customer, supplier and account opening balance to 0
+ *                         (the parties themselves stay). Default: opening balances are kept.
  *     --also-clear <a,b>  also empty these owner-decides tables (default: keep them all).
  *                         `product_audit_trail:lot-events` deletes only the inventory-lot rows
  *                         of product_audit_trail and keeps product edit history.
@@ -50,6 +54,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import {
   CACHED_COLUMNS,
+  OPENING_BALANCE_TABLES,
   OWNER_DECIDES,
   PRODUCT_AUDIT_LOT_ACTIONS_SQL,
   PRODUCT_AUDIT_LOT_EVENT,
@@ -59,6 +64,7 @@ import {
   buildProductAuditLotEventSql,
   buildPruneSql,
   buildTruncateSql,
+  buildZeroOpeningBalanceSql,
   planReset,
 } from "./goLiveResetPlan.mjs";
 
@@ -69,7 +75,7 @@ const { Client } = require("../../backend/node_modules/pg");
 // Pure pieces (imported by backend/goLiveReset.test.js)
 // ---------------------------------------------------------------------------------------------
 
-/** `{ apply, confirm, alsoClear, errors }` from argv. */
+/** `{ apply, confirm, alsoClear, zeroOpeningBalances, errors }` from argv. */
 export const parseArgs = (argv) => {
   const errors = [];
   const valueOf = (name) => {
@@ -78,7 +84,7 @@ export const parseArgs = (argv) => {
     const value = argv[index + 1];
     return value && !value.startsWith("--") ? value : "";
   };
-  const known = new Set(["--apply", "--confirm", "--also-clear"]);
+  const known = new Set(["--apply", "--confirm", "--also-clear", "--zero-opening-balances"]);
   argv.forEach((token, index) => {
     if (!token.startsWith("--")) {
       const previous = argv[index - 1];
@@ -96,7 +102,8 @@ export const parseArgs = (argv) => {
   if (apply && confirm === null) {
     errors.push("--apply needs --confirm <database-name>: the name of the database you mean to reset");
   }
-  return { apply, confirm, alsoClear, errors };
+  const zeroOpeningBalances = argv.includes("--zero-opening-balances");
+  return { apply, confirm, alsoClear, zeroOpeningBalances, errors };
 };
 
 /**
@@ -212,7 +219,21 @@ const readState = async (client) => {
     )).rows[0].n);
   }
 
-  return { liveTables, counts, entityTypeCounts, foreignKeys, truncateTriggers, sequences, productAuditLotEvents };
+  // Parties carrying a non-zero opening balance, per table: what --zero-opening-balances would set
+  // to 0, and after it, the proof that nothing is left.
+  const openingBalances = {};
+  for (const table of OPENING_BALANCE_TABLES) {
+    if (!liveTables.includes(table)) continue;
+    const row = (await client.query(
+      `SELECT COUNT(*)::BIGINT AS n, COALESCE(SUM(opening_balance), 0)::TEXT AS total
+       FROM public.${quoteIdent(table)} WHERE COALESCE(opening_balance, 0) <> 0`,
+    )).rows[0];
+    openingBalances[table] = { rows: Number(row.n), total: row.total };
+  }
+
+  return {
+    liveTables, counts, entityTypeCounts, foreignKeys, truncateTriggers, sequences, productAuditLotEvents, openingBalances,
+  };
 };
 
 /** Everything that must stop `--apply`, given a plan and the state it came from. */
@@ -253,6 +274,14 @@ const printTables = (title, tables, counts, note) => {
   line();
   line(`${title} -- ${tables.length} tables, ${total} rows${note ? `  (${note})` : ""}`);
   for (const table of tables) line(`  ${pad(table, 34)}${num(counts[table] || 0)}`);
+};
+
+const printOpeningBalances = (state, zero) => {
+  line();
+  line(`Opening balances (customers / suppliers / accounts) -- ${zero ? "WILL BE SET TO 0 (--zero-opening-balances)" : "kept; --zero-opening-balances sets them to 0"}`);
+  for (const [table, { rows, total }] of Object.entries(state.openingBalances || {})) {
+    line(`  ${pad(table, 34)}${num(rows)} with a balance, total ${total}`);
+  }
 };
 
 const printPlan = (plan, state) => {
@@ -320,7 +349,7 @@ const fail = (message) => {
 // Apply
 // ---------------------------------------------------------------------------------------------
 
-const applyReset = async (client, { alsoClear }) => {
+const applyReset = async (client, { alsoClear, zeroOpeningBalances }) => {
   // REPEATABLE READ so the before/after counts are one consistent picture: a sign-in logged by the
   // live backend mid-reset must not read as "a kept table changed". TRUNCATE empties the whole
   // table regardless of snapshot, so nothing committed by anybody else survives it.
@@ -358,6 +387,13 @@ const applyReset = async (client, { alsoClear }) => {
     for (const entry of CACHED_COLUMNS) {
       if (entry.reset) await client.query(entry.reset);
     }
+    const zeroed = {};
+    if (zeroOpeningBalances) {
+      for (const table of OPENING_BALANCE_TABLES) {
+        if (!state.liveTables.includes(table)) continue;
+        zeroed[table] = (await client.query(buildZeroOpeningBalanceSql(table))).rowCount;
+      }
+    }
 
     // Proof before COMMIT.
     const after = await readState(client);
@@ -374,9 +410,13 @@ const applyReset = async (client, { alsoClear }) => {
     ]
       .filter((table) => after.counts[table] !== state.counts[table]);
     if (keptChanged.length) throw new Error(`a kept table changed row count: ${keptChanged.join(", ")}`);
+    if (zeroOpeningBalances) {
+      const left = Object.entries(after.openingBalances).filter(([, { rows }]) => rows !== 0).map(([table]) => table);
+      if (left.length) throw new Error(`opening balances still non-zero after zeroing: ${left.join(", ")}`);
+    }
 
     await client.query("COMMIT");
-    return { before: state, after, plan, pruned, lotEvents };
+    return { before: state, after, plan, pruned, lotEvents, zeroed };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => null);
     throw new Error(`rolled back, nothing changed: ${error?.message || error}`);
@@ -423,12 +463,14 @@ const main = async () => {
         alsoClear: args.alsoClear,
       });
       printPlan(plan, state);
+      printOpeningBalances(state, args.zeroOpeningBalances);
       const refusals = allRefusals(plan, state);
       printRefusals(refusals, "--apply WOULD BE REFUSED:");
       if (!refusals.length) {
         line();
         line(`To apply: node scripts/cloud/go-live-reset.mjs --apply --confirm ${server.database}`
-          + (args.alsoClear.length ? ` --also-clear ${args.alsoClear.join(",")}` : ""));
+          + (args.alsoClear.length ? ` --also-clear ${args.alsoClear.join(",")}` : "")
+          + (args.zeroOpeningBalances ? " --zero-opening-balances" : ""));
       }
       line();
       line("go-live reset dry run: nothing changed");
@@ -443,13 +485,14 @@ const main = async () => {
       alsoClear: args.alsoClear,
     });
     printPlan(previewPlan, preview);
+    printOpeningBalances(preview, args.zeroOpeningBalances);
     const refusals = allRefusals(previewPlan, preview);
     if (refusals.length) {
       printRefusals(refusals, "REFUSED:");
       fail("go-live reset refused: nothing changed");
     }
 
-    const result = await applyReset(client, { alsoClear: args.alsoClear });
+    const result = await applyReset(client, { alsoClear: args.alsoClear, zeroOpeningBalances: args.zeroOpeningBalances });
 
     line();
     line("AFTER -- rows per table (before -> after)");
@@ -461,6 +504,9 @@ const main = async () => {
     line();
     line(`sync_change_log rows deleted: ${result.pruned}`);
     if (result.plan.pruneProductAuditLotEvents) line(`product_audit_trail lot-event rows deleted: ${result.lotEvents}`);
+    if (args.zeroOpeningBalances) {
+      line(`Opening balances set to 0: ${Object.entries(result.zeroed).map(([table, n]) => `${table} ${n}`).join(", ") || "none"}`);
+    }
     line("Sequences: unchanged (checked before COMMIT).");
     const owner = Object.keys(OWNER_DECIDES).filter((t) => result.after.liveTables.includes(t) && !result.plan.ownerTruncate.includes(t));
     if (owner.length) line(`Owner-decides tables kept: ${owner.join(", ")}`);
