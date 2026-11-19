@@ -21494,8 +21494,12 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE(pi.lot_size, p.lot_size, ib.lot_size) AS lot_size,
           ib.batch_no,
           ib.stock_source,
-          ib.remaining_qty
+          ib.remaining_qty,
+          COALESCE(NULLIF(entered.full_name, ''), entered.username) AS created_by_name
         FROM purchases p
+        -- Who saved the arrival: a Cashier holding Stock Arrival can, so the Owner completing the
+        -- bill sees whose quantity it is.
+        LEFT JOIN users entered ON entered.id = p.created_by
         -- Each item beside its own lot, paired as GET /purchases pairs them. Joining lots on
         -- purchase_id alone crossed every item with every lot, so a 2-fruit bill was 4 rows here.
         LEFT JOIN LATERAL (
@@ -23539,8 +23543,11 @@ app.get("/purchases", async (req, res) => {
         ib.stock_source,
         ib.purchase_qty AS batch_purchase_qty,
         ib.remaining_qty AS batch_remaining_qty,
-        ib.batch_status
+        ib.batch_status,
+        COALESCE(NULLIF(entered.full_name, ''), entered.username) AS created_by_name
       FROM purchases p
+      -- Who saved it, shown in Pending Bills beside each arrival.
+      LEFT JOIN users entered ON entered.id = p.created_by
       -- One row per purchase item, beside that item's own lot. A bill from the purchase cart holds
       -- several items and one lot per item, with no column linking the two, so they are paired by
       -- product and by their order within that product (both are inserted in the same order). The

@@ -45,3 +45,14 @@ test("App.jsx: the category cards show the description, not a repeated 'Open rep
   assert.doesNotMatch(app, /Open report workspace/);
   assert.match(app, /<span>\{describeReport\(reportId\)\}<\/span>/);
 });
+
+test("the audit reports are on the menu, and an arrival names who entered it", () => {
+  // Edited Bills, Cancelled Bills, Pending Purchase Bills and Purchase Edit / Cancel were built
+  // and loaded, but no category listed them, so a reason typed on a cancel could not be read back
+  // anywhere in the app (owner's question, 19 Nov 2026: "reasons kaha save hote he?").
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /reports: \["salesHistory", "discountReport", "editedBills", "cancelledBills"\]/);
+  assert.match(app, /reports: \["purchaseHistory", "pendingPurchaseBills", "purchaseEditCancel"\]/);
+  assert.match(app, /"Expected Rate", "Entered By", "Remarks"\]/);
+  assert.match(app, /Entered by \$\{purchase\.created_by_name\}/, "Pending Bills shows who saved each arrival");
+});
