@@ -15970,7 +15970,7 @@ function PendingPurchaseBillsModule({ actionNotice = null, canManagePending = fa
               // No row click: it used to open the amendment screen without saying so. The buttons
               // say what each one does.
               <tr key={bill.key}>
-                <td>{formatDisplayDate(purchase.purchase_date)}<small className="cell-note">{`Bill #${purchase.id}`}</small></td>
+                <td>{formatDisplayDate(purchase.purchase_date)}<small className="cell-note">{`Bill #${purchase.id}`}</small>{purchase.created_by_name && <small className="cell-note">{`Entered by ${purchase.created_by_name}`}</small>}</td>
                 <td className="primary-cell purchase-items-cell">
                   <span title={itemsNarration}>{itemsNarration}</span>
                   {changeBlock && <small className="cell-note">{changeBlock}</small>}
@@ -19740,8 +19740,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       title: "Pending Purchase Bills",
       rows: filterRows(data.pendingPurchaseBillsReport),
       summary: (rows) => [["Pending Bills", purchaseItemCounts(rows).size, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
-      headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Remarks"],
-      render: (row, index) => <tr key={`${row.id}-${row.batch_no || index}`}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(pendingItemRate(row))}</td><td>{row.remarks || MISSING_VALUE}</td></tr>,
+      headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Entered By", "Remarks"],
+      render: (row, index) => <tr key={`${row.id}-${row.batch_no || index}`}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(pendingItemRate(row))}</td><td>{row.created_by_name || MISSING_VALUE}</td><td>{row.remarks || MISSING_VALUE}</td></tr>,
     },
     stockWithoutBill: {
       title: "Stock Received Without Bill",
@@ -19982,8 +19982,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const categories = [
     { id: "orders", title: "Order Reports", icon: "parcel", description: "Orders taken by phone, WhatsApp and at the counter: what was ordered, by whom, and what is still open. Works without internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
-    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Every bill with its items, discounts, payments and status.", reports: ["salesHistory", "discountReport"] },
-    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Every purchase with its items, bill status, payments and changes.", reports: ["purchaseHistory"] },
+    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Every bill with its items, discounts, payments and status.", reports: ["salesHistory", "discountReport", "editedBills", "cancelledBills"] },
+    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Every purchase with its items, bill status, payments and changes.", reports: ["purchaseHistory", "pendingPurchaseBills", "purchaseEditCancel"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "What came back, what it was worth, and why.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Waste by day, month and product, and what it cost.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
