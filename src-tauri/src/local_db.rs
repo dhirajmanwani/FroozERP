@@ -1455,8 +1455,66 @@ pub fn queue_sync_test_entity(
 
 pub fn retry_failed_operations(app: &AppHandle) -> Result<LocalDbStatus, String> {
     let path = database_path(app)?;
-    initialize_at(&path)?;
-    let conn = Connection::open(&path).map_err(to_error)?;
+    retry_failed_operations_at(&path)
+}
+
+/// The cloud's answer when an order arrives with no lines (`normalizeCustomerOrderItems`).
+const CUSTOMER_ORDER_NO_LINES_REJECTION: &str = "Customer order requires at least one item";
+
+/// Orders whose lines were wiped by the old pull, sent again as a fresh version.
+///
+/// Until the pull learnt the cloud's field names, every order echoed back from the cloud lost all
+/// its lines on this device, and the next change to it was refused for having none. Resending that
+/// refused operation is pointless: the cloud answers a resend with its stored verdict. So the
+/// refused operations are marked `superseded` and the order goes out again as the next version. A
+/// cloud that knows the order keeps its own lines when the device sends none, and the echo of that
+/// push brings the lines back here.
+fn requeue_orders_refused_for_no_lines(tx: &rusqlite::Transaction) -> Result<usize, String> {
+    let order_ids: Vec<String> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT DISTINCT o.entity_id
+                   FROM sync_outbox o
+                   JOIN local_customer_orders c ON c.id = o.entity_id AND c.deleted_at IS NULL
+                  WHERE o.entity_type = 'customer_order'
+                    AND o.status = 'failed'
+                    AND o.last_error = ?1",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([CUSTOMER_ORDER_NO_LINES_REJECTION], |row| row.get::<_, String>(0))
+            .map_err(to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_error)?;
+        rows
+    };
+    for order_id in &order_ids {
+        tx.execute(
+            "UPDATE sync_outbox SET status = 'superseded'
+              WHERE entity_type = 'customer_order' AND entity_id = ?1
+                AND status = 'failed' AND last_error = ?2",
+            rusqlite::params![order_id, CUSTOMER_ORDER_NO_LINES_REJECTION],
+        )
+        .map_err(to_error)?;
+        tx.execute(
+            "UPDATE local_customer_orders
+                SET entity_version = entity_version + 1,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+              WHERE id = ?1",
+            rusqlite::params![order_id],
+        )
+        .map_err(to_error)?;
+        enqueue_customer_order_with_tx(tx, order_id)?;
+    }
+    Ok(order_ids.len())
+}
+
+fn retry_failed_operations_at(path: &Path) -> Result<LocalDbStatus, String> {
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    requeue_orders_refused_for_no_lines(&tx)?;
+    tx.commit().map_err(to_error)?;
     // Held-back ('conflict') operations go back too. The cloud judges a held-back new bill again
     // and accepts it once the cause is gone; for anything else it returns its stored answer, so
     // retrying one changes nothing. Before this, a conflict could never leave this computer.
@@ -10560,7 +10618,16 @@ fn apply_pulled_customer_order_with_tx(
         for (index, item) in items.iter().enumerate() {
             // Never coerced. `"004"` and `4` are different products, and comparing one against the
             // other is what silently emptied the Inventory table once.
-            let Some(product_id) = order_text(item, "product_id") else {
+            //
+            // The cloud names its fields `product_global_id`, `global_id` and
+            // `inventory_lot_global_id` (`normalizeCustomerOrderItems` in backend/server.js), while
+            // this device names them `product_id`, `id` and `inventory_lot_id`. Reading only the
+            // device names skipped every line of every order echoed back from the cloud, so an
+            // order lost all its lines on the device that took it, and its next change was refused
+            // with "Customer order requires at least one item". Both names are accepted.
+            let Some(product_id) = order_text(item, "product_id")
+                .or_else(|| order_text(item, "product_global_id"))
+            else {
                 record_unapplied_change(
                     tx,
                     change,
@@ -10588,6 +10655,7 @@ fn apply_pulled_customer_order_with_tx(
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     order_text(item, "id")
+                        .or_else(|| order_text(item, "global_id"))
                         .unwrap_or_else(|| format!("{}-line-{}", change.entity_id, index)),
                     change.entity_id,
                     index as i64,
@@ -10599,7 +10667,8 @@ fn apply_pulled_customer_order_with_tx(
                     item.get("agreed_rate").and_then(json_number),
                     // Text, and left alone. The lot assigned at packing is an opaque id like every
                     // other id here.
-                    order_text(item, "inventory_lot_id"),
+                    order_text(item, "inventory_lot_id")
+                        .or_else(|| order_text(item, "inventory_lot_global_id")),
                 ],
             )
             .map_err(to_error)?;
@@ -20898,6 +20967,83 @@ mod tests {
         cleared.payload["payment_state"] = serde_json::Value::Null;
         pull_changes(&path, &[cleared], "cursor-p2");
         assert!(order_row(&path, "order-pull")["payment_state"].is_null());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The cloud's echo names its line fields `product_global_id`, `global_id` and
+    /// `inventory_lot_global_id`, and sends NUMERIC as strings. The pull used to read only
+    /// `product_id`, so every echo emptied the order on the device that took it.
+    #[test]
+    fn a_cloud_echo_keeps_the_order_lines() {
+        let path = delivery_test_order("echo-lines", "order-pull", "PACKED");
+        let version = order_row(&path, "order-pull")["entity_version"].as_i64().unwrap();
+        let line_id = order_row(&path, "order-pull")["items"][0]["id"].as_str().unwrap().to_string();
+
+        let mut echo = pulled_order(version, None);
+        echo.payload["status"] = serde_json::json!("PACKED");
+        echo.payload["items"] = serde_json::json!([{
+            "global_id": line_id, "line_index": 0, "product_global_id": "004",
+            "product_name": "Apple", "unit": "KG", "quantity": "2.000", "agreed_rate": "80.00",
+            "line_amount": "160.00", "inventory_lot_global_id": "lot-77"
+        }]);
+        pull_changes(&path, &[echo], "cursor-echo");
+
+        assert_eq!(unapplied_count(&path), 0, "no line was skipped");
+        let order = order_row(&path, "order-pull");
+        let items = order["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "the line survives the echo");
+        assert_eq!(items[0]["id"], line_id.as_str());
+        assert_eq!(items[0]["product_id"], "004", "opaque, never 4");
+        assert_eq!(items[0]["quantity"], 2.0);
+        assert_eq!(items[0]["agreed_rate"], 80.0);
+        assert_eq!(items[0]["inventory_lot_id"], "lot-77");
+
+        // And the next change goes out with its line, not refused for having none.
+        set_customer_order_status_at(&path, "order-pull", "SENT", &serde_json::json!({})).ok();
+        let latest = outbox_rows(&path).into_iter().last().unwrap();
+        assert_eq!(latest.7["items"].as_array().unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Orders already emptied by the old pull: Retry Failed sends them again as a fresh version
+    /// instead of resending the refused one, which the cloud answers with its stored verdict.
+    #[test]
+    fn retry_failed_requeues_an_order_refused_for_having_no_lines() {
+        let path = delivery_test_order("requeue", "order-lost", "PACKED");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM local_customer_order_items WHERE order_id = 'order-lost'", []).unwrap();
+        conn.execute(
+            "UPDATE sync_outbox SET status = 'failed', last_error = ?1 WHERE entity_id = 'order-lost'",
+            [CUSTOMER_ORDER_NO_LINES_REJECTION],
+        )
+        .unwrap();
+        // Something refused for another reason is left to the ordinary retry.
+        conn.execute(
+            "INSERT INTO sync_outbox (id, operation_id, entity_type, entity_id, operation_type, payload,
+                                      payload_json, version, entity_version, status, last_error)
+             VALUES ('op-other', 'op-other', 'customer_order', 'order-lost', 'UPSERT', '{}', '{}', 1, 1,
+                     'failed', 'Customer order is now being fulfilled by another branch')",
+            [],
+        )
+        .unwrap();
+        let before = order_row(&path, "order-lost")["entity_version"].as_i64().unwrap();
+        drop(conn);
+
+        let status = retry_failed_operations_at(&path).expect("retry");
+        assert_eq!(status.failed_operations, 0);
+
+        let rows = outbox_rows(&path);
+        let superseded = rows.iter().filter(|row| row.6 == "superseded").count();
+        assert!(superseded >= 1, "the refused operations are retired: {rows:?}");
+        assert!(rows.iter().all(|row| row.6 != "failed"));
+        let fresh = rows
+            .iter()
+            .find(|row| row.0 == format!("order-order-lost-v{}", before + 1))
+            .expect("the order goes out again as the next version");
+        assert_eq!(fresh.6, "pending");
+        assert_eq!(order_row(&path, "order-lost")["entity_version"].as_i64().unwrap(), before + 1);
+        let other = rows.iter().find(|row| row.0 == "op-other").unwrap();
+        assert_eq!(other.6, "pending", "an unrelated refusal is retried as before");
         let _ = fs::remove_file(&path);
     }
 
