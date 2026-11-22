@@ -90,6 +90,15 @@ const modules = [
     sections: [],
   },
   {
+    // Drawn beside POS Billing (owner, 22 Nov 2026). The key is its own, not its position: Alt+5.
+    id: "orders",
+    label: "Orders",
+    icon: "parcel",
+    shortcut: "5",
+    keywords: ["advance order", "phone order", "whatsapp", "booking", "reserved"],
+    sections: [],
+  },
+  {
     id: "products",
     label: "Products",
     icon: "box",
@@ -181,14 +190,6 @@ const modules = [
     icon: "wallet",
     shortcut: "X",
     keywords: ["spending", "petty cash", "overheads", "paid out"],
-    sections: [],
-  },
-  {
-    id: "orders",
-    label: "Orders",
-    icon: "parcel",
-    shortcut: "5",
-    keywords: ["advance order", "phone order", "whatsapp", "booking", "reserved"],
     sections: [],
   },
   {

@@ -174,8 +174,12 @@ test("Orders: Save order is confirmed, Cancel order asks why in a box, and butto
   // The reason is asked when cancelling, required, and closing the box leaves the order alone.
   assert.match(orders, /const reason = await askCancelReason\(\{[\s\S]*?tone: "danger",\s*\}\);\s*if \(reason === null\) return;/);
   assert.doesNotMatch(orders, /Reason \(if cancelling\)/);
-  assert.match(orders, /action\.tone === "danger" \? "danger-text-button"/);
+  // Since 22 Nov 2026 an order's moves (Cancel included) sit in its detail drawer, not on the card.
+  const detail = functionBody("OrderDetailSheet");
+  assert.match(detail, /action\.tone === "danger" \? "danger-text-button"/);
+  assert.match(orders, /onAction=\{\(action\) => runOrderAction\(selected, action\)\}/);
   assert.doesNotMatch(orders, /<p>\s*<button/, "no buttons run together in a bare paragraph");
+  assert.doesNotMatch(detail, /<p>\s*<button/, "no buttons run together in a bare paragraph");
   assert.match(appCss, /\.order-card \.carrier-top \{[^}]*justify-content: space-between;/);
 });
 

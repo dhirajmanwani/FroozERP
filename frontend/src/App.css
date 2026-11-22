@@ -12655,3 +12655,984 @@ td.wrap-cell {
 .pos-delivery-charge-note {
   margin: var(--space-2) 0;
 }
+
+/* ------------------------------------------------------------------------------------------------
+   Orders (22 Nov 2026, the owner: "bht taam jaam he ... premium and sophisticated aur simple").
+   One frame: a slim header (Orders | Deliveries, refresh, New order), count chips, then the board of
+   compact cards. Everything else opens in a drawer from the right (.orders-sheet).
+   ------------------------------------------------------------------------------------------------ */
+.orders-frame {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.orders-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.orders-switch {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-pill);
+  background: var(--fill-subtle);
+}
+
+.orders-switch-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--control-height-sm);
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  color: var(--ink-muted);
+  background: transparent;
+  font-size: var(--font-size-sm);
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.orders-switch-tab:hover {
+  color: var(--ink);
+}
+
+.orders-switch-active {
+  color: var(--ink);
+  background: var(--card);
+  box-shadow: 0 1px 2px var(--shadow-soft), 0 0 0 1px var(--line-soft);
+}
+
+.orders-switch-count {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  color: var(--ink-on-accent);
+  background: var(--accent);
+  font-size: 10px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.orders-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.orders-new-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.orders-icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--ink-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.orders-icon-button:hover {
+  border-color: var(--line-soft);
+  color: var(--ink);
+  background: var(--hover);
+}
+
+.orders-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.orders-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-pill);
+  color: var(--ink-muted);
+  background: var(--fill-subtle);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+}
+
+.orders-chip strong {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.orders-chip-attention {
+  border-color: var(--attention-line);
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+}
+
+.orders-chip-attention strong,
+.orders-chip-danger strong {
+  color: inherit;
+}
+
+.orders-chip-danger {
+  border-color: var(--danger-line);
+  color: var(--danger-ink);
+  background: var(--warning-soft);
+}
+
+.orders-chip-quiet {
+  border-color: transparent;
+  background: transparent;
+}
+
+.orders-chips-note {
+  flex: 1 1 260px;
+  min-width: 0;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+}
+
+.orders-chips-end {
+  margin-left: auto;
+}
+
+.orders-saved-notice {
+  margin: 0;
+}
+
+.orders-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 10px 14px;
+  border: 1px solid var(--accent-line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  color: var(--ink-body);
+  background: var(--accent-wash);
+  font-size: var(--font-size-sm);
+}
+
+.orders-banner-error {
+  border-color: var(--danger-line);
+  border-left-color: var(--danger);
+  background: var(--warning-soft);
+}
+
+.orders-check-note {
+  margin: 0;
+  font-size: var(--font-size-sm);
+}
+
+/* The board: New, Packed, Out for delivery, and Done today folded to a strip until it is wanted. */
+.orders-board {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) 44px;
+  gap: var(--space-4);
+  align-items: start;
+  min-width: 0;
+}
+
+.orders-board-done-open {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+/* Deliveries: each step a band across the frame, its cards side by side; a rider card needs the
+   width for the number and its QR code. */
+.orders-board-deliveries {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.orders-board-deliveries .orders-column-body {
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  max-height: none;
+  overflow: visible;
+}
+
+.orders-board-deliveries .orders-column-empty {
+  grid-column: 1 / -1;
+  padding: var(--space-2);
+  text-align: left;
+}
+
+.orders-column {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  background: var(--fill-subtle);
+}
+
+.orders-column-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px 4px 6px;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.orders-column-count {
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  color: var(--ink);
+  background: var(--fill-strong);
+  font-size: 11px;
+  letter-spacing: 0;
+  line-height: 20px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.orders-fold {
+  width: 24px;
+  height: 24px;
+  margin-left: auto;
+}
+
+.orders-column-body {
+  display: grid;
+  gap: var(--space-2);
+  max-height: calc(100vh - var(--topbar-height, 0px) - 300px);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.orders-column-empty {
+  margin: 0;
+  padding: var(--space-5) var(--space-2);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-md);
+  color: var(--ink-faint);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+.orders-done-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 160px;
+  padding: var(--space-3) 0;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  color: var(--ink-muted);
+  background: var(--fill-subtle);
+  cursor: pointer;
+}
+
+.orders-done-strip:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+
+.orders-done-strip-label {
+  writing-mode: vertical-rl;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* A card: who and how much, what, then order number, age and payment; one step underneath. */
+.orders-card {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  box-shadow: 0 1px 2px var(--shadow-faint);
+}
+
+.orders-card + .orders-card {
+  margin-top: 0;
+}
+
+.orders-card-flagged {
+  border-left: 3px solid var(--attention);
+}
+
+.orders-card-open {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.orders-card-open:hover .orders-card-name {
+  color: var(--accent);
+}
+
+.orders-card-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.orders-card-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orders-card-value {
+  color: var(--ink);
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.orders-card-items {
+  overflow: hidden;
+  color: var(--ink-body);
+  font-size: var(--font-size-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orders-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.orders-pay {
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  font-weight: 750;
+}
+
+.orders-pay-positive {
+  color: var(--success-ink);
+  background: var(--paper-savings-wash);
+}
+
+.orders-pay-neutral {
+  color: var(--ink-muted);
+  background: var(--fill);
+}
+
+.orders-pay-attention {
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+}
+
+.orders-card-step {
+  justify-self: start;
+}
+
+.orders-earlier summary {
+  padding: var(--space-2) 4px;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.orders-earlier-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.orders-earlier-row {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--ink-body);
+  background: transparent;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.orders-earlier-row:hover {
+  background: var(--hover);
+}
+
+.orders-earlier-row span:last-child {
+  color: var(--ink-faint);
+}
+
+/* Drawers from the right: an order's detail, a new order, the unassigned queue. */
+.orders-sheet-backdrop {
+  z-index: 60;
+  place-items: stretch end;
+  padding: 0;
+  background: var(--scrim-soft);
+}
+
+.orders-sheet {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(560px, 100vw);
+  height: 100vh;
+  border-left: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: -24px 0 60px var(--shadow-strong);
+  outline: none;
+  animation: orders-sheet-in 180ms ease-out;
+}
+
+.orders-sheet-wide {
+  width: min(1000px, 100vw);
+}
+
+@keyframes orders-sheet-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orders-sheet { animation: none; }
+}
+
+.orders-sheet-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-6) var(--space-4);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.orders-sheet-head h2 {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-family: "Bodoni Moda Variable", Georgia, "Times New Roman", serif;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.orders-sheet-body {
+  display: grid;
+  align-content: start;
+  gap: var(--space-5);
+  min-height: 0;
+  padding: var(--space-5) var(--space-6);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.orders-sheet-foot {
+  padding: var(--space-4) var(--space-6);
+  border-top: 1px solid var(--line-soft);
+  background: var(--fill-subtle);
+}
+
+.orders-sheet-foot .order-actions {
+  justify-content: flex-end;
+  margin: 0;
+}
+
+.orders-detail-contact {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+}
+
+.orders-detail-section {
+  display: grid;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line-soft);
+}
+
+.orders-detail-section h3 {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.orders-detail-total {
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.orders-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.orders-sheet .delivery-panel {
+  margin-top: 0;
+}
+
+/* New order: who it is for and the lines on the left, the shelf on the right. */
+.orders-compose {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+  gap: var(--space-6);
+  min-height: 0;
+}
+
+.orders-compose-form {
+  display: grid;
+  align-content: start;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.orders-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.orders-source-label {
+  margin-right: 4px;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.orders-source-pill {
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  color: var(--ink-muted);
+  background: transparent;
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.orders-source-pill:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+
+.orders-source-pill-active {
+  border-color: var(--accent-line-strong);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.orders-lines {
+  display: grid;
+  border-top: 1px solid var(--line-soft);
+}
+
+.orders-lines-head,
+.orders-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 92px 92px 104px 28px;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.orders-lines-head {
+  padding: var(--space-2) 0;
+  color: var(--ink-faint);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.orders-lines-head span:nth-child(4) {
+  text-align: right;
+}
+
+.orders-lines-empty {
+  margin: 0;
+  padding: var(--space-5) 0;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-faint);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+.orders-line {
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.orders-line-problem {
+  background: linear-gradient(90deg, var(--attention-soft), transparent 70%);
+}
+
+.orders-line-name {
+  display: grid;
+  min-width: 0;
+}
+
+.orders-line-name strong {
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orders-line-name small,
+.orders-line-input small {
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.orders-line-input {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.orders-line-input input {
+  width: 100%;
+  min-width: 0;
+}
+
+.orders-line-amount {
+  white-space: nowrap;
+  color: var(--ink);
+  font-weight: 700;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.orders-line-problem-text {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--attention-ink);
+  font-size: var(--font-size-sm);
+}
+
+.orders-picker {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: var(--space-3);
+  min-width: 0;
+  min-height: 0;
+  max-height: calc(100vh - 230px);
+  padding: var(--space-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  background: var(--fill-subtle);
+}
+
+.orders-picker-search {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  color: var(--ink-faint);
+  background: var(--card);
+}
+
+.orders-picker-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.orders-pick-list {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  scrollbar-width: thin;
+}
+
+.orders-pick {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--ink-body);
+  background: var(--card);
+  text-align: left;
+  cursor: pointer;
+}
+
+.orders-pick:hover {
+  border-color: var(--accent-line-strong);
+  background: var(--accent-wash);
+}
+
+.orders-pick-added {
+  border-color: var(--accent-line);
+}
+
+.orders-pick-name {
+  display: grid;
+  min-width: 0;
+}
+
+.orders-pick-name strong {
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orders-pick-name small {
+  color: var(--ink-muted);
+  font-size: 11px;
+}
+
+.orders-pick-rate {
+  display: grid;
+  justify-items: end;
+  color: var(--ink);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.orders-pick-rate em {
+  color: var(--accent);
+  font-size: 10px;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.orders-picker-note {
+  margin: 0;
+  padding: var(--space-3);
+  font-size: var(--font-size-sm);
+}
+
+.orders-picker-held {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.orders-compose-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.orders-compose-total {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+}
+
+.orders-compose-total strong {
+  color: var(--ink);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 1100px) {
+  .orders-board,
+  .orders-board-done-open {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .orders-done-strip {
+    flex-direction: row;
+    justify-content: center;
+    min-height: 0;
+  }
+
+  .orders-done-strip-label {
+    writing-mode: horizontal-tb;
+  }
+
+  .orders-column-body {
+    max-height: none;
+  }
+}
+
+@media (max-width: 820px) {
+  .orders-board,
+  .orders-board-done-open,
+  .orders-compose,
+  .orders-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .orders-picker {
+    max-height: 60vh;
+  }
+
+  .orders-lines-head {
+    display: none;
+  }
+
+  .orders-line {
+    grid-template-columns: minmax(0, 1fr) 1fr 1fr 28px;
+  }
+
+  .orders-line-name {
+    grid-column: 1 / -1;
+  }
+}
+
+/* POS: the Orders button beside the shortcut hint, the held-for-orders line on a tile, and the one
+   checkout button with its quiet reprint link. */
+.pos-heading-tools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.pos-orders-button {
+  gap: 6px;
+}
+
+.pos-orders-count {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  color: var(--ink-on-accent);
+  background: var(--accent);
+  font-size: 10px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.product-result-held {
+  justify-self: start;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--attention-ink);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.checkout-key {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 800;
+  opacity: 0.7;
+}
+
+.checkout-reprint {
+  justify-self: center;
+  margin: var(--space-2) auto 0;
+  padding: 2px 6px;
+  border: 0;
+  color: var(--ink-muted);
+  background: transparent;
+  font-size: var(--font-size-sm);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.checkout-reprint:hover {
+  color: var(--accent);
+}
+
+.checkout-reprint:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+/* The app's text-size setting sets every span, button and h3 with !important (top of this file).
+   These Orders labels are deliberately smaller than body text, so they say so with the same scale. */
+@media screen {
+  .orders-column-head > span,
+  .orders-detail-section h3,
+  .orders-lines-head span,
+  .orders-done-strip-label,
+  .orders-pick-rate em,
+  .orders-switch-count,
+  .pos-orders-count,
+  .checkout-key {
+    font-size: var(--font-size-xs) !important;
+  }
+
+  .orders-column-head > .orders-column-count,
+  .orders-card-meta span,
+  .orders-card-items,
+  .orders-chip,
+  .orders-chip strong,
+  .orders-chips-note,
+  .orders-picker-held,
+  .orders-earlier-row span,
+  .orders-detail-contact,
+  .orders-source-label,
+  .orders-source-pill,
+  .orders-compose-total > span,
+  .product-result-held {
+    font-size: var(--font-size-sm) !important;
+  }
+
+  .orders-detail-section h3 .orders-detail-total {
+    font-size: var(--font-size-base) !important;
+  }
+
+  .orders-compose-total strong {
+    font-size: var(--font-size-xl) !important;
+  }
+}

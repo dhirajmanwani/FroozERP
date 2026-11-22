@@ -48,9 +48,10 @@ test("POS-4: the invoice is shown before the refresh, and a failed refresh is no
   assert.match(saleEdit, /describeSavedBillRefreshFailure\(invoice\.invoice_no, refreshError, \{ edited: true \}\)/);
 });
 
-test("POS-5: a charge that could not be priced stops checkout and disables both buttons", () => {
+test("POS-5: a charge that could not be priced stops checkout and disables the checkout button", () => {
   assert.match(checkout, /chargeRefusalProblem\(totals\.chargeRefusals\)/);
-  assert.equal((pos.match(/totals\.chargeRefusals\.length > 0\} onClick=\{\(\) => checkout\((true|false)\)\}/g) || []).length, 2);
+  // One checkout button since 22 Nov 2026 (Checkout & Print folded into Checkout + Auto print).
+  assert.equal((pos.match(/totals\.chargeRefusals\.length > 0\} onClick=\{\(\) => checkout\((true|false)\)\}/g) || []).length, 1);
 });
 
 test("POS-6: choosing Walk-in mid-bill keeps the bill's charges", () => {
@@ -110,5 +111,7 @@ test("POS-20..25 polish: -₹0.00, lot left, row total, lot picker, wording", ()
   assert.doesNotMatch(pos, /Sold-out lots are reference-only/);
   assert.doesNotMatch(pos, /"Change packing"/);
   assert.match(pos, /<option value="BANK_TRANSFER">Bank Transfer<\/option>/);
-  assert.match(pos, /F4 Checkout & Print/);
+  // One checkout button since 22 Nov 2026: the hint names F4 as Checkout, with no "& Print".
+  assert.match(pos, /F4 Checkout\{effectiveQuantityMode/);
+  assert.doesNotMatch(pos, /Checkout & Print/);
 });

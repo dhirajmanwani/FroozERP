@@ -137,6 +137,8 @@ import { buildPosPayments, buildUpiPayload, describePaymentConfirmation, invoice
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems, seedLinesToCart } from "./local/orderBilling";
+import { ORDER_SHELF_STATUS, buildOrderPickList, checkOrderAgainstShelf, checkOrderQuantity, heldForOrdersNote, posLotRate, searchOrderPickList } from "./local/orderStock";
+import { NEXT_STEP_KIND, ORDER_COLUMN_LABEL, orderAgeLabel, orderCountChips, orderItemSummary, orderNextStep, orderPaymentChip, splitFinishedToday } from "./local/ordersScreen";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 // Only the consuming half is used now. `stashSessionForReload` existed so that saving an API mode
@@ -1284,6 +1286,9 @@ const icons = {
 const navigationItems = [
   ["dashboard", "Dashboard"],
   ["sales", "POS Billing"],
+  // Beside the till (owner, 22 Nov 2026): phone orders are worked between walk-ins. Keys are
+  // named per module in local/appNavigation.js, so Orders keeps Alt+5 wherever it sits.
+  ["orders", "Orders"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
   ["pending-bills", "Pending Bills"],
@@ -1295,7 +1300,6 @@ const navigationItems = [
   ["frooz-pack", "PEP Pack"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
-  ["orders", "Orders"],
   ["distribution", "Stock Distribution"],
   ["reports", "Reports"],
   ["all-shops", "All Shops"],
@@ -2609,6 +2613,10 @@ function App() {
   // cashier saw, and the shelf kept emptying itself a minute after it was filled. Only
   // `refreshPosInventoryFromSQLite` and a completed sale write this, so nothing else can empty it.
   const [posShelf, setPosShelf] = useState({ loaded: false, products: [], inventoryLots: [] });
+  // What happened to Orders' attempt to have that shelf read: Orders offers only what POS could sell
+  // (local/orderStock.js), so a shelf that has not loaded must say why rather than list nothing.
+  // Only a status: the shelf itself is still written by the POS refresh alone.
+  const [ordersShelfLoad, setOrdersShelfLoad] = useState({ status: "idle", message: "" });
   // The combos POS sells (local/combos.js), read from the same SQLite snapshot by the same refresh
   // and by nothing else, for the same reason as the shelf above. `missing` until it has been read:
   // a counter that has not been told its combos must not say it has none.
@@ -5059,6 +5067,33 @@ function App() {
       setSyncMessage("POS could not refresh its local SQLite inventory. Existing values remain visible.");
     });
   }, [activeView, connectivityMode, deviceInfo.device_id, posRefreshToken, user?.id]);
+
+  /**
+   * Orders take only what POS could sell, so Orders needs POS's shelf. Read through the POS refresh
+   * itself (never a second writer) when Orders opens and the shelf has not been read yet; after
+   * that a sale and a sync keep it current. A failure is kept as a status so the order form can say
+   * the stock could not be read instead of offering an empty list that looks like a sold-out shop.
+   */
+  const loadOrdersShelf = async (reason = "orders-open") => {
+    if (!isTauriRuntime()) {
+      setOrdersShelfLoad({ status: ORDER_SHELF_STATUS.UNAVAILABLE, message: "" });
+      return;
+    }
+    if (!user?.id) return;
+    setOrdersShelfLoad({ status: ORDER_SHELF_STATUS.LOADING, message: "" });
+    try {
+      await refreshPosInventoryFromSQLite(reason);
+      setOrdersShelfLoad({ status: ORDER_SHELF_STATUS.READY, message: "" });
+    } catch (error) {
+      writeDiagnosticLog("ERROR", "orders-shelf-load-failed", { reason, message: error?.message || String(error) });
+      setOrdersShelfLoad({ status: ORDER_SHELF_STATUS.ERROR, message: describeLocalServiceFailure(error, "the local stock list did not load") });
+    }
+  };
+  useEffect(() => {
+    if (!user?.id || activeView !== "orders" || posShelf.loaded) return;
+    loadOrdersShelf("orders-open");
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only the view, the person and the shelf's loaded flag decide whether to read it
+  }, [activeView, user?.id, posShelf.loaded]);
 
   // Read-only: unlike the POS refresh it never replaces the app's product or stock lists, so the
   // Dashboard's other figures stay exactly as they were.
@@ -7604,8 +7639,11 @@ function App() {
       // stranded there with no bill shows as done while its fruit is unaccounted for — and the
       // operator has no way back, because a sent order cannot be returned to packed.
       let seed = null;
+      // From POS's own shelf when it has been read: the bill lands on POS, so its lots must be the
+      // ones POS sells from, not whichever loader last wrote the shared lists.
+      const billFrom = posShelf.loaded ? { products: posShelf.products, lots: posShelf.inventoryLots } : { products, lots: inventory };
       if (to === ORDER_STATUS.SENT) {
-        seed = buildOrderCartSeed(order, { products, lots: inventory });
+        seed = buildOrderCartSeed(order, billFrom);
         if (seed.lines.length === 0) {
           const refusal = `This order was not sent: nothing on it can be billed. ${describeOrderBillingProblems(seed)}`;
           setSyncMessage(refusal);
@@ -11963,6 +12001,7 @@ function App() {
               onPackingShortages={(rows) => rows.forEach((row) => notify(row))}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
+              onOpenOrders={hasModuleAccess("orders") ? () => navigate("orders") : null}
               seedCart={posSeedCart}
               onSeedConsumed={() => setPosSeedCart(null)}
               deviceInfo={deviceInfo}
@@ -12265,9 +12304,12 @@ function App() {
               }}
               queue={orderQueueState}
               routingBusy={orderRoutingBusy}
-              onReload={() => { loadOrders(); loadUnassignedOrders(); }}
+              onReload={() => { loadOrders(); loadUnassignedOrders(); loadOrdersShelf("orders-refresh"); }}
               onTakeOrder={takeOrder}
-              products={products}
+              // The order form offers what POS could sell: POS's own shelf, never the shared lists.
+              shelf={posShelf}
+              shelfLoad={ordersShelfLoad}
+              counterScope={counterScope}
               state={ordersState}
               user={user}
             />
@@ -22795,12 +22837,27 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], n
   );
 }
 
-function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance, onAssign, onReload, onSetPayment, onTakeOrder, products = [], queue, routingBusy = false, state, user }) {
+const ORDER_SOURCES = Object.freeze([
+  { value: "PHONE", label: "Phone" },
+  { value: "WHATSAPP", label: "WhatsApp" },
+  { value: "COUNTER", label: "Counter" },
+  { value: "WEBSITE", label: "Website" },
+  { value: "OTHER", label: "Other" },
+]);
+
+const emptyOrderDraft = () => ({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [] });
+
+/**
+ * Orders: one slim header, a board of compact cards, and everything else one click away in a
+ * drawer (owner, 22 Nov 2026: "bht taam jaam he ... simple rakho"). Taking an order opens its own
+ * drawer whose item picker offers only what POS could sell right now (local/orderStock.js).
+ */
+function OrdersModule({ branches = [], busy = false, counterScope = null, delivery = null, onAdvance, onAssign, onReload, onSetPayment, onTakeOrder, queue, routingBusy = false, shelf = null, shelfLoad = null, state, user }) {
   const money = (value) => currency.format(Number(value || 0));
   const [assignDraft, setAssignDraft] = useState({});
   // Orders or the Deliveries board. A tab inside Orders, not a sidebar row: the sidebar is full.
   const [ordersTab, setOrdersTab] = useState("orders");
-  // A payment answer that could not be saved, by order id, said on that order's card.
+  // A payment answer that could not be saved, by order id, said in that order's drawer.
   const [paymentProblem, setPaymentProblem] = useState({});
   const canRoute = ["Owner", "Admin"].includes(String(user?.role || ""));
   const waiting = resolveUnassignedQueue({
@@ -22810,28 +22867,42 @@ function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance,
     permitted: canRoute,
   });
   const [carrierDraft, setCarrierDraft] = useState({});
-  const emptyLine = { product_id: "", quantity: "", agreed_rate: "" };
-  const [draft, setDraft] = useState({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
+  // Kept while the New order drawer is closed, so closing it by accident loses nothing.
+  const [draft, setDraft] = useState(emptyOrderDraft);
   const [draftError, setDraftError] = useState("");
+  const [composing, setComposing] = useState(false);
+  // The order whose drawer is open, and what it was opened for (payment, send, delivery).
+  const [openOrder, setOpenOrder] = useState({ id: null, focus: "" });
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [doneOpen, setDoneOpen] = useState(false);
+  // The clock the cards' ages and the six-hour lapse are read against, recounted each minute.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 60000);
+    return () => clearInterval(timer);
+  }, []);
   // "Order ORD-… for Sunita is saved." after Save order, which used to clear the form in silence.
   const [orderNotice, showOrderNotice, clearOrderNotice] = useSaveNotice();
   // Cancelling asks why in a box of its own, at the moment of cancelling, instead of a "Reason (if
   // cancelling)" field on every open order. The reason is still required (validateOrderAction).
   const askCancelReason = useAskReason();
-
-  const setLine = (index, patch) => setDraft((current) => ({
-    ...current,
-    items: current.items.map((line, position) => (position === index ? { ...line, ...patch } : line)),
-  }));
+  // What can be ordered: POS's shelf, less what open orders already hold.
+  const pickList = useMemo(
+    () => buildOrderPickList({ shelf, load: shelfLoad, orders: state.orders, scope: counterScope }),
+    [counterScope, shelf, shelfLoad, state.orders],
+  );
 
   const submitOrder = async () => {
     // Validated here rather than only in the store, so the operator is told which field is missing
     // instead of being handed the storage layer's message about the first one it happened to reach.
     if (!draft.customer_name.trim()) return setDraftError("Enter the customer's name, even for a first-time caller.");
     // A half-filled line (an item with no quantity, a zero rate) is refused naming it, never
-    // dropped from the order without a word (local/ordersBoard.js).
-    const built = buildOrderDraftLines(draft.items, products);
+    // dropped from the order without a word (local/ordersBoard.js). Only items on the shelf count.
+    const built = buildOrderDraftLines(draft.items, pickList.items.map((item) => item.product));
     if (!built.ok) return setDraftError(built.message);
+    // And none of it may promise more than is free on the shelf (local/orderStock.js).
+    const stock = checkOrderAgainstShelf(built.lines, pickList);
+    if (!stock.ok) return setDraftError(stock.message);
     const lines = built.lines;
     setDraftError("");
     clearOrderNotice();
@@ -22844,8 +22915,25 @@ function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance,
       return;
     }
     showOrderNotice(successNotice(orderSavedText({ orderNo: saved.orderNo, customerName: draft.customer_name })));
-    setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
+    setDraft(emptyOrderDraft());
+    setComposing(false);
   };
+
+  const openDeliveryCount = state.loadState === "loaded" ? buildDeliveryBoard({ orders: state.orders }).openCount : 0;
+  const header = (
+    <div className="orders-header">
+      <div aria-label="Orders or deliveries" className="orders-switch" role="tablist">
+        <button aria-selected={ordersTab === "orders"} className={ordersTab === "orders" ? "orders-switch-tab orders-switch-active" : "orders-switch-tab"} onClick={() => setOrdersTab("orders")} role="tab" type="button">Orders</button>
+        <button aria-selected={ordersTab === "deliveries"} className={ordersTab === "deliveries" ? "orders-switch-tab orders-switch-active" : "orders-switch-tab"} onClick={() => setOrdersTab("deliveries")} role="tab" type="button">
+          Deliveries{openDeliveryCount > 0 ? <span className="orders-switch-count">{openDeliveryCount}</span> : null}
+        </button>
+      </div>
+      <div className="orders-header-actions">
+        <button aria-label="Refresh orders" className="orders-icon-button" onClick={onReload} title="Refresh" type="button"><Icon name="refresh" size={16} /></button>
+        <button className="primary-button orders-new-button" onClick={() => { setDraftError(""); setComposing(true); }} type="button"><Icon name="add" size={16} /> New order</button>
+      </div>
+    </div>
+  );
 
   if (state.loadState === "loading") {
     return (
@@ -22877,12 +22965,19 @@ function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance,
     );
   }
 
-  const board = buildOrdersBoard(state.orders);
+  const board = buildOrdersBoard(state.orders, nowMs);
   // The board presents each order in its own shape; the delivery panel needs the stored order
   // (its `deliveries`, its status), found by the same canonical id.
   const rawOrderById = new Map((Array.isArray(state.orders) ? state.orders : []).map((raw) => [canonicalInventoryId(raw?.id), raw]));
-  const openDeliveryCount = buildDeliveryBoard({ orders: state.orders }).openCount;
+  const rawOf = (order) => rawOrderById.get(canonicalInventoryId(order?.id)) || null;
   const deliverySettings = delivery?.settingsState?.settings || DEFAULT_DELIVERY_SETTINGS;
+  const chips = orderCountChips(board);
+  const done = splitFinishedToday(board.finished, rawOrderById, nowMs, canonicalInventoryId);
+  const allPresented = [...board.columns.flatMap((column) => column.orders), ...board.finished, ...board.unknown];
+  const selected = openOrder.id === null ? null : allPresented.find((order) => canonicalInventoryId(order.id) === canonicalInventoryId(openOrder.id)) || null;
+  // Only when there is somebody waiting, or the list could not be read: never an empty card.
+  const showQueueBanner = waiting.status === ORDER_QUEUE_STATUS.ERROR
+    || (waiting.status === ORDER_QUEUE_STATUS.READY && waiting.orders.length > 0);
 
   /** "Has this been paid?" is its own write (onSetPayment), never a status move. */
   const recordPayment = async (order, paymentState, paymentReference) => {
@@ -22921,48 +23016,181 @@ function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance,
     const branchId = assignDraft[orderId] || "";
     const checked = validateOrderAssignment({ orderId, branchId });
     if (!checked.ok) return;
-    const done = await onAssign?.(orderId, branchId);
-    if (done) setAssignDraft((current) => ({ ...current, [orderId]: "" }));
+    const handed = await onAssign?.(orderId, branchId);
+    if (handed) setAssignDraft((current) => ({ ...current, [orderId]: "" }));
+  };
+
+  /** A card's one button: a move straight from the card, or the order opened where it is needed. */
+  const runNextStep = (order, step) => {
+    if (step.kind === NEXT_STEP_KIND.MOVE) runOrderAction(order, step.action);
+    else if (step.kind === NEXT_STEP_KIND.OPEN) setOpenOrder({ id: order.id, focus: step.focus || "" });
+  };
+  const cardFor = (order, { finished = false } = {}) => {
+    const raw = rawOf(order);
+    const step = finished
+      ? { kind: NEXT_STEP_KIND.NONE, label: "" }
+      : orderNextStep(order, { open: Boolean(raw && openDeliveryOf(raw)), canStart: Boolean(raw && canStartDelivery(raw).ok) });
+    return (
+      <OrderCard
+        age={orderAgeLabel(raw?.created_at, nowMs)}
+        busy={busy}
+        finished={finished}
+        key={order.id}
+        onOpen={() => setOpenOrder({ id: order.id, focus: "" })}
+        onStep={() => runNextStep(order, step)}
+        order={order}
+        step={step}
+      />
+    );
   };
 
   return (
-    <section className="settings-layout">
-      <div aria-label="Orders or deliveries" className="account-tabs orders-tabs" role="tablist">
-        <button aria-selected={ordersTab === "orders"} className={ordersTab === "orders" ? "account-tab account-tab-active" : "account-tab"} onClick={() => setOrdersTab("orders")} role="tab" type="button">Orders</button>
-        <button aria-selected={ordersTab === "deliveries"} className={ordersTab === "deliveries" ? "account-tab account-tab-active" : "account-tab"} onClick={() => setOrdersTab("deliveries")} role="tab" type="button">
-          Deliveries{openDeliveryCount > 0 ? ` (${openDeliveryCount})` : ""}
-        </button>
-      </div>
-      {ordersTab === "deliveries" ? (
-        <DeliveriesBoard
-          busy={Boolean(delivery?.busy) || busy}
-          onMove={delivery?.onMove}
-          onReload={onReload}
-          orders={state.orders}
-          settings={deliverySettings}
-          settingsState={delivery?.settingsState}
-          shopName={delivery?.shopName || ""}
-        />
-      ) : (<>
-      {/* Orders that arrived with nobody handling them -- a website order, or a WhatsApp to the
-          company number. They never reach a counter on their own: the sync road scopes by branch
-          and has no notion of role, so an unassigned order on it would land on every till carrying
-          a customer's name, mobile and home address. A person decides, here.
-
-          Drawn above the board because it is the only part of this screen with a customer waiting
-          on the other end of it, and hidden entirely from anybody who cannot act on it -- an
-          Owner-only queue shown to a cashier as an empty box would read as "nothing is waiting". */}
-      {waiting.status !== ORDER_QUEUE_STATUS.NOT_PERMITTED && (
-        <ModuleCard
-          eyebrow="Waiting for a shop"
-          title="Unassigned orders"
-          subtitle="These arrived without a shop. Until one is chosen, no counter can see them and no stock is set aside."
-        >
-          <div className="button-row orders-toolbar">
-            <span className="pill">{waiting.countLabel}</span>
-            <button className="table-action" type="button" onClick={onReload}>Refresh</button>
+    <section className="settings-layout orders-page">
+      <div className="content-card orders-frame">
+        {header}
+        {ordersTab === "orders" && (
+          <div className="orders-chips">
+            {chips.map((chip) => (
+              <span className={chip.tone === "attention" ? "orders-chip orders-chip-attention" : "orders-chip"} key={chip.key}>
+                <strong>{chip.count}</strong> {chip.label}
+              </span>
+            ))}
+            {board.reservedValue > 0 && <span className="orders-chip orders-chip-quiet">{money(board.reservedValue)} held</span>}
           </div>
+        )}
 
+        <SaveNotice className="orders-saved-notice" notice={orderNotice} />
+
+        {/* Orders that arrived with nobody handling them -- a website order, or a WhatsApp to the
+            company number. They never reach a counter on their own: the sync road scopes by branch
+            and has no notion of role, so an unassigned order on it would land on every till carrying
+            a customer's name, mobile and home address. A person decides, from the list this opens.
+
+            Hidden entirely from anybody who cannot act on it, and when nobody is waiting: an
+            Owner-only queue shown to a cashier as an empty box would read as "nothing is waiting". */}
+        {showQueueBanner && (
+          <div className={waiting.status === ORDER_QUEUE_STATUS.ERROR ? "orders-banner orders-banner-error" : "orders-banner"} role={waiting.status === ORDER_QUEUE_STATUS.ERROR ? "alert" : "status"}>
+            <span>
+              {waiting.status === ORDER_QUEUE_STATUS.ERROR
+                ? <><strong>Orders waiting for a shop could not be checked.</strong> {waiting.message}</>
+                : <><strong>{waiting.orders.length === 1 ? "1 order is" : `${waiting.orders.length} orders are`} waiting for a shop.</strong> No counter can see {waiting.orders.length === 1 ? "it" : "them"} until one is chosen.</>}
+            </span>
+            <button className="secondary-button compact-button" onClick={() => setQueueOpen(true)} type="button">{waiting.status === ORDER_QUEUE_STATUS.ERROR ? "Details" : "Choose shops"}</button>
+          </div>
+        )}
+
+        {ordersTab === "orders" && board.needsAttention.length > 0 && (
+          // Above the board, not a badge on a card. A lapsed order looks exactly like a healthy one
+          // and the difference is that its fruit may already have been sold to somebody else.
+          <div className="warning-note orders-check-note" role="alert">
+            <strong>{ordersNeedCheckingText(board.needsAttention.length)}</strong>{" "}
+            {board.needsAttention.map((order) => `${order.orderNo || "Order"} (${order.customerName})`).join(", ")}
+            {" — "}the stock held for these went back on the shelf after six hours. Check it is still in the shop before packing.
+          </div>
+        )}
+
+        {ordersTab === "deliveries" ? (
+          <DeliveriesBoard
+            busy={Boolean(delivery?.busy) || busy}
+            onMove={delivery?.onMove}
+            orders={state.orders}
+            settings={deliverySettings}
+            settingsState={delivery?.settingsState}
+            shopName={delivery?.shopName || ""}
+          />
+        ) : (
+          <div className={doneOpen ? "orders-board orders-board-done-open" : "orders-board"}>
+            {board.columns.map((column) => (
+              <section aria-label={ORDER_COLUMN_LABEL[column.key] || column.label} className="orders-column" key={column.key}>
+                <header className="orders-column-head" title={column.hint}>
+                  <span>{ORDER_COLUMN_LABEL[column.key] || column.label}</span>
+                  <span className="orders-column-count">{column.orders.length}</span>
+                </header>
+                <div className="orders-column-body">
+                  {column.orders.length === 0 && <p className="orders-column-empty">Nothing here</p>}
+                  {column.orders.map((order) => cardFor(order))}
+                </div>
+              </section>
+            ))}
+            {doneOpen ? (
+              <section aria-label="Done today" className="orders-column orders-column-done">
+                <header className="orders-column-head">
+                  <span>Done today</span>
+                  <span className="orders-column-count">{done.today.length}</span>
+                  <button aria-label="Fold Done today" className="orders-icon-button orders-fold" onClick={() => setDoneOpen(false)} title="Fold" type="button"><Icon name="close" size={14} /></button>
+                </header>
+                <div className="orders-column-body">
+                  {done.today.length === 0 && <p className="orders-column-empty">Nothing finished today</p>}
+                  {done.today.map((order) => cardFor(order, { finished: true }))}
+                  {/* Delivered, returned and cancelled orders are kept, so "did that go out?" can
+                      still be answered the next morning. */}
+                  {done.earlier.length > 0 && (
+                    <details className="orders-earlier">
+                      <summary>Earlier ({done.earlier.length})</summary>
+                      <ul className="orders-earlier-list">
+                        {done.earlier.map((order) => (
+                          <li key={order.id}>
+                            <button className="orders-earlier-row" onClick={() => setOpenOrder({ id: order.id, focus: "" })} type="button">
+                              <span>{order.orderNo} · {order.customerName}</span>
+                              <span>{labelFor("orderStatus", order.status)}{order.carrier ? ` · ${order.carrier}` : ""} · {money(order.value)}</span>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                </div>
+              </section>
+            ) : (
+              <button aria-label={`Show done today (${done.today.length})`} className="orders-done-strip" onClick={() => setDoneOpen(true)} type="button">
+                <span className="orders-column-count">{done.today.length}</span>
+                <span className="orders-done-strip-label">Done today</span>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {composing && (
+        <NewOrderSheet
+          busy={busy}
+          draft={draft}
+          error={draftError}
+          onChange={(next) => { setDraft(next); if (draftError) setDraftError(""); }}
+          onClear={() => { setDraft(emptyOrderDraft()); setDraftError(""); }}
+          onClose={() => setComposing(false)}
+          onReloadShelf={onReload}
+          onSubmit={submitOrder}
+          pickList={pickList}
+        />
+      )}
+
+      {selected && (
+        <OrderDetailSheet
+          busy={busy}
+          carrier={carrierDraft[selected.id] || ""}
+          delivery={delivery}
+          deliverySettings={deliverySettings}
+          focus={openOrder.focus}
+          onAction={(action) => runOrderAction(selected, action)}
+          onCarrierChange={(value) => setCarrierDraft({ ...carrierDraft, [selected.id]: value })}
+          onClose={() => setOpenOrder({ id: null, focus: "" })}
+          onPayment={(paymentState, paymentReference) => recordPayment(selected, paymentState, paymentReference)}
+          order={selected}
+          paymentProblem={paymentProblem[selected.id] || ""}
+          raw={rawOf(selected)}
+          user={user}
+        />
+      )}
+
+      {waiting.status !== ORDER_QUEUE_STATUS.NOT_PERMITTED && (queueOpen && (
+        <OrdersSheet
+          eyebrow="Waiting for a shop"
+          onClose={() => setQueueOpen(false)}
+          title="Unassigned orders"
+          wide
+        >
+          <p className="form-note">These arrived without a shop. Until one is chosen, no counter can see them and no stock is set aside.</p>
           {/* Never a bare empty list: "none waiting", "could not load" and "not allowed" look the
               same as rows, and only one of them means a customer is not waiting. */}
           {waiting.message && <p className="form-note">{waiting.message}</p>}
@@ -23013,242 +23241,418 @@ function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance,
               ))}
             </DataTable>
           )}
-        </ModuleCard>
-      )}
+        </OrdersSheet>
+      ))}
+    </section>
+  );
+}
 
-      <ModuleCard
-        eyebrow="At a glance"
-        title="Open orders"
-        subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Kept on this computer, so it works without internet."
+/**
+ * The drawer every Orders sheet sits in: from the right, over a dim, closed by Esc, the close
+ * button or a click on the dim. Not a native popup.
+ */
+function OrdersSheet({ children, eyebrow = "", footer = null, labelId = "", onClose, title, wide = false }) {
+  const sheetRef = useRef(null);
+  const headingId = labelId || `orders-sheet-${String(title || "").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    sheetRef.current?.focus();
+    // Esc closes the drawer wherever focus has fallen, but never from under an in-app question
+    // (Cancel order's reason box), which takes its own Esc first.
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape" || event.defaultPrevented || appDialogQueue.current()) return;
+      closeRef.current?.();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return (
+    <div className="modal-backdrop orders-sheet-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <aside
+        aria-labelledby={headingId}
+        aria-modal="true"
+        className={wide ? "orders-sheet orders-sheet-wide" : "orders-sheet"}
+        ref={sheetRef}
+        role="dialog"
+        tabIndex={-1}
       >
-        <div className="button-row orders-toolbar"><button className="table-action" type="button" onClick={onReload}>Refresh</button></div>
-
-        {board.needsAttention.length > 0 && (
-          // Above the board, not a badge on a card. A lapsed order looks exactly like a healthy one
-          // and the difference is that its fruit may already have been sold to somebody else.
-          <div className="warning-note" role="alert">
-            <strong>{ordersNeedCheckingText(board.needsAttention.length)}</strong>{" "}
-            {board.needsAttention.map((order) => `${order.orderNo || "Order"} (${order.customerName})`).join(", ")}
-            {" — "}the stock held for these went back on the shelf after six hours. Check it is still in the shop before packing.
+        <header className="orders-sheet-head">
+          <div>
+            {eyebrow && <span className="eyebrow">{eyebrow}</span>}
+            <h2 id={headingId}>{title}</h2>
           </div>
-        )}
+          <button aria-label="Close" className="orders-icon-button" onClick={onClose} type="button"><Icon name="close" size={16} /></button>
+        </header>
+        <div className="orders-sheet-body">{children}</div>
+        {footer && <footer className="orders-sheet-foot">{footer}</footer>}
+      </aside>
+    </div>
+  );
+}
 
-        <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric featured label="Open Orders" value={board.openCount} />
-          <SummaryMetric label="Value Held" value={money(board.reservedValue)} />
-          <SummaryMetric label="Needs Checking" value={board.needsAttention.length} />
-          <SummaryMetric label="Finished" value={board.finished.length} />
+/** One order on the board: who, what, how much, paid or not, how long, and the one next step. */
+function OrderCard({ age = "", busy = false, finished = false, onOpen, onStep, order, step }) {
+  const money = (value) => currency.format(Number(value || 0));
+  const payment = orderPaymentChip(order.paymentState);
+  const flagged = Boolean(order.warning);
+  return (
+    <article className={flagged ? "orders-card orders-card-flagged" : "orders-card"}>
+      <button className="orders-card-open" onClick={onOpen} title={`Open ${order.orderNo || "this order"}`} type="button">
+        <span className="orders-card-top">
+          <strong className="orders-card-name">{order.customerName}</strong>
+          <span className="orders-card-value">{money(order.value)}</span>
+        </span>
+        <span className="orders-card-items">{orderItemSummary(order.items)}</span>
+        <span className="orders-card-meta">
+          <span>{order.orderNo}</span>
+          {age && <span>{age}</span>}
+          {finished
+            ? <span className="orders-pay orders-pay-neutral">{labelFor("orderStatus", order.status)}</span>
+            : <span className={`orders-pay orders-pay-${payment.tone}`}>{payment.label}</span>}
+          {flagged && <span className="orders-pay orders-pay-attention">Check stock</span>}
+        </span>
+      </button>
+      {step.kind !== NEXT_STEP_KIND.NONE && (
+        <button
+          className={step.kind === NEXT_STEP_KIND.MOVE ? "primary-button compact-button orders-card-step" : "secondary-button compact-button orders-card-step"}
+          disabled={busy}
+          onClick={onStep}
+          type="button"
+        >
+          {step.label}
+        </button>
+      )}
+    </article>
+  );
+}
+
+/**
+ * Everything an order card used to carry: contact, payment answer and reference, the items, who is
+ * carrying it, the delivery panel and every move the lifecycle allows (cancel included).
+ */
+function OrderDetailSheet({ busy = false, carrier = "", delivery = null, deliverySettings, focus = "", onAction, onCarrierChange, onClose, onPayment, order, paymentProblem = "", raw = null, user }) {
+  const money = (value) => currency.format(Number(value || 0));
+  const actions = Array.isArray(order.actions) ? order.actions : [];
+  // Cancel and Came back first, quiet moves next, the step forward last, at the right hand.
+  const backward = actions.filter((action) => action.tone === "danger");
+  const quiet = actions.filter((action) => action.tone !== "danger" && action.tone !== "primary");
+  const forward = actions.filter((action) => action.tone === "primary");
+  const deliveryRef = useRef(null);
+  useEffect(() => {
+    // Opened from "Book delivery" or "Track delivery": the delivery part is what was asked for.
+    if (focus === "delivery") deliveryRef.current?.scrollIntoView({ block: "start" });
+  }, [focus]);
+  return (
+    <OrdersSheet
+      eyebrow={`${order.orderNo || "Order"} · ${labelFor("orderStatus", order.status)}`}
+      footer={actions.length > 0 ? (
+        <div className="button-row order-actions">
+          {[...backward, ...quiet, ...forward].map((action) => (
+            <button
+              className={action.tone === "primary" ? "primary-button" : action.tone === "danger" ? "danger-text-button" : "table-action"}
+              disabled={busy}
+              key={action.to}
+              type="button"
+              onClick={() => onAction(action)}
+            >
+              {action.label}
+            </button>
+          ))}
         </div>
-      </ModuleCard>
+      ) : null}
+      onClose={onClose}
+      title={order.customerName}
+    >
+      <p className="orders-detail-contact">
+        {order.customerMobile || "No number"} · {labelFor("orderSource", order.source)}
+        {order.deliveryAddress ? ` · ${order.deliveryAddress}` : ""}
+        {order.invoiceNo ? ` · billed ${order.invoiceNo}` : ""}
+      </p>
 
-      <ModuleCard eyebrow="New" title="Take an order" subtitle="Rings the phone? Write it here. Stock is set aside the moment you save.">
-        {draftError && <div className="error-banner" role="alert">{draftError}</div>}
-        <SaveNotice className="orders-saved-notice" notice={orderNotice} />
-        {products.length === 0 && (
-          // An empty dropdown with no explanation reads as a broken screen. This says which of the
-          // two it is: nothing to sell yet, or a list that did not arrive.
-          <div className="cart-empty">
-            No items are available to order. Add products first, or reopen this screen if the item
-            list did not load.
-          </div>
-        )}
-        <div className="purchase-summary-grid supplier-payment-preview">
-          <Field label="Customer name">
-            <input onChange={(event) => setDraft({ ...draft, customer_name: event.target.value })} placeholder="Who is ordering" value={draft.customer_name} />
-          </Field>
-          <Field label="Mobile">
-            <input onChange={(event) => setDraft({ ...draft, customer_mobile: event.target.value })} placeholder="For the delivery" value={draft.customer_mobile} />
-          </Field>
-          <Field label="How did it come in">
-            <select onChange={(event) => setDraft({ ...draft, source: event.target.value })} value={draft.source}>
-              <option value="PHONE">Phone</option>
-              <option value="WHATSAPP">WhatsApp</option>
-              <option value="COUNTER">Counter</option>
-              <option value="WEBSITE">Website</option>
-              <option value="OTHER">Other</option>
+      {order.warning && <div className="warning-note" role="alert">{order.warning}</div>}
+
+      <section className="orders-detail-section">
+        <h3>Payment</h3>
+        {/* Money before goods. Shown here and enforced in validateOrderAction, so the answer cannot
+            be skipped by a path that did not draw this control. */}
+        {order.paymentWarning && <div className="warning-note" role="alert">{order.paymentWarning}</div>}
+        <div className="orders-detail-grid">
+          <Field label="Has this been paid?">
+            <select
+              autoFocus={focus === "payment"}
+              disabled={busy}
+              value={order.paymentState || ""}
+              onChange={(event) => onPayment(event.target.value)}
+            >
+              <option value="">Not decided yet</option>
+              <option value="PAID">Paid</option>
+              <option value="ON_DELIVERY">Pay on delivery</option>
+              <option value="UNPAID">Not paid</option>
             </select>
           </Field>
+          {order.paymentState === "PAID" && (
+            <Field label="Payment reference">
+              <input
+                defaultValue={order.paymentReference}
+                placeholder="UPI ref, cash to..., bank note"
+                onBlur={(event) => {
+                  // Saved with the payment answer it belongs to, and only when it changed.
+                  if (event.target.value.trim() === String(order.paymentReference || "").trim()) return;
+                  onPayment(order.paymentState, event.target.value);
+                }}
+              />
+            </Field>
+          )}
         </div>
-        <Field label="Delivery address">
-          <input onChange={(event) => setDraft({ ...draft, delivery_address: event.target.value })} placeholder="Where it is going" value={draft.delivery_address} />
-        </Field>
+        {paymentProblem && <div className="error-banner" role="alert">{paymentProblem}</div>}
+      </section>
 
-        <DataTable className="order-draft-table" headers={markNumericColumns(["Item", "Quantity", "Rate agreed", { label: <span className="pm-sr-only">Remove</span> }])}>
-          {draft.items.map((line, index) => (
-            <tr key={index}>
-              <td>
-                <select
-                  onChange={(event) => {
-                    // Prefill today's rate. Most orders are quoted at the rate on the board, so
-                    // typing it again is work for nothing — and a blank left blank became an order
-                    // worth Rs 0, which is not "no rate", it is a wrong number on a real order.
-                    const picked = products.find((candidate) => canonicalInventoryId(candidate.id) === canonicalInventoryId(event.target.value));
-                    setLine(index, {
-                      product_id: event.target.value,
-                      agreed_rate: line.agreed_rate || (picked?.selling_rate ? String(picked.selling_rate) : ""),
-                    });
-                  }}
-                  value={line.product_id}
-                >
-                  <option value="">Choose an item</option>
-                  {products.map((product) => (
-                    <option key={product.id} value={product.id}>{product.product_name}</option>
-                  ))}
-                </select>
-              </td>
-              <td><input aria-label="Quantity" className="numeric-input" onChange={(event) => setLine(index, { quantity: event.target.value })} placeholder="0.000" step="0.001" type="number" value={line.quantity} /></td>
-              {/* The rate the customer is quoted today, kept for when the order ships. Produce
-                  rates move daily and a customer quoted 80 on Monday is owed 80 on Thursday. */}
-              <td><input aria-label="Rate agreed" className="numeric-input" onChange={(event) => setLine(index, { agreed_rate: event.target.value })} placeholder="0.00" step="0.01" type="number" value={line.agreed_rate} /></td>
-              <td>
-                <button
-                  className="table-action"
-                  disabled={draft.items.length === 1}
-                  type="button"
-                  onClick={() => setDraft({ ...draft, items: draft.items.filter((_, position) => position !== index) })}
-                >
-                  Remove
-                </button>
-              </td>
+      <section className="orders-detail-section">
+        <h3>Items <span className="orders-detail-total">{money(order.value)}</span></h3>
+        <DataTable className="orders-detail-items" headers={markNumericColumns(["Item", "Quantity", "Rate agreed", "Amount"])}>
+          {order.items.map((line) => (
+            <tr key={line.id || `${order.id}-${line.line_index}`}>
+              <td>{line.product_name}</td>
+              {/* Quantities carry three decimals and rates always carry their unit: a produce
+                  price with no unit beside it is the commonest confusion in this trade. */}
+              <td>{counterQuantityWithUnit(line.quantity, line.unit)}</td>
+              <td>{money(line.agreed_rate)} / {unitDisplayName(line.unit) === MISSING_VALUE ? "unit" : unitDisplayName(line.unit)}</td>
+              <td>{money(Number(line.quantity || 0) * Number(line.agreed_rate || 0))}</td>
             </tr>
           ))}
         </DataTable>
-        <div className="button-row orders-form-actions">
-          <button className="table-action" type="button" onClick={() => setDraft({ ...draft, items: [...draft.items, { ...emptyLine }] })}>Add item</button>
-          <button className="primary-button" disabled={busy} type="button" onClick={submitOrder}>{busy ? "Saving…" : "Save order"}</button>
-        </div>
-      </ModuleCard>
+      </section>
 
-      {board.columns.map((column) => (
-        <ModuleCard eyebrow={column.hint} key={column.key} title={`${column.label} (${column.orders.length})`}>
-          {column.orders.length === 0 && <p className="form-note">Nothing here right now.</p>}
-          {column.orders.map((order) => (
-            <div className="content-card order-card" key={order.id}>
-              <div className="carrier-top">
-                <strong>{order.orderNo} · {order.customerName}</strong>
-                <span>{money(order.value)}</span>
-              </div>
-              <p className="form-note">
-                {order.customerMobile || "No number"} · {labelFor("orderSource", order.source)}
-                {order.deliveryAddress ? ` · ${order.deliveryAddress}` : ""}
-                {order.invoiceNo ? ` · billed ${order.invoiceNo}` : ""}
-              </p>
-
-              {order.warning && <div className="warning-note" role="alert">{order.warning}</div>}
-
-              {/* Money before goods. Shown on the card and enforced in validateOrderAction, so the
-                  answer cannot be skipped by a path that did not draw this control. */}
-              {order.paymentWarning && (
-                <div className="warning-note" role="alert">{order.paymentWarning}</div>
-              )}
-              <div className="purchase-summary-grid supplier-payment-preview">
-                <Field label="Has this been paid?">
-                  <select
-                    disabled={busy}
-                    value={order.paymentState || ""}
-                    onChange={(event) => recordPayment(order, event.target.value)}
-                  >
-                    <option value="">Not decided yet</option>
-                    <option value="PAID">Paid</option>
-                    <option value="ON_DELIVERY">Pay on delivery</option>
-                    <option value="UNPAID">Not paid</option>
-                  </select>
-                </Field>
-                {order.paymentState === "PAID" && (
-                  <Field label="Payment reference">
-                    <input
-                      defaultValue={order.paymentReference}
-                      placeholder="UPI ref, cash to..., bank note"
-                      onBlur={(event) => {
-                        // Saved with the payment answer it belongs to, and only when it changed.
-                        if (event.target.value.trim() === String(order.paymentReference || "").trim()) return;
-                        recordPayment(order, order.paymentState, event.target.value);
-                      }}
-                    />
-                  </Field>
-                )}
-              </div>
-
-              {paymentProblem[order.id] && <div className="error-banner" role="alert">{paymentProblem[order.id]}</div>}
-
-              <DataTable headers={markNumericColumns(["Item", "Quantity", "Rate agreed", "Amount"])}>
-                {order.items.map((line) => (
-                  <tr key={line.id || `${order.id}-${line.line_index}`}>
-                    <td>{line.product_name}</td>
-                    {/* Quantities carry three decimals and rates always carry their unit: a produce
-                        price with no unit beside it is the commonest confusion in this trade. */}
-                    <td>{counterQuantityWithUnit(line.quantity, line.unit)}</td>
-                    <td>{money(line.agreed_rate)} / {unitDisplayName(line.unit) === MISSING_VALUE ? "unit" : unitDisplayName(line.unit)}</td>
-                    <td>{money(Number(line.quantity || 0) * Number(line.agreed_rate || 0))}</td>
-                  </tr>
-                ))}
-              </DataTable>
-
-              {order.carrier && (
-                <p className="form-note">
-                  Carried by <strong>{order.carrier}</strong>
-                  {order.carrierReference ? ` · ${order.carrierReference}` : ""}
-                  {order.trackingUrl ? (
-                    <> · <a href={order.trackingUrl} rel="noreferrer" target="_blank">tracking link</a></>
-                  ) : ""}
-                </p>
-              )}
-
-              {order.actions.some((action) => action.needsCarrier) && (
-                <Field label="Who is carrying it">
-                  <input
-                    onChange={(event) => setCarrierDraft({ ...carrierDraft, [order.id]: event.target.value })}
-                    placeholder="Rapido, Porter, our own delivery..."
-                    value={carrierDraft[order.id] || ""}
-                  />
-                </Field>
-              )}
-              {rawOrderById.has(canonicalInventoryId(order.id)) && (
-                <OrderDeliveryPanel
-                  busy={Boolean(delivery?.busy) || busy}
-                  onMove={delivery?.onMove}
-                  onSave={delivery?.onSave}
-                  order={rawOrderById.get(canonicalInventoryId(order.id))}
-                  settings={deliverySettings}
-                  shopName={delivery?.shopName || ""}
-                  user={user}
-                />
-              )}
-              <div className="button-row order-actions">
-                {order.actions.map((action) => (
-                  <button
-                    className={action.tone === "primary" ? "primary-button" : action.tone === "danger" ? "danger-text-button" : "table-action"}
-                    disabled={busy}
-                    key={action.to}
-                    type="button"
-                    onClick={() => runOrderAction(order, action)}
-                  >
-                    {action.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
-        </ModuleCard>
-      ))}
-
-      {board.finished.length > 0 && (
-        <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Delivered, returned and cancelled orders, so you can check what went out.">
-          <DataTable headers={markNumericColumns(["Order", "Customer", "Status", "Carrier", "Value"], { also: ["Value"] })}>
-            {board.finished.map((order) => (
-              <tr key={order.id}>
-                <td>{order.orderNo}</td>
-                <td>{order.customerName}</td>
-                <td>{labelFor("orderStatus", order.status)}</td>
-                <td>{order.carrier || MISSING_VALUE}</td>
-                <td>{money(order.value)}</td>
-              </tr>
-            ))}
-          </DataTable>
-        </ModuleCard>
+      {(order.carrier || actions.some((action) => action.needsCarrier)) && (
+        <section className="orders-detail-section">
+          <h3>Sending</h3>
+          {order.carrier && (
+            <p className="form-note">
+              Carried by <strong>{order.carrier}</strong>
+              {order.carrierReference ? ` · ${order.carrierReference}` : ""}
+              {order.trackingUrl ? (
+                <> · <a href={order.trackingUrl} rel="noreferrer" target="_blank">tracking link</a></>
+              ) : ""}
+            </p>
+          )}
+          {actions.some((action) => action.needsCarrier) && (
+            <Field label="Who is carrying it">
+              <input
+                autoFocus={focus === "send"}
+                onChange={(event) => onCarrierChange(event.target.value)}
+                placeholder="Rapido, Porter, our own delivery..."
+                value={carrier}
+              />
+            </Field>
+          )}
+          {actions.some((action) => action.needsCarrier) && <p className="form-note">Send opens the bill on POS at the rates you quoted.</p>}
+        </section>
       )}
-      </>)}
-    </section>
+
+      {raw && (
+        <div ref={deliveryRef}>
+        <OrderDeliveryPanel
+          busy={Boolean(delivery?.busy) || busy}
+          onMove={delivery?.onMove}
+          onSave={delivery?.onSave}
+          order={raw}
+          settings={deliverySettings}
+          shopName={delivery?.shopName || ""}
+          startOpen={focus === "delivery"}
+          user={user}
+        />
+        </div>
+      )}
+    </OrdersSheet>
+  );
+}
+
+/**
+ * Taking an order: who it is for, then items picked the way POS picks them, from what the counter
+ * can sell right now less what other orders hold (local/orderStock.js).
+ */
+function NewOrderSheet({ busy = false, draft, error = "", onChange, onClear, onClose, onReloadShelf, onSubmit, pickList }) {
+  const money = (value) => currency.format(Number(value || 0));
+  const [search, setSearch] = useState("");
+  const quantityRefs = useRef({});
+  const [focusLine, setFocusLine] = useState(null);
+  useEffect(() => {
+    if (focusLine === null) return;
+    const input = quantityRefs.current[focusLine.index];
+    input?.focus();
+    input?.select();
+  }, [focusLine]);
+
+  const itemById = new Map(pickList.items.map((item) => [item.id, item]));
+  const itemFor = (line) => itemById.get(canonicalInventoryId(line.product_id)) || null;
+  const matches = searchOrderPickList(pickList.items, search);
+  const setLine = (index, patch) => onChange({
+    ...draft,
+    items: draft.items.map((line, position) => (position === index ? { ...line, ...patch } : line)),
+  });
+  const addItem = (item) => {
+    const existing = draft.items.findIndex((line) => canonicalInventoryId(line.product_id) === item.id);
+    if (existing >= 0) {
+      // Already on the order: go to its quantity rather than adding a second line of it.
+      setFocusLine((current) => ({ index: existing, seq: (current?.seq || 0) + 1 }));
+      return;
+    }
+    // Today's rate, as POS would charge it, prefilled. Most orders are quoted at the rate on the
+    // board, and a blank left blank became an order worth Rs 0.
+    onChange({ ...draft, items: [...draft.items, { product_id: String(item.productId), quantity: "", agreed_rate: item.rate ? String(item.rate) : "" }] });
+    setFocusLine((current) => ({ index: draft.items.length, seq: (current?.seq || 0) + 1 }));
+  };
+  const otherLinesOf = (index, productId) => draft.items
+    .filter((line, position) => position !== index && canonicalInventoryId(line.product_id) === canonicalInventoryId(productId))
+    .reduce((total, line) => total + (Number(line.quantity) || 0), 0);
+  const total = draft.items.reduce((sum, line) => sum + (Number(line.quantity) || 0) * (Number(line.agreed_rate) || 0), 0);
+
+  return (
+    <OrdersSheet
+      eyebrow="Stock is set aside the moment you save"
+      footer={(
+        <div className="orders-compose-foot">
+          <span className="orders-compose-total">
+            <span>{draft.items.length === 1 ? "1 item" : `${draft.items.length} items`}</span>
+            <strong>{money(total)}</strong>
+          </span>
+          <div className="button-row">
+            <button className="table-action" disabled={busy} onClick={onClear} type="button">Clear</button>
+            <button className="secondary-button" disabled={busy} onClick={onClose} type="button">Close</button>
+            <button className="primary-button" disabled={busy} type="button" onClick={onSubmit}>{busy ? "Saving…" : "Save order"}</button>
+          </div>
+        </div>
+      )}
+      onClose={onClose}
+      title="New order"
+      wide
+    >
+      <div className="orders-compose">
+        <div className="orders-compose-form">
+          {error && <div className="error-banner" role="alert">{error}</div>}
+          <div className="orders-detail-grid">
+            <Field label={<RequiredLabel>Customer name</RequiredLabel>}>
+              <input autoFocus onChange={(event) => onChange({ ...draft, customer_name: event.target.value })} placeholder="Who is ordering" value={draft.customer_name} />
+            </Field>
+            <Field label="Mobile">
+              <input inputMode="tel" onChange={(event) => onChange({ ...draft, customer_mobile: event.target.value })} placeholder="For the delivery" value={draft.customer_mobile} />
+            </Field>
+          </div>
+          <Field label="Delivery address">
+            <input onChange={(event) => onChange({ ...draft, delivery_address: event.target.value })} placeholder="Where it is going" value={draft.delivery_address} />
+          </Field>
+          <div aria-label="How did it come in" className="orders-source" role="radiogroup">
+            <span className="orders-source-label">Came in by</span>
+            {ORDER_SOURCES.map((source) => (
+              <button
+                aria-checked={draft.source === source.value}
+                className={draft.source === source.value ? "orders-source-pill orders-source-pill-active" : "orders-source-pill"}
+                key={source.value}
+                onClick={() => onChange({ ...draft, source: source.value })}
+                role="radio"
+                type="button"
+              >
+                {source.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="orders-lines">
+            <div className="orders-lines-head">
+              <span>Item</span><span>Quantity</span><span>Rate</span><span>Amount</span><span aria-hidden="true" />
+            </div>
+            {draft.items.length === 0 && <p className="orders-lines-empty">Tap an item on the right to add it.</p>}
+            {draft.items.map((line, index) => {
+              const item = itemFor(line);
+              const check = checkOrderQuantity({ item, quantity: line.quantity, otherLines: otherLinesOf(index, line.product_id) });
+              const unit = item ? unitDisplayName(item.unit) : "";
+              return (
+                <div className={check.ok ? "orders-line" : "orders-line orders-line-problem"} key={`${line.product_id}-${index}`}>
+                  <span className="orders-line-name">
+                    <strong>{item?.name || "Item no longer on the shelf"}</strong>
+                    {item && <small>{counterQuantityWithUnit(item.available, item.unit)} free{unit && unit !== MISSING_VALUE ? ` · rate per ${unit}` : ""}</small>}
+                  </span>
+                  <span className="orders-line-input">
+                    <input
+                      aria-label={`Quantity of ${item?.name || "item"}`}
+                      className="numeric-input"
+                      onChange={(event) => setLine(index, { quantity: event.target.value })}
+                      placeholder="0.000"
+                      ref={(element) => { quantityRefs.current[index] = element; }}
+                      step="0.001"
+                      type="number"
+                      value={line.quantity}
+                    />
+                  </span>
+                  {/* The rate the customer is quoted today, kept for when the order ships. Produce
+                      rates move daily and a customer quoted 80 on Monday is owed 80 on Thursday. */}
+                  <span className="orders-line-input">
+                    <input aria-label={`Rate agreed for ${item?.name || "item"}`} className="numeric-input" onChange={(event) => setLine(index, { agreed_rate: event.target.value })} placeholder="0.00" step="0.01" type="number" value={line.agreed_rate} />
+                  </span>
+                  <span className="orders-line-amount">{money((Number(line.quantity) || 0) * (Number(line.agreed_rate) || 0))}</span>
+                  <button
+                    aria-label={`Remove ${item?.name || "this line"}`}
+                    className="remove-button"
+                    onClick={() => onChange({ ...draft, items: draft.items.filter((_, position) => position !== index) })}
+                    type="button"
+                  >
+                    <Icon name="close" size={14} />
+                  </button>
+                  {!check.ok && <p className="orders-line-problem-text" role="alert">{check.message}</p>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="orders-picker">
+          <label className="orders-picker-search">
+            <Icon name="search" size={16} />
+            <input aria-label="Search items" onChange={(event) => setSearch(event.target.value)} placeholder="Search what is in stock" value={search} />
+          </label>
+          {!pickList.usable ? (
+            // Never an empty list that looks like a sold-out shop: the shelf could not be read, and
+            // this says so.
+            <div className={pickList.status === ORDER_SHELF_STATUS.LOADING ? "orders-picker-note" : "warning-note orders-picker-note"} role={pickList.status === ORDER_SHELF_STATUS.LOADING ? "status" : "alert"}>
+              {pickList.message}
+              {pickList.status === ORDER_SHELF_STATUS.ERROR && (
+                <div className="button-row"><button className="secondary-button compact-button" onClick={onReloadShelf} type="button">Try again</button></div>
+              )}
+            </div>
+          ) : pickList.items.length === 0 ? (
+            <div className="cart-empty orders-picker-note">No items are available to order. {pickList.message}</div>
+          ) : (
+            <ul className="orders-pick-list">
+              {matches.map((item) => {
+                const added = draft.items.some((line) => canonicalInventoryId(line.product_id) === item.id);
+                return (
+                  <li key={item.id}>
+                    <button className={added ? "orders-pick orders-pick-added" : "orders-pick"} onClick={() => addItem(item)} type="button">
+                      <span className="orders-pick-name">
+                        <strong>{item.name}</strong>
+                        <small>
+                          {counterQuantityWithUnit(item.available, item.unit)} free
+                          {item.reserved > 0 ? ` · ${counterQuantityWithUnit(item.reserved, item.unit)} held` : ""}
+                        </small>
+                      </span>
+                      <span className="orders-pick-rate">
+                        {item.rate ? posRateLabel({ min: item.rate, max: item.rate, unit: item.unit, format: (value) => currency.format(value) }) : "No rate"}
+                        {added && <em>Added</em>}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+              {matches.length === 0 && <li className="orders-picker-note">Nothing in stock matches “{search}”.</li>}
+            </ul>
+          )}
+          {pickList.usable && pickList.held.length > 0 && (
+            <p className="orders-picker-held">All held for other orders: {pickList.held.map((item) => item.name).join(", ")}</p>
+          )}
+        </div>
+      </div>
+    </OrdersSheet>
   );
 }
 
@@ -23558,8 +23962,11 @@ const deliveryAttemptSummary = (delivery) => {
  * The Delivery part of an order card: the attempts so far, the current one with its buttons, and
  * Book delivery (or Book again after a failed attempt) when the order may have one.
  */
-function OrderDeliveryPanel({ busy = false, onMove, onSave, order, settings, shopName = "", user }) {
-  const [draft, setDraft] = useState(null);
+function OrderDeliveryPanel({ busy = false, onMove, onSave, order, settings, shopName = "", startOpen = false, user }) {
+  // Opened from a card's "Book delivery": the form is already open, filled from the order.
+  const [draft, setDraft] = useState(() => (startOpen && canStartDelivery(order).ok
+    ? newDeliveryDraft({ order, settings, previous: latestDeliveryOf(order) })
+    : null));
   const [formError, setFormError] = useState("");
   const [saving, setSaving] = useState(false);
   const attempts = deliveriesOf(order);
@@ -23672,55 +24079,59 @@ function DeliveriesBoard({ busy = false, onMove, onReload, orders = [], settings
 
   return (
     <>
-      <ModuleCard
-        eyebrow="Deliveries"
-        title="Deliveries on the way"
-        subtitle={`Rapido, Uber and own-staff deliveries. A card turns red after ${Number.isFinite(overdueMinutes) && overdueMinutes > 0 ? overdueMinutes : 45} minutes in one step.`}
-      >
-        <div className="button-row orders-toolbar">
-          <span className="pill">{board.openCount} open</span>
-          {board.overdueCount > 0 && <span className="pill delivery-late-pill">{board.overdueCount} late</span>}
-          {board.toCloseCount > 0 && <span className="pill">{board.toCloseCount} to close</span>}
-          <button className="table-action" type="button" onClick={onReload}>Refresh</button>
-        </div>
-        {settingsNote && <div className="warning-note" role="status">{settingsNote}</div>}
-        {board.problems.map((problem) => <div className="warning-note" key={problem.key} role="alert">{problem.message}</div>)}
-        <p className="form-note">To book a delivery, open the order on the Orders tab and press Book delivery.</p>
-      </ModuleCard>
-      {board.columns.map((column) => (
-        <ModuleCard eyebrow={column.hint} key={column.key} title={`${column.label} (${column.cards.length})`}>
-          {column.cards.length === 0 && <p className="form-note">Nothing here right now.</p>}
-          {column.cards.map((card) => {
-            const { delivery, order } = card;
-            const late = card.overdue ? minutesLabel(card.minutes) : "";
-            return (
-              <div className={card.overdue ? "content-card order-card delivery-card delivery-card-late" : "content-card order-card delivery-card"} key={card.key}>
-                <div className="carrier-top">
-                  <strong>{order.order_no || "Order"} · {delivery.customer_name || order.customer_name || "Customer"}</strong>
-                  <span>
-                    {late ? <span className="delivery-late">late {late}</span> : (card.minutes !== null && card.status !== DELIVERY_STATUS.CLOSED ? `${minutesLabel(card.minutes)} in ${deliveryStatusLabel(card.status).toLowerCase()}` : deliveryStatusLabel(card.status))}
-                  </span>
-                </div>
-                <p className="form-note">
-                  {providerLabel(delivery.provider)} · attempt {delivery.attempt_no || "?"}
-                  {delivery.area_name ? ` · ${delivery.area_name}` : ""}
-                  {delivery.address ? ` · ${delivery.address}` : ""}
-                  {delivery.landmark ? ` (near ${delivery.landmark})` : ""}
-                </p>
-                <div className="delivery-rider">
-                  <div>
-                    <span className="eyebrow">Rider</span>
-                    <strong className="delivery-rider-phone">{delivery.rider_phone ? formatIndianMobile(delivery.rider_phone) : "No number yet"}</strong>
-                    <span>{delivery.rider_name || (delivery.rider_phone ? "" : "Add it with Edit details on the order")}</span>
+      <div className="orders-chips">
+        <span className="orders-chip"><strong>{board.openCount}</strong> open</span>
+        {board.overdueCount > 0 && <span className="orders-chip orders-chip-danger"><strong>{board.overdueCount}</strong> late</span>}
+        {board.toCloseCount > 0 && <span className="orders-chip"><strong>{board.toCloseCount}</strong> to close</span>}
+        <span className="orders-chips-note">
+          Rapido, Uber and own-staff deliveries. A card turns red after {Number.isFinite(overdueMinutes) && overdueMinutes > 0 ? overdueMinutes : 45} minutes in one step. To book one, open the order on the Orders tab.
+        </span>
+        {onReload && <button aria-label="Refresh deliveries" className="orders-icon-button orders-chips-end" onClick={onReload} title="Refresh" type="button"><Icon name="refresh" size={16} /></button>}
+      </div>
+      {settingsNote && <div className="warning-note" role="status">{settingsNote}</div>}
+      {board.problems.map((problem) => <div className="warning-note" key={problem.key} role="alert">{problem.message}</div>)}
+      <div className="orders-board orders-board-deliveries" style={{ "--orders-columns": board.columns.length }}>
+        {board.columns.map((column) => (
+          <section aria-label={column.label} className="orders-column" key={column.key}>
+            <header className="orders-column-head" title={column.hint}>
+              <span>{column.label}</span>
+              <span className="orders-column-count">{column.cards.length}</span>
+            </header>
+            <div className="orders-column-body">
+              {column.cards.length === 0 && <p className="orders-column-empty">Nothing here</p>}
+              {column.cards.map((card) => {
+                const { delivery, order } = card;
+                const late = card.overdue ? minutesLabel(card.minutes) : "";
+                return (
+                  <div className={card.overdue ? "orders-card order-card delivery-card delivery-card-late" : "orders-card order-card delivery-card"} key={card.key}>
+                    <div className="carrier-top">
+                      <strong>{order.order_no || "Order"} · {delivery.customer_name || order.customer_name || "Customer"}</strong>
+                      <span>
+                        {late ? <span className="delivery-late">late {late}</span> : (card.minutes !== null && card.status !== DELIVERY_STATUS.CLOSED ? `${minutesLabel(card.minutes)} in ${deliveryStatusLabel(card.status).toLowerCase()}` : deliveryStatusLabel(card.status))}
+                      </span>
+                    </div>
+                    <p className="form-note">
+                      {providerLabel(delivery.provider)} · attempt {delivery.attempt_no || "?"}
+                      {delivery.area_name ? ` · ${delivery.area_name}` : ""}
+                      {delivery.address ? ` · ${delivery.address}` : ""}
+                      {delivery.landmark ? ` (near ${delivery.landmark})` : ""}
+                    </p>
+                    <div className="delivery-rider">
+                      <div>
+                        <span className="eyebrow">Rider</span>
+                        <strong className="delivery-rider-phone">{delivery.rider_phone ? formatIndianMobile(delivery.rider_phone) : "No number yet"}</strong>
+                        <span>{delivery.rider_name || (delivery.rider_phone ? "" : "Add it with Edit details on the order")}</span>
+                      </div>
+                      {delivery.rider_phone && <TelQr phone={delivery.rider_phone} size={96} />}
+                    </div>
+                    <DeliveryControls busy={busy} delivery={delivery} onMove={onMove} order={order} settings={settings} shopName={shopName} />
                   </div>
-                  {delivery.rider_phone && <TelQr phone={delivery.rider_phone} />}
-                </div>
-                <DeliveryControls busy={busy} delivery={delivery} onMove={onMove} order={order} settings={settings} shopName={shopName} />
-              </div>
-            );
-          })}
-        </ModuleCard>
-      ))}
+                );
+              })}
+            </div>
+          </section>
+        ))}
+      </div>
     </>
   );
 }
@@ -29213,7 +29624,7 @@ const newCartLineId = () => {
   return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
-function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, comboProblems = null, packing = null, onPackingShortages, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, shortcutsPaused = false, syncInBackground, user }) {
+function PosBilling({ onOpenOrders = null, productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], combos = null, comboProblems = null, packing = null, onPackingShortages, connectivityMode, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onDiscountsStale, onInvoice, onSaved, onSeedConsumed, onWorkChange, offlineMode = false, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, shortcutsPaused = false, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -29439,6 +29850,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    * local/reservedStock.js.
    */
   const reservedIndex = useMemo(() => buildReservedIndex(orders), [orders]);
+  // Orders still waiting on this shop (to pack or to send), for the Orders button in the header.
+  const openOrderCount = useMemo(
+    () => (Array.isArray(orders) ? orders : []).filter((order) => [ORDER_STATUS.RECEIVED, ORDER_STATUS.PACKED].includes(order?.status)).length,
+    [orders],
+  );
 
   /**
    * On-hand for a product, looked up the way the reserved index is keyed.
@@ -29792,8 +30208,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // A tap adds one unit, or the rest of a lot holding less than one (local/posCheckout.js), so the
     // last 0.75 kg of a lot can be sold. The lot check below then sees the real quantity.
     const addQuantity = weighed ?? lotTapQuantity({ available: availableStock, inCart: getCartQuantityForLot(lot.id) });
-    const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
-    const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
+    // The lot's rate, else the product's: one rule, shared with the order form (local/orderStock.js).
+    const defaultRate = posLotRate(lot, product);
     // While a customer's-choice combo is open, the product joins it (local/combos.js): priced by the
     // combo, so no lot discount. A combo's line and a loose line of the same lot never merge.
     const comboTag = customBuild ? { ...customComboTag(customBuild.combo, customBuild.key, { roundingRule: saleRateSettings.rounding_rule }), combo_base_rate: defaultRate } : null;
@@ -30908,7 +31324,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     }
     if (event.key === "F4") {
       event.preventDefault();
-      checkout(true);
+      // The same as the Checkout button: Settings' "Auto print after billing" decides printing.
+      checkout(false);
     }
     if (event.key === "F6" && effectiveQuantityMode === "SCALE") {
       event.preventDefault();
@@ -31049,7 +31466,16 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               <h2>Add items</h2>
               <p>Search for a product or scan its barcode.</p>
             </div>
-            <span className="shortcut-hint">F2 Search · F3 Barcode · F4 Checkout & Print{effectiveQuantityMode === "SCALE" ? " · F6 Weight" : ""}</span>
+            <div className="pos-heading-tools">
+              {onOpenOrders && (
+                // Orders sit beside the till (owner, 22 Nov 2026): phone orders are worked between
+                // walk-ins, and the count says whether any are waiting.
+                <button className="secondary-button compact-button pos-orders-button" onClick={onOpenOrders} title={openOrderCount ? `${openOrderCount} open order${openOrderCount === 1 ? "" : "s"} to pack or send` : "Open Orders"} type="button">
+                  <Icon name="parcel" size={15} /> Orders{openOrderCount > 0 && <span className="pos-orders-count">{openOrderCount}</span>}
+                </button>
+              )}
+              <span className="shortcut-hint">F2 Search · F3 Barcode · F4 Checkout{effectiveQuantityMode === "SCALE" ? " · F6 Weight" : ""}</span>
+            </div>
           </div>
           {/* Only where a weighing scale is switched on in Settings. Without one there is nothing to
               choose: quantities are typed, and a disabled Read Weight button only took a row. */}
@@ -31225,6 +31651,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                     <strong>{product.product_name}</strong>
                     {/* The stock once, with its unit and the lots it sits in: "68 Kg · 4 lots". */}
                     <span className={stock <= 5 ? "product-result-stock stock-low" : "product-result-stock"}>{posTileStockLine({ stock, unit: product.unit, lotCount: activeLots.length })}</span>
+                    {/* What orders already hold of it, and what that leaves free (local/orderStock.js). */}
+                    {heldForOrdersNote({ onHand: stock, reserved: reservedForProduct(reservedIndex, product.id), unit: product.unit }) && (
+                      <span className="product-result-held" title={heldForOrdersNote({ onHand: stock, reserved: reservedForProduct(reservedIndex, product.id), unit: product.unit })}>{heldForOrdersNote({ onHand: stock, reserved: reservedForProduct(reservedIndex, product.id), unit: product.unit })}</span>
+                    )}
                     {posSearching && posTabs.length > 1 && (
                       <span className="product-result-meta"><span className="product-result-section">{posTabFor("retail").label}</span></span>
                     )}
@@ -31492,16 +31922,18 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           )}
           <SaveNotice className="pos-checkout-notice" notice={checkoutNotice} />
         <div className="button-row checkout-actions">
+          {/* One way to finish a bill. The saved bill opens on screen with its own Print and WhatsApp
+              buttons, and prints by itself when Settings > Auto print after billing is on, so a second
+              checkout button that also printed only made the cashier choose (owner, 22 Nov 2026). */}
           <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError) || totals.chargeRefusals.length > 0} onClick={() => checkout(false)}>
-            <Icon name="receipt" /> {saving ? "Saving…" : "Checkout"}
-          </button>
-          <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
-            <Icon name="print" /> Print Bill
-          </button>
-          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment || Boolean(totals.manualBillError) || totals.chargeRefusals.length > 0} onClick={() => checkout(true)}>
-            <Icon name="print" /> Checkout & Print
+            <Icon name="receipt" /> {saving ? "Saving…" : "Checkout"}<kbd className="checkout-key">F4</kbd>
           </button>
         </div>
+        {lastInvoice && (
+          <button className="checkout-reprint" disabled={saving} onClick={printLastInvoice} type="button">
+            Reprint last bill{lastInvoice.invoice_no ? ` (${lastInvoice.invoice_no})` : ""}
+          </button>
+        )}
         {saveNotice && (
           <div className="warning-note pos-discount-notice" role="alert">
             {saveNotice}
