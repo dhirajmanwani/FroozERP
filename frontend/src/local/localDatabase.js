@@ -380,3 +380,67 @@ export async function setLocalCustomerOrderStatus({ orderId, nextStatus, patch =
     patch,
   });
 }
+
+/**
+ * Record whether an order has been paid (`UNPAID`, `PAID`, `ON_DELIVERY`) on this device. Null outside
+ * the desktop shell, like the wrappers above.
+ */
+export async function setLocalCustomerOrderPayment({ orderId, paymentState, paymentReference } = {}) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_set_customer_order_payment", {
+    orderId: String(orderId || ""),
+    paymentState: String(paymentState || ""),
+    // Left out entirely (null) when only the answer changed, so the stored reference is kept;
+    // a string, blank included, replaces it.
+    paymentReference: paymentReference === undefined || paymentReference === null ? null : String(paymentReference),
+  });
+}
+
+/**
+ * Deliveries of customer orders, held on this device.
+ *
+ * Every delivery rides inside its order's sync record: the Rust side writes the delivery, bumps the
+ * order's version and queues the whole order in one transaction, so nothing here talks to the
+ * cloud. Ids are opaque strings and are passed through as text, never `Number()`-ed.
+ *
+ * Each returns `null` outside the desktop shell, for the same reason as the order wrappers above: a
+ * caller that read null as "no deliveries" would show an empty board instead of an error.
+ */
+export async function saveLocalDelivery(delivery) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_save_delivery", { delivery });
+}
+
+export async function setLocalDeliveryStatus({ deliveryId, nextStatus, patch = null } = {}) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_set_delivery_status", {
+    deliveryId: String(deliveryId || ""),
+    nextStatus: String(nextStatus || ""),
+    patch: patch && typeof patch === "object" ? patch : null,
+  });
+}
+
+/** Resolves to `{ deliveries: [...] }`; each row also carries `order_no`, `order_status`, `branch_id`. */
+export async function listLocalDeliveries() {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_list_deliveries");
+}
+
+/**
+ * This branch's delivery settings as last saved on this device: `{ branch_id, settings, dirty,
+ * updated_at }`. Also `null` when nothing has been saved yet, so callers tell the two apart with
+ * `isTauriRuntime()`, never by treating null as defaults.
+ */
+export async function getLocalDeliverySettings(branchId) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_get_delivery_settings", { branchId: String(branchId ?? "") });
+}
+
+export async function saveLocalDeliverySettings({ branchId, settings, dirty = false } = {}) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_save_delivery_settings", {
+    branchId: String(branchId ?? ""),
+    settings: settings && typeof settings === "object" ? settings : {},
+    dirty: Boolean(dirty),
+  });
+}

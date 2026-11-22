@@ -569,3 +569,130 @@ test("POST /api/sync/push carries a customer order end to end", async () => {
     clearConnectionResponder();
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// Deliveries carried inside the order (Delivery module, 22 Nov 2026)
+// ---------------------------------------------------------------------------------------------
+
+const DELIVERY = {
+  id: "d-1",
+  order_id: "ORD-2026-08-27-0001",
+  attempt_no: 1,
+  provider: "rapido",
+  paid_by: "customer",
+  quoted_paise: 0,
+  status: "booked",
+  events: [{ id: "e-1", from_status: null, to_status: "pending", at: "2026-08-27T06:00:00.000Z" }],
+};
+
+const upsertClient = (returned = storedOrderRow()) => scriptedClient([
+  NO_REPLAY,
+  STORE_ACK,
+  [/FROM customer_orders WHERE global_id/, { rows: [], rowCount: 0 }],
+  [/INSERT INTO customer_orders/, { rows: [returned], rowCount: 1 }],
+  [/INSERT INTO sync_change_log/, CHANGE_LOG_ROW],
+]);
+
+test("deliveries in the payload are sanitised and stored as JSON in $33", async () => {
+  const client = upsertClient();
+  const ack = await processSyncOperation(client, orderOperation({ payload: orderPayload({ deliveries: [DELIVERY] }) }), context());
+  assert.equal(ack.status, "accepted", ack.message);
+  const insert = oneStatement(client, /INSERT INTO customer_orders/);
+  assert.match(insert.sql, /deleted_at, deliveries, payment_state, amount_paid, payment_reference, payment_marked_at,\s+updated_at\s*\)/);
+  assert.match(insert.sql, /\$33::jsonb/);
+  assert.equal(insert.values.length, 38);
+  const stored = JSON.parse(insert.values[32]);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].id, "d-1");
+  assert.strictEqual(stored[0].quoted_paise, 0, "a free delivery stays 0 paise");
+  assert.equal(stored[0].events[0].delivery_id, "d-1");
+  // The earlier positional parameters did not move.
+  assert.equal(insert.values[3], 1);
+  assert.equal(insert.values[4], SESSION_BRANCH_ID);
+  assert.equal(insert.values[27], 3);
+});
+
+test("a push without deliveries (an older app version) keeps the stored ones", async () => {
+  for (const payload of [orderPayload(), orderPayload({ deliveries: null })]) {
+    const client = upsertClient();
+    const ack = await processSyncOperation(client, orderOperation({ payload }), context());
+    assert.equal(ack.status, "accepted", ack.message);
+    const insert = oneStatement(client, /INSERT INTO customer_orders/);
+    assert.strictEqual(insert.values[32], null, "absent is NULL, never an empty list");
+    assert.match(
+      insert.sql,
+      /deliveries = COALESCE\(EXCLUDED\.deliveries, customer_orders\.deliveries\)/,
+      "the update must fall back to what is stored when the push carries none",
+    );
+  }
+});
+
+test("the payment answer is stored, and a push that does not carry it keeps the stored one", async () => {
+  const paid = upsertClient();
+  const ack = await processSyncOperation(paid, orderOperation({
+    payload: orderPayload({ payment_state: "paid", amount_paid: 250, payment_reference: "  UPI 123  ", payment_marked_at: "2026-11-22T06:00:00Z" }),
+  }), context());
+  assert.equal(ack.status, "accepted", ack.message);
+  const insert = oneStatement(paid, /INSERT INTO customer_orders/);
+  assert.deepEqual(insert.values.slice(33), [true, "PAID", 250, "UPI 123", "2026-11-22T06:00:00.000Z"]);
+  assert.match(insert.sql, /payment_state = CASE WHEN \$34::boolean THEN EXCLUDED\.payment_state ELSE customer_orders\.payment_state END/);
+
+  const silent = upsertClient();
+  await processSyncOperation(silent, orderOperation({ payload: orderPayload() }), context());
+  assert.strictEqual(oneStatement(silent, /INSERT INTO customer_orders/).values[33], false, "no key = keep what is stored");
+
+  const undecided = upsertClient();
+  await processSyncOperation(undecided, orderOperation({ payload: orderPayload({ payment_state: null }) }), context());
+  assert.deepEqual(oneStatement(undecided, /INSERT INTO customer_orders/).values.slice(33, 35), [true, null], "a present null is a real answer");
+});
+
+test("an unknown payment answer or amount rejects the order by name", async () => {
+  for (const [extra, pattern] of [
+    [{ payment_state: "MAYBE" }, /payment_state/],
+    [{ payment_state: "PAID", amount_paid: -1 }, /amount_paid/],
+    [{ payment_state: "PAID", payment_marked_at: "yesterday" }, /payment_marked_at/],
+  ]) {
+    const client = scriptedClient([NO_REPLAY, STORE_ACK]);
+    const ack = await processCustomerOrderOperation(client, orderOperation({ payload: orderPayload(extra) }), context());
+    assert.equal(ack.status, "rejected");
+    assert.equal(ack.error_code, "VALIDATION_ERROR");
+    assert.match(ack.message, pattern);
+    assert.equal(statementsMatching(client, /INSERT INTO customer_orders/).length, 0);
+  }
+});
+
+test("an empty deliveries list is stored as an empty list", async () => {
+  const client = upsertClient();
+  await processSyncOperation(client, orderOperation({ payload: orderPayload({ deliveries: [] }) }), context());
+  assert.strictEqual(oneStatement(client, /INSERT INTO customer_orders/).values[32], "[]");
+});
+
+test("malformed deliveries reject the order by name, and never throw or write", async () => {
+  const cases = [
+    [{ deliveries: "lots" }, /deliveries must be a list/],
+    [{ deliveries: [{ ...DELIVERY, status: "lost" }] }, /delivery 1 has an unsupported status/],
+    [{ deliveries: [{ ...DELIVERY, status: "cancelled" }] }, /delivery 1 is cancelled without a reason/],
+    [{ deliveries: [{ ...DELIVERY, final_paise: -5 }] }, /final_paise must be whole paise/],
+    [{ deliveries: [{ ...DELIVERY, order_id: "ORD-SOMEONE-ELSE" }] }, /belongs to another order/],
+  ];
+  for (const [overrides, expected] of cases) {
+    const client = scriptedClient([NO_REPLAY, STORE_ACK]);
+    const ack = await processCustomerOrderOperation(client, orderOperation({ payload: orderPayload(overrides) }), context());
+    assert.equal(ack.status, "rejected", `expected a rejection for ${expected}`);
+    assert.equal(ack.error_code, "VALIDATION_ERROR");
+    assert.match(ack.message, expected);
+    assert.equal(statementsMatching(client, /INSERT INTO customer_orders/).length, 0);
+  }
+});
+
+test("the published change carries the stored deliveries, including ones an old push kept", async () => {
+  // RETURNING * hands back the merged row: an old app's push with no deliveries still publishes the
+  // stored ones, so every other device keeps seeing them.
+  const stored = [{ id: "d-1", attempt_no: 1, status: "delivered", events: [] }];
+  const client = upsertClient(storedOrderRow({ deliveries: stored }));
+  await processSyncOperation(client, orderOperation(), context());
+  const change = oneStatement(client, /INSERT INTO sync_change_log/);
+  const payload = JSON.parse(change.values[7]);
+  assert.deepEqual(payload.deliveries, stored);
+  assert.ok(Array.isArray(payload.items));
+});

@@ -54,6 +54,8 @@ const TENANT_TABLES = [
   "contra_entries", "waste_entries", "customers", "suppliers", "accounts", "stock_movements",
   // Frooz Pack (22 Oct 2026): the company's packing master and each branch's counts and history.
   "packing_types", "packing_stock", "packing_purchases", "packing_movements",
+  // Delivery module (22 Nov 2026): each branch's delivery settings.
+  "delivery_settings",
 ];
 
 const TENANT_TABLE_PATTERN = new RegExp(`\\b(?:from|join|into|update)\\s+"?(?:${TENANT_TABLES.join("|")})"?\\b`, "i");

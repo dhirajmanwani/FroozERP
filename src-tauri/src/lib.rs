@@ -2919,6 +2919,57 @@ fn local_set_customer_order_status(
 }
 
 #[tauri::command]
+fn local_set_customer_order_payment(
+    app: AppHandle,
+    order_id: String,
+    payment_state: String,
+    payment_reference: Option<String>,
+) -> Result<serde_json::Value, String> {
+    local_db::set_customer_order_payment(&app, &order_id, &payment_state, payment_reference.as_deref())
+}
+
+#[tauri::command]
+fn local_save_delivery(app: AppHandle, delivery: serde_json::Value) -> Result<serde_json::Value, String> {
+    local_db::save_delivery(&app, &delivery)
+}
+
+#[tauri::command]
+fn local_set_delivery_status(
+    app: AppHandle,
+    delivery_id: String,
+    next_status: String,
+    patch: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    local_db::set_delivery_status(
+        &app,
+        &delivery_id,
+        &next_status,
+        &patch.unwrap_or_else(|| serde_json::json!({})),
+    )
+}
+
+#[tauri::command]
+fn local_list_deliveries(app: AppHandle) -> Result<serde_json::Value, String> {
+    local_db::list_deliveries(&app)
+}
+
+/// JSON null when this branch has no saved delivery settings on this device.
+#[tauri::command]
+fn local_get_delivery_settings(app: AppHandle, branch_id: String) -> Result<serde_json::Value, String> {
+    local_db::get_delivery_settings(&app, &branch_id)
+}
+
+#[tauri::command]
+fn local_save_delivery_settings(
+    app: AppHandle,
+    branch_id: String,
+    settings: serde_json::Value,
+    dirty: bool,
+) -> Result<serde_json::Value, String> {
+    local_db::save_delivery_settings(&app, &branch_id, &settings, dirty)
+}
+
+#[tauri::command]
 fn local_db_set_smoke_value(app: AppHandle, value: String) -> Result<(), String> {
     local_db::set_smoke_value(&app, &value)
 }
@@ -3402,6 +3453,12 @@ pub fn run() {
             local_save_customer_order,
             local_list_customer_orders,
             local_set_customer_order_status,
+            local_set_customer_order_payment,
+            local_save_delivery,
+            local_set_delivery_status,
+            local_list_deliveries,
+            local_get_delivery_settings,
+            local_save_delivery_settings,
             local_db_set_smoke_value,
             local_db_get_smoke_value,
             sync_outbox_enqueue,

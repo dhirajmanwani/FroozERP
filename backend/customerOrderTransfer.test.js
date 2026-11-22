@@ -332,3 +332,26 @@ test("the arriving branch is sent the order's lines, not just its header", async
   assert.equal(upsert.payload.items.length, 1);
   assert.equal(upsert.payload.items[0].product_name, "Alphonso");
 });
+
+test("an order moved to another branch takes its delivery history with it", async () => {
+  // Delivery module (22 Nov 2026): deliveries live in customer_orders.deliveries and the UPDATE
+  // returns the whole row, so the arriving branch's UPSERT carries them. Without this the new shop
+  // would see an order with no record of the rider already booked for it.
+  const deliveries = [{ id: "d-1", order_id: ORDER_ID, attempt_no: 1, status: "failed", status_reason: "Customer not home", events: [] }];
+  const wiring = routes().map(([pattern, respond]) => (
+    String(pattern) === String(/UPDATE customer_orders/)
+      ? [pattern, { rows: [{ ...orderRow(), branch_id: BRANCH_RATANADA, entity_version: 4, deliveries }], rowCount: 1 }]
+      : [pattern, respond]
+  ));
+  const client = scriptedClient(wiring);
+  const result = await transferCustomerOrderBranch(client, {
+    orderGlobalId: ORDER_ID,
+    companyId: COMPANY_ID,
+    toBranchId: BRANCH_RATANADA,
+  });
+  assert.equal(result.ok, true);
+  const update = client.statements.find((entry) => /UPDATE customer_orders/.test(entry.sql));
+  assert.match(update.sql, /RETURNING \*/, "the whole row, deliveries included, is what gets published");
+  const [, upsert] = changeLogWrites(client);
+  assert.deepEqual(upsert.payload.deliveries, deliveries);
+});

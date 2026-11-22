@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { DELIVERY_REPORT } from "./deliveryReports.js";
 import { ORDER_REPORT } from "./orderReporting.js";
 import { REPORT_DESCRIPTIONS, describeReport } from "./reportDescriptions.js";
 
@@ -16,7 +17,8 @@ const categoryReportIds = () => {
   for (const [, list] of block.matchAll(/reports: \[([^\]]*)\]/g)) {
     for (const item of list.split(",").map((value) => value.trim()).filter(Boolean)) {
       const orderKey = item.match(/^ORDER_REPORT\.([A-Z_]+)$/);
-      ids.push(orderKey ? ORDER_REPORT[orderKey[1]] : item.replace(/^"|"$/g, ""));
+      const deliveryKey = item.match(/^DELIVERY_REPORT\.([A-Z_]+)$/);
+      ids.push(orderKey ? ORDER_REPORT[orderKey[1]] : deliveryKey ? DELIVERY_REPORT[deliveryKey[1]] : item.replace(/^"|"$/g, ""));
     }
   }
   return ids;

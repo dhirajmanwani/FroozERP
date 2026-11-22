@@ -8,6 +8,7 @@
  *
  * `reportDescriptions.test.mjs` fails if a report listed in a category has no line here.
  */
+import { DELIVERY_REPORT } from "./deliveryReports.js";
 import { ORDER_REPORT } from "./orderReporting.js";
 
 export const REPORT_DESCRIPTIONS = Object.freeze({
@@ -15,6 +16,10 @@ export const REPORT_DESCRIPTIONS = Object.freeze({
   [ORDER_REPORT.BY_PRODUCT]: "Which fruit was ordered, and how much of it.",
   [ORDER_REPORT.BY_CUSTOMER]: "Who ordered, how often, and for how much.",
   [ORDER_REPORT.FULFILMENT]: "Which orders went out, and which are still open.",
+  [DELIVERY_REPORT.DAILY]: "Deliveries each day: delivered, failed, cancelled, cost and ride time.",
+  [DELIVERY_REPORT.COST_SHARE]: "What deliveries cost as a share of each day's sales.",
+  [DELIVERY_REPORT.BY_AREA]: "Where deliveries go, what each area costs, and how often they fail.",
+  [DELIVERY_REPORT.BY_PROVIDER]: "Rapido, Uber and own staff compared on cost, failures and time.",
   salesHistory: "Every bill, with items, discounts, payment and status.",
   discountReport: "Discounts given, by product and lot, and what they cost in profit.",
   editedBills: "Bills changed after saving: who changed them, who approved, and why.",
