@@ -214,6 +214,7 @@ const modules = [
     // with, so a palette entry can open a category directly instead of landing on the index.
     sections: [
       { id: "reports/orders", label: "Order Reports", eyebrow: "Report Center", keywords: ["fulfilment", "by customer", "open orders"] },
+      { id: "reports/delivery", label: "Delivery Reports", eyebrow: "Report Center", keywords: ["rapido", "uber", "rider", "delivery cost", "by area", "by provider"] },
       { id: "reports/sales", label: "Sales Reports", eyebrow: "Report Center", keywords: ["sales history", "discount report", "bills"] },
       { id: "reports/purchase", label: "Purchase Reports", eyebrow: "Report Center", keywords: ["purchase history", "supplier bills", "mandi"] },
       { id: "reports/accounts", label: "Accounts & Ledger", eyebrow: "Report Center", keywords: ["customer ledger", "supplier ledger", "receivable", "payable", "statement"] },
@@ -273,6 +274,7 @@ const modules = [
       { group: "business", id: "settings/whatsapp", label: "WhatsApp Business Cloud API", eyebrow: "WhatsApp Settings", keywords: ["whatsapp", "send bill", "cloud api", "token"] },
       { group: "business", id: "settings/mandi-tax", label: "Origin-Based Mandi Tax", eyebrow: "Mandi Tax Settings", keywords: ["local", "imported", "purchase tax", "percentage", "gst", "tax", "mandi tax"] },
       { group: "business", id: "settings/other-charges", label: "Other Charges", eyebrow: "Charge Settings", keywords: ["crate", "labour", "delivery", "freight", "charge", "charges", "slab", "per km", "per kg", "extra"] },
+      { group: "business", id: "settings/delivery", label: "Delivery", eyebrow: "Delivery Settings", keywords: ["rapido", "uber", "rider", "pickup", "areas", "delivery charge", "whatsapp template", "late"] },
       { group: "business", id: "settings/supplier-rebate", label: "Payment-Speed Rebate Slabs", eyebrow: "Supplier Rebate Settings", keywords: ["rebate", "early payment", "discount days", "slab"] },
       { group: "business", id: "settings/sale-rate-suggestions", label: "Sale Rate Suggestions", eyebrow: "Sale Rate Settings", keywords: ["margin", "rounding", "suggested rate"] },
       { group: "business", id: "settings/bill-discount-slabs", label: "Discount on bill total", eyebrow: "Bill discounts", keywords: ["slab", "bill discount", "bill-level discount slabs", "automatic discount", "bill total", "payment mode"] },

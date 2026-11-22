@@ -151,7 +151,7 @@ test("the Report Center drill-down lists the categories Report Center actually h
   const start = app.lastIndexOf("const categories = [", anchor);
   const block = app.slice(start, app.indexOf("\n  ];", start));
   const categories = [...block.matchAll(/\{ id: "([^"]+)", title: "([^"]+)"/g)].map(([, id, title]) => ({ id, title }));
-  assert.equal(categories.length, 8, "guard against a truncated parse of the category list");
+  assert.equal(categories.length, 9, "guard against a truncated parse of the category list");
 
   const registered = navigationRegistry.find((item) => item.id === "reports").sections;
   assert.deepEqual(

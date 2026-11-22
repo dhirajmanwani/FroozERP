@@ -31,6 +31,11 @@ import {
   listLocalCustomerOrders,
   saveLocalCustomerOrder,
   setLocalCustomerOrderStatus,
+  getLocalDeliverySettings,
+  saveLocalDelivery,
+  saveLocalDeliverySettings,
+  setLocalDeliveryStatus,
+  setLocalCustomerOrderPayment,
 } from "./local/localDatabase";
 import {
   cacheOfflineSession,
@@ -63,11 +68,59 @@ import {
   ORDER_QUEUE_STATUS,
   buildOrderDraftLines,
   buildOrdersBoard,
+  presentOrder,
   resolveUnassignedQueue,
   validateOrderAction,
   validateOrderAssignment,
 } from "./local/ordersBoard";
 import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
+import {
+  DELIVERY_STATUS,
+  PAID_BY,
+  REASON_REQUIRED_STATUSES,
+  canStartDelivery,
+  deliveriesOf,
+  deliveryChargePaise,
+  latestDeliveryOf,
+  nextAttemptNo,
+  nextDeliveryStatuses,
+  openDeliveryOf,
+} from "./local/deliveryLifecycle";
+import { PROVIDER_LABEL } from "./local/deliveryProviders";
+import { DEFAULT_DELIVERY_SETTINGS, saveDeliverySettingsFlow, syncDeliverySettings } from "./local/deliverySettings";
+import {
+  DELIVERY_MESSAGE_KIND,
+  DELIVERY_PLACEHOLDERS,
+  buildCustomerMessage,
+  buildRiderCopyText,
+  formatIndianMobile,
+  formatPaise,
+  mapLink,
+  normalizeIndianMobile,
+  telLink,
+  whatsappLink,
+} from "./local/deliveryText";
+import { DELIVERY_REPORT, buildDeliveryReports, describeDeliveryReportError } from "./local/deliveryReports";
+import {
+  DELIVERY_MOVE_LABEL,
+  DELIVERY_PROVIDER_IDS,
+  DELIVERY_SENT_BUT_NOT_PICKED_UP,
+  applyDraftArea,
+  buildDeliveryBoard,
+  deliveryBillCharge,
+  deliveryStatusLabel,
+  deliveryToDraft,
+  describeDeliverySettingsSource,
+  draftToDeliveryPayload,
+  formToSettings,
+  isDeliveryEditable,
+  minutesLabel,
+  newDeliveryDraft,
+  planDeliveryMove,
+  providerLabel,
+  resolveDeliverySalesByDay,
+  settingsToForm,
+} from "./local/deliveryUi";
 import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
 import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
@@ -2720,6 +2773,10 @@ function App() {
   // inside PosBilling so the link back to the order survives POS remounting.
   const [pendingOrderBill, setPendingOrderBill] = useState(null);
   const [posSeedCart, setPosSeedCart] = useState(null);
+  // This branch's delivery settings (pickup, areas, templates). `settings` stays null until the first
+  // load answers, so the screens can tell "not read yet" from the starting values.
+  const [deliverySettingsState, setDeliverySettingsState] = useState({ loadState: "idle", settings: null, source: "", dirty: false, error: "" });
+  const [deliveryBusy, setDeliveryBusy] = useState(false);
   const [dashboardRange, setDashboardRange] = useState("7");
   const [dashboardCustomRange, setDashboardCustomRange] = useState({
     date_from: toDateKey(new Date()),
@@ -3061,6 +3118,16 @@ function App() {
     loadOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, ordersState.loadState]);
+
+  // Delivery settings, the same way and for the same reason: the Deliveries board reads the late
+  // limit from them and the delivery form reads the areas. Never a cloud call in Local Only
+  // (loadDeliverySettings asks guardCloudCall first).
+  useEffect(() => {
+    if (!user || (activeView !== "orders" && activeView !== "settings")) return;
+    if (deliverySettingsState.loadState !== "idle") return;
+    loadDeliverySettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, deliverySettingsState.loadState, user?.id]);
 
   // Consignments load when the screen opens, not at sign-in. Unlike orders these are a cloud read,
   // and a counter that never opens this screen should not be paying for it on every launch.
@@ -7516,12 +7583,20 @@ function App() {
    * would then be refused — and the storage layer refuses a billed order independently, so a bug
    * in either of these cannot bill twice.
    */
-  const advanceOrder = async (order, to, extras = {}) => {
-    const check = validateOrderAction({ order, to, carrier: extras.carrier, reason: extras.cancellation_reason });
+  // `afterStatusWrite` runs only once the order's own write has landed (a delivery marked picked
+  // up) and returns what to say if it could not be done; `billCharge` comes from deliveryBillCharge.
+  const advanceOrder = async (order, to, extras = {}, { afterStatusWrite = null, billCharge = null } = {}) => {
+    // Validated against the order's stored payment answer. The board hands over its presented order,
+    // which carries it as `paymentState` and not `payment_state`, and reading only the latter
+    // refused every Send with "say whether this order has been paid" however it had been answered.
+    const paymentState = order?.payment_state ?? order?.paymentState ?? null;
+    const check = validateOrderAction({ order: { ...order, payment_state: paymentState }, to, carrier: extras.carrier, reason: extras.cancellation_reason });
     if (!check.ok) {
       setSyncMessage(check.message);
-      return;
+      return { ok: false, message: check.message };
     }
+    // A customer-paid delivery rides on the bill as an Other Charges line (local/deliveryUi.js).
+    const deliveryChargeSeed = { charges: Array.isArray(billCharge?.charges) ? billCharge.charges : [], chargeNote: billCharge?.note || "", chargeNoteTone: billCharge?.tone || "" };
     setOrderActionBusy(true);
     try {
       // The cart is built before the status moves, and an order that cannot be billed at all is
@@ -7532,15 +7607,17 @@ function App() {
       if (to === ORDER_STATUS.SENT) {
         seed = buildOrderCartSeed(order, { products, lots: inventory });
         if (seed.lines.length === 0) {
-          setSyncMessage(`This order was not sent: nothing on it can be billed. ${describeOrderBillingProblems(seed)}`);
-          return;
+          const refusal = `This order was not sent: nothing on it can be billed. ${describeOrderBillingProblems(seed)}`;
+          setSyncMessage(refusal);
+          return { ok: false, message: refusal };
         }
       }
       await setLocalCustomerOrderStatus({ orderId: order.id, nextStatus: to, patch: extras });
+      const followUp = afterStatusWrite ? String(await afterStatusWrite() || "") : "";
       await loadOrders();
       if (to !== ORDER_STATUS.SENT) {
-        setSyncMessage("");
-        return;
+        setSyncMessage(followUp);
+        return { ok: true, message: followUp };
       }
       // Replacing any previous pending link rather than queuing: only the cart now on screen can
       // be this order's bill. Left to accumulate, a link would outlive its cart and attach itself
@@ -7556,15 +7633,176 @@ function App() {
           name: order.customerName || "",
           mobile: order.customerMobile || "",
         },
+        ...deliveryChargeSeed,
       });
-      setSyncMessage(seed.complete
+      setSyncMessage([followUp, seed.complete
         ? `Order sent. Its items are on the POS screen at the rates you quoted — confirm payment to bill it.`
-        : `Order sent, and part of it is on the POS screen. ${describeOrderBillingProblems(seed)}`);
+        : `Order sent, and part of it is on the POS screen. ${describeOrderBillingProblems(seed)}`].filter(Boolean).join(" "));
       await navigate("sales");
+      return { ok: true, message: followUp };
     } catch (error) {
-      setSyncMessage(describeLocalServiceFailure(error, "That order could not be updated"));
+      const failure = describeLocalServiceFailure(error, "That order could not be updated");
+      setSyncMessage(failure);
+      return { ok: false, message: failure };
     } finally {
       setOrderActionBusy(false);
+    }
+  };
+
+  /**
+   * Record whether an order has been paid. Its own write, not a status move: the status command
+   * does not store the answer, and a same-status "move" re-stamps the order's timestamps.
+   */
+  const setOrderPayment = async (order, paymentState) => {
+    setOrderActionBusy(true);
+    try {
+      const saved = await setLocalCustomerOrderPayment({ orderId: String(order.id), paymentState: paymentState || null });
+      if (saved === null) {
+        return { ok: false, message: "Orders are stored on this device and need the desktop app. This looks like a browser." };
+      }
+      await loadOrders();
+      return { ok: true, message: "" };
+    } catch (error) {
+      return { ok: false, message: describeLocalServiceFailure(error, "The payment answer could not be saved") };
+    } finally {
+      setOrderActionBusy(false);
+    }
+  };
+
+  /** This branch's key for delivery settings: the signed-in user's branch id, as text. */
+  const deliveryBranchKey = String(user?.branch_id ?? "");
+
+  /**
+   * The cloud half of the delivery settings, or nothing at all when a cloud call may not leave this
+   * computer (Local Only): the settings flows then work on this computer's copy alone, and no
+   * request is made.
+   */
+  const deliverySettingsCloud = () => {
+    const gate = guardCloudCall("delivery-settings", API_URL);
+    if (!gate.allowed) return { fetchCloud: undefined, pushCloud: undefined };
+    return {
+      fetchCloud: async () => (await axios.get(`${API_URL}/api/v3/delivery-settings`, { ...createOperationalReadConfig(user), timeout: 15000 })).data,
+      pushCloud: async (settings) => (await axios.put(`${API_URL}/api/v3/delivery-settings`, { settings }, { ...createOperationalReadConfig(user), timeout: 15000 })).data,
+    };
+  };
+  const deliverySettingsLocal = () => (isTauriRuntime()
+    ? {
+      readLocal: (branchId) => getLocalDeliverySettings(branchId),
+      writeLocal: (row) => saveLocalDeliverySettings(row),
+    }
+    : { readLocal: undefined, writeLocal: undefined });
+
+  /** Read this branch's delivery settings: this computer's copy, brought into line with the cloud's. */
+  const loadDeliverySettings = async () => {
+    setDeliverySettingsState((current) => ({ ...current, loadState: "loading" }));
+    try {
+      const result = await syncDeliverySettings({ branchId: deliveryBranchKey, ...deliverySettingsLocal(), ...deliverySettingsCloud() });
+      setDeliverySettingsState({ loadState: "loaded", settings: result.settings, source: result.source, dirty: Boolean(result.dirty), error: result.error || "" });
+      return result;
+    } catch (error) {
+      // syncDeliverySettings does not throw; this is for a fault in the wiring itself, which must
+      // still read as a failure rather than as the starting values.
+      const message = getErrorMessage(error, "Delivery settings could not be read");
+      setDeliverySettingsState((current) => ({ ...current, loadState: "error", error: message }));
+      return null;
+    }
+  };
+
+  /** Save the Settings -> Delivery form: on this computer first, then to the cloud when it can. */
+  const saveDeliverySettings = async (settings) => {
+    const result = await saveDeliverySettingsFlow({
+      branchId: deliveryBranchKey,
+      settings,
+      writeLocal: deliverySettingsLocal().writeLocal,
+      pushCloud: deliverySettingsCloud().pushCloud,
+    });
+    if (result.saved) {
+      setDeliverySettingsState({
+        loadState: "loaded",
+        settings: result.settings,
+        source: result.pushed ? "cloud" : "local",
+        dirty: !result.pushed,
+        error: result.pushed ? (result.error || "") : "",
+      });
+    }
+    return result;
+  };
+
+  /** Create or edit one delivery attempt. Its order's version is bumped and queued by the same write. */
+  const saveDelivery = async (payload) => {
+    setDeliveryBusy(true);
+    try {
+      const saved = await saveLocalDelivery(payload);
+      if (saved === null) {
+        return { ok: false, message: "Deliveries are stored on this device and need the desktop app. This looks like a browser." };
+      }
+      await loadOrders();
+      return { ok: true, message: "", delivery: saved };
+    } catch (error) {
+      return { ok: false, message: describeLocalServiceFailure(error, "That delivery could not be saved") };
+    } finally {
+      setDeliveryBusy(false);
+    }
+  };
+
+  /**
+   * Move a delivery, and the order with it where the two are linked (local/deliveryUi.js,
+   * planDeliveryMove):
+   *
+   * - Picked up while the order is Packed is the order's Send, which creates the bill. The order is
+   *   sent first, through `advanceOrder`, and the delivery is marked picked up only once that write
+   *   has landed. If the delivery write then fails, that is said in so many words; the order is
+   *   already Sent, so pressing Picked up again moves only the delivery.
+   * - Delivered also marks a Sent order Delivered.
+   * - Failed after pickup leaves the order Sent, ready for another attempt.
+   *
+   * @returns {Promise<{ok: boolean, message: string}>}
+   */
+  const moveDelivery = async ({ order, delivery, to, reason = "", finalInput = "" }) => {
+    const plan = planDeliveryMove({ order, delivery, to, reason, finalInput, byUser: user?.full_name || "" });
+    if (!plan.ok) return { ok: false, message: plan.message };
+    const writeDelivery = async () => {
+      const written = await setLocalDeliveryStatus({ deliveryId: String(delivery.id), nextStatus: to, patch: plan.patch });
+      if (written === null) throw new Error("Deliveries are stored on this device and need the desktop app.");
+      return written;
+    };
+    // The board's own order shape, plus the stored fields (payment_state) its checks read.
+    const orderForAdvance = { ...order, ...presentOrder(order) };
+    setDeliveryBusy(true);
+    try {
+      if (plan.orderTo === ORDER_STATUS.SENT) {
+        let deliveryProblem = "";
+        const sent = await advanceOrder(orderForAdvance, ORDER_STATUS.SENT, { ...plan.orderPatch, created_by: user?.full_name || "" }, {
+          billCharge: deliveryBillCharge({ delivery, chargeTypes }),
+          afterStatusWrite: async () => {
+            try {
+              await writeDelivery();
+            } catch (error) {
+              writeDiagnosticLog("ERROR", "delivery-pickup-after-send-failed", { message: String(error?.message || error || "") });
+              deliveryProblem = DELIVERY_SENT_BUT_NOT_PICKED_UP;
+            }
+            return deliveryProblem;
+          },
+        });
+        if (!sent.ok) return { ok: false, message: sent.message };
+        return { ok: !deliveryProblem, message: deliveryProblem };
+      }
+      await writeDelivery();
+      if (plan.orderTo === ORDER_STATUS.DELIVERED) {
+        const moved = await advanceOrder(orderForAdvance, ORDER_STATUS.DELIVERED, { created_by: user?.full_name || "" });
+        if (!moved.ok) {
+          await loadOrders();
+          return { ok: false, message: `The delivery is marked delivered, but the order is still Sent (${moved.message}). Mark the order delivered on its card.` };
+        }
+        return { ok: true, message: "" };
+      }
+      await loadOrders();
+      return { ok: true, message: "" };
+    } catch (error) {
+      await loadOrders().catch(() => null);
+      return { ok: false, message: describeLocalServiceFailure(error, "That delivery could not be updated") };
+    } finally {
+      setDeliveryBusy(false);
     }
   };
 
@@ -9855,6 +10093,7 @@ function App() {
       // from the local snapshot, so calling it here would both contact the network in LOCAL_ONLY
       // and overwrite good local data with the result.
       if (view === "orders") await loadOrders().catch(() => null);
+      if (view === "orders" || view === "settings") await loadDeliverySettings().catch(() => null);
       // POS needs them too: it refuses to sell stock that orders have already promised, and with
       // an empty list it would refuse nothing and quietly sell the same fruit twice.
       if (view === "sales") await loadOrders().catch(() => null);
@@ -9895,7 +10134,7 @@ function App() {
       // needed them, which is exactly why it was missed.
       // The waiting queue and the shop list too: without branches the "Give it to" dropdown is
       // empty and the screen looks broken, which is exactly how the order form was missed once.
-      if (view === "orders") await Promise.all([loadOrders(), loadProducts(), loadUnassignedOrders(), loadSettingsData()]);
+      if (view === "orders") await Promise.all([loadOrders(), loadProducts(), loadUnassignedOrders(), loadSettingsData(), loadDeliverySettings()]);
       if (view === "sales") await loadOrders().catch(() => null);
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
@@ -9906,6 +10145,7 @@ function App() {
       // Branches & Counters shows the device list the licences are issued against and the screen
       // lock, both of which come from the settings bundle.
       if (view === "settings" || view === "branches") await loadSettingsData();
+      if (view === "settings") await loadDeliverySettings();
       // Sale Rate Update loads itself when it opens, so it is not loaded here as well.
     } catch (error) {
       console.warn(`Unable to refresh ${view}`, error);
@@ -11904,6 +12144,9 @@ function App() {
           {activeView === "settings" && (
             <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
               <SettingsModule
+                deliverySettingsState={deliverySettingsState}
+                onReloadDeliverySettings={loadDeliverySettings}
+                onSaveDeliverySettings={saveDeliverySettings}
                 onBackupBusyChange={handleBackupBusyChange}
                 themeMode={themeMode}
                 setThemeMode={setThemeMode}
@@ -12011,6 +12254,15 @@ function App() {
               busy={orderActionBusy}
               onAdvance={advanceOrder}
               onAssign={assignOrderToBranch}
+              onSetPayment={setOrderPayment}
+              delivery={{
+                busy: deliveryBusy,
+                settingsState: deliverySettingsState,
+                shopName: (brandIdentityStore.getSnapshot() || DEFAULT_BRAND_IDENTITY).title || settingsData.businessSettings?.business_name || "",
+                onSave: saveDelivery,
+                onMove: moveDelivery,
+                onReloadSettings: loadDeliverySettings,
+              }}
               queue={orderQueueState}
               routingBusy={orderRoutingBusy}
               onReload={() => { loadOrders(); loadUnassignedOrders(); }}
@@ -18796,6 +19048,47 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
     if (!report?.ok) return [["Orders", MISSING_VALUE, true], ["Status", orderReportsState.notice || "Unavailable"]];
     return build(report.summary);
   };
+  /**
+   * The four delivery reports, from the same order list (each order carries its `deliveries`) and
+   * for the same range as the order reports, so they also answer with no internet.
+   *
+   * Sales per day for "cost as % of sales" come from the bills Report Center already loaded for this
+   * range (local or cloud). When those bills are not loaded, failed, or are for other dates, sales
+   * are passed as null and the percentage says unavailable — never 0 (local/deliveryUi.js).
+   */
+  const deliveryReportsState = (() => {
+    const loadState = ordersState.loadState || "idle";
+    if (loadState === "error") {
+      return { ready: false, failed: true, notice: ordersState.loadError || "Orders could not be read on this device, so deliveries cannot be counted.", reports: null };
+    }
+    if (loadState === "idle" || loadState === "loading") {
+      return { ready: false, failed: false, notice: "Reading this device's deliveries…", reports: null };
+    }
+    const salesByDay = resolveDeliverySalesByDay({
+      rows: Array.isArray(data.salesHistoryReport) ? data.salesHistoryReport : data.salesHistoryReport?.rows,
+      loadError: data.salesHistoryLoadError,
+      serverError: data.serverReportsError,
+      loadedFrom: data.dateFrom,
+      loadedTo: data.dateTo,
+      dateFrom: appliedQuery.date_from,
+      dateTo: appliedQuery.date_to,
+    });
+    const reports = buildDeliveryReports({ orders: ordersState.orders, salesByDay }, {
+      range: "custom",
+      date_from: appliedQuery.date_from,
+      date_to: appliedQuery.date_to,
+    });
+    return { ready: reports.ok, failed: !reports.ok, notice: describeDeliveryReportError(reports), reports };
+  })();
+  const deliveryReportRows = (key) => (
+    deliveryReportsState.reports?.[key]?.ok ? filterRows(deliveryReportsState.reports[key].rows) : []
+  );
+  /** Same rule as `orderReportSummary`: no figures while unread, never a tile of zeros. */
+  const deliveryReportSummary = (key, build) => {
+    const report = deliveryReportsState.reports?.[key];
+    if (!report?.ok) return [["Deliveries", MISSING_VALUE, true], ["Status", deliveryReportsState.notice || "Unavailable"]];
+    return build(report.summary);
+  };
   const money = (value) => currency.format(Number(value || 0));
   const number = (value) => Number(value || 0).toLocaleString("en-IN");
   const stockRows = filterRows(data.stockReport);
@@ -19499,6 +19792,114 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
         </tr>
       ),
     },
+    // ---- Deliveries ---------------------------------------------------------------------------
+    // From the same order list as the order reports, and every summary from its own rows.
+    [DELIVERY_REPORT.DAILY]: {
+      title: "Deliveries by Day",
+      rows: deliveryReportRows(DELIVERY_REPORT.DAILY),
+      summary: () => deliveryReportSummary(DELIVERY_REPORT.DAILY, (total) => [
+        ["Delivery Cost", money(total.cost), true],
+        ["Deliveries", number(total.deliveries)],
+        ["Delivered", number(total.delivered)],
+        ["Failed", number(total.failed)],
+        ["Cancelled", number(total.cancelled)],
+        ["Still Open", number(total.open)],
+        ["Shop Paid", money(total.shopCost)],
+        ["Customer Paid", money(total.customerCost)],
+        ["Average Ride", total.averageMinutes === null ? MISSING_VALUE : `${total.averageMinutes} min`],
+        ...(total.uncosted > 0 ? [["No Charge Entered", number(total.uncosted)]] : []),
+      ]),
+      headers: ["Date", "Deliveries", "Delivered", "Failed", "Cancelled", "Open", "Cost", "Shop Paid", "Customer Paid", "Average Ride"],
+      render: (row) => (
+        <tr key={row.date}>
+          <td>{row.dateLabel}</td>
+          <td>{number(row.deliveries)}</td>
+          <td>{number(row.delivered)}</td>
+          <td>{number(row.failed)}</td>
+          <td>{number(row.cancelled)}</td>
+          <td>{number(row.open)}</td>
+          <td>{money(row.cost)}</td>
+          <td>{money(row.shopCost)}</td>
+          <td>{money(row.customerCost)}</td>
+          <td>{row.averageMinutes === null ? MISSING_VALUE : `${row.averageMinutes} min`}</td>
+        </tr>
+      ),
+    },
+    // A percentage of sales that are not known is "unavailable", never 0%.
+    [DELIVERY_REPORT.COST_SHARE]: {
+      title: "Delivery Cost vs Sales",
+      rows: deliveryReportRows(DELIVERY_REPORT.COST_SHARE),
+      summary: () => deliveryReportSummary(DELIVERY_REPORT.COST_SHARE, (total) => [
+        ["Cost as % of Sales", total.costPercent === null ? "Unavailable" : `${total.costPercent}%`, true],
+        ["Shop-paid as % of Sales", total.shopCostPercent === null ? "Unavailable" : `${total.shopCostPercent}%`],
+        ["Delivery Cost", money(total.cost)],
+        ["Sales", total.sales === null ? "Unavailable" : money(total.sales)],
+        ...(Array.isArray(total.months) && total.months.length > 1
+          ? total.months.map((month) => [month.monthLabel, month.costPercent === null ? "Unavailable" : `${month.costPercent}%`])
+          : []),
+        ...(total.salesNotice ? [["Note", total.salesNotice]] : []),
+      ]),
+      headers: ["Date", "Deliveries", "Sales", "Delivery Cost", "Shop Paid", "Cost %", "Shop-paid %"],
+      render: (row) => (
+        <tr key={row.date}>
+          <td>{row.dateLabel}</td>
+          <td>{number(row.deliveries)}</td>
+          <td>{row.sales === null ? "Unavailable" : money(row.sales)}</td>
+          <td>{money(row.cost)}</td>
+          <td>{money(row.shopCost)}</td>
+          <td>{row.costPercent === null ? (row.sales === null ? "Unavailable" : MISSING_VALUE) : `${row.costPercent}%`}</td>
+          <td>{row.shopCostPercent === null ? (row.sales === null ? "Unavailable" : MISSING_VALUE) : `${row.shopCostPercent}%`}</td>
+        </tr>
+      ),
+    },
+    [DELIVERY_REPORT.BY_AREA]: {
+      title: "Deliveries by Area",
+      rows: deliveryReportRows(DELIVERY_REPORT.BY_AREA),
+      summary: () => deliveryReportSummary(DELIVERY_REPORT.BY_AREA, (total) => [
+        ["Delivery Cost", money(total.cost), true],
+        ["Areas", number(total.areas)],
+        ["Deliveries", number(total.deliveries)],
+        ["Failed", number(total.failed)],
+        ["Average Cost", total.averageCost === null ? MISSING_VALUE : money(total.averageCost)],
+      ]),
+      headers: ["Area", "Deliveries", "Delivered", "Failed", "Cancelled", "Cost", "Average Cost", "Average Ride"],
+      render: (row) => (
+        <tr key={row.areaKey || row.label}>
+          <td className="primary-cell">{row.areaName || "No area"}</td>
+          <td>{number(row.deliveries)}</td>
+          <td>{number(row.delivered)}</td>
+          <td>{number(row.failed)}</td>
+          <td>{number(row.cancelled)}</td>
+          <td>{money(row.cost)}</td>
+          <td>{row.averageCost === null ? MISSING_VALUE : money(row.averageCost)}</td>
+          <td>{row.averageMinutes === null ? MISSING_VALUE : `${row.averageMinutes} min`}</td>
+        </tr>
+      ),
+    },
+    [DELIVERY_REPORT.BY_PROVIDER]: {
+      title: "Deliveries by Provider",
+      rows: deliveryReportRows(DELIVERY_REPORT.BY_PROVIDER),
+      summary: () => deliveryReportSummary(DELIVERY_REPORT.BY_PROVIDER, (total) => [
+        ["Delivery Cost", money(total.cost), true],
+        ["Deliveries", number(total.deliveries)],
+        ["Delivered", number(total.delivered)],
+        ["Failed", number(total.failed)],
+        ["Average Ride", total.averageMinutes === null ? MISSING_VALUE : `${total.averageMinutes} min`],
+      ]),
+      headers: ["Provider", "Deliveries", "Delivered", "Failed", "Cancelled", "Cost", "Average Cost", "Average Ride"],
+      render: (row) => (
+        <tr key={row.provider || row.label}>
+          <td className="primary-cell">{row.providerLabel || row.label}{row.known === false ? <small className="cell-note">Not a known provider</small> : null}</td>
+          <td>{number(row.deliveries)}</td>
+          <td>{number(row.delivered)}</td>
+          <td>{number(row.failed)}</td>
+          <td>{number(row.cancelled)}</td>
+          <td>{money(row.cost)}</td>
+          <td>{row.averageCost === null ? MISSING_VALUE : money(row.averageCost)}</td>
+          <td>{row.averageMinutes === null ? MISSING_VALUE : `${row.averageMinutes} min`}</td>
+        </tr>
+      ),
+    },
     salesByDate: {
       title: "Sales by Date",
       rows: filterRows(data.salesReport),
@@ -19982,6 +20383,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   };
   const categories = [
     { id: "orders", title: "Order Reports", icon: "parcel", description: "Orders taken by phone, WhatsApp and at the counter: what was ordered, by whom, and what is still open. Works without internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
+    { id: "delivery", title: "Delivery Reports", icon: "parcel", description: "Rapido, Uber and own-staff deliveries: how many, what they cost, by area and by provider. Works without internet.", reports: [DELIVERY_REPORT.DAILY, DELIVERY_REPORT.COST_SHARE, DELIVERY_REPORT.BY_AREA, DELIVERY_REPORT.BY_PROVIDER] },
     { id: "sales", title: "Sales Reports", icon: "receipt", description: "Every bill with its items, discounts, payments and status.", reports: ["salesHistory", "discountReport", "editedBills", "cancelledBills"] },
     { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Every purchase with its items, bill status, payments and changes.", reports: ["purchaseHistory", "pendingPurchaseBills", "purchaseEditCancel"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
@@ -19992,7 +20394,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);
   const currentReport = reports[selectedReport];
-  const reportAvailability = resolveReportAvailability(selectedReport, data, { selfContained: Object.values(ORDER_REPORT) });
+  const reportAvailability = resolveReportAvailability(selectedReport, data, { selfContained: [...Object.values(ORDER_REPORT), ...Object.values(DELIVERY_REPORT)] });
   const profitLossLine = (label, value, options = {}) => {
     const numericValue = Number(value || 0);
     const amountClass = numericValue < 0 ? "pl-negative" : options.positive ? "pl-positive" : "";
@@ -20719,6 +21121,8 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       return renderedRows;
     };
     const isOrderReport = Object.values(ORDER_REPORT).includes(selectedReport);
+    // Delivery reports carry their own read state, from the same orders, and say it the same way.
+    const isDeliveryReport = Object.values(DELIVERY_REPORT).includes(selectedReport);
     const reportFileName = (() => {
       const from = formatFileDate(appliedQuery.date_from || data.dateFrom);
       const to = formatFileDate(appliedQuery.date_to || data.dateTo);
@@ -20743,6 +21147,7 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
       // A short total that does not say it is short is the failure `describeOrderReportError`
       // exists to prevent, so it is surfaced beside the range rather than only in a tile.
       if (isOrderReport && orderReportsState.notice) parts.push(orderReportsState.notice);
+      if (isDeliveryReport && deliveryReportsState.notice) parts.push(deliveryReportsState.notice);
       if (selectedReport === "salesHistory") {
         parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
         parts.push(`Status: ${labelFor("status", salesFilters.status)}`);
@@ -20817,14 +21222,16 @@ function ReportsModule({ accounts = [], loadPackingStock = null, canCancelSales,
                   </DataTable>
                   {rows.length === 0 && (
                     <div
-                      className={isOrderReport && orderReportsState.failed ? "error-banner" : "cart-empty"}
-                      role={isOrderReport && orderReportsState.failed ? "alert" : undefined}
+                      className={(isOrderReport && orderReportsState.failed) || (isDeliveryReport && deliveryReportsState.failed) ? "error-banner" : "cart-empty"}
+                      role={(isOrderReport && orderReportsState.failed) || (isDeliveryReport && deliveryReportsState.failed) ? "alert" : undefined}
                     >
                       {/* An order report with no rows has two very different causes, and saying
                           "no records found" for both would report a failed read as a quiet day. */}
                       {isOrderReport && !orderReportsState.ready
                         ? orderReportsState.notice
-                        : `No records found for the selected range ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}.`}
+                        : isDeliveryReport && !deliveryReportsState.ready
+                          ? deliveryReportsState.notice
+                          : `No records found for the selected range ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}.`}
                     </div>
                   )}
                 </>
@@ -22388,9 +22795,13 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], n
   );
 }
 
-function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onReload, onTakeOrder, products = [], queue, routingBusy = false, state, user }) {
+function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance, onAssign, onReload, onSetPayment, onTakeOrder, products = [], queue, routingBusy = false, state, user }) {
   const money = (value) => currency.format(Number(value || 0));
   const [assignDraft, setAssignDraft] = useState({});
+  // Orders or the Deliveries board. A tab inside Orders, not a sidebar row: the sidebar is full.
+  const [ordersTab, setOrdersTab] = useState("orders");
+  // A payment answer that could not be saved, by order id, said on that order's card.
+  const [paymentProblem, setPaymentProblem] = useState({});
   const canRoute = ["Owner", "Admin"].includes(String(user?.role || ""));
   const waiting = resolveUnassignedQueue({
     orders: queue?.orders,
@@ -22467,6 +22878,20 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
   }
 
   const board = buildOrdersBoard(state.orders);
+  // The board presents each order in its own shape; the delivery panel needs the stored order
+  // (its `deliveries`, its status), found by the same canonical id.
+  const rawOrderById = new Map((Array.isArray(state.orders) ? state.orders : []).map((raw) => [canonicalInventoryId(raw?.id), raw]));
+  const openDeliveryCount = buildDeliveryBoard({ orders: state.orders }).openCount;
+  const deliverySettings = delivery?.settingsState?.settings || DEFAULT_DELIVERY_SETTINGS;
+
+  /** "Has this been paid?" is its own write (onSetPayment), never a status move. */
+  const recordPayment = async (order, paymentState) => {
+    setPaymentProblem((current) => ({ ...current, [order.id]: "" }));
+    const result = await onSetPayment?.(order, paymentState);
+    if (!result?.ok) {
+      setPaymentProblem((current) => ({ ...current, [order.id]: result?.message || "The payment answer was not saved." }));
+    }
+  };
 
   /** Cancel asks why first; closing the box leaves the order as it is. */
   const runOrderAction = async (order, action) => {
@@ -22502,6 +22927,23 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
 
   return (
     <section className="settings-layout">
+      <div aria-label="Orders or deliveries" className="account-tabs orders-tabs" role="tablist">
+        <button aria-selected={ordersTab === "orders"} className={ordersTab === "orders" ? "account-tab account-tab-active" : "account-tab"} onClick={() => setOrdersTab("orders")} role="tab" type="button">Orders</button>
+        <button aria-selected={ordersTab === "deliveries"} className={ordersTab === "deliveries" ? "account-tab account-tab-active" : "account-tab"} onClick={() => setOrdersTab("deliveries")} role="tab" type="button">
+          Deliveries{openDeliveryCount > 0 ? ` (${openDeliveryCount})` : ""}
+        </button>
+      </div>
+      {ordersTab === "deliveries" ? (
+        <DeliveriesBoard
+          busy={Boolean(delivery?.busy) || busy}
+          onMove={delivery?.onMove}
+          onReload={onReload}
+          orders={state.orders}
+          settings={deliverySettings}
+          settingsState={delivery?.settingsState}
+          shopName={delivery?.shopName || ""}
+        />
+      ) : (<>
       {/* Orders that arrived with nobody handling them -- a website order, or a WhatsApp to the
           company number. They never reach a counter on their own: the sync road scopes by branch
           and has no notion of role, so an unassigned order on it would land on every till carrying
@@ -22704,10 +23146,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                   <select
                     disabled={busy}
                     value={order.paymentState || ""}
-                    onChange={(event) => onAdvance(order, order.status, {
-                      payment_state: event.target.value,
-                      amount_paid: event.target.value === "PAID" ? order.value : 0,
-                    })}
+                    onChange={(event) => recordPayment(order, event.target.value)}
                   >
                     <option value="">Not decided yet</option>
                     <option value="PAID">Paid</option>
@@ -22725,6 +23164,8 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                   </Field>
                 )}
               </div>
+
+              {paymentProblem[order.id] && <div className="error-banner" role="alert">{paymentProblem[order.id]}</div>}
 
               <DataTable headers={markNumericColumns(["Item", "Quantity", "Rate agreed", "Amount"])}>
                 {order.items.map((line) => (
@@ -22757,6 +23198,17 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                     value={carrierDraft[order.id] || ""}
                   />
                 </Field>
+              )}
+              {rawOrderById.has(canonicalInventoryId(order.id)) && (
+                <OrderDeliveryPanel
+                  busy={Boolean(delivery?.busy) || busy}
+                  onMove={delivery?.onMove}
+                  onSave={delivery?.onSave}
+                  order={rawOrderById.get(canonicalInventoryId(order.id))}
+                  settings={deliverySettings}
+                  shopName={delivery?.shopName || ""}
+                  user={user}
+                />
               )}
               <div className="button-row order-actions">
                 {order.actions.map((action) => (
@@ -22791,7 +23243,481 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
           </DataTable>
         </ModuleCard>
       )}
+      </>)}
     </section>
+  );
+}
+
+/**
+ * Open WhatsApp on a customer's chat with a message typed in.
+ *
+ * In the Windows app through the same `open_whatsapp_chat` command the bills use (WhatsApp Desktop
+ * when installed, else the browser); elsewhere a `wa.me` link in a new tab. The number is checked
+ * first, because a wa.me link with no number opens a contact picker, which is how a message reaches
+ * the wrong customer.
+ */
+const openDeliveryWhatsapp = async ({ phone, text }) => {
+  const normalized = normalizeIndianMobile(phone);
+  if (!normalized) {
+    return { ok: false, message: "The customer's mobile number is not a valid Indian mobile, so WhatsApp cannot be opened. Fix the number in the delivery details." };
+  }
+  if (isDesktopShell() && !MOBILE_SHELL) {
+    try {
+      const opened = await invokeTauriCommand("open_whatsapp_chat", { phone: normalized, text: text || "" });
+      return {
+        ok: true,
+        message: opened === WHATSAPP_OPENED.APP
+          ? "WhatsApp is open with the message typed. Press Enter there to send it."
+          : "WhatsApp opened in the browser with the message typed. Press Send there.",
+      };
+    } catch (error) {
+      return { ok: false, message: `WhatsApp could not be opened: ${error?.message || error}` };
+    }
+  }
+  window.open(whatsappLink(normalized, text), "_blank", "noopener,noreferrer");
+  return { ok: true, message: "WhatsApp opened in a new tab with the message typed. Press Send there." };
+};
+
+/** Put text on the clipboard. False when the clipboard refused, so the screen can show the text instead. */
+const copyTextToClipboard = async (text) => {
+  try {
+    if (!navigator.clipboard?.writeText) return false;
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Which customer message fits a delivery's status. */
+const deliveryMessageKind = (status) => {
+  if (status === DELIVERY_STATUS.PICKED_UP) return DELIVERY_MESSAGE_KIND.PICKED_UP;
+  if (status === DELIVERY_STATUS.DELIVERED || status === DELIVERY_STATUS.CLOSED) return DELIVERY_MESSAGE_KIND.DELIVERED;
+  return DELIVERY_MESSAGE_KIND.BOOKED;
+};
+
+/**
+ * A rider's number as a QR code holding `tel:+91…`, so the packer can point a phone at the screen
+ * and call. Drawn here with the bundled `qrcode` package: no request, works offline and in Local
+ * Only.
+ */
+function TelQr({ phone, size = 132 }) {
+  const payload = telLink(phone);
+  const [qr, setQr] = useState({ payload: "", image: "", error: "" });
+  useEffect(() => {
+    if (!payload) return undefined;
+    let cancelled = false;
+    QRCode.toDataURL(payload, { errorCorrectionLevel: "M", margin: 1, width: size })
+      .then((image) => { if (!cancelled) setQr({ payload, image, error: "" }); })
+      .catch(() => { if (!cancelled) setQr({ payload, image: "", error: "The QR could not be drawn. Dial the number shown." }); });
+    return () => { cancelled = true; };
+  }, [payload, size]);
+  if (!payload) return null;
+  if (qr.payload === payload && qr.error) return <small className="stock-low">{qr.error}</small>;
+  if (qr.payload !== payload || !qr.image) return <span className="delivery-qr delivery-qr-loading" style={{ width: size, height: size }} />;
+  return <img alt={`Scan to call ${formatIndianMobile(phone)}`} className="delivery-qr" height={size} src={qr.image} width={size} />;
+}
+
+/**
+ * The form for one delivery attempt: where it is going, who carries it, what it costs, who pays.
+ * Prefilled by the caller (local/deliveryUi.js, newDeliveryDraft / deliveryToDraft).
+ */
+function DeliveryForm({ busy = false, draft, error = "", onCancel, onChange, onSubmit, settings, submitLabel }) {
+  const areas = Array.isArray(settings?.areas) ? settings.areas : [];
+  const set = (field) => (event) => onChange({ ...draft, [field]: event.target.value, ...(field === "quoted" ? { quotedFromArea: false } : {}) });
+  const areaListId = `delivery-areas-${draft.order_id || "new"}`;
+  return (
+    <form
+      className="delivery-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSubmit();
+      }}
+    >
+      <div className="form-grid delivery-form-grid">
+        <Field label="Carried by">
+          <select onChange={set("provider")} value={draft.provider}>
+            {DELIVERY_PROVIDER_IDS.map((id) => <option key={id} value={id}>{PROVIDER_LABEL[id]}</option>)}
+          </select>
+        </Field>
+        <Field label="Paid by">
+          <select onChange={set("paid_by")} value={draft.paid_by}>
+            <option value={PAID_BY.SHOP}>Shop</option>
+            <option value={PAID_BY.CUSTOMER}>Customer (added to the bill)</option>
+          </select>
+        </Field>
+        <Field label="Quoted amount (Rs)">
+          <input inputMode="decimal" onChange={set("quoted")} placeholder="e.g. 60" value={draft.quoted} />
+        </Field>
+        <Field label="Customer name">
+          <input onChange={set("customer_name")} value={draft.customer_name} />
+        </Field>
+        <Field label="Customer mobile">
+          <input inputMode="tel" onChange={set("customer_phone")} value={draft.customer_phone} />
+        </Field>
+        <Field label="Area">
+          <input
+            list={areaListId}
+            onChange={(event) => onChange(applyDraftArea(draft, event.target.value, settings))}
+            placeholder={areas.length ? "Choose or type" : "Type the area"}
+            value={draft.area_name}
+          />
+          <datalist id={areaListId}>
+            {areas.map((area) => (
+              <option key={area.id || area.name} value={area.name}>
+                {Number.isFinite(area.usual_paise) ? `usually ${formatPaise(area.usual_paise)}` : ""}
+              </option>
+            ))}
+          </datalist>
+        </Field>
+      </div>
+      <Field label={<RequiredLabel>Address</RequiredLabel>}>
+        <input onChange={set("address")} placeholder="House, street, area" value={draft.address} />
+      </Field>
+      <div className="form-grid delivery-form-grid">
+        <Field label="Landmark">
+          <input onChange={set("landmark")} placeholder="Near…" value={draft.landmark} />
+        </Field>
+        <Field label="Map link">
+          <input onChange={set("map_link")} placeholder="Google Maps link or lat,lng" value={draft.map_link} />
+        </Field>
+        <Field label="Rider name">
+          <input onChange={set("rider_name")} value={draft.rider_name} />
+        </Field>
+        <Field label="Rider phone">
+          <input inputMode="tel" onChange={set("rider_phone")} value={draft.rider_phone} />
+        </Field>
+        <Field label="Tracking link">
+          <input onChange={set("tracking_link")} placeholder="From the Rapido/Uber app" value={draft.tracking_link} />
+        </Field>
+        <Field label="Booking ref">
+          <input onChange={set("booking_ref")} value={draft.booking_ref} />
+        </Field>
+      </div>
+      <Field label="Notes">
+        <input onChange={set("notes")} value={draft.notes} />
+      </Field>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      <div className="button-row">
+        <button className="primary-button" disabled={busy} type="submit">{busy ? "Saving…" : submitLabel}</button>
+        <button className="secondary-button" disabled={busy} onClick={onCancel} type="button">Close</button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * What can be done with one delivery attempt: copy the booking text, open the map, WhatsApp the
+ * customer, and the status moves that are legal from where it is. Shared by the order card and the
+ * Deliveries board, so the two can never offer different buttons for the same delivery.
+ */
+function DeliveryControls({ busy = false, delivery, onEdit = null, onMove, order, settings, shopName = "" }) {
+  const askReason = useAskReason();
+  const [notice, setNotice] = useState(null);
+  const [copyState, setCopyState] = useState({ status: "", text: "" });
+  const [finalInput, setFinalInput] = useState("");
+  const [working, setWorking] = useState("");
+  useEffect(() => {
+    if (copyState.status !== "copied") return undefined;
+    const timer = setTimeout(() => setCopyState({ status: "", text: "" }), 4000);
+    return () => clearTimeout(timer);
+  }, [copyState.status]);
+
+  const status = String(delivery?.status || "");
+  const moves = nextDeliveryStatuses(status);
+  const map = mapLink(delivery || {});
+  const orderStatus = String(order?.status || "").toUpperCase();
+  const sendsOrder = moves.includes(DELIVERY_STATUS.PICKED_UP) && orderStatus === ORDER_STATUS.PACKED;
+
+  const copyForRider = async () => {
+    const text = buildRiderCopyText({ delivery, order, settings, shopName });
+    if (!text) {
+      setCopyState({ status: "failed", text: "" });
+      setNotice({ tone: "error", text: "There is nothing to copy yet. Add the address first." });
+      return;
+    }
+    const copied = await copyTextToClipboard(text);
+    setCopyState({ status: copied ? "copied" : "failed", text });
+    setNotice(null);
+  };
+
+  const whatsappCustomer = async () => {
+    setWorking("whatsapp");
+    const text = buildCustomerMessage({ kind: deliveryMessageKind(status), delivery, order, settings, shopName });
+    const opened = await openDeliveryWhatsapp({ phone: delivery?.customer_phone || order?.customer_mobile, text });
+    setWorking("");
+    setNotice({ tone: opened.ok ? "success" : "error", text: opened.message });
+  };
+
+  const runMove = async (to) => {
+    let reason = "";
+    if (REASON_REQUIRED_STATUSES.includes(to)) {
+      const failing = to === DELIVERY_STATUS.FAILED;
+      reason = await askReason({
+        title: failing ? `Mark attempt ${delivery.attempt_no || ""} failed?`.replace("  ", " ") : "Cancel this delivery?",
+        message: failing
+          ? "The order stays as it is, and you can book another attempt."
+          : "The order stays as it is. You can book a new delivery for it later.",
+        label: failing ? "Why did it fail?" : "Why is it being cancelled?",
+        placeholder: failing ? "Customer not reachable, wrong address, rider cancelled…" : "Customer will collect, rider not available…",
+        confirmLabel: failing ? "Mark failed" : "Cancel delivery",
+        cancelLabel: "Go back",
+        tone: "danger",
+      });
+      if (reason === null) return;
+    }
+    setNotice(null);
+    setWorking(to);
+    const result = await onMove?.({ order, delivery, to, reason, finalInput: to === DELIVERY_STATUS.CLOSED ? finalInput : "" });
+    setWorking("");
+    if (!result) {
+      setNotice({ tone: "error", text: "Deliveries cannot be changed here." });
+      return;
+    }
+    if (!result.ok) {
+      setNotice({ tone: result.message === DELIVERY_SENT_BUT_NOT_PICKED_UP ? "warning" : "error", text: result.message });
+      return;
+    }
+    if (to === DELIVERY_STATUS.CLOSED) setFinalInput("");
+    setNotice(result.message ? { tone: "warning", text: result.message } : null);
+  };
+
+  const quoted = deliveryChargePaise(delivery);
+  return (
+    <div className="delivery-controls">
+      <div className="button-row delivery-tools">
+        <button className="secondary-button compact-button" disabled={busy} onClick={copyForRider} type="button">
+          {copyState.status === "copied" ? "Copied" : "Copy for Rapido/Uber"}
+        </button>
+        {map
+          ? <a className="secondary-button compact-button delivery-link-button" href={map} rel="noreferrer" target="_blank">Open map</a>
+          : <button className="secondary-button compact-button" disabled title="Add an address or a map link first" type="button">Open map</button>}
+        <button className="secondary-button compact-button" disabled={busy || working === "whatsapp"} onClick={whatsappCustomer} type="button">
+          {working === "whatsapp" ? "Opening…" : "WhatsApp customer"}
+        </button>
+        {delivery?.tracking_link && /^https?:\/\//i.test(delivery.tracking_link) && (
+          <a className="secondary-button compact-button delivery-link-button" href={delivery.tracking_link} rel="noreferrer" target="_blank">Tracking</a>
+        )}
+        {onEdit && isDeliveryEditable(delivery) && (
+          <button className="secondary-button compact-button" disabled={busy} onClick={onEdit} type="button">Edit details</button>
+        )}
+      </div>
+      {copyState.status === "failed" && copyState.text && (
+        <div className="delivery-copy-fallback">
+          <p className="form-note">Copy did not work here. Select the text below and press Ctrl+C.</p>
+          <textarea onFocus={(event) => event.target.select()} readOnly rows={Math.min(10, copyState.text.split("\n").length + 1)} value={copyState.text} />
+        </div>
+      )}
+      {status === DELIVERY_STATUS.DELIVERED && (
+        <Field label={`Final amount (Rs) — blank = ${Number.isFinite(quoted) ? formatPaise(quoted) : "no amount"}`}>
+          <input inputMode="decimal" onChange={(event) => setFinalInput(event.target.value)} placeholder={Number.isFinite(quoted) ? String(quoted / 100) : ""} value={finalInput} />
+        </Field>
+      )}
+      {moves.length > 0 && (
+        <div className="button-row delivery-moves">
+          {moves.map((to) => {
+            const danger = REASON_REQUIRED_STATUSES.includes(to);
+            return (
+              <button
+                className={danger ? "danger-text-button" : "primary-button"}
+                disabled={busy || Boolean(working)}
+                key={to}
+                onClick={() => runMove(to)}
+                type="button"
+              >
+                {working === to ? "Saving…" : DELIVERY_MOVE_LABEL[to] || deliveryStatusLabel(to)}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {sendsOrder && <p className="form-note">Picked up sends the order and opens its bill on POS.</p>}
+      {notice && (
+        <p className={notice.tone === "error" ? "inline-error" : notice.tone === "warning" ? "warning-note" : "form-note"} role={notice.tone === "error" ? "alert" : "status"}>
+          {notice.text}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** One line of an attempt's history: who carried it, what happened, and why if it went wrong. */
+const deliveryAttemptSummary = (delivery) => {
+  const parts = [`Attempt ${delivery.attempt_no || "?"}`, providerLabel(delivery.provider), deliveryStatusLabel(delivery.status)];
+  const charge = deliveryChargePaise(delivery);
+  if (Number.isFinite(charge)) parts.push(`${formatPaise(charge)} (${delivery.paid_by === PAID_BY.CUSTOMER ? "customer pays" : "shop pays"})`);
+  const line = parts.join(" · ");
+  return delivery.status_reason ? `${line} — ${delivery.status_reason}` : line;
+};
+
+/**
+ * The Delivery part of an order card: the attempts so far, the current one with its buttons, and
+ * Book delivery (or Book again after a failed attempt) when the order may have one.
+ */
+function OrderDeliveryPanel({ busy = false, onMove, onSave, order, settings, shopName = "", user }) {
+  const [draft, setDraft] = useState(null);
+  const [formError, setFormError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const attempts = deliveriesOf(order);
+  const open = openDeliveryOf(order);
+  const latest = latestDeliveryOf(order);
+  const current = open || (latest?.status === DELIVERY_STATUS.DELIVERED ? latest : null);
+  const start = canStartDelivery(order);
+  const status = String(order?.status || "").toUpperCase();
+  // Nothing to show on an order that never had a delivery and cannot have one yet (Received).
+  if (attempts.length === 0 && !start.ok && !draft) return null;
+
+  const openNew = () => {
+    setFormError("");
+    setDraft(newDeliveryDraft({ order, settings, previous: latest }));
+  };
+  const openEdit = () => {
+    setFormError("");
+    setDraft(deliveryToDraft(current));
+  };
+  const submit = async () => {
+    const built = draftToDeliveryPayload(draft, { createdBy: user?.full_name || "" });
+    if (!built.ok) {
+      setFormError(built.message);
+      return;
+    }
+    setSaving(true);
+    const result = await onSave?.(built.delivery);
+    setSaving(false);
+    if (!result?.ok) {
+      setFormError(`${result?.message || "That delivery was not saved."} Your details are still here.`);
+      return;
+    }
+    setDraft(null);
+    setFormError("");
+  };
+
+  return (
+    <div className="delivery-panel">
+      <div className="delivery-panel-head">
+        <strong>Delivery</strong>
+        {current && <span className="pill">{deliveryStatusLabel(current.status)}</span>}
+      </div>
+      {attempts.length > 0 && (
+        <ul className="delivery-history">
+          {attempts.map((attempt) => (
+            <li className={attempt === current ? "delivery-history-current" : ""} key={attempt.id || attempt.attempt_no}>{deliveryAttemptSummary(attempt)}</li>
+          ))}
+        </ul>
+      )}
+      {current && !draft && (
+        <>
+          <p className="form-note">
+            {current.rider_name || current.rider_phone
+              ? <>Rider <strong>{current.rider_name || "not named"}</strong>{current.rider_phone ? ` · ${formatIndianMobile(current.rider_phone)}` : ""}</>
+              : "No rider details yet."}
+            {current.booking_ref ? ` · Ref ${current.booking_ref}` : ""}
+          </p>
+          <DeliveryControls busy={busy || saving} delivery={current} onEdit={openEdit} onMove={onMove} order={order} settings={settings} shopName={shopName} />
+        </>
+      )}
+      {!current && !draft && start.ok && (
+        <div className="button-row">
+          <button className="primary-button" disabled={busy} onClick={openNew} type="button">
+            {attempts.length > 0 ? `Book again (attempt ${nextAttemptNo(order)})` : "Book delivery"}
+          </button>
+          {status === ORDER_STATUS.PACKED && <span className="form-note">Fills in the customer, address and your usual charges.</span>}
+        </div>
+      )}
+      {!current && !draft && !start.ok && attempts.length > 0 && <p className="form-note">{start.message}</p>}
+      {draft && (
+        <DeliveryForm
+          busy={busy || saving}
+          draft={draft}
+          error={formError}
+          onCancel={() => { setDraft(null); setFormError(""); }}
+          onChange={(next) => { setDraft(next); if (formError) setFormError(""); }}
+          onSubmit={submit}
+          settings={settings}
+          submitLabel={draft.id ? "Save details" : `Save delivery (attempt ${nextAttemptNo(order)})`}
+        />
+      )}
+    </div>
+  );
+}
+
+/** How often the Deliveries board recounts its minutes while it is on screen. */
+const DELIVERY_BOARD_TICK_MS = 30000;
+
+/**
+ * The Deliveries tab inside Orders: every attempt in flight, by status, the late ones in red, with
+ * the rider's number large and as a QR code so the packer can call from a phone.
+ */
+function DeliveriesBoard({ busy = false, onMove, onReload, orders = [], settings, settingsState = null, shopName = "" }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    // Recounted while the tab is visible; paused while the window is hidden.
+    const tick = () => { if (document.visibilityState !== "hidden") setNowMs(Date.now()); };
+    const timer = setInterval(tick, DELIVERY_BOARD_TICK_MS);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, []);
+  const overdueMinutes = Number(settings?.overdue_minutes);
+  const board = buildDeliveryBoard({ orders, nowMs, overdueMinutes });
+  const settingsNote = settingsState?.loadState === "error"
+    ? `Delivery settings could not be read (${settingsState.error}). Using the starting values: late after ${settings?.overdue_minutes} minutes.`
+    : settingsState?.error || "";
+
+  return (
+    <>
+      <ModuleCard
+        eyebrow="Deliveries"
+        title="Deliveries on the way"
+        subtitle={`Rapido, Uber and own-staff deliveries. A card turns red after ${Number.isFinite(overdueMinutes) && overdueMinutes > 0 ? overdueMinutes : 45} minutes in one step.`}
+      >
+        <div className="button-row orders-toolbar">
+          <span className="pill">{board.openCount} open</span>
+          {board.overdueCount > 0 && <span className="pill delivery-late-pill">{board.overdueCount} late</span>}
+          {board.toCloseCount > 0 && <span className="pill">{board.toCloseCount} to close</span>}
+          <button className="table-action" type="button" onClick={onReload}>Refresh</button>
+        </div>
+        {settingsNote && <div className="warning-note" role="status">{settingsNote}</div>}
+        {board.problems.map((problem) => <div className="warning-note" key={problem.key} role="alert">{problem.message}</div>)}
+        <p className="form-note">To book a delivery, open the order on the Orders tab and press Book delivery.</p>
+      </ModuleCard>
+      {board.columns.map((column) => (
+        <ModuleCard eyebrow={column.hint} key={column.key} title={`${column.label} (${column.cards.length})`}>
+          {column.cards.length === 0 && <p className="form-note">Nothing here right now.</p>}
+          {column.cards.map((card) => {
+            const { delivery, order } = card;
+            const late = card.overdue ? minutesLabel(card.minutes) : "";
+            return (
+              <div className={card.overdue ? "content-card order-card delivery-card delivery-card-late" : "content-card order-card delivery-card"} key={card.key}>
+                <div className="carrier-top">
+                  <strong>{order.order_no || "Order"} · {delivery.customer_name || order.customer_name || "Customer"}</strong>
+                  <span>
+                    {late ? <span className="delivery-late">late {late}</span> : (card.minutes !== null && card.status !== DELIVERY_STATUS.CLOSED ? `${minutesLabel(card.minutes)} in ${deliveryStatusLabel(card.status).toLowerCase()}` : deliveryStatusLabel(card.status))}
+                  </span>
+                </div>
+                <p className="form-note">
+                  {providerLabel(delivery.provider)} · attempt {delivery.attempt_no || "?"}
+                  {delivery.area_name ? ` · ${delivery.area_name}` : ""}
+                  {delivery.address ? ` · ${delivery.address}` : ""}
+                  {delivery.landmark ? ` (near ${delivery.landmark})` : ""}
+                </p>
+                <div className="delivery-rider">
+                  <div>
+                    <span className="eyebrow">Rider</span>
+                    <strong className="delivery-rider-phone">{delivery.rider_phone ? formatIndianMobile(delivery.rider_phone) : "No number yet"}</strong>
+                    <span>{delivery.rider_name || (delivery.rider_phone ? "" : "Add it with Edit details on the order")}</span>
+                  </div>
+                  {delivery.rider_phone && <TelQr phone={delivery.rider_phone} />}
+                </div>
+                <DeliveryControls busy={busy} delivery={delivery} onMove={onMove} order={order} settings={settings} shopName={shopName} />
+              </div>
+            );
+          })}
+        </ModuleCard>
+      ))}
+    </>
   );
 }
 
@@ -23829,6 +24755,9 @@ class SettingsSectionErrorBoundary extends React.Component {
 
 function SettingsModule({
   applicationFontSize,
+  deliverySettingsState = null,
+  onReloadDeliverySettings,
+  onSaveDeliverySettings,
   onBackupBusyChange,
   themeMode,
   setThemeMode,
@@ -23947,6 +24876,8 @@ function SettingsModule({
     "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
     "settings/mandi-tax": <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />,
     "settings/other-charges": <OtherChargesSettings canManage={canManage} chargeTypes={settingsData.chargeTypes || []} onReload={onReload} user={user} />,
+    // Owner or Admin only, as the cloud route is: everybody else's screens read these settings.
+    "settings/delivery": <DeliverySettingsSection canEdit={canManage && ["OWNER", "ADMIN"].includes(String(user?.role || user?.role_name || "").toUpperCase())} onReload={onReloadDeliverySettings} onSave={onSaveDeliverySettings} settingsState={deliverySettingsState} />,
     "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
     "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
     "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} onChanged={onDiscountRulesChanged} saleRateSettings={settingsData.saleRateSettings} unavailableReason={discountUnavailableReason} />,
@@ -24670,6 +25601,114 @@ function MandiTaxSettings({ canManage, onReload, rules, user }) {
  * all, and the counter says so rather than guessing; that is why the table below shows the top of
  * the range plainly.
  */
+/**
+ * Settings -> Delivery: this shop's pickup point, the areas it delivers to with their usual charge,
+ * the WhatsApp texts, and the defaults the delivery form starts from. Saved on this computer first
+ * and then sent to the cloud, so the other computers of this shop get it (local/deliverySettings.js).
+ */
+function DeliverySettingsSection({ canEdit = false, onReload, onSave, settingsState = null }) {
+  const saved = settingsState?.settings || null;
+  const [edited, setEdited] = useState(null);
+  const form = edited || settingsToForm(saved || DEFAULT_DELIVERY_SETTINGS);
+  const [notice, showNotice, clearNotice] = useSaveNotice();
+  const [saving, runSave] = useSaveInFlight();
+  const update = (patch) => {
+    setEdited({ ...form, ...patch });
+    clearNotice();
+  };
+  const setArea = (index, patch) => update({ areas: form.areas.map((area, position) => (position === index ? { ...area, ...patch } : area)) });
+  const loading = !settingsState || settingsState.loadState === "idle" || (settingsState.loadState === "loading" && !saved);
+  // Nothing could be read, not even this computer's copy: saving the starting values now could
+  // overwrite settings that do exist, so Save waits for a successful read.
+  const unread = settingsState?.loadState === "error" || (settingsState?.source === "default" && Boolean(settingsState?.error));
+  const sourceNote = describeDeliverySettingsSource({ source: settingsState?.source, dirty: settingsState?.dirty, error: settingsState?.error });
+  const editable = canEdit && !loading && !unread;
+
+  const save = () => runSave(async () => {
+    clearNotice();
+    const built = formToSettings(form);
+    if (!built.ok) {
+      showNotice(errorNotice(built.message));
+      return;
+    }
+    const result = await onSave?.(built.settings);
+    if (!result?.saved) {
+      showNotice(errorNotice(result?.error || "The delivery settings were not saved."));
+      return;
+    }
+    setEdited(null);
+    if (!result.pushed) showNotice(warningNotice("Saved on this computer; will reach the other computers when online."));
+    else showNotice(successNotice(result.error ? `Saved. ${result.error}` : "Delivery settings saved for this shop."));
+  });
+
+  return (
+    <ModuleCard eyebrow="Delivery Settings" title="Delivery" onChange={clearNotice} subtitle="Pickup point, areas with their usual charge, and the WhatsApp texts for Rapido/Uber deliveries.">
+      {!canEdit && <p className="warning-note" role="status">Only the Owner or an Admin can change these. You can see them here.</p>}
+      {loading && <p className="form-note">Reading delivery settings…</p>}
+      {unread && (
+        <div className="error-banner" role="alert">
+          {settingsState?.error || "Delivery settings could not be read."} Save is off until they can be read, so nothing saved is overwritten.
+        </div>
+      )}
+      {!loading && !unread && sourceNote && <p className={settingsState?.dirty ? "warning-note" : "form-note"} role="status">{sourceNote}</p>}
+      <div className="form-grid delivery-form-grid">
+        <Field label="Pickup address">
+          <input disabled={!editable} onChange={(event) => update({ pickup_address: event.target.value })} placeholder="Shop address for the rider" value={form.pickup_address} />
+        </Field>
+        <Field label="Pickup pin">
+          <input disabled={!editable} onChange={(event) => update({ pickup_pin: event.target.value })} placeholder="Google Maps link, or lat,lng" value={form.pickup_pin} />
+        </Field>
+        <Field label="Usual provider">
+          <select disabled={!editable} onChange={(event) => update({ default_provider: event.target.value })} value={form.default_provider}>
+            {DELIVERY_PROVIDER_IDS.map((id) => <option key={id} value={id}>{PROVIDER_LABEL[id]}</option>)}
+          </select>
+        </Field>
+        <Field label="Usually paid by">
+          <select disabled={!editable} onChange={(event) => update({ default_paid_by: event.target.value })} value={form.default_paid_by}>
+            <option value={PAID_BY.SHOP}>Shop</option>
+            <option value={PAID_BY.CUSTOMER}>Customer</option>
+          </select>
+        </Field>
+        <Field label="Late after (minutes)">
+          <input disabled={!editable} inputMode="numeric" onChange={(event) => update({ overdue_minutes: event.target.value })} value={form.overdue_minutes} />
+        </Field>
+      </div>
+
+      <DataTable headers={["Area", { label: "Usual charge (Rs)", numeric: true }, { label: <span className="pm-sr-only">Remove</span> }]}>
+        {form.areas.map((area, index) => (
+          <tr key={area.id || `new-${index}`}>
+            <td><input aria-label="Area name" disabled={!editable} onChange={(event) => setArea(index, { name: event.target.value })} placeholder="Kothrud" value={area.name} /></td>
+            <td><input aria-label="Usual charge" className="numeric-input" disabled={!editable} inputMode="decimal" onChange={(event) => setArea(index, { usual: event.target.value })} placeholder="60" value={area.usual} /></td>
+            <td><button className="table-action" disabled={!editable} onClick={() => update({ areas: form.areas.filter((_, position) => position !== index) })} type="button">Remove</button></td>
+          </tr>
+        ))}
+        {form.areas.length === 0 && <tr><td className="empty-cell" colSpan={3}>No areas yet. Add the areas you deliver to, with what a ride there usually costs.</td></tr>}
+      </DataTable>
+      <div className="button-row">
+        <button className="secondary-button" disabled={!editable} onClick={() => update({ areas: [...form.areas, { id: "", name: "", usual: "" }] })} type="button"><Icon name="add" size={15} />Add area</button>
+      </div>
+
+      <p className="form-note">
+        WhatsApp texts for the customer. These words are filled in for you: <strong>{DELIVERY_PLACEHOLDERS.join(" ")}</strong>. A line whose words are all empty is left out. Leave a box empty to use the starting text.
+      </p>
+      <div className="delivery-templates">
+        {[["booked", "When the rider is booked"], ["picked_up", "When the rider has picked it up"], ["delivered", "When it is delivered"]].map(([key, label]) => (
+          <Field key={key} label={label}>
+            <textarea disabled={!editable} onChange={(event) => update({ templates: { ...form.templates, [key]: event.target.value } })} rows={5} value={form.templates[key]} />
+          </Field>
+        ))}
+      </div>
+
+      <div className="button-row">
+        <button className="primary-button" disabled={!editable || saving} onClick={save} type="button">{saving ? "Saving…" : "Save"}</button>
+        {edited && <button className="secondary-button" disabled={saving} onClick={() => { setEdited(null); clearNotice(); }} type="button">Undo changes</button>}
+        <button className="secondary-button" disabled={saving} onClick={() => onReload?.()} type="button">Reload</button>
+      </div>
+      <SaveNotice notice={notice} />
+    </ModuleCard>
+  );
+}
+
 function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
   const blank = { charge_name: "", basis: "FLAT", measure_unit: "", flat_rate: "" };
   const [draft, setDraft] = useState(blank);
@@ -28179,6 +29218,8 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
    * rate changed in Settings while a bill is open is reflected the moment it arrives.
    */
   const [chargeSelections, setChargeSelections] = useState([]);
+  // What a sent order's delivery did to this bill's charges, said beside Other Charges.
+  const [seedChargeNote, setSeedChargeNote] = useState(null);
   const [search, setSearch] = useState("");
   // The app's own question boxes (feedbackDialogs.jsx) for checkout's gates, and the notices that
   // replaced the browser's alert boxes: one where items are added (the search card, or the lot
@@ -28336,6 +29377,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
     // Each line's "available" is its lot's balance, so the order can grow at the till
     // (local/orderBilling.js).
     setCart(seedLinesToCart(seedLines, { lots: inventory, newLineId: newCartLineId }));
+    // A customer-paid delivery arrives as an Other Charges line; the note says what was or was not
+    // put on the bill (local/deliveryUi.js, deliveryBillCharge).
+    setChargeSelections(Array.isArray(seedCart?.charges) ? seedCart.charges : []);
+    setSeedChargeNote(seedCart?.chargeNote ? { text: seedCart.chargeNote, tone: seedCart.chargeNoteTone || "info" } : null);
     onSeedConsumed?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seedCart]);
@@ -29581,6 +30626,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // Charges belong to the bill that just left, not the next customer. A crate charge
       // carried into the following sale is money taken from somebody who was not charged it.
       setChargeSelections([]);
+      setSeedChargeNote(null);
         setCreditInfo({ due_date: "", remarks: "" });
         resetBillDate();
         setDiscountNotice("");
@@ -29667,6 +30713,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
       // Charges belong to the bill that just left, not the next customer. A crate charge
       // carried into the following sale is money taken from somebody who was not charged it.
       setChargeSelections([]);
+      setSeedChargeNote(null);
       setCreditInfo({ due_date: "", remarks: "" });
       resetBillDate();
       setDiscountNotice("");
@@ -30389,6 +31436,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             </div>
           )}
         </div>
+        {seedChargeNote && (
+          <p className={seedChargeNote.tone === "warning" ? "warning-note pos-delivery-charge-note" : "form-note pos-delivery-charge-note"} role="status">{seedChargeNote.text}</p>
+        )}
         <OtherChargesPanel
           chargeTypes={chargeTypes}
           lines={totals.chargeLines}

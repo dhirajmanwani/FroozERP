@@ -12533,3 +12533,125 @@ td.wrap-cell {
     padding-inline: 8px;
   }
 }
+
+/* Delivery (Rapido/Uber, 22 Nov 2026). The panel on an order card, the Deliveries tab inside
+   Orders, and Settings -> Delivery. Colours come from the theme tokens so light and dark both hold. */
+.orders-tabs {
+  margin-bottom: var(--space-3);
+}
+
+.delivery-panel {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--fill-subtle);
+}
+
+.delivery-panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.delivery-history {
+  margin: 0 0 var(--space-2);
+  padding-left: 18px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.delivery-history-current {
+  color: var(--ink-strong);
+  font-weight: 600;
+}
+
+.delivery-controls .button-row {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.delivery-moves {
+  margin-top: var(--space-2);
+}
+
+.delivery-link-button {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.delivery-copy-fallback textarea,
+.delivery-templates textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.delivery-form {
+  margin-top: var(--space-2);
+}
+
+.delivery-form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.delivery-templates {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.delivery-card-late {
+  border: 2px solid var(--danger-strong);
+}
+
+.delivery-late,
+.delivery-late-pill {
+  color: var(--danger-ink);
+  font-weight: 700;
+}
+
+.delivery-late-pill {
+  background: var(--danger-soft);
+}
+
+.delivery-rider {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.delivery-rider > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.delivery-rider-phone {
+  font-size: 28px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  color: var(--ink-strong);
+}
+
+.delivery-qr {
+  display: block;
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+}
+
+.delivery-qr-loading {
+  background: var(--fill);
+}
+
+.pos-delivery-charge-note {
+  margin: var(--space-2) 0;
+}
