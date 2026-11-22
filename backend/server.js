@@ -3473,6 +3473,11 @@ const initializeDatabase = async () => {
     -- delivery settings. Cloud migration 027 carries exactly these statements; keep the two
     -- identical.
     ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS deliveries JSONB;
+    -- The order's payment answer, which devices always pushed and the cloud used to drop.
+    ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS payment_state VARCHAR(20);
+    ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(14, 2);
+    ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(200);
+    ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS payment_marked_at TIMESTAMPTZ;
     CREATE TABLE IF NOT EXISTS delivery_settings (
       id SERIAL PRIMARY KEY,
       company_id INTEGER NOT NULL,
@@ -13207,6 +13212,43 @@ const normalizeCustomerOrderItems = (rawItems) => {
   return { items };
 };
 
+const CUSTOMER_ORDER_PAYMENT_STATES = new Set(["UNPAID", "PAID", "ON_DELIVERY"]);
+
+/**
+ * The order's payment answer from a device push, or a named refusal.
+ *
+ * `present: false` when the payload has no `payment_state` key at all: that sender says nothing
+ * about payment and the stored answer is kept. A present null is a real answer ("not decided yet").
+ */
+const normalizeCustomerOrderPayment = (payload) => {
+  const source = payload && typeof payload === "object" ? payload : {};
+  if (!Object.prototype.hasOwnProperty.call(source, "payment_state")) {
+    return { present: false, payment_state: null, amount_paid: null, payment_reference: null, payment_marked_at: null };
+  }
+  const rawState = cleanText(source.payment_state);
+  const paymentState = rawState ? rawState.toUpperCase() : null;
+  if (paymentState && !CUSTOMER_ORDER_PAYMENT_STATES.has(paymentState)) {
+    return { error: `Unsupported customer order payment_state: ${paymentState}` };
+  }
+  let amountPaid = null;
+  if (source.amount_paid !== null && source.amount_paid !== undefined && String(source.amount_paid).trim() !== "") {
+    const value = Number(source.amount_paid);
+    if (!Number.isFinite(value) || value < 0 || value >= 1e12) {
+      return { error: "Customer order amount_paid is not a valid amount" };
+    }
+    amountPaid = roundCurrency(value);
+  }
+  const markedAt = parseCustomerOrderTimestamp(source.payment_marked_at);
+  if (markedAt.error) return { error: "Customer order payment_marked_at is not a valid timestamp" };
+  return {
+    present: true,
+    payment_state: paymentState,
+    amount_paid: amountPaid,
+    payment_reference: (cleanText(source.payment_reference) || "").slice(0, 200) || null,
+    payment_marked_at: markedAt.value,
+  };
+};
+
 const processCustomerOrderOperation = async (client, operation, context) => {
   const payload = operation.payload && typeof operation.payload === "object" ? operation.payload : {};
   if (operation.operation_type !== "UPSERT") {
@@ -13284,6 +13326,15 @@ const processCustomerOrderOperation = async (client, operation, context) => {
     return rejectOperation(operation, "VALIDATION_ERROR", sanitizedDeliveries.error);
   }
 
+  // The order's payment answer ("has this been paid?"). Devices have always pushed it; the cloud
+  // used to drop it, so every pulled copy - a device's own echo included - came back blank and
+  // blocked Send again. A sender that does not carry the key at all says nothing about it, and the
+  // stored answer is kept (the CASE on $34 below).
+  const payment = normalizeCustomerOrderPayment(payload);
+  if (payment.error) {
+    return rejectOperation(operation, "VALIDATION_ERROR", payment.error);
+  }
+
   const existingResult = await client.query(
     `SELECT global_id, order_no, status, company_id, branch_id, entity_version, updated_at
      FROM customer_orders
@@ -13356,11 +13407,12 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       status, reserved_at, packed_at, sent_at, delivered_at, cancelled_at, cancellation_reason,
       carrier, carrier_reference, tracking_url, carrier_contact, sale_global_id, invoice_no,
       notes, created_by, source_device_id, entity_version, device_created_at, device_updated_at,
-      deleted_at, deliveries, updated_at
+      deleted_at, deliveries, payment_state, amount_paid, payment_reference, payment_marked_at,
+      updated_at
     )
     VALUES (
       $1,$2,$3,$4,$5,$32,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-      $25,$26,$27,$28,$29,$30,$31, $33::jsonb, CURRENT_TIMESTAMP
+      $25,$26,$27,$28,$29,$30,$31, $33::jsonb, $35, $36, $37, $38, CURRENT_TIMESTAMP
     )
     ON CONFLICT (global_id) DO UPDATE SET
       order_no = EXCLUDED.order_no,
@@ -13399,6 +13451,10 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       -- NULL is "the sender did not carry deliveries" (an app version from before the module), not
       -- "there are none" -- that is an empty array. Keep what is stored rather than wipe it.
       deliveries = COALESCE(EXCLUDED.deliveries, customer_orders.deliveries),
+      payment_state = CASE WHEN $34::boolean THEN EXCLUDED.payment_state ELSE customer_orders.payment_state END,
+      amount_paid = CASE WHEN $34::boolean THEN EXCLUDED.amount_paid ELSE customer_orders.amount_paid END,
+      payment_reference = CASE WHEN $34::boolean THEN EXCLUDED.payment_reference ELSE customer_orders.payment_reference END,
+      payment_marked_at = CASE WHEN $34::boolean THEN EXCLUDED.payment_marked_at ELSE customer_orders.payment_marked_at END,
       updated_at = CURRENT_TIMESTAMP
     WHERE customer_orders.entity_version < EXCLUDED.entity_version
     RETURNING *
@@ -13441,6 +13497,12 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       parsePositiveInteger(payload.taken_at_branch_id) || branchId,
       // $33. Serialised here: pg would send a bare JS array as a Postgres array literal, not JSON.
       sanitizedDeliveries.value === null ? null : JSON.stringify(sanitizedDeliveries.value),
+      // $34-$38: the payment answer, and whether the sender carried it at all.
+      payment.present,
+      payment.payment_state,
+      payment.amount_paid,
+      payment.payment_reference,
+      payment.payment_marked_at,
     ]
   );
   const row = upserted.rows[0];
@@ -28000,6 +28062,7 @@ module.exports = {
   resolveGoodsReceivedAt,
   resolveBranchDefaultLocationId,
   normalizeCustomerOrderItems,
+  normalizeCustomerOrderPayment,
   // Other charges. Exported so `otherCharges.test.js` can drive the pricing directly instead of
   // asserting it exists in the source text -- the rule that a measurement past the top slab is
   // refused rather than priced is a behaviour, and only running it proves it.

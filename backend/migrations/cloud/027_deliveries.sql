@@ -16,6 +16,11 @@
 -- Owner or an Admin through PUT /api/v3/delivery-settings. Timestamps are TIMESTAMPTZ from the
 -- start, so 008 never has to retype them (see 026).
 --
+-- customer_orders.payment_state / amount_paid / payment_reference / payment_marked_at: the order's
+-- "has this been paid?" answer. Devices always carried these in the order push, but the cloud had
+-- no columns for them, so the answer was dropped and every pulled copy (including a device's own
+-- echo) came back with it blank, which re-blocked Send. Stored as sent, like the other fields.
+--
 -- ## Why this file exists
 --
 -- Every statement below is declared in `initializeDatabase()`, word for word, and the startup
@@ -27,6 +32,10 @@
 -- runner can replay it (it applies the whole list every time). Forward-only. Never edit this file
 -- once it has been applied anywhere. Requires 015 (customer_orders).
 ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS deliveries JSONB;
+ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS payment_state VARCHAR(20);
+ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(14, 2);
+ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(200);
+ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS payment_marked_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS delivery_settings (
   id SERIAL PRIMARY KEY,
   company_id INTEGER NOT NULL,

@@ -2804,17 +2804,21 @@ pub fn set_customer_order_payment(
     app: &AppHandle,
     order_id: &str,
     payment_state: &str,
+    payment_reference: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    set_customer_order_payment_at(&database_path(app)?, order_id, payment_state)
+    set_customer_order_payment_at(&database_path(app)?, order_id, payment_state, payment_reference)
 }
 
 pub fn set_customer_order_payment_at(
     path: &Path,
     order_id: &str,
     payment_state: &str,
+    payment_reference: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let state = payment_state.trim().to_uppercase();
-    if !CUSTOMER_ORDER_PAYMENT_STATES.contains(&state.as_str()) {
+    // Blank is the board's "Not decided yet": stored as NULL, which is what an order that was never
+    // asked carries, rather than refused.
+    if !state.is_empty() && !CUSTOMER_ORDER_PAYMENT_STATES.contains(&state.as_str()) {
         return Err(format!(
             "\"{}\" is not a payment state this app knows. Use Unpaid, Paid or On delivery.",
             payment_state.trim()
@@ -2827,11 +2831,19 @@ pub fn set_customer_order_payment_at(
         .execute(
             "UPDATE local_customer_orders SET
                payment_state = ?2,
+               -- ?3 / ?4: a reference is written only when one was sent (blank clears it); a
+               -- payment answer alone leaves the stored reference as it was.
+               payment_reference = CASE WHEN ?3 THEN NULLIF(TRIM(?4), '') ELSE payment_reference END,
                payment_marked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                entity_version = entity_version + 1,
                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1 AND deleted_at IS NULL",
-            rusqlite::params![order_id, state],
+            rusqlite::params![
+                order_id,
+                if state.is_empty() { None } else { Some(state.clone()) },
+                payment_reference.is_some(),
+                payment_reference.map(|text| text.chars().take(200).collect::<String>()),
+            ],
         )
         .map_err(to_error)?;
     if changed == 0 {
@@ -10470,10 +10482,13 @@ fn apply_pulled_customer_order_with_tx(
            created_by = excluded.created_by,
            updated_at = excluded.updated_at,
            deleted_at = excluded.deleted_at,
-           payment_state = excluded.payment_state,
-           amount_paid = excluded.amount_paid,
-           payment_reference = excluded.payment_reference,
-           payment_marked_at = excluded.payment_marked_at,
+           -- ?33: whether the incoming copy carried a payment answer at all. A cloud that predates
+           -- storing it publishes rows without the key, and taking that as 'not decided' would wipe
+           -- this device's own answer on the echo of its own push and block Send again.
+           payment_state = CASE WHEN ?33 THEN excluded.payment_state ELSE local_customer_orders.payment_state END,
+           amount_paid = CASE WHEN ?33 THEN excluded.amount_paid ELSE local_customer_orders.amount_paid END,
+           payment_reference = CASE WHEN ?33 THEN excluded.payment_reference ELSE local_customer_orders.payment_reference END,
+           payment_marked_at = CASE WHEN ?33 THEN excluded.payment_marked_at ELSE local_customer_orders.payment_marked_at END,
            entity_version = excluded.entity_version,
            -- COALESCE, not `excluded.`, and it is the one field here treated that way. Provenance
            -- never changes, so an incoming copy that does not carry it is saying nothing about it
@@ -10526,6 +10541,7 @@ fn apply_pulled_customer_order_with_tx(
             optional_text(payload, "payment_marked_at"),
             incoming_version,
             taken_at_branch_id,
+            payload.get("payment_state").is_some(),
         ],
     )
     .map_err(to_error)?;
@@ -20866,6 +20882,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pulled_order_without_a_payment_answer_keeps_the_local_one() {
+        let path = delivery_test_order("pull-payment", "order-pull", "SENT");
+        set_customer_order_payment_at(&path, "order-pull", "ON_DELIVERY", Some("cash with rider")).unwrap();
+        let version = order_row(&path, "order-pull")["entity_version"].as_i64().unwrap();
+
+        // An echo from a cloud that does not store payment carries no key: keep the local answer.
+        pull_changes(&path, &[pulled_order(version, None)], "cursor-p1");
+        let kept = order_row(&path, "order-pull");
+        assert_eq!(kept["payment_state"], "ON_DELIVERY");
+        assert_eq!(kept["payment_reference"], "cash with rider");
+
+        // A copy that does carry it is the newer truth, null included.
+        let mut cleared = pulled_order(version + 1, None);
+        cleared.payload["payment_state"] = serde_json::Value::Null;
+        pull_changes(&path, &[cleared], "cursor-p2");
+        assert!(order_row(&path, "order-pull")["payment_state"].is_null());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn a_pulled_delivery_with_an_unknown_word_is_skipped_without_aborting_the_pull() {
         let path = order_sync_test_path("delivery-pull-unknown");
         initialize_at(&path).expect("initialize");
@@ -20966,7 +21002,7 @@ mod tests {
         let before = order_row(&path, "order-pay");
         let version = before["entity_version"].as_i64().unwrap();
 
-        let paid = set_customer_order_payment_at(&path, "order-pay", "paid").expect("payment records");
+        let paid = set_customer_order_payment_at(&path, "order-pay", "paid", None).expect("payment records");
         assert_eq!(paid["payment_state"], "PAID");
         assert!(paid["payment_marked_at"].is_string());
         assert_eq!(paid["entity_version"].as_i64().unwrap(), version + 1);
@@ -20979,12 +21015,21 @@ mod tests {
         assert_eq!(queued_version, version + 1);
         assert_eq!(payload["payment_state"], "PAID");
 
-        assert!(set_customer_order_payment_at(&path, "order-pay", "MAYBE").is_err());
-        assert!(set_customer_order_payment_at(&path, "no-such-order", "PAID").is_err());
+        let referenced = set_customer_order_payment_at(&path, "order-pay", "PAID", Some("  UPI 4411  ")).unwrap();
+        assert_eq!(referenced["payment_reference"], "UPI 4411");
+        let answer_only = set_customer_order_payment_at(&path, "order-pay", "PAID", None).unwrap();
+        assert_eq!(answer_only["payment_reference"], "UPI 4411", "an answer alone keeps the reference");
+        let cleared = set_customer_order_payment_at(&path, "order-pay", "PAID", Some(" ")).unwrap();
+        assert!(cleared["payment_reference"].is_null(), "a blank reference clears it");
+        let undecided = set_customer_order_payment_at(&path, "order-pay", " ", None).unwrap();
+        assert!(undecided["payment_state"].is_null(), "blank is 'not decided yet', stored as NULL");
+
+        assert!(set_customer_order_payment_at(&path, "order-pay", "MAYBE", None).is_err());
+        assert!(set_customer_order_payment_at(&path, "no-such-order", "PAID", None).is_err());
         Connection::open(&path).unwrap()
             .execute("UPDATE local_customer_orders SET deleted_at = '2026-11-22T00:00:00.000Z' WHERE id = 'order-pay'", [])
             .unwrap();
-        assert!(set_customer_order_payment_at(&path, "order-pay", "UNPAID").is_err(), "a deleted order is refused");
+        assert!(set_customer_order_payment_at(&path, "order-pay", "UNPAID", None).is_err(), "a deleted order is refused");
         let _ = fs::remove_file(&path);
     }
 }

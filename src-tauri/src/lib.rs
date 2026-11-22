@@ -2923,8 +2923,9 @@ fn local_set_customer_order_payment(
     app: AppHandle,
     order_id: String,
     payment_state: String,
+    payment_reference: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    local_db::set_customer_order_payment(&app, &order_id, &payment_state)
+    local_db::set_customer_order_payment(&app, &order_id, &payment_state, payment_reference.as_deref())
 }
 
 #[tauri::command]

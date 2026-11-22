@@ -598,9 +598,9 @@ test("deliveries in the payload are sanitised and stored as JSON in $33", async 
   const ack = await processSyncOperation(client, orderOperation({ payload: orderPayload({ deliveries: [DELIVERY] }) }), context());
   assert.equal(ack.status, "accepted", ack.message);
   const insert = oneStatement(client, /INSERT INTO customer_orders/);
-  assert.match(insert.sql, /deleted_at, deliveries, updated_at \)/);
+  assert.match(insert.sql, /deleted_at, deliveries, payment_state, amount_paid, payment_reference, payment_marked_at,\s+updated_at\s*\)/);
   assert.match(insert.sql, /\$33::jsonb/);
-  assert.equal(insert.values.length, 33);
+  assert.equal(insert.values.length, 38);
   const stored = JSON.parse(insert.values[32]);
   assert.equal(stored.length, 1);
   assert.equal(stored[0].id, "d-1");
@@ -624,6 +624,40 @@ test("a push without deliveries (an older app version) keeps the stored ones", a
       /deliveries = COALESCE\(EXCLUDED\.deliveries, customer_orders\.deliveries\)/,
       "the update must fall back to what is stored when the push carries none",
     );
+  }
+});
+
+test("the payment answer is stored, and a push that does not carry it keeps the stored one", async () => {
+  const paid = upsertClient();
+  const ack = await processSyncOperation(paid, orderOperation({
+    payload: orderPayload({ payment_state: "paid", amount_paid: 250, payment_reference: "  UPI 123  ", payment_marked_at: "2026-11-22T06:00:00Z" }),
+  }), context());
+  assert.equal(ack.status, "accepted", ack.message);
+  const insert = oneStatement(paid, /INSERT INTO customer_orders/);
+  assert.deepEqual(insert.values.slice(33), [true, "PAID", 250, "UPI 123", "2026-11-22T06:00:00.000Z"]);
+  assert.match(insert.sql, /payment_state = CASE WHEN \$34::boolean THEN EXCLUDED\.payment_state ELSE customer_orders\.payment_state END/);
+
+  const silent = upsertClient();
+  await processSyncOperation(silent, orderOperation({ payload: orderPayload() }), context());
+  assert.strictEqual(oneStatement(silent, /INSERT INTO customer_orders/).values[33], false, "no key = keep what is stored");
+
+  const undecided = upsertClient();
+  await processSyncOperation(undecided, orderOperation({ payload: orderPayload({ payment_state: null }) }), context());
+  assert.deepEqual(oneStatement(undecided, /INSERT INTO customer_orders/).values.slice(33, 35), [true, null], "a present null is a real answer");
+});
+
+test("an unknown payment answer or amount rejects the order by name", async () => {
+  for (const [extra, pattern] of [
+    [{ payment_state: "MAYBE" }, /payment_state/],
+    [{ payment_state: "PAID", amount_paid: -1 }, /amount_paid/],
+    [{ payment_state: "PAID", payment_marked_at: "yesterday" }, /payment_marked_at/],
+  ]) {
+    const client = scriptedClient([NO_REPLAY, STORE_ACK]);
+    const ack = await processCustomerOrderOperation(client, orderOperation({ payload: orderPayload(extra) }), context());
+    assert.equal(ack.status, "rejected");
+    assert.equal(ack.error_code, "VALIDATION_ERROR");
+    assert.match(ack.message, pattern);
+    assert.equal(statementsMatching(client, /INSERT INTO customer_orders/).length, 0);
   }
 });
 

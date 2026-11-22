@@ -7653,10 +7653,10 @@ function App() {
    * Record whether an order has been paid. Its own write, not a status move: the status command
    * does not store the answer, and a same-status "move" re-stamps the order's timestamps.
    */
-  const setOrderPayment = async (order, paymentState) => {
+  const setOrderPayment = async (order, paymentState, paymentReference) => {
     setOrderActionBusy(true);
     try {
-      const saved = await setLocalCustomerOrderPayment({ orderId: String(order.id), paymentState: paymentState || null });
+      const saved = await setLocalCustomerOrderPayment({ orderId: String(order.id), paymentState: paymentState || null, paymentReference });
       if (saved === null) {
         return { ok: false, message: "Orders are stored on this device and need the desktop app. This looks like a browser." };
       }
@@ -22885,9 +22885,9 @@ function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance,
   const deliverySettings = delivery?.settingsState?.settings || DEFAULT_DELIVERY_SETTINGS;
 
   /** "Has this been paid?" is its own write (onSetPayment), never a status move. */
-  const recordPayment = async (order, paymentState) => {
+  const recordPayment = async (order, paymentState, paymentReference) => {
     setPaymentProblem((current) => ({ ...current, [order.id]: "" }));
-    const result = await onSetPayment?.(order, paymentState);
+    const result = await onSetPayment?.(order, paymentState, paymentReference);
     if (!result?.ok) {
       setPaymentProblem((current) => ({ ...current, [order.id]: result?.message || "The payment answer was not saved." }));
     }
@@ -23159,7 +23159,11 @@ function OrdersModule({ branches = [], busy = false, delivery = null, onAdvance,
                     <input
                       defaultValue={order.paymentReference}
                       placeholder="UPI ref, cash to..., bank note"
-                      onBlur={(event) => onAdvance(order, order.status, { payment_reference: event.target.value })}
+                      onBlur={(event) => {
+                        // Saved with the payment answer it belongs to, and only when it changed.
+                        if (event.target.value.trim() === String(order.paymentReference || "").trim()) return;
+                        recordPayment(order, order.paymentState, event.target.value);
+                      }}
                     />
                   </Field>
                 )}

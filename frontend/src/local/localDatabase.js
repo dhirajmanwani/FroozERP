@@ -385,11 +385,14 @@ export async function setLocalCustomerOrderStatus({ orderId, nextStatus, patch =
  * Record whether an order has been paid (`UNPAID`, `PAID`, `ON_DELIVERY`) on this device. Null outside
  * the desktop shell, like the wrappers above.
  */
-export async function setLocalCustomerOrderPayment({ orderId, paymentState } = {}) {
+export async function setLocalCustomerOrderPayment({ orderId, paymentState, paymentReference } = {}) {
   if (!isTauriRuntime()) return null;
   return invokeLocal("local_set_customer_order_payment", {
     orderId: String(orderId || ""),
     paymentState: String(paymentState || ""),
+    // Left out entirely (null) when only the answer changed, so the stored reference is kept;
+    // a string, blank included, replaces it.
+    paymentReference: paymentReference === undefined || paymentReference === null ? null : String(paymentReference),
   });
 }
 
