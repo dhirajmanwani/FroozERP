@@ -99,6 +99,10 @@ export const KEEP = Object.freeze({
   packing_designs: "PEP Pack design master",
   packing_sizes: "PEP Pack size master; unit_cost is kept (see CACHED_COLUMNS)",
 
+  // Delivery module: per-branch pickup, areas and WhatsApp templates (the deliveries themselves
+  // live in customer_orders.deliveries and are cleared with the orders)
+  delivery_settings: "delivery settings per branch",
+
   // Replay guards: what stops a stale counter pushing a test bill back
   sync_processed_operations: "replay guard by operation id: a resent operation is answered 'already processed' instead of being applied again",
   sync_pos_sale_staging: "second replay guard for POS bills, by invoice global id / offline ref (both unique per bill, never reused); read only by that duplicate check, by no report",

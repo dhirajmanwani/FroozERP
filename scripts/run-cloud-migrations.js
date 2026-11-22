@@ -114,6 +114,13 @@ const migrationFiles = [
   // sale_items.combo_id and sale_packing_usage's size/combo columns for the "in use" checks. All
   // of it is mirrored in `initializeDatabase()`. Must run after 025.
   "backend/migrations/cloud/026_packing_purchase_client_ref.sql",
+  // 027 (22 Nov 2026) adds `customer_orders.deliveries` (JSONB: each order's delivery attempts and
+  // their status events, carried inside the order's own sync record) and creates
+  // `delivery_settings` (one row per company and branch: pickup, areas, WhatsApp templates). Both
+  // are declared in `initializeDatabase()`, which never runs on a hosted deployment, so without this
+  // file `verifyDeclaredSchema` refuses to start the backend, and once it did every customer order
+  // push would 500 on the missing column. Must run after 015 (customer_orders).
+  "backend/migrations/cloud/027_deliveries.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

@@ -82,6 +82,8 @@ const { validateProductPhoto } = require("./productPhoto");
 const { parsePosSection } = require("./productPosSection");
 const comboRules = require("./combos");
 const froozPack = require("./froozPack");
+const { sanitizeOrderDeliveries } = require("./customerOrderDeliveries");
+const deliverySettings = require("./deliverySettings");
 const { parseBusinessLogo } = require("./businessLogo");
 const { assignBillNo } = require("./dailyBillNumber");
 const saleChangeApproval = require("./saleChangeApproval");
@@ -3464,6 +3466,23 @@ const initializeDatabase = async () => {
     );
     CREATE INDEX IF NOT EXISTS customer_order_items_product_idx
       ON customer_order_items (product_global_id, order_global_id);
+
+    -- Delivery module (backend/customerOrderDeliveries.js, backend/deliverySettings.js): each
+    -- order's delivery attempts with their events, carried inside the order's sync record (NULL
+    -- until a device sends the field; a push without it keeps what is stored), and per-branch
+    -- delivery settings. Cloud migration 027 carries exactly these statements; keep the two
+    -- identical.
+    ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS deliveries JSONB;
+    CREATE TABLE IF NOT EXISTS delivery_settings (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER NOT NULL,
+      branch_id INTEGER NOT NULL,
+      settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_by INTEGER,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (company_id, branch_id)
+    );
 
     ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
     ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
@@ -11504,6 +11523,21 @@ app.get("/api/v3/packing/shops", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------------------------
+// Delivery settings, per branch (backend/deliverySettings.js holds the rules and the database work).
+//
+// GET needs only a session (the counter fills WhatsApp templates from it). PUT is Owner/Admin,
+// re-read from the database by `requireRateManager(req.auth.userId)`. Company and branch are
+// `req.auth.companyId` / `req.auth.branchId`; nothing is read from the body but `settings`.
+// ---------------------------------------------------------------------------------------------
+const deliverySettingsHandlers = deliverySettings.createDeliverySettingsHandlers({
+  pool,
+  requireRateManager,
+  parsePositiveInteger,
+});
+app.get("/api/v3/delivery-settings", deliverySettingsHandlers.getHandler);
+app.put("/api/v3/delivery-settings", deliverySettingsHandlers.putHandler);
+
 app.post("/settings/rebate-rules", async (req, res) => {
   try {
     const { rule_name, pay_within_days, rebate_percent, active } = req.body;
@@ -13241,6 +13275,15 @@ const processCustomerOrderOperation = async (client, operation, context) => {
   }
   const items = normalizedItems.items;
 
+  // Deliveries ride inside the order (backend/customerOrderDeliveries.js). Absent or null: this
+  // sender predates the Delivery module, or the order never had one, and what is stored is kept by
+  // the COALESCE below -- an old counter editing an order must never wipe a newer counter's
+  // deliveries. An array is the sender's whole truth and replaces them.
+  const sanitizedDeliveries = sanitizeOrderDeliveries(payload.deliveries, { orderId: orderGlobalId });
+  if (sanitizedDeliveries.error) {
+    return rejectOperation(operation, "VALIDATION_ERROR", sanitizedDeliveries.error);
+  }
+
   const existingResult = await client.query(
     `SELECT global_id, order_no, status, company_id, branch_id, entity_version, updated_at
      FROM customer_orders
@@ -13313,11 +13356,11 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       status, reserved_at, packed_at, sent_at, delivered_at, cancelled_at, cancellation_reason,
       carrier, carrier_reference, tracking_url, carrier_contact, sale_global_id, invoice_no,
       notes, created_by, source_device_id, entity_version, device_created_at, device_updated_at,
-      deleted_at, updated_at
+      deleted_at, deliveries, updated_at
     )
     VALUES (
       $1,$2,$3,$4,$5,$32,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-      $25,$26,$27,$28,$29,$30,$31, CURRENT_TIMESTAMP
+      $25,$26,$27,$28,$29,$30,$31, $33::jsonb, CURRENT_TIMESTAMP
     )
     ON CONFLICT (global_id) DO UPDATE SET
       order_no = EXCLUDED.order_no,
@@ -13353,6 +13396,9 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       device_created_at = EXCLUDED.device_created_at,
       device_updated_at = EXCLUDED.device_updated_at,
       deleted_at = EXCLUDED.deleted_at,
+      -- NULL is "the sender did not carry deliveries" (an app version from before the module), not
+      -- "there are none" -- that is an empty array. Keep what is stored rather than wipe it.
+      deliveries = COALESCE(EXCLUDED.deliveries, customer_orders.deliveries),
       updated_at = CURRENT_TIMESTAMP
     WHERE customer_orders.entity_version < EXCLUDED.entity_version
     RETURNING *
@@ -13393,6 +13439,8 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       // creation. The payload may still carry a value - an order the device received by transfer
       // and later edited - and that one is the truthful provenance, so it wins over the session.
       parsePositiveInteger(payload.taken_at_branch_id) || branchId,
+      // $33. Serialised here: pg would send a bare JS array as a Postgres array literal, not JSON.
+      sanitizedDeliveries.value === null ? null : JSON.stringify(sanitizedDeliveries.value),
     ]
   );
   const row = upserted.rows[0];
