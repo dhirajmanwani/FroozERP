@@ -133,5 +133,7 @@ test("the shortcut list names F6 and calls F4 what it does", () => {
   const sheet = buildShortcutSheet({ visibleModuleIds: ["sales"] });
   const rows = JSON.stringify(sheet);
   assert.match(rows, /"keys":"F6"/);
-  assert.match(rows, /Checkout & Print/);
+  // One checkout since 22 Nov 2026: F4 is Checkout, and printing follows the Auto print setting.
+  assert.match(rows, /"keys":"F4","label":"Checkout \(prints too when Auto print is on\)"/);
+  assert.doesNotMatch(rows, /Checkout & Print/);
 });

@@ -42,8 +42,9 @@ const ANYWHERE_ROWS = Object.freeze([
 const POS_ROWS = Object.freeze([
   Object.freeze({ keys: "F2", label: "Go to product search" }),
   Object.freeze({ keys: "F3", label: "Go to barcode scan" }),
-  // F4 is Checkout & Print: it saves the bill and prints it, so it is not called plain "Checkout".
-  Object.freeze({ keys: "F4", label: "Checkout & Print the bill" }),
+  // F4 is Checkout, the one checkout button (22 Nov 2026). The saved bill opens on screen with its
+  // own Print button, and prints by itself when Settings > "Auto print after billing" is on.
+  Object.freeze({ keys: "F4", label: "Checkout (prints too when Auto print is on)" }),
   Object.freeze({ keys: "F6", label: "Read the scale weight (Weighing Scale mode)" }),
 ]);
 
