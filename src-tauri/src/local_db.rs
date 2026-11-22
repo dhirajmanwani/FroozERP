@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager};
 use crate::entitlement::{self, EntitlementState};
 use crate::machine_identity::{self, AnchorOutcome, AnchorWritePolicy, MachineContext};
 
-const CURRENT_SCHEMA_VERSION: &str = "031_local_bill_no";
+const CURRENT_SCHEMA_VERSION: &str = "032_deliveries";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -41,6 +41,7 @@ const MIGRATION_028: &str = include_str!("../migrations/sqlite/028_combos.sql");
 const MIGRATION_029: &str = include_str!("../migrations/sqlite/029_frooz_pack.sql");
 const MIGRATION_030: &str = include_str!("../migrations/sqlite/030_dedupe_cached_sale_copies.sql");
 const MIGRATION_031: &str = include_str!("../migrations/sqlite/031_local_bill_no.sql");
+const MIGRATION_032: &str = include_str!("../migrations/sqlite/032_deliveries.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -2792,6 +2793,55 @@ pub fn set_customer_order_status_at(
     read_customer_order(&conn, order_id)
 }
 
+/// Record whether an order has been paid, without moving it.
+///
+/// Its own command because the status command's patch never carried `payment_state`, so the board's
+/// "Has this been paid?" answer was dropped and every Send that needs it was refused. Writes the
+/// state and `payment_marked_at` only: status, `reserved_at`, `packed_at` and every other timestamp
+/// are left alone. Same single transaction as a status change: the write, the version bump and the
+/// outbox row land together or not at all.
+pub fn set_customer_order_payment(
+    app: &AppHandle,
+    order_id: &str,
+    payment_state: &str,
+) -> Result<serde_json::Value, String> {
+    set_customer_order_payment_at(&database_path(app)?, order_id, payment_state)
+}
+
+pub fn set_customer_order_payment_at(
+    path: &Path,
+    order_id: &str,
+    payment_state: &str,
+) -> Result<serde_json::Value, String> {
+    let state = payment_state.trim().to_uppercase();
+    if !CUSTOMER_ORDER_PAYMENT_STATES.contains(&state.as_str()) {
+        return Err(format!(
+            "\"{}\" is not a payment state this app knows. Use Unpaid, Paid or On delivery.",
+            payment_state.trim()
+        ));
+    }
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    let changed = tx
+        .execute(
+            "UPDATE local_customer_orders SET
+               payment_state = ?2,
+               payment_marked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+               entity_version = entity_version + 1,
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![order_id, state],
+        )
+        .map_err(to_error)?;
+    if changed == 0 {
+        return Err("That order could not be found.".to_string());
+    }
+    enqueue_customer_order_with_tx(&tx, order_id)?;
+    tx.commit().map_err(to_error)?;
+    read_customer_order(&conn, order_id)
+}
+
 /// Every order this device knows about, newest first, with its lines attached.
 ///
 /// Deleted orders are excluded; finished ones are not. A board that hid delivered orders would make
@@ -2932,7 +2982,1009 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_error)?;
     order["items"] = serde_json::Value::Array(items);
+    // Every delivery attempt, with its events, in attempt order. Part of the order record on
+    // purpose: this function is also what builds the outbox payload, so the deliveries travel to
+    // the cloud inside the order's own sync record rather than as an entity of their own.
+    order["deliveries"] = serde_json::Value::Array(read_order_deliveries(conn, order_id)?);
     Ok(order)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deliveries (migration 032): Rapido / Uber / own-staff runs for a customer order.
+//
+// The full rule set (labels, overdue flag, which order move a delivery move implies) lives in
+// `frontend/src/local/deliveryLifecycle.js`, where it is tested. This layer re-checks only the two
+// rules that guard money and history before it writes: the legal move table and the reason rule.
+// The vocabulary below is the shared contract's, identical in the SQL CHECKs, the server's sets and
+// the JS constants.
+// ---------------------------------------------------------------------------------------------
+
+const DELIVERY_STATUSES: [&str; 7] =
+    ["pending", "booked", "picked_up", "delivered", "closed", "cancelled", "failed"];
+/// A delivery in one of these blocks a new attempt for the same order.
+const DELIVERY_OPEN_STATUSES: [&str; 3] = ["pending", "booked", "picked_up"];
+/// Finished: no move out, and no edits.
+const DELIVERY_TERMINAL_STATUSES: [&str; 3] = ["closed", "cancelled", "failed"];
+const DELIVERY_REASON_REQUIRED_STATUSES: [&str; 2] = ["cancelled", "failed"];
+const DELIVERY_PROVIDERS: [&str; 4] = ["rapido", "uber", "own_staff", "other"];
+const DELIVERY_PAID_BY: [&str; 2] = ["shop", "customer"];
+/// Used when a new delivery names none. The same defaults the delivery settings ship with.
+const DELIVERY_DEFAULT_PROVIDER: &str = "rapido";
+const DELIVERY_DEFAULT_PAID_BY: &str = "shop";
+/// The order statuses a delivery may be started from.
+const DELIVERY_STARTABLE_ORDER_STATUSES: [&str; 2] = ["PACKED", "SENT"];
+/// The cloud refuses an order carrying more deliveries than this (and the whole push with it), so
+/// a further attempt is refused here, where the operator can be told why.
+const DELIVERY_MAX_PER_ORDER: i64 = 50;
+/// The ceiling the cloud sanitiser applies too (1e11 paise = 100 crore rupees).
+const DELIVERY_MAX_PAISE: i64 = 100_000_000_000;
+
+/// The legal moves. `delivered` is neither open nor terminal: it can only be closed.
+const DELIVERY_MOVES: [(&str, &[&str]); 7] = [
+    ("pending", &["booked", "cancelled"]),
+    ("booked", &["picked_up", "cancelled", "failed"]),
+    ("picked_up", &["delivered", "failed"]),
+    ("delivered", &["closed"]),
+    ("closed", &[]),
+    ("cancelled", &[]),
+    ("failed", &[]),
+];
+
+const DELIVERY_COLUMNS: &str = "id, order_id, attempt_no, customer_name, customer_phone, address, \
+     landmark, area_name, map_link, provider, rider_name, rider_phone, tracking_link, booking_ref, \
+     quoted_paise, final_paise, paid_by, status, status_reason, booked_at, picked_up_at, \
+     delivered_at, closed_at, cancelled_at, failed_at, notes, created_by, created_at, updated_at";
+
+fn delivery_move_allowed(from: &str, to: &str) -> bool {
+    DELIVERY_MOVES
+        .iter()
+        .find(|(status, _)| *status == from)
+        .map(|(_, next)| next.contains(&to))
+        .unwrap_or(false)
+}
+
+fn delivery_status_label(status: &str) -> &str {
+    match status {
+        "pending" => "Pending",
+        "booked" => "Booked",
+        "picked_up" => "Picked up",
+        "delivered" => "Delivered",
+        "closed" => "Closed",
+        "cancelled" => "Cancelled",
+        "failed" => "Failed",
+        other => other,
+    }
+}
+
+/// A vocabulary word as the contract spells it: trimmed and lower-case. Blank is None.
+fn delivery_word(value: &serde_json::Value, key: &str) -> Option<String> {
+    optional_text(value, key).map(|word| word.to_lowercase())
+}
+
+/// A fresh opaque id for a delivery or an event: a random version-4 UUID, lower-case hyphenated.
+///
+/// Not `unique_local_id`. That one is unique within this process, but deliveries travel inside the
+/// order record to every device of the branch, and two devices minting `prefix-millis-hash` in the
+/// same millisecond would collide on the PRIMARY KEY of whichever device pulled the second one.
+///
+/// Two paths, because the `uuid` crate is only a dependency off Windows (see Cargo.toml). Windows
+/// uses `CoCreateGuid`, which is itself a random v4 GUID — the same call the device identity uses.
+#[cfg(windows)]
+fn new_delivery_uuid() -> Result<String, String> {
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::System::Com::CoCreateGuid;
+
+    let mut guid = GUID::from_u128(0);
+    let result = unsafe { CoCreateGuid(&mut guid) };
+    if result < 0 {
+        return Err(format!("Windows could not generate a delivery id (HRESULT {result})."));
+    }
+    Ok(format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    ))
+}
+
+#[cfg(not(windows))]
+fn new_delivery_uuid() -> Result<String, String> {
+    Ok(uuid::Uuid::new_v4().hyphenated().to_string())
+}
+
+/// SQLite's clock, read once, so a delivery row and the event written with it carry the identical
+/// timestamp. Same format as every column DEFAULT in migrations 020 and 032.
+fn sqlite_now(conn: &Connection) -> Result<String, String> {
+    conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| row.get(0))
+        .map_err(to_error)
+}
+
+/// A paise amount as the caller sent it.
+///
+/// `None` = the key is absent (leave the stored value alone). `Some(None)` = null or blank (no
+/// amount). `Some(Some(n))` = a whole, non-negative number of paise. Anything else is an error
+/// rather than a guess: a typo in a charge must not be stored as zero.
+fn delivery_paise_field(value: &serde_json::Value, key: &str) -> Result<Option<Option<i64>>, String> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    let invalid = || format!("{key} must be a whole number of paise, zero or more.");
+    let parsed = match raw {
+        serde_json::Value::Null => return Ok(Some(None)),
+        serde_json::Value::String(text) if text.trim().is_empty() => return Ok(Some(None)),
+        serde_json::Value::String(text) => text.trim().parse::<i64>().map_err(|_| invalid())?,
+        serde_json::Value::Number(number) => match number.as_i64() {
+            Some(whole) => whole,
+            None => {
+                let real = number.as_f64().ok_or_else(invalid)?;
+                if !real.is_finite() || real.fract() != 0.0 || real.abs() > DELIVERY_MAX_PAISE as f64 {
+                    return Err(invalid());
+                }
+                real as i64
+            }
+        },
+        _ => return Err(invalid()),
+    };
+    if !(0..=DELIVERY_MAX_PAISE).contains(&parsed) {
+        return Err(invalid());
+    }
+    Ok(Some(Some(parsed)))
+}
+
+/// A text field as the caller sent it: `None` absent, `Some(None)` null or blank, `Some(Some(t))`.
+/// A number is kept as its text (a phone number typed into a numeric field). Never parsed back.
+fn delivery_text_field(value: &serde_json::Value, key: &str) -> Result<Option<Option<String>>, String> {
+    match value.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(Some(None)),
+        Some(serde_json::Value::String(_)) | Some(serde_json::Value::Number(_)) => {
+            Ok(Some(optional_text(value, key)))
+        }
+        Some(_) => Err(format!("{key} must be text.")),
+    }
+}
+
+/// The fields of a delivery an operator may edit while it is not finished.
+#[derive(Debug, Clone, Default)]
+struct DeliveryEditable {
+    customer_name: Option<String>,
+    customer_phone: Option<String>,
+    address: Option<String>,
+    landmark: Option<String>,
+    area_name: Option<String>,
+    map_link: Option<String>,
+    provider: String,
+    rider_name: Option<String>,
+    rider_phone: Option<String>,
+    tracking_link: Option<String>,
+    booking_ref: Option<String>,
+    quoted_paise: Option<i64>,
+    final_paise: Option<i64>,
+    paid_by: String,
+    notes: Option<String>,
+}
+
+impl DeliveryEditable {
+    fn from_stored(delivery: &serde_json::Value) -> Self {
+        let text = |key: &str| delivery.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        DeliveryEditable {
+            customer_name: text("customer_name"),
+            customer_phone: text("customer_phone"),
+            address: text("address"),
+            landmark: text("landmark"),
+            area_name: text("area_name"),
+            map_link: text("map_link"),
+            provider: text("provider").unwrap_or_else(|| DELIVERY_DEFAULT_PROVIDER.to_string()),
+            rider_name: text("rider_name"),
+            rider_phone: text("rider_phone"),
+            tracking_link: text("tracking_link"),
+            booking_ref: text("booking_ref"),
+            quoted_paise: delivery.get("quoted_paise").and_then(|v| v.as_i64()),
+            final_paise: delivery.get("final_paise").and_then(|v| v.as_i64()),
+            paid_by: text("paid_by").unwrap_or_else(|| DELIVERY_DEFAULT_PAID_BY.to_string()),
+            notes: text("notes"),
+        }
+    }
+
+    /// Overlay the keys the caller actually sent. Absent keys keep what is stored; a key sent as
+    /// null or blank clears it (except provider and paid_by, which always have a value).
+    fn merge(&mut self, input: &serde_json::Value) -> Result<(), String> {
+        for (key, slot) in [
+            ("customer_name", &mut self.customer_name),
+            ("customer_phone", &mut self.customer_phone),
+            ("address", &mut self.address),
+            ("landmark", &mut self.landmark),
+            ("area_name", &mut self.area_name),
+            ("map_link", &mut self.map_link),
+            ("rider_name", &mut self.rider_name),
+            ("rider_phone", &mut self.rider_phone),
+            ("tracking_link", &mut self.tracking_link),
+            ("booking_ref", &mut self.booking_ref),
+            ("notes", &mut self.notes),
+        ] {
+            if let Some(value) = delivery_text_field(input, key)? {
+                *slot = value;
+            }
+        }
+        if let Some(value) = delivery_paise_field(input, "quoted_paise")? {
+            self.quoted_paise = value;
+        }
+        if let Some(value) = delivery_paise_field(input, "final_paise")? {
+            self.final_paise = value;
+        }
+        if let Some(provider) = delivery_word(input, "provider") {
+            if !DELIVERY_PROVIDERS.contains(&provider.as_str()) {
+                return Err(format!("\"{provider}\" is not a delivery provider this app knows."));
+            }
+            self.provider = provider;
+        }
+        if let Some(paid_by) = delivery_word(input, "paid_by") {
+            if !DELIVERY_PAID_BY.contains(&paid_by.as_str()) {
+                return Err(format!(
+                    "\"{paid_by}\" is not a valid Paid by; it must be shop or customer."
+                ));
+            }
+            self.paid_by = paid_by;
+        }
+        Ok(())
+    }
+}
+
+/// The parent order of a delivery write moves on one version, inside the caller's transaction, and
+/// is queued whole. Refuses when the order is gone, so a delivery change never commits without the
+/// order record that carries it to the other devices.
+fn bump_and_enqueue_delivery_order(
+    tx: &rusqlite::Transaction,
+    order_id: &str,
+    now: &str,
+) -> Result<(), String> {
+    let changed = tx
+        .execute(
+            "UPDATE local_customer_orders
+                SET entity_version = entity_version + 1,
+                    updated_at = ?2
+              WHERE id = ?1 AND deleted_at IS NULL",
+            params![order_id, now],
+        )
+        .map_err(to_error)?;
+    if changed == 0 {
+        return Err("The order this delivery belongs to could not be found.".to_string());
+    }
+    enqueue_customer_order_with_tx(tx, order_id)
+}
+
+fn insert_delivery_event(
+    tx: &rusqlite::Transaction,
+    delivery_id: &str,
+    from_status: Option<&str>,
+    to_status: &str,
+    at: &str,
+    by_user: Option<String>,
+    note: Option<String>,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO delivery_events (id, delivery_id, from_status, to_status, at, by_user, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![new_delivery_uuid()?, delivery_id, from_status, to_status, at, by_user, note],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+/// Start a delivery for an order, or edit one that is not finished.
+///
+/// No `id`, or an id this device does not hold: a new attempt. The order must exist, not be
+/// deleted, be PACKED or SENT, and have no open delivery; the attempt number is the order's highest
+/// plus one, and a creation event (NULL -> pending) is written with it. The drop details default to
+/// the order's own customer name, mobile and address when the caller leaves them out.
+///
+/// A known id: the editable fields the caller sent are overwritten, the rest are kept. A closed,
+/// cancelled or failed delivery is history and is refused.
+///
+/// Either way, in one transaction: the delivery (and event), the parent order's version bump, and
+/// the order's outbox row. The order's own status is not touched.
+pub fn save_delivery(app: &AppHandle, delivery: &serde_json::Value) -> Result<serde_json::Value, String> {
+    save_delivery_at(&database_path(app)?, delivery)
+}
+
+pub fn save_delivery_at(path: &Path, delivery: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if !delivery.is_object() {
+        return Err("A delivery must be sent as an object.".to_string());
+    }
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    let now = sqlite_now(&tx)?;
+
+    let existing = match order_text(delivery, "id") {
+        Some(id) => match read_delivery(&tx, &id) {
+            Ok(stored) => Some(stored),
+            Err(_) => None,
+        },
+        None => None,
+    };
+
+    let (delivery_id, order_id) = if let Some(stored) = existing {
+        let delivery_id = stored["id"].as_str().unwrap_or_default().to_string();
+        let order_id = stored["order_id"].as_str().unwrap_or_default().to_string();
+        let status = stored["status"].as_str().unwrap_or_default().to_string();
+        if DELIVERY_TERMINAL_STATUSES.contains(&status.as_str()) {
+            return Err(format!(
+                "This delivery is {} and can no longer be changed.",
+                delivery_status_label(&status).to_lowercase()
+            ));
+        }
+        let mut fields = DeliveryEditable::from_stored(&stored);
+        fields.merge(delivery)?;
+        tx.execute(
+            "UPDATE deliveries SET
+               customer_name = ?2, customer_phone = ?3, address = ?4, landmark = ?5,
+               area_name = ?6, map_link = ?7, provider = ?8, rider_name = ?9, rider_phone = ?10,
+               tracking_link = ?11, booking_ref = ?12, quoted_paise = ?13, final_paise = ?14,
+               paid_by = ?15, notes = ?16, updated_at = ?17, synced_at = NULL
+             WHERE id = ?1",
+            params![
+                delivery_id,
+                fields.customer_name,
+                fields.customer_phone,
+                fields.address,
+                fields.landmark,
+                fields.area_name,
+                fields.map_link,
+                fields.provider,
+                fields.rider_name,
+                fields.rider_phone,
+                fields.tracking_link,
+                fields.booking_ref,
+                fields.quoted_paise,
+                fields.final_paise,
+                fields.paid_by,
+                fields.notes,
+                now,
+            ],
+        )
+        .map_err(to_error)?;
+        (delivery_id, order_id)
+    } else {
+        let order_id = order_text(delivery, "order_id")
+            .ok_or_else(|| "A delivery needs the order it belongs to.".to_string())?;
+
+        // The start rule.
+        let order: Option<(String, Option<String>, String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT status, deleted_at, customer_name, customer_mobile, delivery_address
+                   FROM local_customer_orders WHERE id = ?1",
+                params![order_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(to_error)?;
+        let Some((order_status, deleted_at, order_customer, order_mobile, order_address)) = order else {
+            return Err("That order could not be found.".to_string());
+        };
+        if deleted_at.is_some() {
+            return Err("That order has been removed, so a delivery cannot be started for it.".to_string());
+        }
+        if !DELIVERY_STARTABLE_ORDER_STATUSES.contains(&order_status.as_str()) {
+            return Err(
+                "A delivery can be started only when the order is Packed or Sent.".to_string(),
+            );
+        }
+        let open_placeholders = DELIVERY_OPEN_STATUSES
+            .iter()
+            .map(|status| format!("'{status}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let open: i64 = tx
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM deliveries WHERE order_id = ?1 AND status IN ({open_placeholders})"
+                ),
+                params![order_id],
+                |row| row.get(0),
+            )
+            .map_err(to_error)?;
+        if open > 0 {
+            return Err(
+                "This order already has a delivery in progress. Finish or cancel it before starting another."
+                    .to_string(),
+            );
+        }
+        let (attempt_no, attempts): (i64, i64) = tx
+            .query_row(
+                "SELECT COALESCE(MAX(attempt_no), 0) + 1, COUNT(*) FROM deliveries WHERE order_id = ?1",
+                params![order_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(to_error)?;
+        if attempts >= DELIVERY_MAX_PER_ORDER {
+            return Err(format!(
+                "This order already has {attempts} delivery attempts, the most one order can carry."
+            ));
+        }
+
+        let mut fields = DeliveryEditable {
+            customer_name: Some(order_customer),
+            customer_phone: order_mobile,
+            address: order_address,
+            provider: DELIVERY_DEFAULT_PROVIDER.to_string(),
+            paid_by: DELIVERY_DEFAULT_PAID_BY.to_string(),
+            ..DeliveryEditable::default()
+        };
+        fields.merge(delivery)?;
+
+        let delivery_id = new_delivery_uuid()?;
+        let created_by = optional_text(delivery, "created_by");
+        tx.execute(
+            "INSERT INTO deliveries (
+               id, order_id, attempt_no, customer_name, customer_phone, address, landmark,
+               area_name, map_link, provider, rider_name, rider_phone, tracking_link, booking_ref,
+               quoted_paise, final_paise, paid_by, status, notes, created_by, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                       'pending', ?18, ?19, ?20, ?20)",
+            params![
+                delivery_id,
+                order_id,
+                attempt_no,
+                fields.customer_name,
+                fields.customer_phone,
+                fields.address,
+                fields.landmark,
+                fields.area_name,
+                fields.map_link,
+                fields.provider,
+                fields.rider_name,
+                fields.rider_phone,
+                fields.tracking_link,
+                fields.booking_ref,
+                fields.quoted_paise,
+                fields.final_paise,
+                fields.paid_by,
+                fields.notes,
+                created_by,
+                now,
+            ],
+        )
+        .map_err(to_error)?;
+        insert_delivery_event(&tx, &delivery_id, None, "pending", &now, created_by, None)?;
+        (delivery_id, order_id)
+    };
+
+    bump_and_enqueue_delivery_order(&tx, &order_id, &now)?;
+    tx.commit().map_err(to_error)?;
+    read_delivery(&conn, &delivery_id)
+}
+
+/// Move a delivery along the legal table, and record the move as an event.
+///
+/// `patch` may carry `status_reason` (required, non-blank, for cancelled and failed),
+/// `final_paise`, `rider_name`, `rider_phone`, `tracking_link`, `booking_ref`, and `by_user` and
+/// `note` for the event. The matching `<status>_at` is stamped. Closing with no final amount sent
+/// and none stored writes the quoted amount as final, so a closed delivery always says what it cost.
+/// Same single transaction as `save_delivery`: delivery, event, order version bump, outbox row.
+pub fn set_delivery_status(
+    app: &AppHandle,
+    delivery_id: &str,
+    next_status: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    set_delivery_status_at(&database_path(app)?, delivery_id, next_status, patch)
+}
+
+pub fn set_delivery_status_at(
+    path: &Path,
+    delivery_id: &str,
+    next_status: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let next = next_status.trim().to_lowercase();
+    if !DELIVERY_STATUSES.contains(&next.as_str()) {
+        return Err(format!("\"{}\" is not a delivery status this app knows.", next_status.trim()));
+    }
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+
+    let stored = read_delivery(&tx, delivery_id)?;
+    let current = stored["status"].as_str().unwrap_or_default().to_string();
+    let order_id = stored["order_id"].as_str().unwrap_or_default().to_string();
+    if !delivery_move_allowed(&current, &next) {
+        return Err(format!(
+            "A delivery cannot move from {} to {}.",
+            delivery_status_label(&current),
+            delivery_status_label(&next)
+        ));
+    }
+    let reason = optional_text(patch, "status_reason");
+    if DELIVERY_REASON_REQUIRED_STATUSES.contains(&next.as_str()) && reason.is_none() {
+        return Err(format!(
+            "Say why the delivery is being marked {}.",
+            delivery_status_label(&next).to_lowercase()
+        ));
+    }
+
+    // Explicit checks rather than `or`-chains on values that may legitimately be zero: a final of
+    // 0 paise (a free delivery) is an answer, not a blank.
+    let patch_final = delivery_paise_field(patch, "final_paise")?.flatten();
+    let stored_final = stored.get("final_paise").and_then(|v| v.as_i64());
+    let quoted = stored.get("quoted_paise").and_then(|v| v.as_i64());
+    let final_paise = match (patch_final, stored_final) {
+        (Some(value), _) => Some(value),
+        (None, Some(value)) => Some(value),
+        (None, None) if next == "closed" => quoted,
+        (None, None) => None,
+    };
+
+    let stamp_column = match next.as_str() {
+        "booked" => "booked_at",
+        "picked_up" => "picked_up_at",
+        "delivered" => "delivered_at",
+        "closed" => "closed_at",
+        "cancelled" => "cancelled_at",
+        "failed" => "failed_at",
+        _ => "",
+    };
+    let now = sqlite_now(&tx)?;
+    let changed = tx
+        .execute(
+            "UPDATE deliveries SET
+               status = ?2,
+               status_reason = COALESCE(?3, status_reason),
+               final_paise = ?4,
+               rider_name = COALESCE(?5, rider_name),
+               rider_phone = COALESCE(?6, rider_phone),
+               tracking_link = COALESCE(?7, tracking_link),
+               booking_ref = COALESCE(?8, booking_ref),
+               booked_at = CASE WHEN ?9 = 'booked_at' THEN ?10 ELSE booked_at END,
+               picked_up_at = CASE WHEN ?9 = 'picked_up_at' THEN ?10 ELSE picked_up_at END,
+               delivered_at = CASE WHEN ?9 = 'delivered_at' THEN ?10 ELSE delivered_at END,
+               closed_at = CASE WHEN ?9 = 'closed_at' THEN ?10 ELSE closed_at END,
+               cancelled_at = CASE WHEN ?9 = 'cancelled_at' THEN ?10 ELSE cancelled_at END,
+               failed_at = CASE WHEN ?9 = 'failed_at' THEN ?10 ELSE failed_at END,
+               updated_at = ?10,
+               synced_at = NULL
+             WHERE id = ?1 AND status = ?11",
+            params![
+                delivery_id,
+                next,
+                reason,
+                final_paise,
+                optional_text(patch, "rider_name"),
+                optional_text(patch, "rider_phone"),
+                optional_text(patch, "tracking_link"),
+                optional_text(patch, "booking_ref"),
+                stamp_column,
+                now,
+                current,
+            ],
+        )
+        .map_err(to_error)?;
+    if changed == 0 {
+        return Err("That delivery changed underneath this update and was not moved.".to_string());
+    }
+    insert_delivery_event(
+        &tx,
+        delivery_id,
+        Some(&current),
+        &next,
+        &now,
+        optional_text(patch, "by_user"),
+        optional_text(patch, "note").or_else(|| reason.clone()),
+    )?;
+
+    bump_and_enqueue_delivery_order(&tx, &order_id, &now)?;
+    tx.commit().map_err(to_error)?;
+    read_delivery(&conn, delivery_id)
+}
+
+/// Every delivery of every order this device holds that is not deleted, newest first, each with
+/// its events and with `order_no`, `order_status` and `branch_id` from its order.
+pub fn list_deliveries(app: &AppHandle) -> Result<serde_json::Value, String> {
+    list_deliveries_at(&database_path(app)?)
+}
+
+pub fn list_deliveries_at(path: &Path) -> Result<serde_json::Value, String> {
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    let rows: Vec<(String, String, String, rusqlite::types::Value)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT d.id, o.order_no, o.status, o.branch_id
+                   FROM deliveries d
+                   JOIN local_customer_orders o ON o.id = d.order_id
+                  WHERE o.deleted_at IS NULL
+                  ORDER BY d.created_at DESC, d.attempt_no DESC, d.id DESC",
+            )
+            .map_err(to_error)?;
+        let mapped = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .map_err(to_error)?;
+        mapped.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+    let mut deliveries = Vec::with_capacity(rows.len());
+    for (delivery_id, order_no, order_status, branch_id) in rows {
+        let mut delivery = read_delivery(&conn, &delivery_id)?;
+        delivery["order_no"] = serde_json::Value::String(order_no);
+        delivery["order_status"] = serde_json::Value::String(order_status);
+        delivery["branch_id"] = sqlite_value_to_json(branch_id);
+        deliveries.push(delivery);
+    }
+    Ok(serde_json::json!({ "deliveries": deliveries }))
+}
+
+/// A raw SQLite value as JSON: the same mapping `read_customer_order` uses for its INTEGER-affinity
+/// `branch_id`, so the order and its deliveries report one branch the same way.
+fn sqlite_value_to_json(value: rusqlite::types::Value) -> serde_json::Value {
+    match value {
+        rusqlite::types::Value::Null => serde_json::Value::Null,
+        rusqlite::types::Value::Integer(value) => serde_json::Value::from(value),
+        rusqlite::types::Value::Real(value) => serde_json::Value::from(value),
+        rusqlite::types::Value::Text(value) => serde_json::Value::String(value),
+        rusqlite::types::Value::Blob(_) => serde_json::Value::Null,
+    }
+}
+
+fn delivery_from_row(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "id": row.get::<_, String>(0)?,
+        "order_id": row.get::<_, String>(1)?,
+        "attempt_no": row.get::<_, i64>(2)?,
+        "customer_name": row.get::<_, Option<String>>(3)?,
+        "customer_phone": row.get::<_, Option<String>>(4)?,
+        "address": row.get::<_, Option<String>>(5)?,
+        "landmark": row.get::<_, Option<String>>(6)?,
+        "area_name": row.get::<_, Option<String>>(7)?,
+        "map_link": row.get::<_, Option<String>>(8)?,
+        "provider": row.get::<_, String>(9)?,
+        "rider_name": row.get::<_, Option<String>>(10)?,
+        "rider_phone": row.get::<_, Option<String>>(11)?,
+        "tracking_link": row.get::<_, Option<String>>(12)?,
+        "booking_ref": row.get::<_, Option<String>>(13)?,
+        "quoted_paise": row.get::<_, Option<i64>>(14)?,
+        "final_paise": row.get::<_, Option<i64>>(15)?,
+        "paid_by": row.get::<_, String>(16)?,
+        "status": row.get::<_, String>(17)?,
+        "status_reason": row.get::<_, Option<String>>(18)?,
+        "booked_at": row.get::<_, Option<String>>(19)?,
+        "picked_up_at": row.get::<_, Option<String>>(20)?,
+        "delivered_at": row.get::<_, Option<String>>(21)?,
+        "closed_at": row.get::<_, Option<String>>(22)?,
+        "cancelled_at": row.get::<_, Option<String>>(23)?,
+        "failed_at": row.get::<_, Option<String>>(24)?,
+        "notes": row.get::<_, Option<String>>(25)?,
+        "created_by": row.get::<_, Option<String>>(26)?,
+        "created_at": row.get::<_, String>(27)?,
+        "updated_at": row.get::<_, String>(28)?,
+    }))
+}
+
+/// A delivery's events, oldest first. `rowid` breaks a tie between two events stamped in the same
+/// millisecond, which keeps them in the order they were written.
+fn read_delivery_events(conn: &Connection, delivery_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT id, delivery_id, from_status, to_status, at, by_user, note
+               FROM delivery_events WHERE delivery_id = ?1 ORDER BY at, rowid",
+        )
+        .map_err(to_error)?;
+    let events = statement
+        .query_map(params![delivery_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "delivery_id": row.get::<_, String>(1)?,
+                "from_status": row.get::<_, Option<String>>(2)?,
+                "to_status": row.get::<_, String>(3)?,
+                "at": row.get::<_, String>(4)?,
+                "by_user": row.get::<_, Option<String>>(5)?,
+                "note": row.get::<_, Option<String>>(6)?,
+            }))
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    Ok(events)
+}
+
+fn read_delivery(conn: &Connection, delivery_id: &str) -> Result<serde_json::Value, String> {
+    let mut delivery = conn
+        .query_row(
+            &format!("SELECT {DELIVERY_COLUMNS} FROM deliveries WHERE id = ?1"),
+            params![delivery_id],
+            delivery_from_row,
+        )
+        // "Not found" only when there genuinely is no such row, as for orders.
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => "That delivery could not be found.".to_string(),
+            other => format!("That delivery could not be read: {other}"),
+        })?;
+    delivery["events"] = serde_json::Value::Array(read_delivery_events(conn, delivery_id)?);
+    Ok(delivery)
+}
+
+/// An order's deliveries in attempt order, each with its events. Empty for an order that never had
+/// one, which is most of them.
+fn read_order_deliveries(conn: &Connection, order_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut deliveries: Vec<serde_json::Value> = {
+        let mut statement = conn
+            .prepare_cached(&format!(
+                "SELECT {DELIVERY_COLUMNS} FROM deliveries WHERE order_id = ?1 ORDER BY attempt_no, id"
+            ))
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map(params![order_id], delivery_from_row)
+            .map_err(to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_error)?;
+        rows
+    };
+    for delivery in deliveries.iter_mut() {
+        let id = delivery["id"].as_str().unwrap_or_default().to_string();
+        delivery["events"] = serde_json::Value::Array(read_delivery_events(conn, &id)?);
+    }
+    Ok(deliveries)
+}
+
+/// Replace an order's deliveries with the ones a pulled copy carries.
+///
+/// Called only when the payload's `deliveries` is an array; an absent or null key leaves the local
+/// rows alone (an older app version pushed the order, or the order never had a delivery). Whole
+/// replacement, like the order's lines, so a delivery removed on the other device does not linger
+/// here.
+///
+/// **Never aborts the pull.** A delivery with an unknown status, provider or paid-by, no id, a bad
+/// attempt number or a junk amount is skipped and recorded in `local_unapplied_changes`; an id or
+/// attempt number that would break a UNIQUE constraint is skipped the same way. The order itself and
+/// every other delivery still land.
+fn replace_pulled_order_deliveries_with_tx(
+    tx: &rusqlite::Transaction,
+    change: &PulledChange,
+    deliveries: &[serde_json::Value],
+) -> Result<(), String> {
+    let order_id = change.entity_id.as_str();
+    tx.execute(
+        "DELETE FROM delivery_events
+          WHERE delivery_id IN (SELECT id FROM deliveries WHERE order_id = ?1)",
+        params![order_id],
+    )
+    .map_err(to_error)?;
+    tx.execute("DELETE FROM deliveries WHERE order_id = ?1", params![order_id])
+        .map_err(to_error)?;
+
+    let now = sqlite_now(tx)?;
+    for (index, delivery) in deliveries.iter().enumerate() {
+        let skip = |reason: &str, detail: String| {
+            record_unapplied_change(tx, change, reason, Some(format!("delivery {index}: {detail}")))
+        };
+        let Some(delivery_id) = optional_text(delivery, "id") else {
+            skip("CUSTOMER_ORDER_DELIVERY_MALFORMED", "carries no id and was skipped".to_string())?;
+            continue;
+        };
+        let status = delivery_word(delivery, "status").unwrap_or_default();
+        if !DELIVERY_STATUSES.contains(&status.as_str()) {
+            skip(
+                "CUSTOMER_ORDER_DELIVERY_STATUS_NOT_RECOGNISED",
+                format!("status {status:?} is not one this build knows; the delivery was skipped"),
+            )?;
+            continue;
+        }
+        let provider = delivery_word(delivery, "provider")
+            .unwrap_or_else(|| DELIVERY_DEFAULT_PROVIDER.to_string());
+        if !DELIVERY_PROVIDERS.contains(&provider.as_str()) {
+            skip(
+                "CUSTOMER_ORDER_DELIVERY_PROVIDER_NOT_RECOGNISED",
+                format!("provider {provider:?} is not one this build knows; the delivery was skipped"),
+            )?;
+            continue;
+        }
+        let paid_by = delivery_word(delivery, "paid_by")
+            .unwrap_or_else(|| DELIVERY_DEFAULT_PAID_BY.to_string());
+        if !DELIVERY_PAID_BY.contains(&paid_by.as_str()) {
+            skip(
+                "CUSTOMER_ORDER_DELIVERY_PAID_BY_NOT_RECOGNISED",
+                format!("paid_by {paid_by:?} is not one this build knows; the delivery was skipped"),
+            )?;
+            continue;
+        }
+        let attempt_no = delivery
+            .get("attempt_no")
+            .and_then(json_number)
+            .filter(|value| value.is_finite() && value.fract() == 0.0 && *value >= 1.0)
+            .map(|value| value as i64);
+        let Some(attempt_no) = attempt_no else {
+            skip("CUSTOMER_ORDER_DELIVERY_MALFORMED", "has no valid attempt_no and was skipped".to_string())?;
+            continue;
+        };
+        let (quoted_paise, final_paise) = match (
+            delivery_paise_field(delivery, "quoted_paise"),
+            delivery_paise_field(delivery, "final_paise"),
+        ) {
+            (Ok(quoted), Ok(finalv)) => (quoted.flatten(), finalv.flatten()),
+            (Err(error), _) | (_, Err(error)) => {
+                skip("CUSTOMER_ORDER_DELIVERY_MALFORMED", format!("{error} The delivery was skipped"))?;
+                continue;
+            }
+        };
+        let clash: Option<String> = tx
+            .query_row(
+                "SELECT order_id FROM deliveries WHERE id = ?1 OR (order_id = ?2 AND attempt_no = ?3)",
+                params![delivery_id, order_id, attempt_no],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_error)?;
+        if let Some(other) = clash {
+            skip(
+                "CUSTOMER_ORDER_DELIVERY_ALREADY_PRESENT",
+                format!(
+                    "id {delivery_id:?} or attempt {attempt_no} is already held here (order {other:?}); the delivery was skipped"
+                ),
+            )?;
+            continue;
+        }
+
+        tx.execute(
+            "INSERT INTO deliveries (
+               id, order_id, attempt_no, customer_name, customer_phone, address, landmark,
+               area_name, map_link, provider, rider_name, rider_phone, tracking_link, booking_ref,
+               quoted_paise, final_paise, paid_by, status, status_reason, booked_at, picked_up_at,
+               delivered_at, closed_at, cancelled_at, failed_at, notes, created_by, created_at,
+               updated_at, synced_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                       ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                       COALESCE(?28, ?30), COALESCE(?29, ?28, ?30), ?30)",
+            params![
+                delivery_id,
+                order_id,
+                attempt_no,
+                optional_text(delivery, "customer_name"),
+                optional_text(delivery, "customer_phone"),
+                optional_text(delivery, "address"),
+                optional_text(delivery, "landmark"),
+                optional_text(delivery, "area_name"),
+                optional_text(delivery, "map_link"),
+                provider,
+                optional_text(delivery, "rider_name"),
+                optional_text(delivery, "rider_phone"),
+                optional_text(delivery, "tracking_link"),
+                optional_text(delivery, "booking_ref"),
+                quoted_paise,
+                final_paise,
+                paid_by,
+                status,
+                optional_text(delivery, "status_reason"),
+                optional_text(delivery, "booked_at"),
+                optional_text(delivery, "picked_up_at"),
+                optional_text(delivery, "delivered_at"),
+                optional_text(delivery, "closed_at"),
+                optional_text(delivery, "cancelled_at"),
+                optional_text(delivery, "failed_at"),
+                optional_text(delivery, "notes"),
+                optional_text(delivery, "created_by"),
+                optional_text(delivery, "created_at"),
+                optional_text(delivery, "updated_at"),
+                now,
+            ],
+        )
+        .map_err(to_error)?;
+
+        if let Some(events) = delivery.get("events").and_then(|value| value.as_array()) {
+            for (event_index, event) in events.iter().enumerate() {
+                // History, so stored as sent, but an event with nothing to say is skipped rather
+                // than invented. Its delivery is always the one it arrived inside.
+                let (Some(to_status), Some(at)) = (optional_text(event, "to_status"), optional_text(event, "at"))
+                else {
+                    continue;
+                };
+                tx.execute(
+                    "INSERT INTO delivery_events (id, delivery_id, from_status, to_status, at, by_user, note)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        optional_text(event, "id")
+                            .unwrap_or_else(|| format!("{delivery_id}-event-{event_index}")),
+                        delivery_id,
+                        optional_text(event, "from_status"),
+                        to_status,
+                        at,
+                        optional_text(event, "by_user"),
+                        optional_text(event, "note"),
+                    ],
+                )
+                .map_err(to_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// This branch's delivery settings as this device last saved them, or JSON null when none were
+/// ever saved. A stored document that no longer parses is an error, never an empty settings object.
+pub fn get_delivery_settings(app: &AppHandle, branch_id: &str) -> Result<serde_json::Value, String> {
+    get_delivery_settings_at(&database_path(app)?, branch_id)
+}
+
+pub fn get_delivery_settings_at(path: &Path, branch_id: &str) -> Result<serde_json::Value, String> {
+    let branch_id = branch_id.trim();
+    if branch_id.is_empty() {
+        return Err("Delivery settings need a branch.".to_string());
+    }
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    read_delivery_settings(&conn, branch_id)
+}
+
+fn read_delivery_settings(conn: &Connection, branch_id: &str) -> Result<serde_json::Value, String> {
+    let row: Option<(String, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT settings_json, dirty, updated_at FROM local_delivery_settings WHERE branch_id = ?1",
+            params![branch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(to_error)?;
+    let Some((settings_json, dirty, updated_at)) = row else {
+        return Ok(serde_json::Value::Null);
+    };
+    let settings: serde_json::Value = serde_json::from_str(&settings_json).map_err(|error| {
+        format!("The delivery settings saved on this computer could not be read: {error}")
+    })?;
+    Ok(serde_json::json!({
+        "branch_id": branch_id,
+        "settings": settings,
+        "dirty": dirty != 0,
+        "updated_at": updated_at,
+    }))
+}
+
+/// Keep this branch's delivery settings on this device. `dirty` says whether the copy still has to
+/// be pushed to the cloud. The document is stored as given; its shape is `deliverySettings.js`'s.
+pub fn save_delivery_settings(
+    app: &AppHandle,
+    branch_id: &str,
+    settings: &serde_json::Value,
+    dirty: bool,
+) -> Result<serde_json::Value, String> {
+    save_delivery_settings_at(&database_path(app)?, branch_id, settings, dirty)
+}
+
+pub fn save_delivery_settings_at(
+    path: &Path,
+    branch_id: &str,
+    settings: &serde_json::Value,
+    dirty: bool,
+) -> Result<serde_json::Value, String> {
+    let branch_id = branch_id.trim();
+    if branch_id.is_empty() {
+        return Err("Delivery settings need a branch.".to_string());
+    }
+    if !settings.is_object() {
+        return Err("Delivery settings must be sent as an object.".to_string());
+    }
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    conn.execute(
+        "INSERT INTO local_delivery_settings (branch_id, settings_json, dirty, updated_at)
+         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(branch_id) DO UPDATE SET
+           settings_json = excluded.settings_json,
+           dirty = excluded.dirty,
+           updated_at = excluded.updated_at",
+        params![
+            branch_id,
+            serde_json::to_string(settings).map_err(to_error)?,
+            if dirty { 1 } else { 0 },
+        ],
+    )
+    .map_err(to_error)?;
+    read_delivery_settings(&conn, branch_id)
 }
 
 /// A boolean field that a server may send as `true`, as `1`, or not at all.
@@ -5534,6 +6586,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "029_frooz_pack", MIGRATION_029)?;
     apply_migration(&mut conn, "030_dedupe_cached_sale_copies", MIGRATION_030)?;
     apply_migration(&mut conn, "031_local_bill_no", MIGRATION_031)?;
+    apply_migration(&mut conn, "032_deliveries", MIGRATION_032)?;
     if first_open_in_this_process(path) {
         release_interrupted_syncing_at(&conn)?;
     }
@@ -9537,6 +10590,13 @@ fn apply_pulled_customer_order_with_tx(
         }
     }
 
+    // Deliveries ride inside the order record (migration 032). Only an array replaces them: an
+    // absent or null key means the sender said nothing about deliveries (an older app version, or
+    // an order that never had one), and wiping the local attempts on that would lose history.
+    if let Some(deliveries) = payload.get("deliveries").and_then(|value| value.as_array()) {
+        replace_pulled_order_deliveries_with_tx(tx, change, deliveries)?;
+    }
+
     Ok(())
 }
 
@@ -10215,7 +11275,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 30;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 31;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -19459,6 +20519,472 @@ mod tests {
             .unwrap();
         assert_eq!((bill_no, reference.as_str(), total_amount), (None, "REF-pre-031", 20.0));
         drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---- Deliveries (migration 032) ----
+
+    /// A profile with a branch and one order moved to `status` through the real commands.
+    fn delivery_test_order(label: &str, order_id: &str, status: &str) -> PathBuf {
+        let path = order_sync_test_path(&format!("delivery-{label}"));
+        initialize_at(&path).expect("initialize delivery database");
+        seed_order_branch(&path, "3");
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": order_id,
+                "order_no": format!("ORD-{order_id}"),
+                "customer_name": "Anita",
+                "customer_mobile": "9876500000",
+                "delivery_address": "12 MG Road",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+            }),
+        )
+        .expect("order saves");
+        if status != "RECEIVED" {
+            set_customer_order_status_at(&path, order_id, "PACKED", &serde_json::json!({}))
+                .expect("order packs");
+        }
+        if status == "SENT" {
+            set_customer_order_status_at(&path, order_id, "SENT", &serde_json::json!({}))
+                .expect("order sends");
+        }
+        path
+    }
+
+    fn start_delivery(path: &Path, order_id: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut input = serde_json::json!({ "order_id": order_id });
+        if let Some(fields) = extra.as_object() {
+            for (key, value) in fields {
+                input[key] = value.clone();
+            }
+        }
+        save_delivery_at(path, &input).expect("a delivery starts")
+    }
+
+    fn move_delivery(path: &Path, delivery: &serde_json::Value, to: &str, patch: serde_json::Value) -> Result<serde_json::Value, String> {
+        set_delivery_status_at(path, delivery["id"].as_str().unwrap(), to, &patch)
+    }
+
+    #[test]
+    fn delivery_move_table_matches_the_contract() {
+        let legal = [
+            ("pending", "booked"), ("pending", "cancelled"),
+            ("booked", "picked_up"), ("booked", "cancelled"), ("booked", "failed"),
+            ("picked_up", "delivered"), ("picked_up", "failed"),
+            ("delivered", "closed"),
+        ];
+        for from in DELIVERY_STATUSES {
+            for to in DELIVERY_STATUSES {
+                assert_eq!(
+                    delivery_move_allowed(from, to),
+                    legal.contains(&(from, to)),
+                    "{from} -> {to}"
+                );
+            }
+        }
+        assert!(!delivery_move_allowed("unknown", "booked"));
+    }
+
+    /// A delivery starts on a PACKED order: attempt 1, pending, a creation event, the drop copied
+    /// from the order, and the order bumped one version and queued with the delivery inside it.
+    #[test]
+    fn a_delivery_starts_on_a_packed_order_and_rides_in_the_order_outbox_payload() {
+        let path = delivery_test_order("start", "order-d1", "PACKED");
+        let before = order_row(&path, "order-d1")["entity_version"].as_i64().unwrap();
+
+        let delivery = start_delivery(&path, "order-d1", serde_json::json!({
+            "provider": "uber", "quoted_paise": 4500, "landmark": "Near temple", "created_by": "ravi"
+        }));
+        assert_eq!(delivery["status"], "pending");
+        assert_eq!(delivery["attempt_no"], 1);
+        assert_eq!(delivery["order_id"], "order-d1");
+        assert_eq!(delivery["provider"], "uber");
+        assert_eq!(delivery["paid_by"], "shop", "the default Paid by");
+        assert_eq!(delivery["quoted_paise"], 4500);
+        assert!(delivery["final_paise"].is_null());
+        assert_eq!(delivery["customer_name"], "Anita", "the drop defaults to the order's customer");
+        assert_eq!(delivery["customer_phone"], "9876500000");
+        assert_eq!(delivery["address"], "12 MG Road");
+        let id = delivery["id"].as_str().unwrap();
+        assert_eq!(id.len(), 36, "a uuid: {id}");
+        assert_eq!(&id[14..15], "4", "version 4: {id}");
+        let events = delivery["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]["from_status"].is_null());
+        assert_eq!(events[0]["to_status"], "pending");
+        assert_eq!(events[0]["by_user"], "ravi");
+        assert_eq!(events[0]["at"], delivery["created_at"]);
+
+        let order = order_row(&path, "order-d1");
+        assert_eq!(order["entity_version"].as_i64().unwrap(), before + 1, "the order moves one version");
+        assert_eq!(order["status"], "PACKED", "the order's own status is not touched");
+        assert_eq!(order["deliveries"][0]["id"], delivery["id"]);
+
+        let rows = outbox_rows(&path);
+        let (operation_id, _, _, _, version, _, _, payload) = rows.last().cloned().unwrap();
+        assert_eq!(operation_id, format!("order-order-d1-v{}", before + 1));
+        assert_eq!(version, before + 1);
+        let carried = payload["deliveries"].as_array().expect("the payload carries deliveries");
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0]["id"], delivery["id"]);
+        assert_eq!(carried[0]["events"].as_array().unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_delivery_is_refused_on_an_order_that_is_not_packed_or_sent() {
+        let path = delivery_test_order("refuse", "order-d2", "RECEIVED");
+        let refused = save_delivery_at(&path, &serde_json::json!({ "order_id": "order-d2" }))
+            .expect_err("a RECEIVED order cannot start a delivery");
+        assert!(refused.contains("Packed or Sent"), "{refused}");
+        let missing = save_delivery_at(&path, &serde_json::json!({ "order_id": "no-such-order" }))
+            .expect_err("an unknown order cannot start a delivery");
+        assert!(missing.contains("could not be found"), "{missing}");
+        assert!(save_delivery_at(&path, &serde_json::json!({})).is_err(), "an order is required");
+
+        Connection::open(&path).unwrap()
+            .execute("UPDATE local_customer_orders SET status = 'PACKED', deleted_at = '2026-11-22T00:00:00.000Z' WHERE id = 'order-d2'", [])
+            .unwrap();
+        assert!(save_delivery_at(&path, &serde_json::json!({ "order_id": "order-d2" })).is_err(), "a deleted order cannot start one");
+
+        let count: i64 = Connection::open(&path).unwrap()
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_second_open_delivery_is_refused_and_a_failed_one_allows_attempt_two() {
+        let path = delivery_test_order("second", "order-d3", "SENT");
+        let first = start_delivery(&path, "order-d3", serde_json::json!({}));
+        let refused = save_delivery_at(&path, &serde_json::json!({ "order_id": "order-d3" }))
+            .expect_err("one open delivery per order");
+        assert!(refused.contains("in progress"), "{refused}");
+
+        move_delivery(&path, &first, "booked", serde_json::json!({ "rider_name": "Suresh" })).unwrap();
+        move_delivery(&path, &first, "failed", serde_json::json!({ "status_reason": "Customer not home" })).unwrap();
+        let second = start_delivery(&path, "order-d3", serde_json::json!({}));
+        assert_eq!(second["attempt_no"], 2);
+        let order = order_row(&path, "order-d3");
+        let attempts: Vec<i64> = order["deliveries"].as_array().unwrap().iter().map(|d| d["attempt_no"].as_i64().unwrap()).collect();
+        assert_eq!(attempts, vec![1, 2], "attempt order");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delivery_moves_are_rechecked_and_stamped() {
+        let path = delivery_test_order("moves", "order-d4", "PACKED");
+        let delivery = start_delivery(&path, "order-d4", serde_json::json!({ "quoted_paise": 6000 }));
+        for illegal in ["picked_up", "delivered", "closed", "failed"] {
+            let error = move_delivery(&path, &delivery, illegal, serde_json::json!({ "status_reason": "x" }))
+                .expect_err("not a legal move from pending");
+            assert!(error.contains("cannot move"), "{error}");
+        }
+        assert!(move_delivery(&path, &delivery, "teleported", serde_json::json!({})).is_err());
+
+        let booked = move_delivery(&path, &delivery, "booked", serde_json::json!({
+            "rider_name": "Suresh", "rider_phone": "9000000001", "tracking_link": "https://rapido.example/t/1",
+            "booking_ref": "RB-1", "by_user": "ravi"
+        })).unwrap();
+        assert_eq!(booked["status"], "booked");
+        assert!(booked["booked_at"].is_string());
+        assert_eq!(booked["rider_name"], "Suresh");
+        assert_eq!(booked["booking_ref"], "RB-1");
+        let picked = move_delivery(&path, &booked, "picked_up", serde_json::json!({})).unwrap();
+        assert_eq!(picked["rider_name"], "Suresh", "a move without rider fields keeps them");
+        let delivered = move_delivery(&path, &picked, "delivered", serde_json::json!({})).unwrap();
+        assert!(move_delivery(&path, &delivered, "failed", serde_json::json!({ "status_reason": "x" })).is_err(), "delivered can only close");
+        let closed = move_delivery(&path, &delivered, "closed", serde_json::json!({})).unwrap();
+        assert!(closed["closed_at"].is_string());
+        for anything in ["pending", "booked", "cancelled", "failed", "closed"] {
+            assert!(move_delivery(&path, &closed, anything, serde_json::json!({ "status_reason": "x" })).is_err(), "closed is final");
+        }
+        let edit = save_delivery_at(&path, &serde_json::json!({ "id": closed["id"], "notes": "late" }))
+            .expect_err("a closed delivery cannot be edited");
+        assert!(edit.contains("closed"), "{edit}");
+
+        let tos: Vec<String> = closed["events"].as_array().unwrap().iter().map(|e| e["to_status"].as_str().unwrap().to_string()).collect();
+        assert_eq!(tos, ["pending", "booked", "picked_up", "delivered", "closed"]);
+        assert_eq!(closed["events"][1]["from_status"], "pending");
+        assert_eq!(closed["events"][1]["by_user"], "ravi");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cancelled_and_failed_need_a_reason() {
+        let path = delivery_test_order("reason", "order-d5", "PACKED");
+        let delivery = start_delivery(&path, "order-d5", serde_json::json!({}));
+        for patch in [serde_json::json!({}), serde_json::json!({ "status_reason": "   " })] {
+            let error = move_delivery(&path, &delivery, "cancelled", patch).expect_err("a reason is required");
+            assert!(error.contains("why"), "{error}");
+        }
+        let version_before = order_row(&path, "order-d5")["entity_version"].as_i64().unwrap();
+        let cancelled = move_delivery(&path, &delivery, "cancelled", serde_json::json!({ "status_reason": "Customer cancelled" })).unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["status_reason"], "Customer cancelled");
+        assert!(cancelled["cancelled_at"].is_string());
+        assert_eq!(order_row(&path, "order-d5")["entity_version"].as_i64().unwrap(), version_before + 1);
+
+        let other = delivery_test_order("reason-fail", "order-d6", "PACKED");
+        let delivery = start_delivery(&other, "order-d6", serde_json::json!({}));
+        let booked = move_delivery(&other, &delivery, "booked", serde_json::json!({})).unwrap();
+        assert!(move_delivery(&other, &booked, "failed", serde_json::json!({})).is_err());
+        let failed = move_delivery(&other, &booked, "failed", serde_json::json!({ "status_reason": "Rider cancelled" })).unwrap();
+        assert!(failed["failed_at"].is_string());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&other);
+    }
+
+    fn deliver(path: &Path, delivery: &serde_json::Value) -> serde_json::Value {
+        let booked = move_delivery(path, delivery, "booked", serde_json::json!({})).unwrap();
+        let picked = move_delivery(path, &booked, "picked_up", serde_json::json!({})).unwrap();
+        move_delivery(path, &picked, "delivered", serde_json::json!({})).unwrap()
+    }
+
+    #[test]
+    fn closing_fills_final_from_quoted_and_keeps_a_real_final() {
+        let path = delivery_test_order("close", "order-d7", "PACKED");
+        let blank = deliver(&path, &start_delivery(&path, "order-d7", serde_json::json!({ "quoted_paise": 5500 })));
+        let closed = move_delivery(&path, &blank, "closed", serde_json::json!({ "final_paise": null })).unwrap();
+        assert_eq!(closed["final_paise"], 5500, "blank final = quoted");
+
+        let path2 = delivery_test_order("close-typed", "order-d8", "PACKED");
+        let typed = deliver(&path2, &start_delivery(&path2, "order-d8", serde_json::json!({ "quoted_paise": 5500 })));
+        let closed = move_delivery(&path2, &typed, "closed", serde_json::json!({ "final_paise": 6200 })).unwrap();
+        assert_eq!(closed["final_paise"], 6200);
+
+        // Zero is an amount, not a blank: a free delivery stays free.
+        let path3 = delivery_test_order("close-zero", "order-d9", "PACKED");
+        let zero = deliver(&path3, &start_delivery(&path3, "order-d9", serde_json::json!({ "quoted_paise": 5500, "final_paise": 0 })));
+        let closed = move_delivery(&path3, &zero, "closed", serde_json::json!({})).unwrap();
+        assert_eq!(closed["final_paise"], 0);
+
+        assert!(save_delivery_at(&path3, &serde_json::json!({ "order_id": "order-d9", "quoted_paise": -1 })).is_err());
+        for path in [path, path2, path3] {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn editing_a_delivery_overwrites_only_what_was_sent() {
+        let path = delivery_test_order("edit", "order-d10", "PACKED");
+        let delivery = start_delivery(&path, "order-d10", serde_json::json!({ "landmark": "Temple", "quoted_paise": 4000 }));
+        let edited = save_delivery_at(&path, &serde_json::json!({
+            "id": delivery["id"], "area_name": "Koramangala", "landmark": "", "paid_by": "customer"
+        })).unwrap();
+        assert_eq!(edited["id"], delivery["id"]);
+        assert_eq!(edited["area_name"], "Koramangala");
+        assert!(edited["landmark"].is_null(), "a blank clears");
+        assert_eq!(edited["quoted_paise"], 4000, "an absent key is kept");
+        assert_eq!(edited["paid_by"], "customer");
+        assert_eq!(edited["events"].as_array().unwrap().len(), 1, "an edit is not a move");
+        assert!(save_delivery_at(&path, &serde_json::json!({ "id": delivery["id"], "provider": "ola" })).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    fn pulled_order(version: i64, deliveries: Option<serde_json::Value>) -> PulledChange {
+        let mut payload = serde_json::json!({
+            "id": "order-pull",
+            "order_no": "ORD-order-pull",
+            "customer_name": "Anita",
+            "status": "SENT",
+            "branch_id": "3",
+            "items": [{ "id": "order-pull-line-0", "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+        });
+        if let Some(value) = deliveries {
+            payload["deliveries"] = value;
+        }
+        PulledChange {
+            change_id: serde_json::json!(version),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-pull".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(version),
+            updated_at: Some("2026-11-22T10:00:00.000Z".to_string()),
+            payload,
+        }
+    }
+
+    fn remote_delivery(id: &str, attempt: i64, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "order_id": "order-pull", "attempt_no": attempt,
+            "customer_name": "Anita", "provider": "rapido", "paid_by": "customer",
+            "quoted_paise": 4000, "final_paise": null, "status": status,
+            "status_reason": if status == "failed" { "No answer" } else { "" },
+            "created_at": "2026-11-22T09:00:00.000Z", "updated_at": "2026-11-22T09:30:00.000Z",
+            "events": [
+                { "id": format!("{id}-e1"), "delivery_id": id, "from_status": null, "to_status": "pending", "at": "2026-11-22T09:00:00.000Z" },
+                { "id": format!("{id}-e2"), "delivery_id": id, "from_status": "pending", "to_status": "booked", "at": "2026-11-22T09:10:00.000Z", "by_user": "ravi" }
+            ]
+        })
+    }
+
+    #[test]
+    fn a_pulled_order_with_deliveries_replaces_the_local_ones() {
+        let path = delivery_test_order("pull-replace", "order-pull", "SENT");
+        let local = start_delivery(&path, "order-pull", serde_json::json!({}));
+        let version = order_row(&path, "order-pull")["entity_version"].as_i64().unwrap();
+
+        pull_changes(&path, &[pulled_order(version + 1, Some(serde_json::json!([
+            remote_delivery("remote-del-1", 1, "failed"),
+            remote_delivery("remote-del-2", 2, "booked"),
+        ])))], "cursor-d1");
+
+        let order = order_row(&path, "order-pull");
+        let deliveries = order["deliveries"].as_array().unwrap();
+        let ids: Vec<&str> = deliveries.iter().map(|d| d["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["remote-del-1", "remote-del-2"], "replaced, in attempt order");
+        assert!(!ids.contains(&local["id"].as_str().unwrap()));
+        assert_eq!(deliveries[1]["paid_by"], "customer");
+        assert_eq!(deliveries[1]["events"].as_array().unwrap().len(), 2);
+        assert_eq!(deliveries[1]["events"][1]["by_user"], "ravi");
+        let conn = Connection::open(&path).unwrap();
+        let orphans: i64 = conn
+            .query_row("SELECT COUNT(*) FROM delivery_events WHERE delivery_id = ?1", [local["id"].as_str().unwrap()], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "the replaced delivery's events go with it");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_order_without_deliveries_leaves_the_local_ones() {
+        let path = delivery_test_order("pull-keep", "order-pull", "SENT");
+        let local = start_delivery(&path, "order-pull", serde_json::json!({}));
+        let version = order_row(&path, "order-pull")["entity_version"].as_i64().unwrap();
+
+        pull_changes(&path, &[pulled_order(version + 1, None)], "cursor-d2");
+        pull_changes(&path, &[pulled_order(version + 2, Some(serde_json::Value::Null))], "cursor-d3");
+
+        let order = order_row(&path, "order-pull");
+        assert_eq!(order["entity_version"].as_i64().unwrap(), version + 2, "the order itself applied");
+        let deliveries = order["deliveries"].as_array().unwrap();
+        assert_eq!(deliveries.len(), 1, "absent or null leaves deliveries untouched");
+        assert_eq!(deliveries[0]["id"], local["id"]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_delivery_with_an_unknown_word_is_skipped_without_aborting_the_pull() {
+        let path = order_sync_test_path("delivery-pull-unknown");
+        initialize_at(&path).expect("initialize");
+        let mut bad_status = remote_delivery("remote-bad-status", 1, "teleported");
+        bad_status["status"] = serde_json::json!("teleported");
+        let mut bad_provider = remote_delivery("remote-bad-provider", 2, "cancelled");
+        bad_provider["provider"] = serde_json::json!("ola");
+        let mut bad_paid = remote_delivery("remote-bad-paid", 3, "cancelled");
+        bad_paid["paid_by"] = serde_json::json!("nobody");
+        pull_changes(&path, &[pulled_order(4, Some(serde_json::json!([
+            bad_status, bad_provider, bad_paid, remote_delivery("remote-good", 4, "booked"),
+        ])))], "cursor-d4");
+
+        let order = order_row(&path, "order-pull");
+        assert_eq!(order["status"], "SENT", "the order still lands");
+        let ids: Vec<&str> = order["deliveries"].as_array().unwrap().iter().map(|d| d["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["remote-good"]);
+        let reason: String = Connection::open(&path).unwrap()
+            .query_row("SELECT reason FROM local_unapplied_changes WHERE entity_id = 'order-pull'", [], |row| row.get(0))
+            .expect("the skip is recorded");
+        assert!(reason.starts_with("CUSTOMER_ORDER_DELIVERY_"), "{reason}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_deliveries_carries_its_order_and_skips_deleted_orders() {
+        let path = delivery_test_order("list", "order-d11", "PACKED");
+        assert_eq!(list_deliveries_at(&path).unwrap()["deliveries"].as_array().unwrap().len(), 0);
+        let board = list_customer_orders_at(&path).expect("orders list with no deliveries at all");
+        assert_eq!(board["orders"][0]["deliveries"], serde_json::json!([]));
+
+        let delivery = start_delivery(&path, "order-d11", serde_json::json!({}));
+        let listed = list_deliveries_at(&path).unwrap();
+        let rows = listed["deliveries"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], delivery["id"]);
+        assert_eq!(rows[0]["order_no"], "ORD-order-d11");
+        assert_eq!(rows[0]["order_status"], "PACKED");
+        assert_eq!(rows[0]["branch_id"], 3);
+        assert_eq!(rows[0]["events"].as_array().unwrap().len(), 1);
+
+        Connection::open(&path).unwrap()
+            .execute("UPDATE local_customer_orders SET deleted_at = '2026-11-22T00:00:00.000Z' WHERE id = 'order-d11'", [])
+            .unwrap();
+        assert_eq!(list_deliveries_at(&path).unwrap()["deliveries"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delivery_settings_round_trip_per_branch() {
+        let path = order_sync_test_path("delivery-settings");
+        assert!(get_delivery_settings_at(&path, "3").unwrap().is_null(), "none saved yet");
+        let settings = serde_json::json!({
+            "pickup_address": "Shop 4", "default_paid_by": "shop", "overdue_minutes": 45,
+            "areas": [{ "id": "a1", "name": "Koramangala", "usual_paise": 4000 }]
+        });
+        let saved = save_delivery_settings_at(&path, "3", &settings, true).unwrap();
+        assert_eq!(saved["branch_id"], "3");
+        assert_eq!(saved["settings"], settings);
+        assert_eq!(saved["dirty"], true);
+        assert!(saved["updated_at"].is_string());
+        let clean = save_delivery_settings_at(&path, "3", &settings, false).unwrap();
+        assert_eq!(clean["dirty"], false);
+        assert!(get_delivery_settings_at(&path, "4").unwrap().is_null(), "per branch");
+        assert!(save_delivery_settings_at(&path, "3", &serde_json::json!([1]), true).is_err());
+        assert!(save_delivery_settings_at(&path, " ", &settings, true).is_err());
+
+        Connection::open(&path).unwrap()
+            .execute("UPDATE local_delivery_settings SET settings_json = '{broken' WHERE branch_id = '3'", [])
+            .unwrap();
+        assert!(get_delivery_settings_at(&path, "3").is_err(), "a corrupt copy is an error, not empty settings");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_032_is_idempotent_on_its_own() {
+        let path = polish_path("migration-032");
+        initialize_at(&path).expect("initialize");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATION_032).expect("032 runs again harmlessly");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                   AND name IN ('deliveries', 'delivery_events', 'local_delivery_settings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3);
+        assert_eq!(status_at(&path).unwrap().schema_version, "032_deliveries");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_order_payment_state_is_recorded_versioned_and_queued() {
+        let path = delivery_test_order("payment", "order-pay", "PACKED");
+        let before = order_row(&path, "order-pay");
+        let version = before["entity_version"].as_i64().unwrap();
+
+        let paid = set_customer_order_payment_at(&path, "order-pay", "paid").expect("payment records");
+        assert_eq!(paid["payment_state"], "PAID");
+        assert!(paid["payment_marked_at"].is_string());
+        assert_eq!(paid["entity_version"].as_i64().unwrap(), version + 1);
+        assert_eq!(paid["status"], "PACKED", "status is not touched");
+        assert_eq!(paid["reserved_at"], before["reserved_at"], "reserved_at is not touched");
+        assert_eq!(paid["packed_at"], before["packed_at"], "packed_at is not touched");
+
+        let (operation_id, _, _, _, queued_version, _, _, payload) = outbox_rows(&path).last().cloned().unwrap();
+        assert_eq!(operation_id, format!("order-order-pay-v{}", version + 1));
+        assert_eq!(queued_version, version + 1);
+        assert_eq!(payload["payment_state"], "PAID");
+
+        assert!(set_customer_order_payment_at(&path, "order-pay", "MAYBE").is_err());
+        assert!(set_customer_order_payment_at(&path, "no-such-order", "PAID").is_err());
+        Connection::open(&path).unwrap()
+            .execute("UPDATE local_customer_orders SET deleted_at = '2026-11-22T00:00:00.000Z' WHERE id = 'order-pay'", [])
+            .unwrap();
+        assert!(set_customer_order_payment_at(&path, "order-pay", "UNPAID").is_err(), "a deleted order is refused");
         let _ = fs::remove_file(&path);
     }
 }
