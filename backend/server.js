@@ -13155,6 +13155,9 @@ const parseCustomerOrderTimestamp = (value) => {
  * `Number()` in a coat - with a `global_id` fallback for products and no fallback at all for lots.
  * "004" and 4 are different products; that coercion, and that asymmetry, are not repeated here.
  */
+/** True when the sender carried no order lines at all: no array, or an empty one. */
+const sentCustomerOrderWithoutLines = (rawItems) => !Array.isArray(rawItems) || rawItems.length === 0;
+
 const normalizeCustomerOrderItems = (rawItems) => {
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
     return { error: "Customer order requires at least one item" };
@@ -13311,11 +13314,15 @@ const processCustomerOrderOperation = async (client, operation, context) => {
     timestamps[field] = parsed.value;
   }
 
-  const normalizedItems = normalizeCustomerOrderItems(payload.items);
-  if (normalizedItems.error) {
+  // An order with no lines. Before the desktop pull learnt the cloud's field names, every order
+  // echoed back from the cloud lost its lines on the device that took it, and that device's next
+  // change sent the order with none. For an order the cloud already holds, the stored lines stand
+  // (resolved below, once the row is locked); a new order with no lines is still refused.
+  const sentNoLines = sentCustomerOrderWithoutLines(payload.items);
+  const normalizedItems = sentNoLines ? null : normalizeCustomerOrderItems(payload.items);
+  if (normalizedItems?.error) {
     return rejectOperation(operation, "VALIDATION_ERROR", normalizedItems.error);
   }
-  const items = normalizedItems.items;
 
   // Deliveries ride inside the order (backend/customerOrderDeliveries.js). Absent or null: this
   // sender predates the Delivery module, or the order never had one, and what is stored is kept by
@@ -13396,6 +13403,24 @@ const processCustomerOrderOperation = async (client, operation, context) => {
         },
       };
     }
+  }
+
+  let items = normalizedItems?.items || [];
+  if (sentNoLines) {
+    const storedLines = current
+      ? await client.query(
+        `SELECT global_id, line_index, product_global_id, product_name, unit, quantity, agreed_rate,
+                line_amount, inventory_lot_global_id
+         FROM customer_order_items
+         WHERE order_global_id = $1
+         ORDER BY line_index`,
+        [orderGlobalId]
+      )
+      : { rows: [] };
+    if (storedLines.rows.length === 0) {
+      return rejectOperation(operation, "VALIDATION_ERROR", "Customer order requires at least one item");
+    }
+    items = storedLines.rows;
   }
 
   const upserted = await client.query(

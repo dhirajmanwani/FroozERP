@@ -696,3 +696,67 @@ test("the published change carries the stored deliveries, including ones an old 
   assert.deepEqual(payload.deliveries, stored);
   assert.ok(Array.isArray(payload.items));
 });
+
+// ---------------------------------------------------------------------------------------------
+// An order sent with no lines
+// ---------------------------------------------------------------------------------------------
+
+/** The cloud's own lines, as Postgres hands NUMERIC back: strings. */
+const STORED_LINES = [
+  {
+    global_id: "ORD-ITEM-1",
+    line_index: 0,
+    product_global_id: "004",
+    product_name: "Alphonso",
+    unit: "KG",
+    quantity: "2.501",
+    agreed_rate: "80.00",
+    line_amount: "200.08",
+    inventory_lot_global_id: "lot-77",
+  },
+];
+
+test("an order the cloud holds keeps its stored lines when a device sends it with none", async () => {
+  // Older desktops lost every line of an order on the cloud's echo (the pull read `product_id`,
+  // the cloud sends `product_global_id`), and their next change was refused for having no lines.
+  for (const items of [[], undefined]) {
+    const client = scriptedClient([
+      NO_REPLAY,
+      STORE_ACK,
+      [/FROM customer_orders WHERE global_id/, { rows: [storedOrderRow({ entity_version: 2 })], rowCount: 1 }],
+      [/FROM customer_order_items WHERE order_global_id/, { rows: STORED_LINES, rowCount: 1 }],
+      [/INSERT INTO customer_orders/, { rows: [storedOrderRow({ entity_version: 3, status: "SENT" })], rowCount: 1 }],
+      [/INSERT INTO sync_change_log/, CHANGE_LOG_ROW],
+    ]);
+    const ack = await processSyncOperation(
+      client,
+      orderOperation({ payload: { ...orderPayload(), status: "SENT", items } }),
+      context()
+    );
+    assert.equal(ack.status, "accepted", `items: ${JSON.stringify(items)}`);
+    const line = oneStatement(client, /INSERT INTO customer_order_items/);
+    assert.deepEqual(line.values, [
+      "ORD-2026-08-27-0001", "ORD-ITEM-1", 0, "004", "Alphonso", "KG", "2.501", "80.00", "200.08", "lot-77",
+    ]);
+    const change = oneStatement(client, /INSERT INTO sync_change_log/);
+    assert.deepEqual(JSON.parse(change.values[7]).items, STORED_LINES, "the echo carries the lines back");
+  }
+});
+
+test("a new order with no lines is still refused, and so is a held one with none stored", async () => {
+  const unknown = scriptedClient([NO_REPLAY, STORE_ACK]);
+  const fresh = await processCustomerOrderOperation(unknown, orderOperation({ payload: { ...orderPayload(), items: [] } }), context());
+  assert.equal(fresh.status, "rejected");
+  assert.match(fresh.message, /at least one item/);
+  assert.equal(statementsMatching(unknown, /INSERT INTO customer_orders/).length, 0);
+
+  const empty = scriptedClient([
+    NO_REPLAY,
+    STORE_ACK,
+    [/FROM customer_orders WHERE global_id/, { rows: [storedOrderRow({ entity_version: 2 })], rowCount: 1 }],
+  ]);
+  const held = await processCustomerOrderOperation(empty, orderOperation({ payload: { ...orderPayload(), items: [] } }), context());
+  assert.equal(held.status, "rejected");
+  assert.match(held.message, /at least one item/);
+  assert.equal(statementsMatching(empty, /INSERT INTO customer_orders/).length, 0);
+});
